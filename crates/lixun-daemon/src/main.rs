@@ -45,6 +45,14 @@ struct IndexStats {
 /// Map a transport `Result<GuiResponse>` to the daemon's public
 /// `Response::Visibility` wire type. Transport errors and semantic
 /// errors both surface as `Response::Error`.
+/// Clamp the Stage-2 score multiplier (frecency × latch) so no
+/// single hit can accumulate unbounded score growth from long-lived
+/// click history or exact-query latch streaks. `cap` is
+/// `RankingConfig.total_multiplier_cap` (default 6.0).
+fn clamp_stage2_mult(stage2: f32, cap: f32) -> f32 {
+    stage2.min(cap)
+}
+
 fn gui_result_to_response(r: anyhow::Result<GuiResponse>) -> Response {
     match r {
         Ok(GuiResponse::Ok { visible }) => Response::Visibility { visible },
@@ -459,17 +467,15 @@ async fn handle_client(
                 let now = chrono::Utc::now().timestamp();
                 {
                     let frecency = frecency.read().await;
-                    let alpha = config.ranking_frecency_alpha;
-                    for hit in &mut hits {
-                        hit.score *= frecency.mult(&hit.id.0, now, alpha);
-                    }
-                }
-                {
                     let latch = query_latch.read().await;
+                    let alpha = config.ranking_frecency_alpha;
                     let w = config.ranking_latch_weight;
                     let cap = config.ranking_latch_cap;
+                    let total_cap = config.ranking_total_multiplier_cap;
                     for hit in &mut hits {
-                        hit.score *= latch.mult(&q, &hit.id.0, now, w, cap);
+                        let stage2 = frecency.mult(&hit.id.0, now, alpha)
+                            * latch.mult(&q, &hit.id.0, now, w, cap);
+                        hit.score *= clamp_stage2_mult(stage2, total_cap);
                     }
                 }
                 hits.sort_by(|a, b| {
@@ -694,4 +700,27 @@ fn register_builtin_sources(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clamp_stage2_mult_caps_at_total() {
+        assert_eq!(clamp_stage2_mult(10.0, 6.0), 6.0);
+        assert_eq!(clamp_stage2_mult(1000.0, 6.0), 6.0);
+    }
+
+    #[test]
+    fn clamp_stage2_mult_passes_through_below_cap() {
+        assert_eq!(clamp_stage2_mult(2.0, 6.0), 2.0);
+        assert_eq!(clamp_stage2_mult(1.0, 6.0), 1.0);
+        assert_eq!(clamp_stage2_mult(0.5, 6.0), 0.5);
+    }
+
+    #[test]
+    fn clamp_stage2_mult_boundary_cap() {
+        assert_eq!(clamp_stage2_mult(6.0, 6.0), 6.0);
+    }
 }
