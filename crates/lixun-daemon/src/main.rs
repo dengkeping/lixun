@@ -53,6 +53,21 @@ fn clamp_stage2_mult(stage2: f32, cap: f32) -> f32 {
     stage2.min(cap)
 }
 
+/// Total-order comparator for the final hit sort: descending by
+/// score, with a deterministic tiebreaker on `doc_id.0` ascending.
+/// Without the tiebreaker, near-ties (or NaN scores) produce
+/// non-deterministic order, which propagates into Top Hit selection
+/// because `select_top_hit` reads `hits[0]` and `hits[1]` directly.
+fn compare_hits_for_ranking(
+    a: &lixun_core::Hit,
+    b: &lixun_core::Hit,
+) -> std::cmp::Ordering {
+    b.score
+        .partial_cmp(&a.score)
+        .unwrap_or(std::cmp::Ordering::Equal)
+        .then_with(|| a.id.0.cmp(&b.id.0))
+}
+
 fn gui_result_to_response(r: anyhow::Result<GuiResponse>) -> Response {
     match r {
         Ok(GuiResponse::Ok { visible }) => Response::Visibility { visible },
@@ -478,11 +493,7 @@ async fn handle_client(
                         hit.score *= clamp_stage2_mult(stage2, total_cap);
                     }
                 }
-                hits.sort_by(|a, b| {
-                    b.score
-                        .partial_cmp(&a.score)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
+                hits.sort_by(compare_hits_for_ranking);
                 let top_hit_id = {
                     let frecency = frecency.read().await;
                     let latch = query_latch.read().await;
@@ -705,6 +716,30 @@ fn register_builtin_sources(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lixun_core::{Action, Category, DocId, Hit};
+
+    fn mk_hit(id: &str, score: f32) -> Hit {
+        Hit {
+            id: DocId(id.into()),
+            category: Category::App,
+            title: id.into(),
+            subtitle: String::new(),
+            icon_name: None,
+            kind_label: None,
+            score,
+            action: Action::Launch {
+                exec: "true".into(),
+                terminal: false,
+                desktop_id: None,
+                desktop_file: None,
+                working_dir: None,
+            },
+            extract_fail: false,
+            sender: None,
+            recipients: None,
+            body: None,
+        }
+    }
 
     #[test]
     fn clamp_stage2_mult_caps_at_total() {
@@ -722,5 +757,43 @@ mod tests {
     #[test]
     fn clamp_stage2_mult_boundary_cap() {
         assert_eq!(clamp_stage2_mult(6.0, 6.0), 6.0);
+    }
+
+    #[test]
+    fn sort_tiebreaker_deterministic() {
+        let mut a = [
+            mk_hit("app:c", 5.0),
+            mk_hit("app:a", 5.0),
+            mk_hit("app:b", 5.0),
+        ];
+        let mut b = [
+            mk_hit("app:b", 5.0),
+            mk_hit("app:c", 5.0),
+            mk_hit("app:a", 5.0),
+        ];
+        a.sort_by(compare_hits_for_ranking);
+        b.sort_by(compare_hits_for_ranking);
+        assert_eq!(
+            a.iter().map(|h| h.id.0.as_str()).collect::<Vec<_>>(),
+            ["app:a", "app:b", "app:c"]
+        );
+        assert_eq!(
+            b.iter().map(|h| h.id.0.as_str()).collect::<Vec<_>>(),
+            ["app:a", "app:b", "app:c"]
+        );
+    }
+
+    #[test]
+    fn sort_score_descending_takes_precedence() {
+        let mut hits = [
+            mk_hit("app:a", 1.0),
+            mk_hit("app:b", 10.0),
+            mk_hit("app:c", 5.0),
+        ];
+        hits.sort_by(compare_hits_for_ranking);
+        assert_eq!(
+            hits.iter().map(|h| h.id.0.as_str()).collect::<Vec<_>>(),
+            ["app:b", "app:c", "app:a"]
+        );
     }
 }
