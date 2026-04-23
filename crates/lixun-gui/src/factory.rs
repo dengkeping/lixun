@@ -56,6 +56,18 @@ pub(crate) fn with_cached_hits<R>(f: impl FnOnce(&[Hit]) -> R) -> R {
     CACHED_HITS.with(|c| f(&c.borrow()))
 }
 
+/// Look up a cached Hit by doc id and return a clone so callers
+/// can execute side effects without holding the `CACHED_HITS`
+/// borrow. Action callbacks that activate app actions (e.g.
+/// `clear-and-hide-launcher`) trigger a chain that re-enters
+/// `clear_cached_hits()` → `borrow_mut()`, which would panic on
+/// a live read borrow. Clone-out avoids re-entrancy; the cost is
+/// one `Hit::clone` per click event (a handful per second at
+/// most) instead of per-bind (hundreds during scrolling).
+pub(crate) fn cached_hit_by_id(doc_id: &str) -> Option<Hit> {
+    CACHED_HITS.with(|c| c.borrow().iter().find(|h| h.id.0 == doc_id).cloned())
+}
+
 pub(crate) fn clear_cached_hits() {
     CACHED_HITS.with(|c| c.borrow_mut().clear());
     TOP_HIT_DOC_ID.with(|c| *c.borrow_mut() = None);
@@ -246,14 +258,12 @@ pub(crate) fn create_list_factory(entry: gtk::Entry) -> gtk::SignalListItemFacto
                 tracing::debug!("row.open fired on unbound row");
                 return;
             };
-            with_cached_hits(|hits| {
-                if let Some(hit) = hits.iter().find(|h| h.id.0 == doc_id) {
-                    dispatch_click_pair(&hit.id.0, open_entry.text().as_str());
-                    if let Err(e) = execute_action(hit) {
-                        tracing::error!("Action failed: {}", e);
-                    }
+            if let Some(hit) = cached_hit_by_id(&doc_id) {
+                dispatch_click_pair(&hit.id.0, open_entry.text().as_str());
+                if let Err(e) = execute_action(&hit) {
+                    tracing::error!("Action failed: {}", e);
                 }
-            });
+            }
         });
         group.add_action(&open);
 
@@ -264,13 +274,11 @@ pub(crate) fn create_list_factory(entry: gtk::Entry) -> gtk::SignalListItemFacto
                 tracing::debug!("row.reveal fired on unbound row");
                 return;
             };
-            with_cached_hits(|hits| {
-                if let Some(hit) = hits.iter().find(|h| h.id.0 == doc_id)
-                    && let Err(e) = execute_secondary_action(hit)
-                {
-                    tracing::error!("Reveal failed: {}", e);
-                }
-            });
+            if let Some(hit) = cached_hit_by_id(&doc_id)
+                && let Err(e) = execute_secondary_action(&hit)
+            {
+                tracing::error!("Reveal failed: {}", e);
+            }
         });
         group.add_action(&reveal);
 
@@ -281,11 +289,9 @@ pub(crate) fn create_list_factory(entry: gtk::Entry) -> gtk::SignalListItemFacto
                 tracing::debug!("row.copy fired on unbound row");
                 return;
             };
-            with_cached_hits(|hits| {
-                if let Some(hit) = hits.iter().find(|h| h.id.0 == doc_id) {
-                    copy_to_clipboard(hit);
-                }
-            });
+            if let Some(hit) = cached_hit_by_id(&doc_id) {
+                copy_to_clipboard(&hit);
+            }
         });
         group.add_action(&copy);
 
@@ -297,15 +303,13 @@ pub(crate) fn create_list_factory(entry: gtk::Entry) -> gtk::SignalListItemFacto
                 tracing::debug!("row.quicklook fired on unbound row");
                 return;
             };
-            with_cached_hits(|hits| {
-                if let Some(hit) = hits.iter().find(|h| h.id.0 == doc_id) {
-                    let monitor = quick_row
-                        .root()
-                        .and_then(|r| r.downcast::<gtk::ApplicationWindow>().ok())
-                        .and_then(|w| crate::ipc::current_monitor_connector(&w));
-                    send_preview_request(hit, monitor);
-                }
-            });
+            if let Some(hit) = cached_hit_by_id(&doc_id) {
+                let monitor = quick_row
+                    .root()
+                    .and_then(|r| r.downcast::<gtk::ApplicationWindow>().ok())
+                    .and_then(|w| crate::ipc::current_monitor_connector(&w));
+                send_preview_request(&hit, monitor);
+            }
         });
         group.add_action(&quick);
 
@@ -334,12 +338,10 @@ pub(crate) fn create_list_factory(entry: gtk::Entry) -> gtk::SignalListItemFacto
                 tracing::debug!("row.info fired on unbound row");
                 return;
             };
-            with_cached_hits(|hits| {
-                if let Some(hit) = hits.iter().find(|h| h.id.0 == doc_id) {
-                    populate_info_popover_body(&info_vbox_for_action, hit);
-                    info_popover_for_action.popup();
-                }
-            });
+            if let Some(hit) = cached_hit_by_id(&doc_id) {
+                populate_info_popover_body(&info_vbox_for_action, &hit);
+                info_popover_for_action.popup();
+            }
         });
         group.add_action(&info);
 
@@ -378,21 +380,22 @@ pub(crate) fn create_list_factory(entry: gtk::Entry) -> gtk::SignalListItemFacto
                 tracing::debug!("double-click fired on unbound row");
                 return;
             };
-            with_cached_hits(|hits| {
-                if let Some(hit) = hits.iter().find(|h| h.id.0 == doc_id) {
-                    dispatch_click_pair(&hit.id.0, dblclick_entry.text().as_str());
-                    if let Err(e) = execute_action(hit) {
-                        tracing::error!("double-click open failed: {}", e);
-                        return;
-                    }
-                    // Double-click = launch-completing action;
-                    // drop the launcher session cache via the
-                    // "clear-and-hide-launcher" app action.
-                    if let Some(app) = gio::Application::default() {
-                        app.activate_action("clear-and-hide-launcher", None);
-                    }
+            if let Some(hit) = cached_hit_by_id(&doc_id) {
+                dispatch_click_pair(&hit.id.0, dblclick_entry.text().as_str());
+                if let Err(e) = execute_action(&hit) {
+                    tracing::error!("double-click open failed: {}", e);
+                    return;
                 }
-            });
+                // Double-click = launch-completing action;
+                // drop the launcher session cache via the
+                // "clear-and-hide-launcher" app action. Safe
+                // now because we're no longer inside a
+                // CACHED_HITS borrow (cached_hit_by_id drops
+                // it before returning).
+                if let Some(app) = gio::Application::default() {
+                    app.activate_action("clear-and-hide-launcher", None);
+                }
+            }
         });
         row.add_controller(dblclick_gesture);
 
@@ -407,17 +410,15 @@ pub(crate) fn create_list_factory(entry: gtk::Entry) -> gtk::SignalListItemFacto
         drag.set_actions(gdk::DragAction::COPY);
         drag.connect_prepare(move |source, _x, _y| {
             let doc_id = drag_state.borrow().doc_id.clone()?;
-            with_cached_hits(|hits| {
-                let hit = hits.iter().find(|h| h.id.0 == doc_id)?;
-                let path = hit_file_path(hit)?;
-                let file = gio::File::for_path(&path);
-                let uri = file.uri();
-                let content = gdk::ContentProvider::for_value(&uri.to_value());
-                if let Some(paintable) = resolve_icon(hit, ICON_SIZE_NORMAL) {
-                    source.set_icon(Some(&paintable), 0, 0);
-                }
-                Some(content)
-            })
+            let hit = cached_hit_by_id(&doc_id)?;
+            let path = hit_file_path(&hit)?;
+            let file = gio::File::for_path(&path);
+            let uri = file.uri();
+            let content = gdk::ContentProvider::for_value(&uri.to_value());
+            if let Some(paintable) = resolve_icon(&hit, ICON_SIZE_NORMAL) {
+                source.set_icon(Some(&paintable), 0, 0);
+            }
+            Some(content)
         });
         row.add_controller(drag);
 
