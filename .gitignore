@@ -12,6 +12,7 @@ Cargo.lock
 
 # Local notes workspace (plans, notepads, transcripts — local only)
 /.local/
+/.local-plans/
 
 # Local-only notes and instructions, not distributed with the repo
 /AGENTS.md
