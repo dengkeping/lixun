@@ -17,8 +17,10 @@ use tokio::sync::RwLock;
 
 
 mod frecency;
+mod query_latch;
 mod query_log;
 use frecency::FrecencyStore;
+use query_latch::QueryLatchStore;
 use query_log::QueryLog;
 
 use lixun_daemon::config;
@@ -124,6 +126,9 @@ async fn main() -> Result<()> {
 
     let frecency = FrecencyStore::load(&state_dir)?;
     let frecency = Arc::new(RwLock::new(frecency));
+
+    let query_latch = QueryLatchStore::load(&state_dir)?;
+    let query_latch = Arc::new(RwLock::new(query_latch));
 
     let query_log = QueryLog::load(&state_dir)?;
     let query_log = Arc::new(RwLock::new(query_log));
@@ -265,6 +270,7 @@ async fn main() -> Result<()> {
                 let search = search.clone();
                 let mutation_tx = mutation_tx.clone();
                 let frecency = Arc::clone(&frecency);
+                let query_latch = Arc::clone(&query_latch);
                 let query_log = Arc::clone(&query_log);
                 let stats = Arc::clone(&stats);
                 let gui_control = Arc::clone(&gui_control);
@@ -273,7 +279,7 @@ async fn main() -> Result<()> {
                 let client_registry = Arc::clone(&registry);
 
                 tokio::spawn(async move {
-                    if let Err(e) = handle_client(stream, search, mutation_tx, frecency, query_log, stats, gui_control, preview_spawner, shared_config, client_registry).await {
+                    if let Err(e) = handle_client(stream, search, mutation_tx, frecency, query_latch, query_log, stats, gui_control, preview_spawner, shared_config, client_registry).await {
                         tracing::debug!("Client error: {}", e);
                     }
                 });
@@ -285,6 +291,10 @@ async fn main() -> Result<()> {
                 let frecency = frecency.read().await;
                 if let Err(e) = frecency.save(&state_dir) {
                     tracing::error!("Failed to save frecency store: {}", e);
+                }
+                let latch = query_latch.read().await;
+                if let Err(e) = latch.save(&state_dir) {
+                    tracing::error!("Failed to save query latch store: {}", e);
                 }
                 let log = query_log.read().await;
                 if let Err(e) = log.save(&state_dir) {
@@ -405,6 +415,7 @@ async fn handle_client(
     search: SearchHandle,
     mutation_tx: IndexMutationTx,
     frecency: Arc<RwLock<FrecencyStore>>,
+    query_latch: Arc<RwLock<QueryLatchStore>>,
     query_log: Arc<RwLock<QueryLog>>,
     stats: Arc<RwLock<IndexStats>>,
     gui_control: Arc<GuiControl>,
@@ -444,22 +455,36 @@ async fn handle_client(
         Request::Hide => gui_result_to_response(gui_control.dispatch(GuiCommand::Hide).await),
         Request::Search { q, limit } => match search.search(&lixun_core::Query { text: q.clone(), limit }).await {
             Ok(mut hits) => {
-                let frecency = frecency.read().await;
                 let now = chrono::Utc::now().timestamp();
-                let alpha = config.ranking_frecency_alpha;
-                for hit in &mut hits {
-                    hit.score *= frecency.mult(&hit.id.0, now, alpha);
+                {
+                    let frecency = frecency.read().await;
+                    let alpha = config.ranking_frecency_alpha;
+                    for hit in &mut hits {
+                        hit.score *= frecency.mult(&hit.id.0, now, alpha);
+                    }
+                }
+                {
+                    let latch = query_latch.read().await;
+                    let w = config.ranking_latch_weight;
+                    let cap = config.ranking_latch_cap;
+                    for hit in &mut hits {
+                        hit.score *= latch.mult(&q, &hit.id.0, now, w, cap);
+                    }
                 }
                 hits.sort_by(|a, b| {
                     b.score
                         .partial_cmp(&a.score)
                         .unwrap_or(std::cmp::Ordering::Equal)
                 });
-                if negotiated_version >= 2 {
-                    let calculation = lixun_index::calculator::detect(&q);
-                    Response::HitsWithExtras { hits, calculation }
-                } else {
-                    Response::Hits(hits)
+                let calculation = lixun_index::calculator::detect(&q);
+                match negotiated_version {
+                    1 => Response::Hits(hits),
+                    2 => Response::HitsWithExtras { hits, calculation },
+                    _ => Response::HitsWithExtrasV3 {
+                        hits,
+                        calculation,
+                        top_hit: None,
+                    },
                 }
             }
             Err(e) => Response::Error(e.to_string()),
@@ -552,6 +577,18 @@ async fn handle_client(
                 log.record_query(&q);
                 Response::Ok
             }
+        }
+        Request::RecordQueryClick { doc_id, query } => {
+            let now = chrono::Utc::now().timestamp();
+            {
+                let mut latch = query_latch.write().await;
+                latch.record(&query, &doc_id, now);
+            }
+            if lixun_index::calculator::detect(&query).is_none() {
+                let mut log = query_log.write().await;
+                log.record_query(&query);
+            }
+            Response::Ok
         }
         Request::SearchHistory { limit } => {
             let log = query_log.read().await;

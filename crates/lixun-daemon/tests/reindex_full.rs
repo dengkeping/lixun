@@ -20,6 +20,8 @@ fn test_config(root: std::path::PathBuf, state_dir: std::path::PathBuf) -> Confi
         ranking_recency_weight: 0.0,
         ranking_recency_tau_days: 30.0,
         ranking_frecency_alpha: 0.0,
+        ranking_latch_weight: 0.0,
+        ranking_latch_cap: 1.0,
         keybindings: Keybindings::default(),
         preview: PreviewConfig::default(),
         gui: GuiConfig::default(),
