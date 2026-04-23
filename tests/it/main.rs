@@ -1,7 +1,7 @@
 use std::process::Command;
 
 use lixun_core::{Action, Category, DocId, Document, Query, RankingConfig};
-use lixun_index::{calculator, LixunIndex};
+use lixun_index::{LixunIndex, calculator};
 
 #[test]
 fn test_lixun_help() {
@@ -40,8 +40,7 @@ fn make_doc(id: &str, title: &str, body: Option<&str>) -> Document {
 fn fresh_index() -> (tempfile::TempDir, LixunIndex) {
     let tmp = tempfile::tempdir().unwrap();
     let idx =
-        LixunIndex::create_or_open(tmp.path().to_str().unwrap(), RankingConfig::default())
-            .unwrap();
+        LixunIndex::create_or_open(tmp.path().to_str().unwrap(), RankingConfig::default()).unwrap();
     (tmp, idx)
 }
 
@@ -139,7 +138,7 @@ fn calculator_ignores_non_math() {
 #[test]
 fn ipc_codec_roundtrip_v1_hits() {
     use bytes::BytesMut;
-    use lixun_ipc::{FrameCodec, Request, PROTOCOL_VERSION};
+    use lixun_ipc::{FrameCodec, PROTOCOL_VERSION, Request};
     use tokio_util::codec::Encoder;
 
     let mut codec = FrameCodec::default();

@@ -48,6 +48,10 @@ struct RankingToml {
     files: Option<f32>,
     mail: Option<f32>,
     attachments: Option<f32>,
+    prefix_boost: Option<f32>,
+    acronym_boost: Option<f32>,
+    recency_weight: Option<f32>,
+    recency_tau_days: Option<f32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -154,6 +158,10 @@ pub struct Config {
     pub ranking_files: f32,
     pub ranking_mail: f32,
     pub ranking_attachments: f32,
+    pub ranking_prefix_boost: f32,
+    pub ranking_acronym_boost: f32,
+    pub ranking_recency_weight: f32,
+    pub ranking_recency_tau_days: f32,
     pub keybindings: Keybindings,
     pub preview: PreviewConfig,
     pub gui: GuiConfig,
@@ -212,6 +220,10 @@ impl Default for Config {
             ranking_files: 1.2,
             ranking_mail: 1.0,
             ranking_attachments: 0.9,
+            ranking_prefix_boost: 1.4,
+            ranking_acronym_boost: 1.25,
+            ranking_recency_weight: 0.2,
+            ranking_recency_tau_days: 30.0,
             keybindings: Keybindings::default(),
             preview: PreviewConfig::default(),
             gui: GuiConfig::default(),
@@ -299,18 +311,14 @@ impl Config {
             cfg.extractor_timeout_secs = timeout;
         }
         if let Some(ranking) = parsed.ranking {
-            if let Some(v) = ranking.apps {
-                cfg.ranking_apps = v;
-            }
-            if let Some(v) = ranking.files {
-                cfg.ranking_files = v;
-            }
-            if let Some(v) = ranking.mail {
-                cfg.ranking_mail = v;
-            }
-            if let Some(v) = ranking.attachments {
-                cfg.ranking_attachments = v;
-            }
+            cfg.ranking_apps = ranking.apps.unwrap_or(1.3);
+            cfg.ranking_files = ranking.files.unwrap_or(1.2);
+            cfg.ranking_mail = ranking.mail.unwrap_or(1.0);
+            cfg.ranking_attachments = ranking.attachments.unwrap_or(0.9);
+            cfg.ranking_prefix_boost = ranking.prefix_boost.unwrap_or(1.4);
+            cfg.ranking_acronym_boost = ranking.acronym_boost.unwrap_or(1.25);
+            cfg.ranking_recency_weight = ranking.recency_weight.unwrap_or(0.2);
+            cfg.ranking_recency_tau_days = ranking.recency_tau_days.unwrap_or(30.0);
         }
         if let Some(bindings) = parsed.keybindings {
             if let Some(v) = bindings.close {
@@ -441,6 +449,10 @@ impl Config {
             files: self.ranking_files,
             mail: self.ranking_mail,
             attachments: self.ranking_attachments,
+            prefix_boost: self.ranking_prefix_boost,
+            acronym_boost: self.ranking_acronym_boost,
+            recency_weight: self.ranking_recency_weight,
+            recency_tau_days: self.ranking_recency_tau_days,
             ..lixun_core::RankingConfig::default()
         }
     }

@@ -3,20 +3,22 @@
 pub mod calculator;
 pub mod normalize;
 pub mod plugin_schema;
+pub mod scoring;
 pub mod tokenizer;
 
 use anyhow::Result;
+use chrono::Utc;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use tantivy::{
+    Index, IndexWriter, TantivyDocument,
     collector::TopDocs,
     directory::MmapDirectory,
     doc,
     query::{BooleanQuery, QueryParser},
     schema::{
-        IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value, STORED, STRING, TEXT,
+        IndexRecordOption, STORED, STRING, Schema, TEXT, TextFieldIndexing, TextOptions, Value,
     },
-    Index, IndexWriter, TantivyDocument,
 };
 
 pub use plugin_schema::CompiledPluginSchema;
@@ -25,6 +27,7 @@ pub use tantivy::{IndexWriter as TantivyIndexWriter, TantivyDocument as TantivyD
 use lixun_core::{
     Category, Document, Hit, PluginFieldSpec, PluginFieldType, PluginValue, Query, RankingConfig,
 };
+use normalize::normalize_for_match;
 
 const INDEX_VERSION: u32 = 6;
 const INDEX_VERSION_FILE: &str = "index_version.txt";
@@ -282,6 +285,8 @@ impl LixunIndex {
         let reader = self.index.reader()?;
         let searcher = reader.searcher();
         let s = &self.schema;
+        let q_norm = normalize_for_match(&query.text);
+        let now_secs = Utc::now().timestamp();
 
         let query_obj = build_search_query(&query.text, &self.index, s, &self.plugins);
         let top_docs = searcher.search(&query_obj, &TopDocs::with_limit(query.limit as usize))?;
@@ -313,6 +318,11 @@ impl LixunIndex {
                 .and_then(|value| value.as_str())
                 .unwrap_or("")
                 .to_string();
+            let mtime = doc
+                .get_first(s.mtime)
+                .and_then(|value| value.as_i64())
+                .unwrap_or(0);
+            let title_norm = normalize_for_match(&title);
 
             let subtitle = doc
                 .get_first(s.subtitle)
@@ -339,6 +349,16 @@ impl LixunIndex {
             let sender = stored_optional_text(&doc, s.sender);
             let recipients = stored_optional_text(&doc, s.recipients);
             let body = stored_optional_text(&doc, s.body);
+            let doc_mult = self.ranking.multiplier_for(category)
+                * scoring::prefix_mult(&title_norm, &q_norm, self.ranking.prefix_boost)
+                * scoring::acronym_mult(&title, &q_norm, self.ranking.acronym_boost)
+                * scoring::recency_mult(
+                    category,
+                    mtime,
+                    now_secs,
+                    self.ranking.recency_weight,
+                    self.ranking.recency_tau_days,
+                );
 
             results.push(Hit {
                 id: lixun_core::DocId(id),
@@ -347,7 +367,7 @@ impl LixunIndex {
                 subtitle,
                 icon_name,
                 kind_label,
-                score: score * self.ranking.multiplier_for(category),
+                score: score * doc_mult,
                 action,
                 extract_fail,
                 sender,
@@ -633,11 +653,7 @@ mod tests {
         for i in 0..3 {
             index
                 .upsert(
-                    &sample_document(
-                        &format!("fs:/tmp/a{i}.txt"),
-                        &format!("a{i}.txt"),
-                        "body",
-                    ),
+                    &sample_document(&format!("fs:/tmp/a{i}.txt"), &format!("a{i}.txt"), "body"),
                     &mut writer,
                 )
                 .unwrap();

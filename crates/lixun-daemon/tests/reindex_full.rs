@@ -1,8 +1,8 @@
 use lixun_daemon::config::{Config, GuiConfig, Keybindings, PreviewConfig};
-use std::collections::BTreeMap;
 use lixun_daemon::index_service::spawn_writer_service;
 use lixun_daemon::indexer;
 use lixun_sources::manifest::Manifest;
+use std::collections::BTreeMap;
 
 fn test_config(root: std::path::PathBuf, state_dir: std::path::PathBuf) -> Config {
     Config {
@@ -15,6 +15,10 @@ fn test_config(root: std::path::PathBuf, state_dir: std::path::PathBuf) -> Confi
         ranking_files: 1.0,
         ranking_mail: 1.0,
         ranking_attachments: 1.0,
+        ranking_prefix_boost: 1.0,
+        ranking_acronym_boost: 1.0,
+        ranking_recency_weight: 0.0,
+        ranking_recency_tau_days: 30.0,
         keybindings: Keybindings::default(),
         preview: PreviewConfig::default(),
         gui: GuiConfig::default(),
