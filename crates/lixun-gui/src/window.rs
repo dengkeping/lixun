@@ -25,49 +25,71 @@ use crate::ipc::{IpcClient, start_ipc_thread};
 use crate::status::StatusBar;
 use lixun_core::{DocId, Hit};
 
-/// Decision record for one response cycle: which hit (if any)
-/// belongs in the hero region, and which subset of hits goes into
-/// the scrolling list. Kept pure and widget-free so the
-/// split-logic can be unit-tested headlessly (see window::tests).
+/// Decision record for one response cycle: the list of hits to
+/// render in order, and optionally the index of the top-hit row
+/// that should receive hero styling. Kept pure and widget-free so
+/// the reorder logic can be unit-tested headlessly (see
+/// window::tests).
+///
+/// Invariant: when `top_hit_index` is `Some(i)`, `i == 0`. The
+/// reorder in `compute_render_plan` floats the top hit to the
+/// front; callers rely on this to key hero styling by "row 0 iff
+/// top_hit_index.is_some()" without scanning.
 #[derive(Debug)]
 pub(crate) struct RenderPlan {
-    pub(crate) hero: Option<Hit>,
-    pub(crate) list: Vec<Hit>,
+    pub(crate) hits: Vec<Hit>,
+    pub(crate) top_hit_index: Option<usize>,
 }
 
-/// Split incoming `hits` into (hero, list) according to
-/// `top_hit`:
+impl RenderPlan {
+    pub(crate) fn hero(&self) -> Option<&Hit> {
+        self.top_hit_index.and_then(|i| self.hits.get(i))
+    }
+
+    pub(crate) fn list(&self) -> &[Hit] {
+        match self.top_hit_index {
+            Some(i) if i < self.hits.len() => &self.hits[i + 1..],
+            _ => &self.hits,
+        }
+    }
+}
+
+/// Compose render order from daemon's `hits` and optional
+/// `top_hit` nomination. Matches Spotlight + every surveyed
+/// open-source launcher: the top hit is NOT a separate structural
+/// widget; it IS the first row of the unified list, styled
+/// prominently.
 ///
-/// - `top_hit = Some(id)` and a hit with that id exists → that
-///   hit becomes the hero, everything else goes into the list.
-/// - `top_hit = None` or id not found in `hits` → no hero, all
-///   hits remain in the list in original order.
-///
-/// The hero is never duplicated in the list (Spotlight
-/// semantic: Top Hit is a structural element, not an in-list
-/// highlight).
+/// - `top_hit = Some(id)` and a hit with that id exists at
+///   position N in `hits` → move that hit to index 0, shift
+///   0..N down by one (stable for the rest); return
+///   `top_hit_index = Some(0)`.
+/// - `top_hit = None`, `top_hit = Some` but not present in hits,
+///   or `hits` is empty → leave order untouched; return
+///   `top_hit_index = None`.
 pub(crate) fn compute_render_plan(hits: &[Hit], top_hit: Option<&DocId>) -> RenderPlan {
     let Some(want) = top_hit else {
         return RenderPlan {
-            hero: None,
-            list: hits.to_vec(),
+            hits: hits.to_vec(),
+            top_hit_index: None,
         };
     };
     let Some(pos) = hits.iter().position(|h| h.id == *want) else {
         return RenderPlan {
-            hero: None,
-            list: hits.to_vec(),
+            hits: hits.to_vec(),
+            top_hit_index: None,
         };
     };
-    let mut list = Vec::with_capacity(hits.len().saturating_sub(1));
+    let mut reordered = Vec::with_capacity(hits.len());
+    reordered.push(hits[pos].clone());
     for (i, h) in hits.iter().enumerate() {
         if i != pos {
-            list.push(h.clone());
+            reordered.push(h.clone());
         }
     }
     RenderPlan {
-        hero: Some(hits[pos].clone()),
-        list,
+        hits: reordered,
+        top_hit_index: Some(0),
     }
 }
 
@@ -843,10 +865,10 @@ fn install_response_poller(
                 t.take()
             };
             let plan = compute_render_plan(&hits_snapshot, top_hit_snapshot.as_ref());
-            render_hero(&hero_box, plan.hero.as_ref(), &entry);
-            update_results(&model, &selection, &plan.list);
+            render_hero(&hero_box, plan.hero(), &entry);
+            update_results(&model, &selection, plan.list());
             filter.changed(gtk::FilterChange::Different);
-            if !plan.list.is_empty() {
+            if !plan.list().is_empty() {
                 // Compute the desired index in the post-filter list
                 // (hero has already been excluded from `plan.list`).
                 // set_selected on a filter-backed SingleSelection
@@ -856,7 +878,7 @@ fn install_response_poller(
                 // above.
                 let wanted_doc = prior_selected
                     .clone()
-                    .or_else(|| plan.list.first().map(|h| h.id.0.clone()));
+                    .or_else(|| plan.list().first().map(|h| h.id.0.clone()));
                 let new_idx = wanted_doc
                     .as_deref()
                     .and_then(|want| {
@@ -875,7 +897,7 @@ fn install_response_poller(
                 }
             }
 
-            let has_anything = plan.hero.is_some() || !plan.list.is_empty();
+            let has_anything = plan.hero().is_some() || !plan.list().is_empty();
             if let Some(calc) = calc_snapshot.as_ref() {
                 chips_container.set_visible(true);
                 scrolled.set_visible(false);
@@ -897,7 +919,7 @@ fn install_response_poller(
                 }
             } else {
                 chips_container.set_visible(true);
-                let list_has_rows = !plan.list.is_empty();
+                let list_has_rows = !plan.list().is_empty();
                 scrolled.set_visible(list_has_rows);
                 scrolled.set_vexpand(list_has_rows);
                 status.hide();
@@ -1151,23 +1173,25 @@ mod tests {
         ];
         let top = DocId("app:firefox".into());
         let plan = compute_render_plan(&hits, Some(&top));
-        let hero = plan.hero.expect("hero must be populated when top_hit resolves");
-        assert_eq!(hero.id.0, "app:firefox");
-        assert_eq!(plan.list.len(), 2, "hero excluded from list (Spotlight semantic)");
-        assert_eq!(plan.list[0].id.0, "app:chromium");
-        assert_eq!(plan.list[1].id.0, "app:thunderbird");
+        assert_eq!(plan.top_hit_index, Some(0));
+        assert_eq!(plan.hits.len(), 3);
+        assert_eq!(plan.hits[0].id.0, "app:firefox");
+        assert_eq!(plan.hits[1].id.0, "app:chromium");
+        assert_eq!(plan.hits[2].id.0, "app:thunderbird");
     }
 
     #[test]
     fn hero_hidden_without_top_hit() {
         let hits = vec![mk_hit("app:a", "A"), mk_hit("app:b", "B")];
         let plan = compute_render_plan(&hits, None);
-        assert!(plan.hero.is_none(), "top_hit=None → no hero");
-        assert_eq!(plan.list.len(), 2, "list carries all hits when hero absent");
+        assert!(plan.top_hit_index.is_none());
+        assert_eq!(plan.hits.len(), 2);
+        assert_eq!(plan.hits[0].id.0, "app:a");
+        assert_eq!(plan.hits[1].id.0, "app:b");
     }
 
     #[test]
-    fn hero_excludes_top_hit_from_list() {
+    fn top_hit_moves_to_front() {
         let hits = vec![
             mk_hit("app:a", "A"),
             mk_hit("app:b", "B"),
@@ -1175,10 +1199,9 @@ mod tests {
         ];
         let top = DocId("app:b".into());
         let plan = compute_render_plan(&hits, Some(&top));
-        assert_eq!(plan.hero.as_ref().map(|h| h.id.0.as_str()), Some("app:b"));
-        let list_ids: Vec<&str> = plan.list.iter().map(|h| h.id.0.as_str()).collect();
-        assert_eq!(list_ids, vec!["app:a", "app:c"],
-            "hero doc filtered out; order preserved for survivors");
+        assert_eq!(plan.top_hit_index, Some(0));
+        let ids: Vec<&str> = plan.hits.iter().map(|h| h.id.0.as_str()).collect();
+        assert_eq!(ids, vec!["app:b", "app:a", "app:c"]);
     }
 
     #[test]
@@ -1186,8 +1209,48 @@ mod tests {
         let hits = vec![mk_hit("app:a", "A"), mk_hit("app:b", "B")];
         let top = DocId("app:missing".into());
         let plan = compute_render_plan(&hits, Some(&top));
-        assert!(plan.hero.is_none(),
-            "top_hit id absent from hits → graceful fallback to no hero");
-        assert_eq!(plan.list.len(), 2, "all hits retained when top_hit unresolvable");
+        assert!(plan.top_hit_index.is_none());
+        assert_eq!(plan.hits.len(), 2);
+        assert_eq!(plan.hits[0].id.0, "app:a");
+        assert_eq!(plan.hits[1].id.0, "app:b");
+    }
+
+    #[test]
+    fn empty_hits_with_some_top_hit() {
+        let hits: Vec<Hit> = vec![];
+        let top = DocId("app:x".into());
+        let plan = compute_render_plan(&hits, Some(&top));
+        assert!(plan.top_hit_index.is_none());
+        assert!(plan.hits.is_empty());
+    }
+
+    #[test]
+    fn top_hit_already_at_front() {
+        let hits = vec![
+            mk_hit("app:x", "X"),
+            mk_hit("app:y", "Y"),
+            mk_hit("app:z", "Z"),
+        ];
+        let top = DocId("app:x".into());
+        let plan = compute_render_plan(&hits, Some(&top));
+        assert_eq!(plan.top_hit_index, Some(0));
+        let ids: Vec<&str> = plan.hits.iter().map(|h| h.id.0.as_str()).collect();
+        assert_eq!(ids, vec!["app:x", "app:y", "app:z"]);
+    }
+
+    #[test]
+    fn compute_render_plan_is_deterministic() {
+        let hits = vec![
+            mk_hit("app:a", "A"),
+            mk_hit("app:b", "B"),
+            mk_hit("app:c", "C"),
+        ];
+        let top = DocId("app:b".into());
+        let p1 = compute_render_plan(&hits, Some(&top));
+        let p2 = compute_render_plan(&hits, Some(&top));
+        assert_eq!(p1.top_hit_index, p2.top_hit_index);
+        let ids1: Vec<&str> = p1.hits.iter().map(|h| h.id.0.as_str()).collect();
+        let ids2: Vec<&str> = p2.hits.iter().map(|h| h.id.0.as_str()).collect();
+        assert_eq!(ids1, ids2);
     }
 }
