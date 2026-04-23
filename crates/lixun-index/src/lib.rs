@@ -29,7 +29,7 @@ use lixun_core::{
 };
 use normalize::normalize_for_match;
 
-const INDEX_VERSION: u32 = 6;
+const INDEX_VERSION: u32 = 7;
 const INDEX_VERSION_FILE: &str = "index_version.txt";
 
 /// Tantivy schema fields.
@@ -39,6 +39,8 @@ pub struct LixunSchema {
     pub category: tantivy::schema::Field,
     pub title: tantivy::schema::Field,
     pub title_terms: tantivy::schema::Field,
+    pub title_initials: tantivy::schema::Field,
+    pub title_prefixes: tantivy::schema::Field,
     pub subtitle: tantivy::schema::Field,
     pub icon_name: tantivy::schema::Field,
     pub kind_label: tantivy::schema::Field,
@@ -80,6 +82,8 @@ impl LixunSchema {
         let category = builder.add_text_field("category", TEXT | STORED);
         let title = builder.add_text_field("title", stored_spotlight_text());
         let title_terms = builder.add_text_field("title_terms", indexed_spotlight_text());
+        let title_initials = builder.add_text_field("title_initials", indexed_spotlight_text());
+        let title_prefixes = builder.add_text_field("title_prefixes", indexed_spotlight_text());
         let subtitle = builder.add_text_field("subtitle", STORED);
         let icon_name = builder.add_text_field("icon_name", STORED);
         let kind_label = builder.add_text_field("kind_label", STORED);
@@ -105,6 +109,8 @@ impl LixunSchema {
                 category,
                 title,
                 title_terms,
+                title_initials,
+                title_prefixes,
                 subtitle,
                 icon_name,
                 kind_label,
@@ -210,12 +216,16 @@ impl LixunIndex {
 
         let action_json = serde_json::to_string(&doc.action)?;
         let title_split = tokenizer::split_identifiers(&doc.title);
+        let title_initials_indexed = scoring::acronym_initials_indexed(&doc.title);
+        let title_prefixes_indexed = scoring::compute_title_prefixes(&doc.title);
 
         let mut tdoc = doc![
             s.id => doc.id.0.as_str(),
             s.category => doc.category.as_str(),
             s.title => doc.title.as_str(),
             s.title_terms => title_split.as_str(),
+            s.title_initials => title_initials_indexed.as_str(),
+            s.title_prefixes => title_prefixes_indexed.as_str(),
             s.subtitle => doc.subtitle.as_str(),
             s.icon_name => doc.icon_name.as_deref().unwrap_or(""),
             s.kind_label => doc.kind_label.as_deref().unwrap_or(""),
@@ -938,6 +948,62 @@ mod tests {
             })
             .unwrap();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_index_version_triggers_rebuild() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().to_str().unwrap();
+
+        let doc = sample_document("fs:/tmp/probe.txt", "probe", "body");
+        let (_idx, rebuilt_first) = LixunIndex::create_or_open_with_plugins(
+            path,
+            &BTreeMap::new(),
+            RankingConfig::default(),
+        )
+        .unwrap();
+        assert!(
+            rebuilt_first,
+            "fresh directory → rebuilt_from_scratch must be true"
+        );
+
+        let mut idx = LixunIndex::create_or_open(path, RankingConfig::default()).unwrap();
+        let mut writer = idx.writer(20_000_000).unwrap();
+        idx.upsert(&doc, &mut writer).unwrap();
+        idx.commit(&mut writer).unwrap();
+        drop(idx);
+
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join(INDEX_VERSION_FILE))
+                .unwrap()
+                .trim(),
+            INDEX_VERSION.to_string(),
+            "version file should hold current INDEX_VERSION after create"
+        );
+
+        std::fs::write(
+            tmp.path().join(INDEX_VERSION_FILE),
+            (INDEX_VERSION - 1).to_string(),
+        )
+        .unwrap();
+
+        let (_idx2, rebuilt_second) = LixunIndex::create_or_open_with_plugins(
+            path,
+            &BTreeMap::new(),
+            RankingConfig::default(),
+        )
+        .unwrap();
+        assert!(
+            rebuilt_second,
+            "downgraded version file → rebuilt_from_scratch must be true"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join(INDEX_VERSION_FILE))
+                .unwrap()
+                .trim(),
+            INDEX_VERSION.to_string(),
+            "rebuild must restore current INDEX_VERSION on disk"
+        );
     }
 
     #[test]
