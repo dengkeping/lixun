@@ -110,11 +110,11 @@ fn try_single_instance() -> Result<std::fs::File> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env().add_directive("lixun=info".parse()?),
-        )
-        .init();
+    let env_filter = match std::env::var("RUST_LOG") {
+        Ok(raw) if !raw.trim().is_empty() => tracing_subscriber::EnvFilter::new(raw),
+        _ => tracing_subscriber::EnvFilter::new("lixun=info"),
+    };
+    tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
     tracing::info!("lixund starting...");
 
