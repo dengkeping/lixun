@@ -25,6 +25,7 @@ fn test_config(root: std::path::PathBuf, state_dir: std::path::PathBuf) -> Confi
         ranking_total_multiplier_cap: 6.0,
         ranking_top_hit_min_confidence: 0.6,
         ranking_top_hit_min_margin: 1.3,
+        ranking_strong_latch_threshold: 3,
         keybindings: Keybindings::default(),
         preview: PreviewConfig::default(),
         gui: GuiConfig::default(),

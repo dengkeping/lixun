@@ -56,6 +56,7 @@ pub struct RankingConfig {
     pub total_multiplier_cap: f32,
     pub top_hit_min_confidence: f32,
     pub top_hit_min_margin: f32,
+    pub strong_latch_threshold: u32,
 }
 
 impl Default for RankingConfig {
@@ -75,6 +76,7 @@ impl Default for RankingConfig {
             total_multiplier_cap: 6.0,
             top_hit_min_confidence: 0.6,
             top_hit_min_margin: 1.3,
+            strong_latch_threshold: 3,
         }
     }
 }
