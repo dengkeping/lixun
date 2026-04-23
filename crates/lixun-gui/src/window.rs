@@ -18,10 +18,58 @@ use gtk4_layer_shell::{Edge, LayerShell};
 use lixun_core::Category;
 
 use crate::factory::{
-    add_css_class, clear_cached_hits, create_list_factory, update_results, with_cached_hits,
+    add_css_class, build_hero_row, clear_cached_hits, create_list_factory, update_results,
+    with_cached_hits,
 };
 use crate::ipc::{IpcClient, start_ipc_thread};
 use crate::status::StatusBar;
+use lixun_core::{DocId, Hit};
+
+/// Decision record for one response cycle: which hit (if any)
+/// belongs in the hero region, and which subset of hits goes into
+/// the scrolling list. Kept pure and widget-free so the
+/// split-logic can be unit-tested headlessly (see window::tests).
+#[derive(Debug)]
+pub(crate) struct RenderPlan {
+    pub(crate) hero: Option<Hit>,
+    pub(crate) list: Vec<Hit>,
+}
+
+/// Split incoming `hits` into (hero, list) according to
+/// `top_hit`:
+///
+/// - `top_hit = Some(id)` and a hit with that id exists → that
+///   hit becomes the hero, everything else goes into the list.
+/// - `top_hit = None` or id not found in `hits` → no hero, all
+///   hits remain in the list in original order.
+///
+/// The hero is never duplicated in the list (Spotlight
+/// semantic: Top Hit is a structural element, not an in-list
+/// highlight).
+pub(crate) fn compute_render_plan(hits: &[Hit], top_hit: Option<&DocId>) -> RenderPlan {
+    let Some(want) = top_hit else {
+        return RenderPlan {
+            hero: None,
+            list: hits.to_vec(),
+        };
+    };
+    let Some(pos) = hits.iter().position(|h| h.id == *want) else {
+        return RenderPlan {
+            hero: None,
+            list: hits.to_vec(),
+        };
+    };
+    let mut list = Vec::with_capacity(hits.len().saturating_sub(1));
+    for (i, h) in hits.iter().enumerate() {
+        if i != pos {
+            list.push(h.clone());
+        }
+    }
+    RenderPlan {
+        hero: Some(hits[pos].clone()),
+        list,
+    }
+}
 
 pub(crate) type CategoryFilter = std::rc::Rc<std::cell::Cell<Option<Category>>>;
 
@@ -76,6 +124,7 @@ pub(crate) struct LauncherController {
     chips: std::rc::Rc<CategoryChips>,
     selection: gtk::SingleSelection,
     scrolled: gtk::ScrolledWindow,
+    hero_box: gtk::Box,
     status: std::rc::Rc<StatusBar>,
     model: gtk::StringList,
     current_category: CategoryFilter,
@@ -272,6 +321,10 @@ impl LauncherController {
 
         self.scrolled.set_visible(false);
         self.scrolled.set_vexpand(false);
+        while let Some(child) = self.hero_box.first_child() {
+            self.hero_box.remove(&child);
+        }
+        self.hero_box.set_visible(false);
         self.chips.container.set_visible(false);
         self.status.hide();
 
@@ -524,6 +577,11 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
     // Without all four, either the collapse breaks (no propagate
     // or non-zero min) or the window stretches past max_height_px
     // (no cap).
+    let hero_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    hero_box.set_widget_name("lixun-hero");
+    hero_box.set_visible(false);
+    vbox.append(&hero_box);
+
     let scrolled = gtk::ScrolledWindow::builder()
         .vexpand(true)
         .propagate_natural_height(true)
@@ -565,7 +623,7 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
 
     let list_view = gtk::ListView::builder()
         .model(&selection)
-        .factory(&create_list_factory())
+        .factory(&create_list_factory(entry.clone()))
         .build();
     list_view.set_widget_name("lixun-results");
     scrolled.set_child(Some(&list_view));
@@ -601,6 +659,7 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
         chips: std::rc::Rc::clone(&chips_rc),
         selection: selection.clone(),
         scrolled: scrolled.clone(),
+        hero_box: hero_box.clone(),
         status: std::rc::Rc::clone(&status_bar),
         model: model.clone(),
         current_category: std::rc::Rc::clone(&current_category),
@@ -637,6 +696,8 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
         list_view.clone(),
         chips_rc.container.clone(),
         scrolled.clone(),
+        hero_box.clone(),
+        entry.clone(),
         std::rc::Rc::clone(&status_bar),
         std::rc::Rc::clone(&last_query),
         std::rc::Rc::clone(&user_selected_override),
@@ -649,6 +710,7 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
         selection.clone(),
         chips_rc.container.clone(),
         scrolled.clone(),
+        hero_box.clone(),
         std::rc::Rc::clone(&status_bar),
         std::rc::Rc::clone(&last_query),
         std::rc::Rc::clone(&pending_debounce),
@@ -723,12 +785,15 @@ fn install_response_poller(
     list_view: gtk::ListView,
     chips_container: gtk::Box,
     scrolled: gtk::ScrolledWindow,
+    hero_box: gtk::Box,
+    entry: gtk::Entry,
     status: std::rc::Rc<StatusBar>,
     last_query: std::rc::Rc<std::cell::RefCell<String>>,
     user_selected_override: std::rc::Rc<std::cell::Cell<bool>>,
 ) {
     let responses = Arc::clone(&ipc.responses);
     let calculation = Arc::clone(&ipc.calculation);
+    let top_hit = Arc::clone(&ipc.top_hit);
     let epoch = Arc::clone(&ipc.response_epoch);
     let last_epoch = std::rc::Rc::new(std::cell::Cell::new(0u64));
 
@@ -773,23 +838,25 @@ fn install_response_poller(
                 let mut c = calculation.lock().unwrap();
                 c.take()
             };
-            update_results(&model, &selection, &hits_snapshot);
+            let top_hit_snapshot = {
+                let mut t = top_hit.lock().unwrap();
+                t.take()
+            };
+            let plan = compute_render_plan(&hits_snapshot, top_hit_snapshot.as_ref());
+            render_hero(&hero_box, plan.hero.as_ref(), &entry);
+            update_results(&model, &selection, &plan.list);
             filter.changed(gtk::FilterChange::Different);
-            if !hits_snapshot.is_empty() {
-                // Compute the desired index in the source hits list,
-                // then translate it to the filtered view position by
-                // looking up the StringObject (DocId) in the live
-                // SingleSelection (which iterates the filtered
-                // FilterListModel). set_selected on a filter-backed
-                // SingleSelection silently no-ops when the requested
-                // index exceeds the post-filter n_items, so we must
-                // resolve against selection.n_items() — not the raw
-                // hits_snapshot length — and we must do it AFTER the
-                // filter.changed invalidation above so n_items
-                // reflects the new view.
-                let wanted_doc = prior_selected.clone().or_else(|| {
-                    hits_snapshot.first().map(|h| h.id.0.clone())
-                });
+            if !plan.list.is_empty() {
+                // Compute the desired index in the post-filter list
+                // (hero has already been excluded from `plan.list`).
+                // set_selected on a filter-backed SingleSelection
+                // silently no-ops when the requested index exceeds
+                // the post-filter n_items, so we must resolve
+                // against selection.n_items() after filter.changed
+                // above.
+                let wanted_doc = prior_selected
+                    .clone()
+                    .or_else(|| plan.list.first().map(|h| h.id.0.clone()));
                 let new_idx = wanted_doc
                     .as_deref()
                     .and_then(|want| {
@@ -808,12 +875,13 @@ fn install_response_poller(
                 }
             }
 
+            let has_anything = plan.hero.is_some() || !plan.list.is_empty();
             if let Some(calc) = calc_snapshot.as_ref() {
                 chips_container.set_visible(true);
                 scrolled.set_visible(false);
                 scrolled.set_vexpand(false);
                 status.show_calculation(calc);
-            } else if hits_snapshot.is_empty() {
+            } else if !has_anything {
                 let q = last_query.borrow().clone();
                 if !q.is_empty() {
                     chips_container.set_visible(true);
@@ -829,13 +897,30 @@ fn install_response_poller(
                 }
             } else {
                 chips_container.set_visible(true);
-                scrolled.set_visible(true);
-                scrolled.set_vexpand(true);
+                let list_has_rows = !plan.list.is_empty();
+                scrolled.set_visible(list_has_rows);
+                scrolled.set_vexpand(list_has_rows);
                 status.hide();
             }
         }
         glib::ControlFlow::Continue
     });
+}
+
+fn render_hero(hero_box: &gtk::Box, hero: Option<&Hit>, entry: &gtk::Entry) {
+    while let Some(child) = hero_box.first_child() {
+        hero_box.remove(&child);
+    }
+    match hero {
+        Some(hit) => {
+            let row = build_hero_row(hit, entry);
+            hero_box.append(&row);
+            hero_box.set_visible(true);
+        }
+        None => {
+            hero_box.set_visible(false);
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -846,6 +931,7 @@ fn install_entry_handler(
     selection: gtk::SingleSelection,
     chips_container: gtk::Box,
     scrolled: gtk::ScrolledWindow,
+    hero_box: gtk::Box,
     status: std::rc::Rc<StatusBar>,
     last_query: std::rc::Rc<std::cell::RefCell<String>>,
     pending_debounce: std::rc::Rc<std::cell::RefCell<Option<glib::SourceId>>>,
@@ -915,6 +1001,10 @@ fn install_entry_handler(
             chips_container.set_visible(false);
             scrolled.set_visible(false);
             scrolled.set_vexpand(false);
+            while let Some(child) = hero_box.first_child() {
+                hero_box.remove(&child);
+            }
+            hero_box.set_visible(false);
             status.hide();
             return;
         }
@@ -1021,5 +1111,83 @@ fn build_category_chips(current: &CategoryFilter) -> CategoryChips {
     CategoryChips {
         container,
         buttons: buttons_arr,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lixun_core::{Action, Category, DocId};
+
+    fn mk_hit(id: &str, title: &str) -> Hit {
+        Hit {
+            id: DocId(id.into()),
+            category: Category::App,
+            title: title.into(),
+            subtitle: String::new(),
+            icon_name: None,
+            kind_label: None,
+            score: 0.0,
+            action: Action::Launch {
+                exec: "true".into(),
+                terminal: false,
+                desktop_id: None,
+                desktop_file: None,
+                working_dir: None,
+            },
+            extract_fail: false,
+            sender: None,
+            recipients: None,
+            body: None,
+        }
+    }
+
+    #[test]
+    fn response_routing_renders_hero() {
+        let hits = vec![
+            mk_hit("app:firefox", "Firefox"),
+            mk_hit("app:chromium", "Chromium"),
+            mk_hit("app:thunderbird", "Thunderbird"),
+        ];
+        let top = DocId("app:firefox".into());
+        let plan = compute_render_plan(&hits, Some(&top));
+        let hero = plan.hero.expect("hero must be populated when top_hit resolves");
+        assert_eq!(hero.id.0, "app:firefox");
+        assert_eq!(plan.list.len(), 2, "hero excluded from list (Spotlight semantic)");
+        assert_eq!(plan.list[0].id.0, "app:chromium");
+        assert_eq!(plan.list[1].id.0, "app:thunderbird");
+    }
+
+    #[test]
+    fn hero_hidden_without_top_hit() {
+        let hits = vec![mk_hit("app:a", "A"), mk_hit("app:b", "B")];
+        let plan = compute_render_plan(&hits, None);
+        assert!(plan.hero.is_none(), "top_hit=None → no hero");
+        assert_eq!(plan.list.len(), 2, "list carries all hits when hero absent");
+    }
+
+    #[test]
+    fn hero_excludes_top_hit_from_list() {
+        let hits = vec![
+            mk_hit("app:a", "A"),
+            mk_hit("app:b", "B"),
+            mk_hit("app:c", "C"),
+        ];
+        let top = DocId("app:b".into());
+        let plan = compute_render_plan(&hits, Some(&top));
+        assert_eq!(plan.hero.as_ref().map(|h| h.id.0.as_str()), Some("app:b"));
+        let list_ids: Vec<&str> = plan.list.iter().map(|h| h.id.0.as_str()).collect();
+        assert_eq!(list_ids, vec!["app:a", "app:c"],
+            "hero doc filtered out; order preserved for survivors");
+    }
+
+    #[test]
+    fn unknown_top_hit_id_degrades_to_no_hero() {
+        let hits = vec![mk_hit("app:a", "A"), mk_hit("app:b", "B")];
+        let top = DocId("app:missing".into());
+        let plan = compute_render_plan(&hits, Some(&top));
+        assert!(plan.hero.is_none(),
+            "top_hit id absent from hits → graceful fallback to no hero");
+        assert_eq!(plan.list.len(), 2, "all hits retained when top_hit unresolvable");
     }
 }

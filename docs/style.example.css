@@ -20,6 +20,12 @@
  *                            selectors like `.lixun-hit:focus-within`
  *   .lixun-top-hit         - toggled onto the currently selected row
  *                            (our "hero" card frame; selection indicator)
+ *   #lixun-hero            - container Box for the structural Top Hit
+ *                            hero region above the results list (hidden
+ *                            when no confident Top Hit is selected)
+ *   .lixun-top-hit-hero    - class on the hero row itself; sibling of
+ *                            `.lixun-top-hit` (structural hero region
+ *                            vs. stateful selected-row indicator)
  *   .lixun-title           - row title label
  *   .lixun-subtitle        - row subtitle / path label
  *   .lixun-kind            - right-aligned category badge
@@ -122,6 +128,24 @@ row:focus-within .lixun-hit,
     padding: 12px 14px;
     background-color: rgba(255, 255, 255, 0.04);
     border: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+/* Structural Top Hit hero region. `.lixun-top-hit-hero` is a
+   standalone widget rendered ABOVE the scrollable results list
+   when the daemon identifies a confident Top Hit; `.lixun-top-hit`
+   above is the stateful selection indicator painted on the
+   currently-selected list row. Both can be visible at once and
+   are styled independently on purpose. */
+.lixun-top-hit-hero {
+    padding: 12px 14px;
+    background-color: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    border-radius: 10px;
+    margin-bottom: 4px;
+}
+
+.lixun-top-hit-hero .lixun-title {
+    font-size: 16px;
 }
 
 /* ----- Title / subtitle / kind ----- */
