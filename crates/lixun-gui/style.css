@@ -126,24 +126,21 @@ listview row:selected:hover {
     border-radius: 10px;
 }
 
-/* Structural Top Hit hero row: standalone widget rendered ABOVE
-   the scrollable results list when the daemon (v3) identifies a
-   confident Top Hit for the query. Distinct from `.lixun-top-hit`
-   above, which is a stateful selection indicator applied to
-   whichever list row the user has currently selected — the two
-   are intentionally independent so the hero survives arrow-key
-   navigation through the list. Visual parity with `.lixun-top-hit`
-   is deliberate (card elevation + subtle outline); the slightly
-   stronger background signals that the hero sits outside the
-   list flow. Extra bottom margin separates the hero from the
-   list visually without touching `.lixun-hit`'s box model. */
+/* Structural Top Hit hero row: decorates row 0 of the results
+   list when the daemon (v3) identifies a confident Top Hit for
+   the query. Matches Spotlight + every surveyed open-source
+   launcher: Top Hit is row 0 of the unified list, styled
+   prominently, not a separate widget. Distinct from
+   `.lixun-top-hit` above, which is the stateful selection-cursor
+   indicator and moves with arrow keys; the two classes stack
+   independently on the same row when the user hasn't moved the
+   cursor off row 0. */
 .lixun-top-hit-hero {
     padding: 10px 12px;
     background-color: rgba(255, 255, 255, 0.06);
     outline: 1px solid rgba(255, 255, 255, 0.14);
     outline-offset: -1px;
     border-radius: 10px;
-    margin-bottom: 4px;
 }
 
 .lixun-top-hit-hero .lixun-title {
