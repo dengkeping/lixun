@@ -434,6 +434,16 @@ impl Config {
             self.max_file_size_mb,
         ))
     }
+
+    pub fn ranking_config(&self) -> lixun_core::RankingConfig {
+        lixun_core::RankingConfig {
+            apps: self.ranking_apps,
+            files: self.ranking_files,
+            mail: self.ranking_mail,
+            attachments: self.ranking_attachments,
+            ..lixun_core::RankingConfig::default()
+        }
+    }
 }
 
 impl lixun_indexer::IndexerSources for Config {

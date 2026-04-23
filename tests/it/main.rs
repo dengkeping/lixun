@@ -1,6 +1,6 @@
 use std::process::Command;
 
-use lixun_core::{Action, Category, DocId, Document, Query};
+use lixun_core::{Action, Category, DocId, Document, Query, RankingConfig};
 use lixun_index::{calculator, LixunIndex};
 
 #[test]
@@ -39,7 +39,9 @@ fn make_doc(id: &str, title: &str, body: Option<&str>) -> Document {
 
 fn fresh_index() -> (tempfile::TempDir, LixunIndex) {
     let tmp = tempfile::tempdir().unwrap();
-    let idx = LixunIndex::create_or_open(tmp.path().to_str().unwrap()).unwrap();
+    let idx =
+        LixunIndex::create_or_open(tmp.path().to_str().unwrap(), RankingConfig::default())
+            .unwrap();
     (tmp, idx)
 }
 
