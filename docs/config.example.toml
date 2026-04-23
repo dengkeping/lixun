@@ -229,6 +229,18 @@ files = 1.2
 mail = 1.0
 attachments = 0.9
 
+# Title prefix match boost. Applied when normalized title starts with query.
+prefix_boost = 1.4
+
+# Acronym/initials boost using the D4 splitter (e.g. vsc -> Visual Studio Code).
+acronym_boost = 1.25
+
+# Recency bonus weight for File/Mail items based on document mtime.
+recency_weight = 0.2
+
+# Recency decay horizon in days. Larger values keep old edits boosted longer.
+recency_tau_days = 30.0
+
 # Keybindings - GTK accelerator syntax (<Ctrl>c, <Shift>Return, etc).
 [keybindings]
 close = "Escape"
