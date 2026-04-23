@@ -271,6 +271,14 @@ total_multiplier_cap = 6.0
 top_hit_min_confidence = 0.6
 top_hit_min_margin = 1.3
 
+# Minimum query-latch count at which the latch signal is considered
+# "strong" enough to single-handedly clear the Top Hit confidence
+# gate (confidence = 1.0 from latch alone). Below this count the
+# latch still boosts the score via latch.mult, just doesn't drive
+# confidence. Raise to make Top Hit promotion require more deliberate
+# reinforcement; lower to let a single click-through pin the hero.
+strong_latch_threshold = 3
+
 # Keybindings - GTK accelerator syntax (<Ctrl>c, <Shift>Return, etc).
 [keybindings]
 close = "Escape"

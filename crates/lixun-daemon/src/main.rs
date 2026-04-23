@@ -505,7 +505,7 @@ async fn handle_client(
                         now,
                         config.ranking_top_hit_min_confidence,
                         config.ranking_top_hit_min_margin,
-                        3,
+                        config.ranking_strong_latch_threshold,
                     )
                 };
                 let calculation = lixun_index::calculator::detect(&q);
