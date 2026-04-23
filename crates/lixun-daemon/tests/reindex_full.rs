@@ -22,6 +22,8 @@ fn test_config(root: std::path::PathBuf, state_dir: std::path::PathBuf) -> Confi
         ranking_frecency_alpha: 0.0,
         ranking_latch_weight: 0.0,
         ranking_latch_cap: 1.0,
+        ranking_top_hit_min_confidence: 0.6,
+        ranking_top_hit_min_margin: 1.3,
         keybindings: Keybindings::default(),
         preview: PreviewConfig::default(),
         gui: GuiConfig::default(),
