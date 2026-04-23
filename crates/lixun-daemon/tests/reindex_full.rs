@@ -19,6 +19,7 @@ fn test_config(root: std::path::PathBuf, state_dir: std::path::PathBuf) -> Confi
         ranking_acronym_boost: 1.0,
         ranking_recency_weight: 0.0,
         ranking_recency_tau_days: 30.0,
+        ranking_frecency_alpha: 0.0,
         keybindings: Keybindings::default(),
         preview: PreviewConfig::default(),
         gui: GuiConfig::default(),
