@@ -14,7 +14,7 @@ use lixun_core::Hit;
 
 pub mod gui;
 
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WatcherStats {
@@ -52,6 +52,7 @@ pub enum Request {
     Status,
     RecordClick { doc_id: String },
     RecordQuery { q: String },
+    RecordQueryClick { doc_id: String, query: String },
     SearchHistory { limit: u32 },
     /// Open a preview window for the given hit. The GUI embeds the
     /// full Hit rather than a DocId because app / calculator /
@@ -81,6 +82,11 @@ pub enum Response {
     HitsWithExtras {
         hits: Vec<Hit>,
         calculation: Option<lixun_core::Calculation>,
+    },
+    HitsWithExtrasV3 {
+        hits: Vec<Hit>,
+        calculation: Option<lixun_core::Calculation>,
+        top_hit: Option<lixun_core::DocId>,
     },
     Status {
         indexed_docs: u64,
@@ -162,12 +168,12 @@ impl Decoder for FrameCodec {
                         return Ok(None);
                     }
                     let version = src.get_u16();
-                    if version != PROTOCOL_VERSION {
+                    if !(MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&version) {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
                             format!(
-                                "version mismatch: expected {}, got {}",
-                                PROTOCOL_VERSION, version
+                                "version {} outside supported {}..={}",
+                                version, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION
                             ),
                         ));
                     }
@@ -287,7 +293,6 @@ mod tests {
     fn test_version_mismatch() {
         let mut codec = FrameCodec::default();
         let mut buf = BytesMut::new();
-        // Manually craft a frame with wrong version
         let json = serde_json::to_vec(&Request::Toggle).unwrap();
         buf.put_u32((2 + json.len()) as u32);
         buf.put_u16(99);
@@ -296,7 +301,48 @@ mod tests {
         let result = codec.decode(&mut buf);
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.to_string().contains("version mismatch"));
+        assert!(
+            err.to_string().contains("outside supported"),
+            "expected 'outside supported' in error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_protocol_v3_record_query_click_roundtrip() {
+        let mut codec = FrameCodec::default();
+        let mut buf = BytesMut::new();
+        let req = Request::RecordQueryClick {
+            doc_id: "fs:/a".into(),
+            query: "foo".into(),
+        };
+        codec.encode(req, &mut buf).unwrap();
+
+        let decoded = codec.decode(&mut buf).unwrap().unwrap();
+        match decoded {
+            Request::RecordQueryClick { doc_id, query } => {
+                assert_eq!(doc_id, "fs:/a");
+                assert_eq!(query, "foo");
+            }
+            other => panic!("Expected RecordQueryClick, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_codec_accepts_protocol_v2_frame() {
+        let mut codec = FrameCodec::default();
+        let mut buf = BytesMut::new();
+        let json = serde_json::to_vec(&Request::Toggle).unwrap();
+        buf.put_u32((2 + json.len()) as u32);
+        buf.put_u16(2);
+        buf.put_slice(&json);
+
+        let decoded = codec.decode(&mut buf).unwrap();
+        assert!(
+            matches!(decoded, Some(Request::Toggle)),
+            "expected Some(Request::Toggle), got {:?}",
+            decoded
+        );
     }
 
     #[test]

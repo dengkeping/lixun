@@ -129,6 +129,21 @@ fn handle_response(resp: Response) {
                 );
             }
         }
+        Response::HitsWithExtrasV3 {
+            hits,
+            calculation,
+            top_hit: _,
+        } => {
+            if let Some(c) = calculation {
+                println!("= {} = {}", c.expr, c.result);
+            }
+            for hit in hits {
+                println!(
+                    "{:.2} | {:?} | {} | {}",
+                    hit.score, hit.category, hit.title, hit.subtitle
+                );
+            }
+        }
         Response::Status {
             indexed_docs,
             last_reindex,
