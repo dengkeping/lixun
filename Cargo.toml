@@ -71,3 +71,11 @@ inventory = "0.3"
 
 tempfile = "3"
 unicode-normalization = "0.1"
+
+# Profile for memory profiling: release optimizations + full debug info
+# so heaptrack/valgrind can resolve symbols. Used for diagnosis only;
+# production builds keep the default release profile (no debug info).
+[profile.release-debug]
+inherits = "release"
+debug = "full"
+strip = "none"
