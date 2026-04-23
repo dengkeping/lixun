@@ -494,7 +494,7 @@ async fn handle_client(
                     }
                 }
                 hits.sort_by(compare_hits_for_ranking);
-                let top_hit_id = {
+                let decision = {
                     let frecency = frecency.read().await;
                     let latch = query_latch.read().await;
                     top_hit::select_top_hit(
@@ -508,6 +508,18 @@ async fn handle_client(
                         config.ranking_strong_latch_threshold,
                     )
                 };
+                tracing::debug!(
+                    query = %q,
+                    top_hit = ?decision.id,
+                    confidence = decision.confidence,
+                    margin = decision.margin,
+                    prefix_match = decision.prefix_match,
+                    acronym_match = decision.acronym_match,
+                    has_strong_latch = decision.has_strong_latch,
+                    dominance = decision.dominance,
+                    "top_hit selection"
+                );
+                let top_hit_id = decision.id;
                 let calculation = lixun_index::calculator::detect(&q);
                 match negotiated_version {
                     1 => Response::Hits(hits),

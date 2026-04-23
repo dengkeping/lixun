@@ -42,12 +42,30 @@ const FRECENCY_DOMINANCE_MIN_RAW: f32 = 3.0;
 /// runner-up's to count as dominant.
 const FRECENCY_DOMINANCE_RATIO: f32 = 2.0;
 
+/// All inputs and outputs from a Top Hit selection. The gate
+/// decision is `id`; the other fields are the probes that went
+/// into it, returned so the caller can log them regardless of the
+/// outcome. Logging both pass and fail paths is essential for
+/// Phase 3 retune — without the probe values we can't measure
+/// where the gate is failing on live queries.
+#[derive(Debug, Clone)]
+pub struct TopHitDecision {
+    pub id: Option<DocId>,
+    pub confidence: f32,
+    pub margin: f32,
+    pub prefix_match: bool,
+    pub acronym_match: bool,
+    pub has_strong_latch: bool,
+    pub dominance: f32,
+}
+
 /// Decide whether `hits[0]` should be promoted to Top Hit for query
-/// `q_raw`. Returns `Some(hits[0].id.clone())` when both the
-/// confidence and margin thresholds are satisfied, else `None`.
+/// `q_raw`. Returns a `TopHitDecision` whose `.id` is `Some` when
+/// both gates pass and `None` otherwise; the other fields carry
+/// the probes used to compute the decision.
 ///
 /// Edge cases:
-/// - `hits.is_empty()` → `None`.
+/// - `hits.is_empty()` → id None, probes zeroed, margin = -inf.
 /// - `hits.len() == 1` → margin is treated as infinity; promotion
 ///   depends solely on confidence.
 #[allow(clippy::too_many_arguments)]
@@ -60,18 +78,22 @@ pub fn select_top_hit(
     min_confidence: f32,
     min_margin: f32,
     strong_latch_threshold: u32,
-) -> Option<DocId> {
+) -> TopHitDecision {
     if hits.is_empty() {
-        return None;
+        return TopHitDecision {
+            id: None,
+            confidence: 0.0,
+            margin: f32::NEG_INFINITY,
+            prefix_match: false,
+            acronym_match: false,
+            has_strong_latch: false,
+            dominance: 0.0,
+        };
     }
     let candidate = &hits[0];
     let q_norm = normalize_for_match(q_raw);
     let title_norm = normalize_for_match(&candidate.title);
 
-    // `prefix_mult`/`acronym_mult` return `weight` on match, `1.0`
-    // otherwise. Any weight > 1.0 works as a "fired?" probe; the
-    // actual prefix/acronym multiplier applied during search uses
-    // the configured boost (independent from this check).
     let prefix_match = prefix_mult(&title_norm, &q_norm, 2.0) > 1.0;
     let acronym_match = acronym_mult(&candidate.title, &q_norm, 2.0) > 1.0;
     let has_strong_latch = latch.strong(q_raw, &candidate.id.0, strong_latch_threshold);
@@ -91,10 +113,20 @@ pub fn select_top_hit(
         hits[0].score / hits[1].score.max(EPSILON)
     };
 
-    if confidence >= min_confidence && margin >= min_margin {
+    let id = if confidence >= min_confidence && margin >= min_margin {
         Some(candidate.id.clone())
     } else {
         None
+    };
+
+    TopHitDecision {
+        id,
+        confidence,
+        margin,
+        prefix_match,
+        acronym_match,
+        has_strong_latch,
+        dominance,
     }
 }
 
@@ -163,7 +195,7 @@ mod tests {
             make_hit("app:firefox", "Firefox", 10.0),
             make_hit("app:something", "Something", 3.0),
         ];
-        let result = select_top_hit(
+        let decision = select_top_hit(
             "fire",
             &hits,
             &FrecencyStore::default(),
@@ -173,19 +205,22 @@ mod tests {
             1.3,
             3,
         );
-        assert_eq!(result, Some(hits[0].id.clone()));
+        assert_eq!(decision.id, Some(hits[0].id.clone()));
+        assert!(decision.prefix_match);
+        assert!(decision.confidence >= 0.6);
+        assert!(decision.margin >= 1.3);
     }
 
     /// Margin gate bites: two identically-titled docs both
     /// prefix-match, but 10.0/9.5 ≈ 1.05 fails the 1.3 threshold,
-    /// so no Top Hit is emitted.
+    /// so no Top Hit is emitted — but the probes are still filled.
     #[test]
     fn ambiguous_returns_none() {
         let hits = vec![
             make_hit("fs:a", "Doc", 10.0),
             make_hit("fs:b", "Doc", 9.5),
         ];
-        let result = select_top_hit(
+        let decision = select_top_hit(
             "doc",
             &hits,
             &FrecencyStore::default(),
@@ -195,7 +230,34 @@ mod tests {
             1.3,
             3,
         );
-        assert!(result.is_none());
+        assert!(decision.id.is_none());
+        assert!(decision.prefix_match, "probe still fires even when gate rejects");
+        assert!(
+            (decision.margin - (10.0_f32 / 9.5)).abs() < 0.001,
+            "margin value populated regardless of gate outcome"
+        );
+    }
+
+    /// All probes must populate on empty input so callers can log
+    /// uniformly. The gate returns None trivially.
+    #[test]
+    fn empty_hits_returns_zeroed_decision() {
+        let decision = select_top_hit(
+            "anything",
+            &[],
+            &FrecencyStore::default(),
+            &QueryLatchStore::default(),
+            0,
+            0.6,
+            1.3,
+            3,
+        );
+        assert!(decision.id.is_none());
+        assert_eq!(decision.confidence, 0.0);
+        assert!(!decision.prefix_match);
+        assert!(!decision.acronym_match);
+        assert!(!decision.has_strong_latch);
+        assert_eq!(decision.dominance, 0.0);
     }
 
     /// Mirror of the `match negotiated_version { .. }` arm in
