@@ -9,8 +9,8 @@ use lixun_core::{Action, Category, Hit};
 
 use crate::actions::{copy_to_clipboard, execute_action, execute_secondary_action};
 use crate::icons::resolve_icon;
+use crate::ipc::dispatch_click_pair;
 use crate::ipc::send_preview_request;
-use crate::ipc::send_record_click;
 
 pub(crate) const ICON_SIZE_NORMAL: i32 = 32;
 pub(crate) const ICON_SIZE_TOP_HIT: i32 = 48;
@@ -122,13 +122,14 @@ fn build_menu_for(category: &Category) -> gio::Menu {
     menu
 }
 
-fn install_action_group(row: &gtk::Box, hit: &Hit) {
+fn install_action_group(row: &gtk::Box, hit: &Hit, entry: &gtk::Entry) {
     let group = gio::SimpleActionGroup::new();
 
     let open_hit = hit.clone();
+    let open_entry = entry.clone();
     let open = gio::SimpleAction::new("open", None);
     open.connect_activate(move |_, _| {
-        send_record_click(&open_hit.id.0);
+        dispatch_click_pair(&open_hit.id.0, open_entry.text().as_str());
         if let Err(e) = execute_action(&open_hit) {
             tracing::error!("Action failed: {}", e);
         }
@@ -246,15 +247,16 @@ fn install_right_click_popover(row: &gtk::Box, category: &Category) {
     row.add_controller(gesture);
 }
 
-fn install_double_click_open(row: &gtk::Box, hit: &Hit) {
+fn install_double_click_open(row: &gtk::Box, hit: &Hit, entry: &gtk::Entry) {
     let gesture = gtk::GestureClick::new();
     gesture.set_button(gdk::BUTTON_PRIMARY);
     let hit = hit.clone();
+    let entry = entry.clone();
     gesture.connect_pressed(move |_g, n_press, _x, _y| {
         if n_press != 2 {
             return;
         }
-        send_record_click(&hit.id.0);
+        dispatch_click_pair(&hit.id.0, entry.text().as_str());
         if let Err(e) = execute_action(&hit) {
             tracing::error!("double-click open failed: {}", e);
             return;
@@ -293,7 +295,7 @@ fn install_drag_source(row: &gtk::Box, hit: &Hit) {
     row.add_controller(drag);
 }
 
-pub(crate) fn create_list_factory() -> gtk::SignalListItemFactory {
+pub(crate) fn create_list_factory(entry: gtk::Entry) -> gtk::SignalListItemFactory {
     let factory = gtk::SignalListItemFactory::new();
 
     factory.connect_setup(move |_, list_item| {
@@ -362,6 +364,7 @@ pub(crate) fn create_list_factory() -> gtk::SignalListItemFactory {
         }
     });
 
+    let bind_entry = entry.clone();
     factory.connect_bind(move |_, list_item| {
         let list_item = list_item
             .downcast_ref::<gtk::ListItem>()
@@ -398,9 +401,9 @@ pub(crate) fn create_list_factory() -> gtk::SignalListItemFactory {
                     kind.set_text(&kind_text);
 
                     clear_row_controllers(&row);
-                    install_action_group(&row, hit);
+                    install_action_group(&row, hit, &bind_entry);
                     install_right_click_popover(&row, &hit.category);
-                    install_double_click_open(&row, hit);
+                    install_double_click_open(&row, hit, &bind_entry);
                     if matches!(hit.category, Category::File | Category::Attachment) {
                         install_drag_source(&row, hit);
                     }
@@ -412,6 +415,81 @@ pub(crate) fn create_list_factory() -> gtk::SignalListItemFactory {
     });
 
     factory
+}
+
+/// Build a standalone hero row widget for the structural Top Hit
+/// region above the results list. Visuals mirror a regular
+/// `.lixun-hit` row with a larger icon (matches ICON_SIZE_TOP_HIT)
+/// and the `.lixun-top-hit-hero` CSS class applied. Click activates
+/// the same primary action as the list row (`execute_action`) and
+/// emits the dual-emit click pair so frecency + latch both learn.
+/// The hero row is click-activatable only; keyboard navigation
+/// stays in the list, which matches D8's contract (hero is a
+/// visual hint, not a separate focus target).
+pub(crate) fn build_hero_row(hit: &Hit, entry: &gtk::Entry) -> gtk::Box {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    row.set_widget_name("lixun-top-hit-hero");
+    add_css_class(&row, "lixun-hit");
+    add_css_class(&row, "lixun-top-hit-hero");
+
+    let icon = gtk::Image::new();
+    icon.set_pixel_size(ICON_SIZE_TOP_HIT);
+    icon.set_margin_start(4);
+    if let Some(paintable) = resolve_icon(hit, ICON_SIZE_TOP_HIT) {
+        icon.set_paintable(Some(&paintable));
+    } else {
+        icon.set_icon_name(Some(match hit.category {
+            Category::App => "application-x-executable",
+            Category::File => "text-x-generic",
+            Category::Mail => "mail-message",
+            Category::Attachment => "mail-attachment",
+        }));
+    }
+    row.append(&icon);
+
+    let text_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    text_box.set_hexpand(true);
+
+    let title = gtk::Label::new(Some(&hit.title));
+    title.set_xalign(0.0);
+    title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    add_css_class(&title, "lixun-title");
+    text_box.append(&title);
+
+    let subtitle = gtk::Label::new(Some(&hit.subtitle));
+    subtitle.set_xalign(0.0);
+    subtitle.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    add_css_class(&subtitle, "lixun-subtitle");
+    text_box.append(&subtitle);
+
+    row.append(&text_box);
+
+    let kind_text = hit
+        .kind_label
+        .clone()
+        .unwrap_or_else(|| category_kind_fallback(&hit.category).to_string());
+    let kind = gtk::Label::new(Some(&kind_text));
+    kind.set_xalign(1.0);
+    add_css_class(&kind, "lixun-kind");
+    row.append(&kind);
+
+    let gesture = gtk::GestureClick::new();
+    gesture.set_button(gdk::BUTTON_PRIMARY);
+    let hit_for_click = hit.clone();
+    let entry_for_click = entry.clone();
+    gesture.connect_pressed(move |_g, _n_press, _x, _y| {
+        dispatch_click_pair(&hit_for_click.id.0, entry_for_click.text().as_str());
+        if let Err(e) = execute_action(&hit_for_click) {
+            tracing::error!("hero row activate failed: {}", e);
+            return;
+        }
+        if let Some(app) = gio::Application::default() {
+            app.activate_action("clear-and-hide-launcher", None);
+        }
+    });
+    row.add_controller(gesture);
+
+    row
 }
 
 /// Apply the hero "top-hit" visuals to the row iff the list item is
