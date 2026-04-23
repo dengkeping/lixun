@@ -428,7 +428,7 @@ impl LauncherController {
 
         *self.last_query.borrow_mut() = snapshot.query.clone();
 
-        update_results(&self.model, &self.selection, &snapshot.hits);
+        update_results(&self.model, &self.selection, &snapshot.hits, None);
         self.filter.changed(gtk::FilterChange::Different);
 
         let selected_idx = snapshot
@@ -866,7 +866,7 @@ fn install_response_poller(
             };
             let plan = compute_render_plan(&hits_snapshot, top_hit_snapshot.as_ref());
             render_hero(&hero_box, plan.hero(), &entry);
-            update_results(&model, &selection, plan.list());
+            update_results(&model, &selection, plan.list(), None);
             filter.changed(gtk::FilterChange::Different);
             if !plan.list().is_empty() {
                 // Compute the desired index in the post-filter list
