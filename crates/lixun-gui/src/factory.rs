@@ -7,6 +7,21 @@ use gtk::gio;
 use gtk::prelude::*;
 use lixun_core::{Action, Category, Hit};
 
+/// Per-row state carried by every persistent controller created
+/// in `connect_setup`. `doc_id` is the DocId of the Hit currently
+/// bound to this pool-slot row widget; `None` between `unbind`
+/// and the next `bind`. Callbacks fired on an unbound row (late
+/// gestures after scroll recycle, stale drag-prepares) must
+/// no-op by checking `doc_id.is_none()`. `category` is kept
+/// alongside so the right-click popover can swap its menu model
+/// without a second cache lookup on each click.
+#[derive(Default)]
+#[allow(dead_code)] // Wired up in T2 of .local-plans/plans/gui-memory-leak-fix.md
+struct RowState {
+    doc_id: Option<String>,
+    category: Option<Category>,
+}
+
 use crate::actions::{copy_to_clipboard, execute_action, execute_secondary_action};
 use crate::icons::resolve_icon;
 use crate::ipc::dispatch_click_pair;
@@ -523,6 +538,13 @@ mod tests {
     fn menu_for_attachment_has_expected_items() {
         let menu = build_menu_for(&Category::Attachment);
         assert_eq!(menu.n_items(), 4);
+    }
+
+    #[test]
+    fn row_state_default_is_unbound() {
+        let s = RowState::default();
+        assert!(s.doc_id.is_none());
+        assert!(s.category.is_none());
     }
 
     #[test]
