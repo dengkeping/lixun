@@ -1,6 +1,7 @@
 //! ListView factory, result model updater, and cached hit store.
 
 use std::cell::RefCell;
+use std::rc::Rc;
 
 use gtk::gdk;
 use gtk::gio;
@@ -16,7 +17,6 @@ use lixun_core::{Action, Category, Hit};
 /// alongside so the right-click popover can swap its menu model
 /// without a second cache lookup on each click.
 #[derive(Default)]
-#[allow(dead_code)] // Wired up in T2 of .local-plans/plans/gui-memory-leak-fix.md
 struct RowState {
     doc_id: Option<String>,
     category: Option<Category>,
@@ -149,70 +149,17 @@ fn build_menu_for(category: &Category) -> gio::Menu {
     menu
 }
 
-fn install_action_group(row: &gtk::Box, hit: &Hit, entry: &gtk::Entry) {
-    let group = gio::SimpleActionGroup::new();
-
-    let open_hit = hit.clone();
-    let open_entry = entry.clone();
-    let open = gio::SimpleAction::new("open", None);
-    open.connect_activate(move |_, _| {
-        dispatch_click_pair(&open_hit.id.0, open_entry.text().as_str());
-        if let Err(e) = execute_action(&open_hit) {
-            tracing::error!("Action failed: {}", e);
-        }
-    });
-    group.add_action(&open);
-
-    let reveal_hit = hit.clone();
-    let reveal = gio::SimpleAction::new("reveal", None);
-    reveal.connect_activate(move |_, _| {
-        if let Err(e) = execute_secondary_action(&reveal_hit) {
-            tracing::error!("Reveal failed: {}", e);
-        }
-    });
-    group.add_action(&reveal);
-
-    let copy_hit = hit.clone();
-    let copy = gio::SimpleAction::new("copy", None);
-    copy.connect_activate(move |_, _| {
-        copy_to_clipboard(&copy_hit);
-    });
-    group.add_action(&copy);
-
-    let quick_hit = hit.clone();
-    let quick_row = row.clone();
-    let quick = gio::SimpleAction::new("quicklook", None);
-    quick.connect_activate(move |_, _| {
-        let monitor = quick_row
-            .root()
-            .and_then(|r| r.downcast::<gtk::ApplicationWindow>().ok())
-            .and_then(|w| crate::ipc::current_monitor_connector(&w));
-        send_preview_request(&quick_hit, monitor);
-    });
-    group.add_action(&quick);
-
-    let info_hit = hit.clone();
-    let info_row = row.clone();
-    let info = gio::SimpleAction::new("info", None);
-    info.connect_activate(move |_, _| {
-        show_get_info_popover(&info_row, &info_hit);
-    });
-    group.add_action(&info);
-
-    row.insert_action_group("row", Some(&group));
+fn hit_file_path(hit: &Hit) -> Option<std::path::PathBuf> {
+    match &hit.action {
+        Action::OpenFile { path } | Action::ShowInFileManager { path } => Some(path.clone()),
+        _ => None,
+    }
 }
 
-fn show_get_info_popover(anchor: &gtk::Box, hit: &Hit) {
-    let popover = gtk::Popover::new();
-    popover.set_parent(anchor);
-    popover.set_has_arrow(true);
-
-    let vbox = gtk::Box::new(gtk::Orientation::Vertical, 4);
-    vbox.set_margin_top(8);
-    vbox.set_margin_bottom(8);
-    vbox.set_margin_start(12);
-    vbox.set_margin_end(12);
-
+fn populate_info_popover_body(vbox: &gtk::Box, hit: &Hit) {
+    while let Some(child) = vbox.first_child() {
+        vbox.remove(&child);
+    }
     let title = gtk::Label::new(Some(&hit.title));
     title.set_xalign(0.0);
     add_css_class(&title, "lixun-title");
@@ -231,99 +178,11 @@ fn show_get_info_popover(anchor: &gtk::Box, hit: &Hit) {
         add_css_class(&kind_label, "lixun-subtitle");
         vbox.append(&kind_label);
     }
-
-    popover.set_child(Some(&vbox));
-    popover.popup();
-}
-
-fn hit_file_path(hit: &Hit) -> Option<std::path::PathBuf> {
-    match &hit.action {
-        Action::OpenFile { path } | Action::ShowInFileManager { path } => Some(path.clone()),
-        _ => None,
-    }
-}
-
-fn clear_row_controllers(row: &gtk::Box) {
-    let controllers = row.observe_controllers();
-    let n = controllers.n_items();
-    let mut to_remove: Vec<gtk::EventController> = Vec::new();
-    for i in 0..n {
-        if let Some(ctrl) = controllers.item(i).and_downcast::<gtk::EventController>() {
-            to_remove.push(ctrl);
-        }
-    }
-    for c in to_remove {
-        row.remove_controller(&c);
-    }
-}
-
-fn install_right_click_popover(row: &gtk::Box, category: &Category) {
-    let menu = build_menu_for(category);
-    let popover = gtk::PopoverMenu::from_model(Some(&menu));
-    popover.set_parent(row);
-    popover.set_has_arrow(false);
-
-    let gesture = gtk::GestureClick::new();
-    gesture.set_button(gdk::BUTTON_SECONDARY);
-    let popover_for_gesture = popover.clone();
-    gesture.connect_pressed(move |_g, _n_press, x, y| {
-        let rect = gdk::Rectangle::new(x as i32, y as i32, 1, 1);
-        popover_for_gesture.set_pointing_to(Some(&rect));
-        popover_for_gesture.popup();
-    });
-    row.add_controller(gesture);
-}
-
-fn install_double_click_open(row: &gtk::Box, hit: &Hit, entry: &gtk::Entry) {
-    let gesture = gtk::GestureClick::new();
-    gesture.set_button(gdk::BUTTON_PRIMARY);
-    let hit = hit.clone();
-    let entry = entry.clone();
-    gesture.connect_pressed(move |_g, n_press, _x, _y| {
-        if n_press != 2 {
-            return;
-        }
-        dispatch_click_pair(&hit.id.0, entry.text().as_str());
-        if let Err(e) = execute_action(&hit) {
-            tracing::error!("double-click open failed: {}", e);
-            return;
-        }
-        // Double-click = launch-completing action, so tell the
-        // launcher to drop its session cache via the
-        // "clear-and-hide-launcher" app action. The plain "close-
-        // launcher" action does a soft hide that persists state —
-        // wrong for a launch.
-        if let Some(app) = gio::Application::default() {
-            app.activate_action("clear-and-hide-launcher", None);
-        }
-    });
-    row.add_controller(gesture);
-}
-
-fn install_drag_source(row: &gtk::Box, hit: &Hit) {
-    let Some(path) = hit_file_path(hit) else {
-        return;
-    };
-
-    let drag = gtk::DragSource::new();
-    drag.set_actions(gdk::DragAction::COPY);
-
-    let hit_for_icon = hit.clone();
-    drag.connect_prepare(move |source, _x, _y| {
-        let file = gio::File::for_path(&path);
-        let uri = file.uri();
-        let content = gdk::ContentProvider::for_value(&uri.to_value());
-        if let Some(paintable) = resolve_icon(&hit_for_icon, ICON_SIZE_NORMAL) {
-            source.set_icon(Some(&paintable), 0, 0);
-        }
-        Some(content)
-    });
-
-    row.add_controller(drag);
 }
 
 pub(crate) fn create_list_factory(entry: gtk::Entry) -> gtk::SignalListItemFactory {
     let factory = gtk::SignalListItemFactory::new();
+    let setup_entry = entry.clone();
 
     factory.connect_setup(move |_, list_item| {
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
@@ -362,6 +221,220 @@ pub(crate) fn create_list_factory(entry: gtk::Entry) -> gtk::SignalListItemFacto
             .expect("ListItem expected");
         list_item.set_child(Some(&row));
 
+        // Per-row state shared by every persistent controller
+        // installed below. `connect_bind` writes doc_id+category
+        // into this cell; `connect_unbind` clears them. Every
+        // callback guards on `doc_id.is_none()` and no-ops for
+        // late/stale firings (post-recycle gesture, stale drag
+        // prepare). No Hit is ever captured in closures — the
+        // current Hit is resolved through `with_cached_hits` at
+        // callback time, eliminating the bind-time Hit::clone
+        // hotspot that previously leaked ~293 MB per session.
+        let state = Rc::new(RefCell::new(RowState::default()));
+
+        // ===== SimpleActionGroup with five "row.*" actions =====
+        // Built once per pool slot, inserted once. GIO holds a
+        // strong ref from the row; we never reinstall, so no
+        // orphan ActionGroup can accumulate.
+        let group = gio::SimpleActionGroup::new();
+
+        let open_state = Rc::clone(&state);
+        let open_entry = setup_entry.clone();
+        let open = gio::SimpleAction::new("open", None);
+        open.connect_activate(move |_, _| {
+            let Some(doc_id) = open_state.borrow().doc_id.clone() else {
+                tracing::debug!("row.open fired on unbound row");
+                return;
+            };
+            with_cached_hits(|hits| {
+                if let Some(hit) = hits.iter().find(|h| h.id.0 == doc_id) {
+                    dispatch_click_pair(&hit.id.0, open_entry.text().as_str());
+                    if let Err(e) = execute_action(hit) {
+                        tracing::error!("Action failed: {}", e);
+                    }
+                }
+            });
+        });
+        group.add_action(&open);
+
+        let reveal_state = Rc::clone(&state);
+        let reveal = gio::SimpleAction::new("reveal", None);
+        reveal.connect_activate(move |_, _| {
+            let Some(doc_id) = reveal_state.borrow().doc_id.clone() else {
+                tracing::debug!("row.reveal fired on unbound row");
+                return;
+            };
+            with_cached_hits(|hits| {
+                if let Some(hit) = hits.iter().find(|h| h.id.0 == doc_id)
+                    && let Err(e) = execute_secondary_action(hit)
+                {
+                    tracing::error!("Reveal failed: {}", e);
+                }
+            });
+        });
+        group.add_action(&reveal);
+
+        let copy_state = Rc::clone(&state);
+        let copy = gio::SimpleAction::new("copy", None);
+        copy.connect_activate(move |_, _| {
+            let Some(doc_id) = copy_state.borrow().doc_id.clone() else {
+                tracing::debug!("row.copy fired on unbound row");
+                return;
+            };
+            with_cached_hits(|hits| {
+                if let Some(hit) = hits.iter().find(|h| h.id.0 == doc_id) {
+                    copy_to_clipboard(hit);
+                }
+            });
+        });
+        group.add_action(&copy);
+
+        let quick_state = Rc::clone(&state);
+        let quick_row = row.clone();
+        let quick = gio::SimpleAction::new("quicklook", None);
+        quick.connect_activate(move |_, _| {
+            let Some(doc_id) = quick_state.borrow().doc_id.clone() else {
+                tracing::debug!("row.quicklook fired on unbound row");
+                return;
+            };
+            with_cached_hits(|hits| {
+                if let Some(hit) = hits.iter().find(|h| h.id.0 == doc_id) {
+                    let monitor = quick_row
+                        .root()
+                        .and_then(|r| r.downcast::<gtk::ApplicationWindow>().ok())
+                        .and_then(|w| crate::ipc::current_monitor_connector(&w));
+                    send_preview_request(hit, monitor);
+                }
+            });
+        });
+        group.add_action(&quick);
+
+        // ===== Info popover (persistent child of the row) =====
+        // Parented once via set_parent(&row). popdown() hides it;
+        // we NEVER call unparent() — that would crash on the next
+        // activate. Row widgets are pool-stable (never destroyed
+        // during GUI lifetime), so this popover lives as long as
+        // its row.
+        let info_popover = gtk::Popover::new();
+        info_popover.set_parent(&row);
+        info_popover.set_has_arrow(true);
+        let info_vbox = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        info_vbox.set_margin_top(8);
+        info_vbox.set_margin_bottom(8);
+        info_vbox.set_margin_start(12);
+        info_vbox.set_margin_end(12);
+        info_popover.set_child(Some(&info_vbox));
+
+        let info_state = Rc::clone(&state);
+        let info_popover_for_action = info_popover.clone();
+        let info_vbox_for_action = info_vbox.clone();
+        let info = gio::SimpleAction::new("info", None);
+        info.connect_activate(move |_, _| {
+            let Some(doc_id) = info_state.borrow().doc_id.clone() else {
+                tracing::debug!("row.info fired on unbound row");
+                return;
+            };
+            with_cached_hits(|hits| {
+                if let Some(hit) = hits.iter().find(|h| h.id.0 == doc_id) {
+                    populate_info_popover_body(&info_vbox_for_action, hit);
+                    info_popover_for_action.popup();
+                }
+            });
+        });
+        group.add_action(&info);
+
+        row.insert_action_group("row", Some(&group));
+
+        // ===== Right-click popover (persistent, menu model swapped on bind) =====
+        // PopoverMenu is built once with the File-category menu
+        // as a placeholder; connect_bind swaps the model via
+        // set_menu_model(Some(&build_menu_for(&cat))) to match
+        // the currently-bound hit. Parented once; never rebuilt.
+        let right_click_popover =
+            gtk::PopoverMenu::from_model(Some(&build_menu_for(&Category::File)));
+        right_click_popover.set_parent(&row);
+        right_click_popover.set_has_arrow(false);
+
+        let right_click_gesture = gtk::GestureClick::new();
+        right_click_gesture.set_button(gdk::BUTTON_SECONDARY);
+        let right_click_popover_for_gesture = right_click_popover.clone();
+        right_click_gesture.connect_pressed(move |_g, _n_press, x, y| {
+            let rect = gdk::Rectangle::new(x as i32, y as i32, 1, 1);
+            right_click_popover_for_gesture.set_pointing_to(Some(&rect));
+            right_click_popover_for_gesture.popup();
+        });
+        row.add_controller(right_click_gesture);
+
+        // ===== Double-click primary = launch + clear-and-hide =====
+        let dblclick_state = Rc::clone(&state);
+        let dblclick_entry = setup_entry.clone();
+        let dblclick_gesture = gtk::GestureClick::new();
+        dblclick_gesture.set_button(gdk::BUTTON_PRIMARY);
+        dblclick_gesture.connect_pressed(move |_g, n_press, _x, _y| {
+            if n_press != 2 {
+                return;
+            }
+            let Some(doc_id) = dblclick_state.borrow().doc_id.clone() else {
+                tracing::debug!("double-click fired on unbound row");
+                return;
+            };
+            with_cached_hits(|hits| {
+                if let Some(hit) = hits.iter().find(|h| h.id.0 == doc_id) {
+                    dispatch_click_pair(&hit.id.0, dblclick_entry.text().as_str());
+                    if let Err(e) = execute_action(hit) {
+                        tracing::error!("double-click open failed: {}", e);
+                        return;
+                    }
+                    // Double-click = launch-completing action;
+                    // drop the launcher session cache via the
+                    // "clear-and-hide-launcher" app action.
+                    if let Some(app) = gio::Application::default() {
+                        app.activate_action("clear-and-hide-launcher", None);
+                    }
+                }
+            });
+        });
+        row.add_controller(dblclick_gesture);
+
+        // ===== Drag source (permanent row controller) =====
+        // For non-file rows, connect_prepare returns None, which
+        // GTK4 silently aborts before any drag cursor or visual
+        // feedback — same UX as the old "install only for
+        // File/Attachment" code path. The key difference is no
+        // per-bind add_controller churn.
+        let drag_state = Rc::clone(&state);
+        let drag = gtk::DragSource::new();
+        drag.set_actions(gdk::DragAction::COPY);
+        drag.connect_prepare(move |source, _x, _y| {
+            let doc_id = drag_state.borrow().doc_id.clone()?;
+            with_cached_hits(|hits| {
+                let hit = hits.iter().find(|h| h.id.0 == doc_id)?;
+                let path = hit_file_path(hit)?;
+                let file = gio::File::for_path(&path);
+                let uri = file.uri();
+                let content = gdk::ContentProvider::for_value(&uri.to_value());
+                if let Some(paintable) = resolve_icon(hit, ICON_SIZE_NORMAL) {
+                    source.set_icon(Some(&paintable), 0, 0);
+                }
+                Some(content)
+            })
+        });
+        row.add_controller(drag);
+
+        // Per-setup bind/unbind handlers via item-property notify.
+        // Each pool-slot list_item carries a unique closure that
+        // captures ITS OWN `state` Rc (so the controllers above
+        // see state mutations) and ITS OWN right-click popover
+        // (so the menu model swap targets the right widget).
+        // This avoids the need for `unsafe { set_data }` plumbing
+        // a shared factory-level connect_bind handler would have
+        // required, at the cost of one extra closure per row.
+        let notify_state = Rc::clone(&state);
+        let notify_right_click_popover = right_click_popover.clone();
+        list_item.connect_notify_local(Some("item"), move |list_item, _| {
+            on_item_notify(list_item, &notify_state, &notify_right_click_popover);
+        });
+
         // Re-apply hero styling (large icon + card frame) whenever
         // this item's selected state flips. GTK4 ListView recycles
         // child widgets across list_items as the user scrolls; the
@@ -391,60 +464,84 @@ pub(crate) fn create_list_factory(entry: gtk::Entry) -> gtk::SignalListItemFacto
                 icon.set_pixel_size(ICON_SIZE_NORMAL);
             }
         }
+        // Row state is cleared via the `item` notify below when
+        // item becomes None. Nothing to do here for row state.
     });
 
-    let bind_entry = entry.clone();
     factory.connect_bind(move |_, list_item| {
         let list_item = list_item
             .downcast_ref::<gtk::ListItem>()
             .expect("ListItem expected");
-
-        if let Some(str_obj) = list_item
-            .item()
-            .and_then(|i| i.downcast::<gtk::StringObject>().ok())
-        {
-            let doc_id = str_obj.string().to_string();
-            with_cached_hits(|hits| {
-                if let Some(hit) = hits.iter().find(|h| h.id.0 == doc_id) {
-                    let row = list_item.child().and_downcast::<gtk::Box>().unwrap();
-
-                    let text_box = row
-                        .first_child()
-                        .and_then(|c| c.next_sibling())
-                        .and_downcast::<gtk::Box>()
-                        .unwrap();
-                    let title = text_box.first_child().and_downcast::<gtk::Label>().unwrap();
-                    title.set_text(&hit.title);
-
-                    let subtitle = title.next_sibling().and_downcast::<gtk::Label>().unwrap();
-                    subtitle.set_text(&hit.subtitle);
-
-                    let kind = text_box
-                        .next_sibling()
-                        .and_downcast::<gtk::Label>()
-                        .unwrap();
-                    let kind_text = hit
-                        .kind_label
-                        .clone()
-                        .unwrap_or_else(|| category_kind_fallback(&hit.category).to_string());
-                    kind.set_text(&kind_text);
-
-                    clear_row_controllers(&row);
-                    install_action_group(&row, hit, &bind_entry);
-                    install_right_click_popover(&row, &hit.category);
-                    install_double_click_open(&row, hit, &bind_entry);
-                    if matches!(hit.category, Category::File | Category::Attachment) {
-                        install_drag_source(&row, hit);
-                    }
-                }
-            });
-        }
-
         apply_selected_styling(list_item);
         apply_top_hit_styling(list_item);
     });
 
     factory
+}
+
+/// Called from `connect_notify_local("item", ...)` on each list
+/// item: fires when the item is bound (item becomes Some) and
+/// unbound (item becomes None). Updates the row's labels, icon
+/// hint, shared RowState, and the right-click popover's menu
+/// model to match the newly-bound Hit. On unbind (item is None)
+/// clears the RowState so subsequent callbacks no-op safely.
+fn on_item_notify(
+    list_item: &gtk::ListItem,
+    state: &Rc<RefCell<RowState>>,
+    right_click_popover: &gtk::PopoverMenu,
+) {
+    let Some(row) = list_item.child().and_downcast::<gtk::Box>() else {
+        return;
+    };
+
+    let Some(str_obj) = list_item
+        .item()
+        .and_then(|i| i.downcast::<gtk::StringObject>().ok())
+    else {
+        // Item cleared — row is unbound.
+        let mut s = state.borrow_mut();
+        s.doc_id = None;
+        s.category = None;
+        return;
+    };
+
+    let doc_id = str_obj.string().to_string();
+    with_cached_hits(|hits| {
+        if let Some(hit) = hits.iter().find(|h| h.id.0 == doc_id) {
+            let text_box = row
+                .first_child()
+                .and_then(|c| c.next_sibling())
+                .and_downcast::<gtk::Box>()
+                .expect("text_box");
+            let title = text_box
+                .first_child()
+                .and_downcast::<gtk::Label>()
+                .expect("title");
+            title.set_text(&hit.title);
+
+            let subtitle = title
+                .next_sibling()
+                .and_downcast::<gtk::Label>()
+                .expect("subtitle");
+            subtitle.set_text(&hit.subtitle);
+
+            let kind = text_box
+                .next_sibling()
+                .and_downcast::<gtk::Label>()
+                .expect("kind");
+            let kind_text = hit
+                .kind_label
+                .clone()
+                .unwrap_or_else(|| category_kind_fallback(&hit.category).to_string());
+            kind.set_text(&kind_text);
+
+            right_click_popover.set_menu_model(Some(&build_menu_for(&hit.category)));
+
+            let mut s = state.borrow_mut();
+            s.doc_id = Some(doc_id);
+            s.category = Some(hit.category);
+        }
+    });
 }
 
 /// Apply the stateful selection-cursor class `.lixun-top-hit` to
