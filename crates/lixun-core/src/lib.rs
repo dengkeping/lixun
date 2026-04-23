@@ -21,13 +21,73 @@ impl Category {
             Category::Attachment => "attachment",
         }
     }
+}
 
-    pub fn ranking_boost(&self) -> f32 {
-        match self {
-            Category::App => 1.3,
-            Category::File => 1.2,
-            Category::Mail => 1.0,
-            Category::Attachment => 0.9,
+/// Ranking configuration used by the index and daemon scoring layers.
+///
+/// Every field is a scalar weight with a neutral value (1.0 for
+/// multipliers, 0.0 for alphas / recency weights) that disables the
+/// corresponding signal. The host TOML parser in `lixun-daemon`
+/// constructs this struct from `[ranking]` keys; callers without
+/// config (tests, etc.) use [`RankingConfig::default`].
+///
+/// Category fields (`apps`, `files`, `mail`, `attachments`) are the
+/// only fields used in Wave A Task 1. The remaining fields are
+/// declared here ahead of their first use so that later Wave A
+/// tasks (T3..T6) add scoring code without re-widening the struct or
+/// breaking external callers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RankingConfig {
+    // Per-category multipliers — applied in `lixun-index::search`.
+    pub apps: f32,
+    pub files: f32,
+    pub mail: f32,
+    pub attachments: f32,
+
+    // Forward-compatible stub fields. Defined now so the struct is
+    // stable; first consumed by Wave A tasks T3..T6.
+    pub prefix_boost: f32,
+    pub acronym_boost: f32,
+    pub recency_weight: f32,
+    pub recency_tau_days: f32,
+    pub frecency_alpha: f32,
+    pub latch_weight: f32,
+    pub latch_cap: f32,
+    pub total_multiplier_cap: f32,
+    pub top_hit_min_confidence: f32,
+    pub top_hit_min_margin: f32,
+}
+
+impl Default for RankingConfig {
+    fn default() -> Self {
+        Self {
+            apps: 1.3,
+            files: 1.2,
+            mail: 1.0,
+            attachments: 0.9,
+            prefix_boost: 1.4,
+            acronym_boost: 1.25,
+            recency_weight: 0.2,
+            recency_tau_days: 30.0,
+            frecency_alpha: 0.1,
+            latch_weight: 0.5,
+            latch_cap: 3.0,
+            total_multiplier_cap: 6.0,
+            top_hit_min_confidence: 0.6,
+            top_hit_min_margin: 1.3,
+        }
+    }
+}
+
+impl RankingConfig {
+    /// Per-category multiplier applied on top of the Tantivy BM25
+    /// score inside `LixunIndex::search`.
+    pub fn multiplier_for(&self, category: Category) -> f32 {
+        match category {
+            Category::App => self.apps,
+            Category::File => self.files,
+            Category::Mail => self.mail,
+            Category::Attachment => self.attachments,
         }
     }
 }
@@ -199,14 +259,6 @@ mod tests {
         assert_eq!(Category::File.as_str(), "file");
         assert_eq!(Category::Mail.as_str(), "mail");
         assert_eq!(Category::Attachment.as_str(), "attachment");
-    }
-
-    #[test]
-    fn test_category_ranking_boost() {
-        assert_eq!(Category::App.ranking_boost(), 1.3);
-        assert_eq!(Category::File.ranking_boost(), 1.2);
-        assert_eq!(Category::Mail.ranking_boost(), 1.0);
-        assert_eq!(Category::Attachment.ranking_boost(), 0.9);
     }
 
     #[test]

@@ -21,7 +21,9 @@ use tantivy::{
 pub use plugin_schema::CompiledPluginSchema;
 pub use tantivy::{IndexWriter as TantivyIndexWriter, TantivyDocument as TantivyDoc};
 
-use lixun_core::{Category, Document, Hit, PluginFieldSpec, PluginFieldType, PluginValue, Query};
+use lixun_core::{
+    Category, Document, Hit, PluginFieldSpec, PluginFieldType, PluginValue, Query, RankingConfig,
+};
 
 const INDEX_VERSION: u32 = 6;
 const INDEX_VERSION_FILE: &str = "index_version.txt";
@@ -122,11 +124,13 @@ pub struct LixunIndex {
     index: Index,
     schema: LixunSchema,
     plugins: CompiledPluginSchema,
+    ranking: RankingConfig,
 }
 
 impl LixunIndex {
-    pub fn create_or_open(index_path: &str) -> Result<Self> {
-        Self::create_or_open_with_plugins(index_path, &BTreeMap::new()).map(|(index, _)| index)
+    pub fn create_or_open(index_path: &str, ranking: RankingConfig) -> Result<Self> {
+        Self::create_or_open_with_plugins(index_path, &BTreeMap::new(), ranking)
+            .map(|(index, _)| index)
     }
 
     /// Open or create the index.
@@ -140,6 +144,7 @@ impl LixunIndex {
     pub fn create_or_open_with_plugins(
         index_path: &str,
         plugin_fields_by_kind: &BTreeMap<&'static str, &'static [PluginFieldSpec]>,
+        ranking: RankingConfig,
     ) -> Result<(Self, bool)> {
         let (schema, plugins) = LixunSchema::build_with_plugins(plugin_fields_by_kind)?;
         let index_dir = PathBuf::from(index_path);
@@ -182,6 +187,7 @@ impl LixunIndex {
                 index,
                 schema,
                 plugins,
+                ranking,
             },
             needs_rebuild,
         ))
@@ -340,7 +346,7 @@ impl LixunIndex {
                 subtitle,
                 icon_name,
                 kind_label,
-                score: score * category.ranking_boost(),
+                score: score * self.ranking.multiplier_for(category),
                 action,
                 extract_fail,
                 sender,
@@ -480,10 +486,17 @@ mod tests {
     use super::*;
 
     fn create_index_with_docs(docs: &[Document]) -> (tempfile::TempDir, LixunIndex) {
+        create_index_with_docs_and_ranking(docs, RankingConfig::default())
+    }
+
+    fn create_index_with_docs_and_ranking(
+        docs: &[Document],
+        ranking: RankingConfig,
+    ) -> (tempfile::TempDir, LixunIndex) {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().to_str().unwrap();
 
-        let mut index = LixunIndex::create_or_open(path).unwrap();
+        let mut index = LixunIndex::create_or_open(path, ranking).unwrap();
         let mut writer = index.writer(20_000_000).unwrap();
 
         for doc in docs {
@@ -578,7 +591,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().to_str().unwrap();
 
-        let mut index = LixunIndex::create_or_open(path).unwrap();
+        let mut index = LixunIndex::create_or_open(path, RankingConfig::default()).unwrap();
         let mut writer = index.writer(20_000_000).unwrap();
         let doc = sample_document(
             "fs:/tmp/delete_me.txt",
@@ -614,7 +627,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().to_str().unwrap();
 
-        let mut index = LixunIndex::create_or_open(path).unwrap();
+        let mut index = LixunIndex::create_or_open(path, RankingConfig::default()).unwrap();
         let mut writer = index.writer(20_000_000).unwrap();
         for i in 0..3 {
             index
@@ -652,7 +665,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().to_str().unwrap();
 
-        let mut index = LixunIndex::create_or_open(path).unwrap();
+        let mut index = LixunIndex::create_or_open(path, RankingConfig::default()).unwrap();
         let mut writer = index.writer(20_000_000).unwrap();
 
         let doc1 = sample_document("fs:/tmp/same.txt", "old_title.txt", "old content");
@@ -677,7 +690,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().to_str().unwrap();
 
-        let index = LixunIndex::create_or_open(path).unwrap();
+        let index = LixunIndex::create_or_open(path, RankingConfig::default()).unwrap();
 
         let results = index
             .search(&Query {
@@ -891,7 +904,9 @@ mod tests {
         assert!(!tmp.path().join(INDEX_VERSION_FILE).exists());
         drop(old_schema);
 
-        let index = LixunIndex::create_or_open(tmp.path().to_str().unwrap()).unwrap();
+        let index =
+            LixunIndex::create_or_open(tmp.path().to_str().unwrap(), RankingConfig::default())
+                .unwrap();
         assert_eq!(
             std::fs::read_to_string(tmp.path().join(INDEX_VERSION_FILE))
                 .unwrap()
@@ -906,5 +921,38 @@ mod tests {
             })
             .unwrap();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_ranking_config_category_multiplier() {
+        let mut app_doc = sample_document("app:zzz.desktop", "zzz", "");
+        app_doc.category = Category::App;
+        let file_doc = sample_document("fs:/tmp/zzz.txt", "zzz", "");
+
+        let ranking = RankingConfig {
+            apps: 99.0,
+            files: 1.0,
+            mail: 1.0,
+            attachments: 1.0,
+            ..Default::default()
+        };
+        let (_tmp, index) = create_index_with_docs_and_ranking(&[app_doc, file_doc], ranking);
+
+        let hits = index
+            .search(&Query {
+                text: "zzz".into(),
+                limit: 10,
+            })
+            .unwrap();
+
+        assert_eq!(hits.len(), 2, "both docs should match");
+        assert_eq!(hits[0].category, Category::App);
+        assert_eq!(hits[1].category, Category::File);
+        assert!(
+            hits[0].score > hits[1].score * 90.0,
+            "apps=99 vs files=1 must amplify top score by >90×: got {} vs {}",
+            hits[0].score,
+            hits[1].score,
+        );
     }
 }

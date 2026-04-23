@@ -111,6 +111,7 @@ async fn main() -> Result<()> {
     let (index, rebuilt_from_scratch) = lixun_index::LixunIndex::create_or_open_with_plugins(
         index_path.to_str().unwrap(),
         &registry.plugin_fields_by_kind,
+        config.ranking_config(),
     )?;
 
     let stats = Arc::new(RwLock::new(IndexStats::default()));

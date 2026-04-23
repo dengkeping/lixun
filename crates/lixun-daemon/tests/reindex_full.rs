@@ -42,7 +42,11 @@ async fn reindex_full_rebuilds_manifest_and_drops_phantom_entries() {
 
     let index_dir = state_dir.join("index");
     std::fs::create_dir_all(&index_dir).unwrap();
-    let index = lixun_index::LixunIndex::create_or_open(index_dir.to_str().unwrap()).unwrap();
+    let index = lixun_index::LixunIndex::create_or_open(
+        index_dir.to_str().unwrap(),
+        lixun_core::RankingConfig::default(),
+    )
+    .unwrap();
     let (mutation_tx, _search, _writer_handle) = spawn_writer_service(index).unwrap();
 
     let config = test_config(root.clone(), state_dir.clone());
