@@ -39,6 +39,15 @@ Walk through:
 - [ ] **SC-16** (visible selection + focus ring) — arrow up/down; row highlights with blue bar; Tab → focus ring
 - [ ] **SC-17** (loading spinner) — type slowly; brief spinner in status bar during fetch
 - [ ] **SC-18** (empty state) — type "zzzzzzzz"; status shows "No results for 'zzzzzzzz' — Search the web"
+- [ ] **SC-GUI-HERO** (Top Hit hero region) — start the daemon fresh, `lixun-gui` running.
+      Type `firefox`. Expected: a visually-distinct hero row for Firefox appears ABOVE the scrollable
+      results list; widget tree inspection (`GTK_DEBUG=interactive lixun-gui`) shows the row carries
+      CSS class `.lixun-top-hit-hero` (and its parent container is `#lixun-hero`).
+      Type `zzzzz`. Expected: hero region is hidden (`#lixun-hero` is not visible); status bar shows
+      "No results for 'zzzzz'".
+      Type `fo`, select doc X, press Enter; re-open launcher and type `fo` again. Expected: doc X
+      ranks higher than on the first search (latch learned via `Request::RecordQueryClick`).
+      Repeat 3 times to saturate; doc X becomes the hero Top Hit for `fo`.
 - [ ] **SC-19** (Top Hit) — type "firefox"; first row has larger (48px) icon and subtle border
 
 ## Backwards compatibility

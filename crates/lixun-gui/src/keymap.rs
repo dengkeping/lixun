@@ -12,8 +12,8 @@ use lixun_daemon::config::Keybindings;
 use crate::actions::{copy_to_clipboard, execute_action, execute_secondary_action};
 use crate::factory::{synthetic_history_hits, update_results, with_cached_hits};
 use crate::ipc::{
-    IpcClient, current_monitor_connector, request_search_history, send_preview_request,
-    send_record_click,
+    IpcClient, current_monitor_connector, dispatch_click_pair, request_search_history,
+    send_preview_request,
 };
 use crate::status::StatusBar;
 use crate::window::{CategoryChips, LauncherController};
@@ -318,6 +318,7 @@ pub(crate) fn install_keyboard_handler(
                 || accel_matches(&keybindings.secondary_action, key, state)
             {
                     let mut should_hide = true;
+                    let query_at_click = entry.text().to_string();
                     selected_hit_in(&selection, &filter_model, |hit| {
                         if let Action::ReplaceQuery { q } = &hit.action {
                             entry.set_text(q);
@@ -326,7 +327,7 @@ pub(crate) fn install_keyboard_handler(
                             should_hide = false;
                             return;
                         }
-                        send_record_click(&hit.id.0);
+                        dispatch_click_pair(&hit.id.0, &query_at_click);
                         let result = if accel_matches(&keybindings.secondary_action, key, state) || shift || ctrl {
                             execute_secondary_action(hit)
                         } else {
