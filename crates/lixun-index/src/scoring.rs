@@ -1,4 +1,5 @@
 use crate::normalize::normalize_for_match;
+use crate::tokenizer::split_identifiers;
 use lixun_core::Category;
 
 const SECONDS_PER_DAY: f32 = 86_400.0;
@@ -117,6 +118,86 @@ fn push_word_initials(word: &str, initials: &mut String) {
     }
 }
 
+/// Builds the token stream written to `title_prefixes` at ingest.
+///
+/// For each word W in `split_identifiers(title)` (i.e. after
+/// CamelCase + snake_case + punctuation splitting and lowercasing),
+/// emit every prefix of length 2..=min(W.len(), MAX_PREFIX_LEN).
+/// Length-1 prefixes are excluded: they flood the index with single-
+/// char postings that would match every 1-letter query. Length-12
+/// cap prevents unbounded growth on pathologically long names.
+///
+/// The resulting whitespace-separated string is tokenized by the
+/// `spotlight` tokenizer at index time, giving BM25 exact-token
+/// recall for short-prefix queries (Wave A bug #4).
+///
+/// Examples:
+/// - `"Firefox"` → `"fi fir fire firef firefo firefox"`
+/// - `"JSONParser"` → `"js jso json pa par pars parse parser"`
+/// - `""` or `"a"` → `""` (too short after min-length filter)
+#[must_use]
+pub fn compute_title_prefixes(title: &str) -> String {
+    const MIN_PREFIX_LEN: usize = 2;
+    const MAX_PREFIX_LEN: usize = 12;
+
+    let split = split_identifiers(title);
+    let norm = normalize_for_match(&split);
+    let mut out = String::new();
+    for word in norm.split_whitespace() {
+        let chars: Vec<char> = word.chars().collect();
+        let max_len = chars.len().min(MAX_PREFIX_LEN);
+        if max_len < MIN_PREFIX_LEN {
+            continue;
+        }
+        for len in MIN_PREFIX_LEN..=max_len {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.extend(chars[..len].iter());
+        }
+    }
+    out
+}
+
+/// Builds the token stream written to `title_initials` at ingest.
+///
+/// Emits both per-word initials AND the concatenated whole-title
+/// acronym as separate whitespace-separated tokens. This gives
+/// BM25 exact-token recall for BOTH shapes of user intent:
+/// single-letter queries (`"j"`, `"p"`) match the per-word tokens,
+/// multi-letter initialism queries (`"jp"`, `"vsc"`) match the
+/// concatenated acronym token (Wave A bug #3).
+///
+/// Deduplication: the concatenated token is elided when it equals
+/// a per-word token already emitted (e.g. single-word titles like
+/// `"Firefox"` where both streams reduce to `"f"`).
+///
+/// Examples:
+/// - `"Firefox"` → `"f"` (per-word `"f"` == concatenated `"f"`)
+/// - `"JSONParser"` → `"j p jp"`
+/// - `"Visual Studio Code"` → `"v s c vsc"`
+/// - `""` → `""`
+#[must_use]
+pub fn acronym_initials_indexed(title: &str) -> String {
+    let per_word: Vec<String> = split_identifiers(title)
+        .split_whitespace()
+        .map(acronym_initials)
+        .filter(|s| !s.is_empty())
+        .collect();
+    let concatenated = acronym_initials(title);
+
+    let mut out = per_word.join(" ");
+    if !concatenated.is_empty()
+        && !out.split_whitespace().any(|t| t == concatenated)
+    {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(&concatenated);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,6 +228,87 @@ mod tests {
         for (title, expected) in cases {
             assert_eq!(acronym_initials(title), expected, "title: {title:?}");
         }
+    }
+
+    #[test]
+    fn title_prefixes_fixtures() {
+        let cases: &[(&str, &str)] = &[
+            ("Firefox", "fi fir fire firef firefo firefox"),
+            (
+                "JSONParser",
+                "js jso json pa par pars parse parser",
+            ),
+            (
+                "Visual Studio Code",
+                "vi vis visu visua visual st stu stud studi studio co cod code",
+            ),
+            ("", ""),
+            ("A", ""),
+            ("ab", "ab"),
+        ];
+
+        for (title, expected) in cases {
+            assert_eq!(
+                compute_title_prefixes(title),
+                *expected,
+                "title: {title:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn title_prefixes_max_length_cap() {
+        let got = compute_title_prefixes("configurationmanagerfactoryimpl");
+        let longest_token = got
+            .split_whitespace()
+            .max_by_key(|t| t.chars().count())
+            .unwrap();
+        assert_eq!(
+            longest_token.chars().count(),
+            12,
+            "MAX_PREFIX_LEN cap enforced; got longest token {longest_token:?} from {got:?}"
+        );
+        assert!(got.split_whitespace().any(|t| t == "configuratio"));
+    }
+
+    #[test]
+    fn acronym_initials_indexed_fixtures() {
+        let cases: &[(&str, &str)] = &[
+            ("Firefox", "f"),
+            ("JSONParser", "j p jp"),
+            ("Visual Studio Code", "v s c vsc"),
+            ("Google Image Capture", "g i c gic"),
+            ("", ""),
+            ("ABC", "a"),
+        ];
+
+        for (title, expected) in cases {
+            assert_eq!(
+                acronym_initials_indexed(title),
+                *expected,
+                "title: {title:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn acronym_initials_indexed_retrieves_jp_for_jsonparser() {
+        let indexed = acronym_initials_indexed("JSONParser");
+        let tokens: Vec<&str> = indexed.split_whitespace().collect();
+        assert!(
+            tokens.contains(&"jp"),
+            "indexed stream {indexed:?} must contain token `jp` for BM25 recall"
+        );
+    }
+
+    #[test]
+    fn acronym_initials_indexed_filename_with_extension() {
+        let indexed = acronym_initials_indexed("JSONParser.java");
+        let tokens: Vec<&str> = indexed.split_whitespace().collect();
+        assert!(
+            tokens.contains(&"jpj"),
+            "concatenated initials include filename extension; stream: {indexed:?}"
+        );
     }
 
     #[test]
