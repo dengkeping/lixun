@@ -70,3 +70,4 @@ regex = "1"
 inventory = "0.3"
 
 tempfile = "3"
+unicode-normalization = "0.1"
