@@ -254,6 +254,14 @@ latch_weight = 0.5
 # heavily-latched pair from dominating the ranking entirely.
 latch_cap = 3.0
 
+# Upper bound on the Stage-2 multiplier (frecency × latch). Prevents
+# long-lived click history or extreme latch streaks from letting a
+# single doc's score grow without bound across sessions. Applied after
+# both Stage-2 multipliers have been computed but before the final
+# sort. Not applied to Stage-1 signals (category × prefix × acronym ×
+# recency), which are individually well-bounded by their own configs.
+total_multiplier_cap = 6.0
+
 # Top Hit (hero row) selection gates. A result is promoted to the hero
 # slot only when both thresholds are met: confidence in {prefix/acronym
 # match, strong latch, frecency dominance} >= min_confidence, AND the
