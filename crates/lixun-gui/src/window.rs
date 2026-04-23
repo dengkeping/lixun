@@ -18,7 +18,7 @@ use gtk4_layer_shell::{Edge, LayerShell};
 use lixun_core::Category;
 
 use crate::factory::{
-    add_css_class, build_hero_row, clear_cached_hits, create_list_factory, update_results,
+    add_css_class, clear_cached_hits, create_list_factory, update_results,
     with_cached_hits,
 };
 use crate::ipc::{IpcClient, start_ipc_thread};
@@ -39,19 +39,6 @@ use lixun_core::{DocId, Hit};
 pub(crate) struct RenderPlan {
     pub(crate) hits: Vec<Hit>,
     pub(crate) top_hit_index: Option<usize>,
-}
-
-impl RenderPlan {
-    pub(crate) fn hero(&self) -> Option<&Hit> {
-        self.top_hit_index.and_then(|i| self.hits.get(i))
-    }
-
-    pub(crate) fn list(&self) -> &[Hit] {
-        match self.top_hit_index {
-            Some(i) if i < self.hits.len() => &self.hits[i + 1..],
-            _ => &self.hits,
-        }
-    }
 }
 
 /// Compose render order from daemon's `hits` and optional
@@ -146,7 +133,6 @@ pub(crate) struct LauncherController {
     chips: std::rc::Rc<CategoryChips>,
     selection: gtk::SingleSelection,
     scrolled: gtk::ScrolledWindow,
-    hero_box: gtk::Box,
     status: std::rc::Rc<StatusBar>,
     model: gtk::StringList,
     current_category: CategoryFilter,
@@ -343,10 +329,6 @@ impl LauncherController {
 
         self.scrolled.set_visible(false);
         self.scrolled.set_vexpand(false);
-        while let Some(child) = self.hero_box.first_child() {
-            self.hero_box.remove(&child);
-        }
-        self.hero_box.set_visible(false);
         self.chips.container.set_visible(false);
         self.status.hide();
 
@@ -599,11 +581,6 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
     // Without all four, either the collapse breaks (no propagate
     // or non-zero min) or the window stretches past max_height_px
     // (no cap).
-    let hero_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    hero_box.set_widget_name("lixun-hero");
-    hero_box.set_visible(false);
-    vbox.append(&hero_box);
-
     let scrolled = gtk::ScrolledWindow::builder()
         .vexpand(true)
         .propagate_natural_height(true)
@@ -681,7 +658,6 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
         chips: std::rc::Rc::clone(&chips_rc),
         selection: selection.clone(),
         scrolled: scrolled.clone(),
-        hero_box: hero_box.clone(),
         status: std::rc::Rc::clone(&status_bar),
         model: model.clone(),
         current_category: std::rc::Rc::clone(&current_category),
@@ -718,8 +694,6 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
         list_view.clone(),
         chips_rc.container.clone(),
         scrolled.clone(),
-        hero_box.clone(),
-        entry.clone(),
         std::rc::Rc::clone(&status_bar),
         std::rc::Rc::clone(&last_query),
         std::rc::Rc::clone(&user_selected_override),
@@ -732,7 +706,6 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
         selection.clone(),
         chips_rc.container.clone(),
         scrolled.clone(),
-        hero_box.clone(),
         std::rc::Rc::clone(&status_bar),
         std::rc::Rc::clone(&last_query),
         std::rc::Rc::clone(&pending_debounce),
@@ -807,8 +780,6 @@ fn install_response_poller(
     list_view: gtk::ListView,
     chips_container: gtk::Box,
     scrolled: gtk::ScrolledWindow,
-    hero_box: gtk::Box,
-    entry: gtk::Entry,
     status: std::rc::Rc<StatusBar>,
     last_query: std::rc::Rc<std::cell::RefCell<String>>,
     user_selected_override: std::rc::Rc<std::cell::Cell<bool>>,
@@ -865,12 +836,13 @@ fn install_response_poller(
                 t.take()
             };
             let plan = compute_render_plan(&hits_snapshot, top_hit_snapshot.as_ref());
-            render_hero(&hero_box, plan.hero(), &entry);
-            update_results(&model, &selection, plan.list(), None);
+            let top_hit_doc_id = plan
+                .top_hit_index
+                .and_then(|i| plan.hits.get(i))
+                .map(|h| h.id.0.clone());
+            update_results(&model, &selection, &plan.hits, top_hit_doc_id);
             filter.changed(gtk::FilterChange::Different);
-            if !plan.list().is_empty() {
-                // Compute the desired index in the post-filter list
-                // (hero has already been excluded from `plan.list`).
+            if !plan.hits.is_empty() {
                 // set_selected on a filter-backed SingleSelection
                 // silently no-ops when the requested index exceeds
                 // the post-filter n_items, so we must resolve
@@ -878,7 +850,7 @@ fn install_response_poller(
                 // above.
                 let wanted_doc = prior_selected
                     .clone()
-                    .or_else(|| plan.list().first().map(|h| h.id.0.clone()));
+                    .or_else(|| plan.hits.first().map(|h| h.id.0.clone()));
                 let new_idx = wanted_doc
                     .as_deref()
                     .and_then(|want| {
@@ -897,7 +869,7 @@ fn install_response_poller(
                 }
             }
 
-            let has_anything = plan.hero().is_some() || !plan.list().is_empty();
+            let has_anything = !plan.hits.is_empty();
             if let Some(calc) = calc_snapshot.as_ref() {
                 chips_container.set_visible(true);
                 scrolled.set_visible(false);
@@ -919,7 +891,7 @@ fn install_response_poller(
                 }
             } else {
                 chips_container.set_visible(true);
-                let list_has_rows = !plan.list().is_empty();
+                let list_has_rows = !plan.hits.is_empty();
                 scrolled.set_visible(list_has_rows);
                 scrolled.set_vexpand(list_has_rows);
                 status.hide();
@@ -927,22 +899,6 @@ fn install_response_poller(
         }
         glib::ControlFlow::Continue
     });
-}
-
-fn render_hero(hero_box: &gtk::Box, hero: Option<&Hit>, entry: &gtk::Entry) {
-    while let Some(child) = hero_box.first_child() {
-        hero_box.remove(&child);
-    }
-    match hero {
-        Some(hit) => {
-            let row = build_hero_row(hit, entry);
-            hero_box.append(&row);
-            hero_box.set_visible(true);
-        }
-        None => {
-            hero_box.set_visible(false);
-        }
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -953,7 +909,6 @@ fn install_entry_handler(
     selection: gtk::SingleSelection,
     chips_container: gtk::Box,
     scrolled: gtk::ScrolledWindow,
-    hero_box: gtk::Box,
     status: std::rc::Rc<StatusBar>,
     last_query: std::rc::Rc<std::cell::RefCell<String>>,
     pending_debounce: std::rc::Rc<std::cell::RefCell<Option<glib::SourceId>>>,
@@ -1023,10 +978,6 @@ fn install_entry_handler(
             chips_container.set_visible(false);
             scrolled.set_visible(false);
             scrolled.set_vexpand(false);
-            while let Some(child) = hero_box.first_child() {
-                hero_box.remove(&child);
-            }
-            hero_box.set_visible(false);
             status.hide();
             return;
         }
