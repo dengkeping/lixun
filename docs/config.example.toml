@@ -254,6 +254,15 @@ latch_weight = 0.5
 # heavily-latched pair from dominating the ranking entirely.
 latch_cap = 3.0
 
+# Top Hit (hero row) selection gates. A result is promoted to the hero
+# slot only when both thresholds are met: confidence in {prefix/acronym
+# match, strong latch, frecency dominance} >= min_confidence, AND the
+# top-1 / top-2 score ratio >= min_margin. Raising either value makes
+# the hero row appear less often; lowering them (e.g. min_margin=1.0)
+# makes it appear whenever hits[0] would otherwise win anyway.
+top_hit_min_confidence = 0.6
+top_hit_min_margin = 1.3
+
 # Keybindings - GTK accelerator syntax (<Ctrl>c, <Shift>Return, etc).
 [keybindings]
 close = "Escape"

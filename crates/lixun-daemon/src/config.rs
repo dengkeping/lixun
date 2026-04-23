@@ -55,6 +55,8 @@ struct RankingToml {
     frecency_alpha: Option<f32>,
     latch_weight: Option<f32>,
     latch_cap: Option<f32>,
+    top_hit_min_confidence: Option<f32>,
+    top_hit_min_margin: Option<f32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -168,6 +170,8 @@ pub struct Config {
     pub ranking_frecency_alpha: f32,
     pub ranking_latch_weight: f32,
     pub ranking_latch_cap: f32,
+    pub ranking_top_hit_min_confidence: f32,
+    pub ranking_top_hit_min_margin: f32,
     pub keybindings: Keybindings,
     pub preview: PreviewConfig,
     pub gui: GuiConfig,
@@ -233,6 +237,8 @@ impl Default for Config {
             ranking_frecency_alpha: 0.1,
             ranking_latch_weight: 0.5,
             ranking_latch_cap: 3.0,
+            ranking_top_hit_min_confidence: 0.6,
+            ranking_top_hit_min_margin: 1.3,
             keybindings: Keybindings::default(),
             preview: PreviewConfig::default(),
             gui: GuiConfig::default(),
@@ -331,6 +337,9 @@ impl Config {
             cfg.ranking_frecency_alpha = ranking.frecency_alpha.unwrap_or(0.1);
             cfg.ranking_latch_weight = ranking.latch_weight.unwrap_or(0.5);
             cfg.ranking_latch_cap = ranking.latch_cap.unwrap_or(3.0);
+            cfg.ranking_top_hit_min_confidence =
+                ranking.top_hit_min_confidence.unwrap_or(0.6);
+            cfg.ranking_top_hit_min_margin = ranking.top_hit_min_margin.unwrap_or(1.3);
         }
         if let Some(bindings) = parsed.keybindings {
             if let Some(v) = bindings.close {
@@ -468,6 +477,8 @@ impl Config {
             frecency_alpha: self.ranking_frecency_alpha,
             latch_weight: self.ranking_latch_weight,
             latch_cap: self.ranking_latch_cap,
+            top_hit_min_confidence: self.ranking_top_hit_min_confidence,
+            top_hit_min_margin: self.ranking_top_hit_min_margin,
             ..lixun_core::RankingConfig::default()
         }
     }

@@ -19,6 +19,7 @@ use tokio::sync::RwLock;
 mod frecency;
 mod query_latch;
 mod query_log;
+mod top_hit;
 use frecency::FrecencyStore;
 use query_latch::QueryLatchStore;
 use query_log::QueryLog;
@@ -476,6 +477,20 @@ async fn handle_client(
                         .partial_cmp(&a.score)
                         .unwrap_or(std::cmp::Ordering::Equal)
                 });
+                let top_hit_id = {
+                    let frecency = frecency.read().await;
+                    let latch = query_latch.read().await;
+                    top_hit::select_top_hit(
+                        &q,
+                        &hits,
+                        &frecency,
+                        &latch,
+                        now,
+                        config.ranking_top_hit_min_confidence,
+                        config.ranking_top_hit_min_margin,
+                        3,
+                    )
+                };
                 let calculation = lixun_index::calculator::detect(&q);
                 match negotiated_version {
                     1 => Response::Hits(hits),
@@ -483,7 +498,7 @@ async fn handle_client(
                     _ => Response::HitsWithExtrasV3 {
                         hits,
                         calculation,
-                        top_hit: None,
+                        top_hit: top_hit_id,
                     },
                 }
             }
