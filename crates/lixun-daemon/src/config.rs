@@ -58,6 +58,7 @@ struct RankingToml {
     total_multiplier_cap: Option<f32>,
     top_hit_min_confidence: Option<f32>,
     top_hit_min_margin: Option<f32>,
+    strong_latch_threshold: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -174,6 +175,7 @@ pub struct Config {
     pub ranking_total_multiplier_cap: f32,
     pub ranking_top_hit_min_confidence: f32,
     pub ranking_top_hit_min_margin: f32,
+    pub ranking_strong_latch_threshold: u32,
     pub keybindings: Keybindings,
     pub preview: PreviewConfig,
     pub gui: GuiConfig,
@@ -242,6 +244,7 @@ impl Default for Config {
             ranking_total_multiplier_cap: 6.0,
             ranking_top_hit_min_confidence: 0.6,
             ranking_top_hit_min_margin: 1.3,
+            ranking_strong_latch_threshold: 3,
             keybindings: Keybindings::default(),
             preview: PreviewConfig::default(),
             gui: GuiConfig::default(),
@@ -345,6 +348,8 @@ impl Config {
             cfg.ranking_top_hit_min_confidence =
                 ranking.top_hit_min_confidence.unwrap_or(0.6);
             cfg.ranking_top_hit_min_margin = ranking.top_hit_min_margin.unwrap_or(1.3);
+            cfg.ranking_strong_latch_threshold =
+                ranking.strong_latch_threshold.unwrap_or(3);
         }
         if let Some(bindings) = parsed.keybindings {
             if let Some(v) = bindings.close {
@@ -485,6 +490,7 @@ impl Config {
             total_multiplier_cap: self.ranking_total_multiplier_cap,
             top_hit_min_confidence: self.ranking_top_hit_min_confidence,
             top_hit_min_margin: self.ranking_top_hit_min_margin,
+            strong_latch_threshold: self.ranking_strong_latch_threshold,
         }
     }
 }
@@ -522,4 +528,35 @@ fn state_dir() -> PathBuf {
             PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/state")
         })
         .join("lixun")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strong_latch_threshold_defaults_to_three() {
+        let cfg = Config::default();
+        assert_eq!(cfg.ranking_strong_latch_threshold, 3);
+        let ranking = cfg.ranking_config();
+        assert_eq!(ranking.strong_latch_threshold, 3);
+    }
+
+    #[test]
+    fn strong_latch_threshold_propagates_from_config_to_ranking() {
+        let cfg = Config {
+            ranking_strong_latch_threshold: 7,
+            ..Config::default()
+        };
+        let ranking = cfg.ranking_config();
+        assert_eq!(ranking.strong_latch_threshold, 7);
+    }
+
+    #[test]
+    fn total_multiplier_cap_defaults_to_six() {
+        let cfg = Config::default();
+        assert_eq!(cfg.ranking_total_multiplier_cap, 6.0);
+        let ranking = cfg.ranking_config();
+        assert!((ranking.total_multiplier_cap - 6.0).abs() < f32::EPSILON);
+    }
 }
