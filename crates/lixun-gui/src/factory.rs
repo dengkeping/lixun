@@ -30,6 +30,7 @@ fn category_kind_fallback(cat: &Category) -> &'static str {
 
 thread_local! {
     static CACHED_HITS: RefCell<Vec<Hit>> = const { RefCell::new(Vec::new()) };
+    static TOP_HIT_DOC_ID: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
 pub(crate) fn cache_hits(hits: Vec<Hit>) {
@@ -42,6 +43,15 @@ pub(crate) fn with_cached_hits<R>(f: impl FnOnce(&[Hit]) -> R) -> R {
 
 pub(crate) fn clear_cached_hits() {
     CACHED_HITS.with(|c| c.borrow_mut().clear());
+    TOP_HIT_DOC_ID.with(|c| *c.borrow_mut() = None);
+}
+
+pub(crate) fn cache_top_hit_doc_id(id: Option<String>) {
+    TOP_HIT_DOC_ID.with(|c| *c.borrow_mut() = id);
+}
+
+pub(crate) fn is_top_hit_doc(id: &str) -> bool {
+    TOP_HIT_DOC_ID.with(|c| c.borrow().as_deref() == Some(id))
 }
 
 /// Replace every row in `model` with rows derived from `hits`.
@@ -56,6 +66,7 @@ pub(crate) fn update_results(
     model: &gtk::StringList,
     selection: &gtk::SingleSelection,
     hits: &[Hit],
+    top_hit_doc_id: Option<String>,
 ) {
     let prev_autoselect = selection.is_autoselect();
     selection.set_autoselect(false);
@@ -65,6 +76,7 @@ pub(crate) fn update_results(
         model.remove(0);
     }
     cache_hits(hits.to_vec());
+    cache_top_hit_doc_id(top_hit_doc_id);
     for hit in hits {
         model.append(&hit.id.0);
     }
@@ -348,16 +360,18 @@ pub(crate) fn create_list_factory(entry: gtk::Entry) -> gtk::SignalListItemFacto
         });
     });
 
-    // Reset hero styling when a row widget is returned to the pool
-    // for recycling. Without this a row that was selected at unbind
-    // time would retain its .lixun-top-hit class on reuse for an
-    // unselected item, producing a ghost hero highlight.
+    // Reset both selection-cursor and top-hit-hero styling when a
+    // row widget is returned to the pool for recycling. Without
+    // this a row that was decorated at unbind time would retain
+    // its CSS classes on reuse for a different item, producing a
+    // ghost highlight.
     factory.connect_unbind(|_, list_item| {
         let list_item = list_item
             .downcast_ref::<gtk::ListItem>()
             .expect("ListItem expected");
         if let Some(row) = list_item.child().and_downcast::<gtk::Box>() {
             row.remove_css_class("lixun-top-hit");
+            row.remove_css_class("lixun-top-hit-hero");
             if let Some(icon) = row.first_child().and_downcast::<gtk::Image>() {
                 icon.set_pixel_size(ICON_SIZE_NORMAL);
             }
@@ -412,6 +426,7 @@ pub(crate) fn create_list_factory(entry: gtk::Entry) -> gtk::SignalListItemFacto
         }
 
         apply_selected_styling(list_item);
+        apply_top_hit_styling(list_item);
     });
 
     factory
@@ -492,32 +507,36 @@ pub(crate) fn build_hero_row(hit: &Hit, entry: &gtk::Entry) -> gtk::Box {
     row
 }
 
-/// Apply the hero "top-hit" visuals to the row iff the list item is
-/// currently selected. The visuals include a larger icon, a card-like
-/// frame, and a bigger title, all driven from the `lixun-top-hit` CSS
-/// class plus an icon-size swap. Called on initial bind and on every
-/// selection change so the hero styling follows the user's cursor
-/// rather than sitting statically on position 0.
+/// Apply the stateful selection-cursor class `.lixun-top-hit` to
+/// the row iff the list item is currently selected. Called on
+/// initial bind and on every selection-change so the cursor
+/// highlight follows the user's arrow-key input. Icon size and
+/// paintable are owned by `apply_top_hit_styling`, not this
+/// function.
 fn apply_selected_styling(list_item: &gtk::ListItem) {
+    let Some(row) = list_item.child().and_downcast::<gtk::Box>() else {
+        return;
+    };
+    if list_item.is_selected() {
+        row.add_css_class("lixun-top-hit");
+    } else {
+        row.remove_css_class("lixun-top-hit");
+    }
+}
+
+/// Apply the structural hero class `.lixun-top-hit-hero` to the
+/// row iff its DocId matches the top-hit id nominated by the
+/// daemon for the current response. Owns icon size and paintable
+/// (large icon for top hit, normal for the rest). Independent of
+/// selection state, so the hero decoration stays on row 0 even
+/// when the user moves the cursor with arrow keys.
+fn apply_top_hit_styling(list_item: &gtk::ListItem) {
     let Some(row) = list_item.child().and_downcast::<gtk::Box>() else {
         return;
     };
     let Some(icon) = row.first_child().and_downcast::<gtk::Image>() else {
         return;
     };
-    let is_hero = list_item.is_selected();
-    if is_hero {
-        row.add_css_class("lixun-top-hit");
-    } else {
-        row.remove_css_class("lixun-top-hit");
-    }
-    let icon_size = if is_hero {
-        ICON_SIZE_TOP_HIT
-    } else {
-        ICON_SIZE_NORMAL
-    };
-    icon.set_pixel_size(icon_size);
-
     let Some(str_obj) = list_item
         .item()
         .and_then(|i| i.downcast::<gtk::StringObject>().ok())
@@ -525,6 +544,18 @@ fn apply_selected_styling(list_item: &gtk::ListItem) {
         return;
     };
     let doc_id = str_obj.string().to_string();
+    let is_top_hit = is_top_hit_doc(&doc_id);
+    if is_top_hit {
+        row.add_css_class("lixun-top-hit-hero");
+    } else {
+        row.remove_css_class("lixun-top-hit-hero");
+    }
+    let icon_size = if is_top_hit {
+        ICON_SIZE_TOP_HIT
+    } else {
+        ICON_SIZE_NORMAL
+    };
+    icon.set_pixel_size(icon_size);
     with_cached_hits(|hits| {
         if let Some(hit) = hits.iter().find(|h| h.id.0 == doc_id) {
             if let Some(paintable) = resolve_icon(hit, icon_size) {
@@ -567,5 +598,15 @@ mod tests {
     fn menu_for_attachment_has_expected_items() {
         let menu = build_menu_for(&Category::Attachment);
         assert_eq!(menu.n_items(), 4);
+    }
+
+    #[test]
+    fn top_hit_doc_id_roundtrip() {
+        cache_top_hit_doc_id(Some("app:firefox".into()));
+        assert!(is_top_hit_doc("app:firefox"));
+        assert!(!is_top_hit_doc("app:chromium"));
+        assert!(!is_top_hit_doc(""));
+        cache_top_hit_doc_id(None);
+        assert!(!is_top_hit_doc("app:firefox"));
     }
 }

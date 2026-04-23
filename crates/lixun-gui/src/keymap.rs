@@ -407,7 +407,7 @@ pub(crate) fn install_keyboard_handler(
                         return glib::signal::Propagation::Stop;
                     }
                     let hits = synthetic_history_hits(&queries);
-                    update_results(&model, &selection, &hits);
+                    update_results(&model, &selection, &hits, None);
                     selection.set_selected(0);
                     list_view.scroll_to(0, gtk::ListScrollFlags::NONE, None);
                     status_bar.hide();
