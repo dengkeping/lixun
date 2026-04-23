@@ -245,6 +245,15 @@ recency_tau_days = 30.0
 # is a bucket-weighted sum over recent clicks per doc. Set to 0.0 to disable.
 frecency_alpha = 0.1
 
+# Query-latch weight. Final mult = clamp(1 + latch_weight * ln(1+count) * recency,
+# 1.0, latch_cap), where count is the number of times this exact (normalized)
+# query has been clicked through to this doc. Word order matters.
+latch_weight = 0.5
+
+# Upper bound on the query-latch multiplier. Caps the reward for a single
+# heavily-latched pair from dominating the ranking entirely.
+latch_cap = 3.0
+
 # Keybindings - GTK accelerator syntax (<Ctrl>c, <Shift>Return, etc).
 [keybindings]
 close = "Escape"

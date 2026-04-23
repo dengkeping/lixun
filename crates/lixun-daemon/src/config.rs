@@ -53,6 +53,8 @@ struct RankingToml {
     recency_weight: Option<f32>,
     recency_tau_days: Option<f32>,
     frecency_alpha: Option<f32>,
+    latch_weight: Option<f32>,
+    latch_cap: Option<f32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -164,6 +166,8 @@ pub struct Config {
     pub ranking_recency_weight: f32,
     pub ranking_recency_tau_days: f32,
     pub ranking_frecency_alpha: f32,
+    pub ranking_latch_weight: f32,
+    pub ranking_latch_cap: f32,
     pub keybindings: Keybindings,
     pub preview: PreviewConfig,
     pub gui: GuiConfig,
@@ -227,6 +231,8 @@ impl Default for Config {
             ranking_recency_weight: 0.2,
             ranking_recency_tau_days: 30.0,
             ranking_frecency_alpha: 0.1,
+            ranking_latch_weight: 0.5,
+            ranking_latch_cap: 3.0,
             keybindings: Keybindings::default(),
             preview: PreviewConfig::default(),
             gui: GuiConfig::default(),
@@ -323,6 +329,8 @@ impl Config {
             cfg.ranking_recency_weight = ranking.recency_weight.unwrap_or(0.2);
             cfg.ranking_recency_tau_days = ranking.recency_tau_days.unwrap_or(30.0);
             cfg.ranking_frecency_alpha = ranking.frecency_alpha.unwrap_or(0.1);
+            cfg.ranking_latch_weight = ranking.latch_weight.unwrap_or(0.5);
+            cfg.ranking_latch_cap = ranking.latch_cap.unwrap_or(3.0);
         }
         if let Some(bindings) = parsed.keybindings {
             if let Some(v) = bindings.close {
@@ -458,6 +466,8 @@ impl Config {
             recency_weight: self.ranking_recency_weight,
             recency_tau_days: self.ranking_recency_tau_days,
             frecency_alpha: self.ranking_frecency_alpha,
+            latch_weight: self.ranking_latch_weight,
+            latch_cap: self.ranking_latch_cap,
             ..lixun_core::RankingConfig::default()
         }
     }
