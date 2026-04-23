@@ -74,13 +74,27 @@ Walk through:
          `Request::RecordQueryClick`). Repeat 3 times to saturate; doc X becomes the hero Top Hit
          for `fo`.
 
-      Known follow-ups (not covered by this SC):
-      - Top Hit not appearing for short-prefix queries like `firef` (Bug #2 from Wave A QA).
+      Known follow-ups: none. Wave A bugs #2, #3, #4 are fixed by Wave A.1b
+      (bug #2 by retrieval-widened margin; bugs #3 and #4 at the retrieval layer).
+      See SC-32 / SC-33 above and SC-MARGIN-SHORTPREFIX below.
+- [ ] **SC-MARGIN-SHORTPREFIX** (short-prefix queries surface the right Top Hit) —
+      after a Wave A.1b reindex has completed (INDEX_VERSION 6→7, one-time):
+      1. Type `firefox`. Expected: row 0 is Firefox with `.lixun-top-hit-hero` styling.
+      2. Type `firef`. Expected: row 0 is Firefox with hero styling (fixes Wave A bug #2;
+         the retrieval-widened BM25 margin now passes the 1.3 gate without retuning).
+      3. Type `fire`. Expected: NO hero styling on any row. Three characters is coarser
+         than the Top Hit gate should promote on a multi-hundred-thousand-doc corpus —
+         matches Spotlight's behavior (Spotlight also does not guarantee Top Hit at 3 chars).
+         Confirms the margin gate is strict enough to avoid false-positive heroes on
+         low-signal queries.
+      4. Type `doc` in a directory with two or more `Doc…`-named items with similar scores.
+         Expected: NO hero styling on any row. This is the ambiguous-control guard from
+         the Wave A plan; the new retrieval fields must not leak recall such that one of
+         two near-tied docs suddenly wins.
 
-      Bug #2 is tracked for Wave A.1b Phase 3 — it requires retuning `top_hit_min_margin`
-      against the Phase-2 retrieval distribution (live measurement) and is out of scope for
-      this GUI-side SC. Bugs #3 and #4 are fixed at the retrieval layer in Wave A.1b Phase 2
-      (see SC-32 and SC-33 above).
+      This SC, together with SC-GUI-HERO, closes the three user-reported Wave A bugs
+      (#2 via the retrieval-widened margin that now passes the unchanged 1.3 gate, #3
+      and #4 via the schema-level `title_initials` and `title_prefixes` fields).
 - [ ] **SC-19** (Top Hit) — type "firefox"; first row has larger (48px) icon and subtle border
 
 ## Backwards compatibility
