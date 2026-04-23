@@ -47,15 +47,37 @@ Walk through:
 - [ ] **SC-16** (visible selection + focus ring) — arrow up/down; row highlights with blue bar; Tab → focus ring
 - [ ] **SC-17** (loading spinner) — type slowly; brief spinner in status bar during fetch
 - [ ] **SC-18** (empty state) — type "zzzzzzzz"; status shows "No results for 'zzzzzzzz' — Search the web"
-- [ ] **SC-GUI-HERO** (Top Hit hero region) — start the daemon fresh, `lixun-gui` running.
-      Type `firefox`. Expected: a visually-distinct hero row for Firefox appears ABOVE the scrollable
-      results list; widget tree inspection (`GTK_DEBUG=interactive lixun-gui`) shows the row carries
-      CSS class `.lixun-top-hit-hero` (and its parent container is `#lixun-hero`).
-      Type `zzzzz`. Expected: hero region is hidden (`#lixun-hero` is not visible); status bar shows
-      "No results for 'zzzzz'".
-      Type `fo`, select doc X, press Enter; re-open launcher and type `fo` again. Expected: doc X
-      ranks higher than on the first search (latch learned via `Request::RecordQueryClick`).
-      Repeat 3 times to saturate; doc X becomes the hero Top Hit for `fo`.
+- [ ] **SC-GUI-HERO** (Top Hit renders as row 0, activates with Enter by default) —
+      restart daemon fresh (`systemctl --user restart lixund`).
+      1. Open launcher (Super+Space). Type `firefox`. Expected: row 0 shows Firefox with a
+         visually-distinct hero style (larger icon, card frame, subtle outline);
+         `GTK_DEBUG=interactive lixun-gui` confirms the row carries both `.lixun-hit` and
+         `.lixun-top-hit-hero` CSS classes; the selection indicator is on row 0.
+      2. Press Enter. Expected: Firefox launches.
+      3. Close Firefox, re-open the launcher, type `firefox` again. Expected: identical behaviour
+         to step 1 — hero styling on row 0, selection on row 0, Enter launches Firefox. This is
+         the regression guard for the Wave A bug where the second invocation activated the wrong
+         row.
+      4. Type `firefox`, then press Down once. Expected: selection cursor moves to row 1;
+         row 0 keeps `.lixun-top-hit-hero` styling (hero visual stays) while row 1 gains
+         `.lixun-top-hit` (selection cursor).
+      5. Edit query to `zzzzz` (no matches). Expected: results list empty, status bar shows
+         "No results"; no row has hero styling.
+      6. Edit query back to `firefox`. Expected: row 0 is Firefox with hero styling; selection
+         snaps back to row 0 (override cleared by query-text-change).
+      7. Type `fo`, select doc X, press Enter; re-open launcher and type `fo` again. Expected:
+         doc X ranks higher than on the first search (latch learned via
+         `Request::RecordQueryClick`). Repeat 3 times to saturate; doc X becomes the hero Top Hit
+         for `fo`.
+
+      Known follow-ups (not covered by this SC):
+      - Top Hit not appearing for short-prefix queries like `firef` (Bug #2 from Wave A QA).
+      - Acronym queries like `JP` not surfacing JSONParser-style files (Bug #3).
+      - Partial app-name prefixes not reliably surfacing the matching app (Bug #4).
+
+      Bugs #2/#3/#4 are tracked for Wave A.1b — they require schema bump + reindex and are
+      out of scope for this A.1a-0 GUI hotfix. The hero-styling-is-now-a-row-0-decoration
+      change in this wave does not regress any of them; they were already broken on Wave A.
 - [ ] **SC-19** (Top Hit) — type "firefox"; first row has larger (48px) icon and subtle border
 
 ## Backwards compatibility
