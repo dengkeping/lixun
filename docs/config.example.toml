@@ -241,6 +241,10 @@ recency_weight = 0.2
 # Recency decay horizon in days. Larger values keep old edits boosted longer.
 recency_tau_days = 30.0
 
+# Frecency multiplier weight. Final mult = 1 + alpha * raw, where raw in [0, 10]
+# is a bucket-weighted sum over recent clicks per doc. Set to 0.0 to disable.
+frecency_alpha = 0.1
+
 # Keybindings - GTK accelerator syntax (<Ctrl>c, <Shift>Return, etc).
 [keybindings]
 close = "Escape"
