@@ -15,6 +15,14 @@ This document lists the Success Criteria from `.local/plans/spotlight-parity.md`
 | SC-20 | Typing feels instant | event-driven debounce (80 ms single cancelable timeout) replaces 40 ms polling |
 | SC-21 | 110 + 25 new tests green | `cargo test --workspace` |
 | SC-22 | clippy -D warnings clean | `cargo clippy --workspace -- -D warnings` |
+| 23 | Prefix boost: "fire" ranks Firefox above unrelated | `lixun-index scoring::tests::prefix_and_unicode` |
+| 24 | Acronym match: "vsc" ranks Visual Studio Code | `lixun-index scoring::tests::acronym_fixtures` |
+| 25 | Recency: newer mtime wins for tied files | `lixun-index scoring::tests::recency_orders_ties` |
+| 26 | Frecency replaces additive bonus (mult semantics) | `lixun-daemon frecency::tests::mult_semantics` |
+| 27 | Query latching pins doc for its query | `lixun-daemon query_latch::tests::cap_and_ordering` |
+| 28 | Top Hit present iff confidence + margin satisfied | `lixun-daemon top_hit::tests::prefix_match_sets_top_hit` + `ambiguous_returns_none` |
+| 29 | Protocol v2 clients still work | `lixun-ipc test_codec_accepts_protocol_v2_frame` + `lixun-daemon top_hit::tests::v2_response_shape_preserved` |
+| 30 | `[ranking]` config values apply (guards D6 fix) | `lixun-index test_ranking_config_category_multiplier` |
 
 ## Manual (requires Wayland compositor)
 
