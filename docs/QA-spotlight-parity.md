@@ -23,6 +23,10 @@ This document lists the Success Criteria from `.local/plans/spotlight-parity.md`
 | 28 | Top Hit present iff confidence + margin satisfied | `lixun-daemon top_hit::tests::prefix_match_sets_top_hit` + `ambiguous_returns_none` |
 | 29 | Protocol v2 clients still work | `lixun-ipc test_codec_accepts_protocol_v2_frame` + `lixun-daemon top_hit::tests::v2_response_shape_preserved` |
 | 30 | `[ranking]` config values apply (guards D6 fix) | `lixun-index test_ranking_config_category_multiplier` |
+| 31 | Index version bump forces reindex | `lixun-index test_index_version_triggers_rebuild` |
+| 32 | Acronym retrieval: "jp" retrieves JSONParser-like files | `lixun-index test_acronym_retrieval_jsonparser` |
+| 33 | Short prefix retrieval: "fire" retrieves Firefox | `lixun-index test_prefix_retrieval_firefox` |
+| 34 | Prefix ranks above body: title prefix outranks body-only match | `lixun-index test_prefix_ranks_above_body_match` |
 
 ## Manual (requires Wayland compositor)
 
@@ -72,12 +76,11 @@ Walk through:
 
       Known follow-ups (not covered by this SC):
       - Top Hit not appearing for short-prefix queries like `firef` (Bug #2 from Wave A QA).
-      - Acronym queries like `JP` not surfacing JSONParser-style files (Bug #3).
-      - Partial app-name prefixes not reliably surfacing the matching app (Bug #4).
 
-      Bugs #2/#3/#4 are tracked for Wave A.1b — they require schema bump + reindex and are
-      out of scope for this A.1a-0 GUI hotfix. The hero-styling-is-now-a-row-0-decoration
-      change in this wave does not regress any of them; they were already broken on Wave A.
+      Bug #2 is tracked for Wave A.1b Phase 3 — it requires retuning `top_hit_min_margin`
+      against the Phase-2 retrieval distribution (live measurement) and is out of scope for
+      this GUI-side SC. Bugs #3 and #4 are fixed at the retrieval layer in Wave A.1b Phase 2
+      (see SC-32 and SC-33 above).
 - [ ] **SC-19** (Top Hit) — type "firefox"; first row has larger (48px) icon and subtle border
 
 ## Backwards compatibility
