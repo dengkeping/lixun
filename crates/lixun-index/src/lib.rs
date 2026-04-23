@@ -482,6 +482,8 @@ fn build_search_query(
     let mut default_fields: Vec<tantivy::schema::Field> = vec![
         s.title,
         s.title_terms,
+        s.title_initials,
+        s.title_prefixes,
         s.body,
         s.path,
         s.sender,
@@ -495,6 +497,8 @@ fn build_search_query(
     parser.set_conjunction_by_default();
     parser.set_field_boost(s.title, 5.0);
     parser.set_field_boost(s.title_terms, 4.0);
+    parser.set_field_boost(s.title_initials, 3.0);
+    parser.set_field_boost(s.title_prefixes, 2.5);
     parser.set_field_boost(s.sender, 3.0);
     parser.set_field_boost(s.recipients, 2.5);
     parser.set_field_boost(s.path, 1.5);
@@ -886,6 +890,71 @@ mod tests {
         let results = search(&index, "urgent");
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].id.0, "fs:/tmp/title-urgent.txt");
+        assert!(results[0].score > results[1].score);
+    }
+
+    #[test]
+    fn test_acronym_retrieval_jsonparser() {
+        let docs = vec![sample_document(
+            "fs:/tmp/JSONParser.java",
+            "JSONParser",
+            "class JSONParser parses JSON input",
+        )];
+        let (_tmp, index) = create_index_with_docs(&docs);
+
+        let results = search(&index, "jp");
+        assert_eq!(
+            results.len(),
+            1,
+            "query `jp` must retrieve JSONParser via title_initials"
+        );
+        assert_eq!(results[0].id.0, "fs:/tmp/JSONParser.java");
+    }
+
+    #[test]
+    fn test_prefix_retrieval_firefox() {
+        let mut firefox = sample_document(
+            "app:firefox.desktop",
+            "Firefox",
+            "Web browser by Mozilla",
+        );
+        firefox.category = Category::App;
+        let docs = vec![firefox];
+        let (_tmp, index) = create_index_with_docs(&docs);
+
+        let results = search(&index, "fire");
+        assert_eq!(
+            results.len(),
+            1,
+            "query `fire` must retrieve Firefox via title_prefixes"
+        );
+        assert_eq!(results[0].id.0, "app:firefox.desktop");
+    }
+
+    #[test]
+    fn test_prefix_ranks_above_body_match() {
+        let mut firefox = sample_document(
+            "app:firefox.desktop",
+            "Firefox",
+            "browser application",
+        );
+        firefox.category = Category::App;
+        let notes = sample_document(
+            "fs:/tmp/notes.txt",
+            "Notes",
+            "thoughts about fire safety",
+        );
+        let (_tmp, index) = create_index_with_docs(&[firefox, notes]);
+
+        let results = search(&index, "fire");
+        assert!(
+            results.len() >= 2,
+            "both docs must match: title-prefix for Firefox, body for Notes"
+        );
+        assert_eq!(
+            results[0].id.0, "app:firefox.desktop",
+            "title_prefixes + title boosts must outrank body-only match"
+        );
         assert!(results[0].score > results[1].score);
     }
 
