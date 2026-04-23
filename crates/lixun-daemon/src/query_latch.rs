@@ -5,11 +5,9 @@
 //! surface that doc at the top. Word order matters — `"foo bar"` and
 //! `"bar foo"` are different latches.
 //!
-//! See the `Query latching` section of
-//! `.local-plans/plans/spotlight-wave-a-ranking.md` for the authoritative
-//! spec. Count is capped at 50 on write to bound the `ln(1+count)`
-//! growth; recency weighting reuses the frecency age buckets so that
-//! a latch decays into neutral multiplier over months of disuse.
+//! Count is capped at 50 on write to bound the `ln(1+count)` growth;
+//! recency weighting reuses the frecency age buckets so that a latch
+//! decays into a neutral multiplier over months of disuse.
 
 use anyhow::Result;
 use lixun_index::normalize::normalize_for_latch_key;

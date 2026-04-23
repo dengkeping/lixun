@@ -1,14 +1,13 @@
 //! Firefox-style frecency store — local JSON state.
 //!
 //! Per-doc ring-buffer of visit timestamps, each weighted by an
-//! age-bucket function at read time. See the `Frecency model (D3)`
-//! section of `.local-plans/plans/spotlight-wave-a-ranking.md` for the
-//! authoritative spec. Weights are pure functions of `(record, now)`
-//! with no mutation; `record_click` is the sole write path.
+//! age-bucket function at read time. Weights are pure functions of
+//! `(record, now)` with no mutation; `record_click` is the sole write
+//! path.
 //!
 //! The store replaces the old additive `ClickHistory`. On first daemon
 //! start after the upgrade, the legacy `history.json` is deleted and a
-//! cold-start empty frecency store is returned — per plan decision D7.
+//! cold-start empty frecency store is returned.
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
