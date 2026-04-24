@@ -8,6 +8,7 @@ members = [
     "crates/lixun-source-maildir",
     "crates/lixun-source-thunderbird",
     "crates/lixun-source-calculator",
+    "crates/lixun-source-shell",
     "crates/lixun-plugin-bundle",
     "crates/lixun-indexer",
     "crates/lixun-daemon",

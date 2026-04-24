@@ -20,3 +20,7 @@ use lixun_source_thunderbird as _;
 #[cfg(feature = "calculator")]
 #[allow(unused_imports)]
 use lixun_source_calculator as _;
+
+#[cfg(feature = "shell")]
+#[allow(unused_imports)]
+use lixun_source_shell as _;
