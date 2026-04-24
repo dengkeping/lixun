@@ -8,10 +8,12 @@ name = "lixun_plugin_bundle"
 path = "src/lib.rs"
 
 [features]
-default = ["maildir", "thunderbird"]
+default = ["maildir", "thunderbird", "calculator"]
 maildir = ["dep:lixun-source-maildir"]
 thunderbird = ["dep:lixun-source-thunderbird"]
+calculator = ["dep:lixun-source-calculator"]
 
 [dependencies]
 lixun-source-maildir = { path = "../lixun-source-maildir", optional = true }
 lixun-source-thunderbird = { path = "../lixun-source-thunderbird", optional = true }
+lixun-source-calculator = { path = "../lixun-source-calculator", optional = true }
