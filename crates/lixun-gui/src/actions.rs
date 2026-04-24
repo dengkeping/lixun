@@ -306,6 +306,7 @@ pub(crate) fn copy_to_clipboard(hit: &Hit) {
         Action::OpenMail { message_id } | Action::OpenParentMail { message_id } => {
             message_id.clone()
         }
+        Action::OpenUri { uri } => uri.clone(),
         Action::OpenAttachment { .. } => hit.title.clone(),
         _ => hit.title.clone(),
     };
