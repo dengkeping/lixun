@@ -32,6 +32,58 @@ pub(crate) fn file_uri(abs: &std::path::Path) -> String {
     out
 }
 
+/// How to spawn a terminal-mode app: which binary to invoke and what
+/// argv to prepend before the user command's tokens. Encodes the
+/// three-way fallback below.
+#[derive(Debug, PartialEq, Eq)]
+struct TerminalSpawn {
+    program: String,
+    args_before_exec: Vec<&'static str>,
+}
+
+/// Resolve how to spawn a terminal emulator for
+/// `Action::Launch { terminal: true, .. }`. Three-tier fallback:
+/// 1. `xdg-terminal-exec` — freedesktop's proposed Default Terminal
+///    Execution spec; honours user's `xdg-terminals.list`. Takes the
+///    command directly (no `-e` prefix).
+/// 2. `$TERMINAL` env var — widely-supported de-facto convention.
+///    Invoked as `$TERMINAL -e <cmd>`.
+/// 3. `xterm -e <cmd>` — universal last-resort fallback.
+///
+/// Split from `terminal_spawn()` so it can be unit-tested without
+/// mutating `$TERMINAL` or `$PATH` (Rust 2024 makes `env::set_var`
+/// unsafe). Caller supplies the two environmental inputs.
+fn resolve_terminal_spawn(
+    xdg_terminal_exec_on_path: bool,
+    env_terminal: Option<&str>,
+) -> TerminalSpawn {
+    if xdg_terminal_exec_on_path {
+        return TerminalSpawn {
+            program: "xdg-terminal-exec".to_string(),
+            args_before_exec: vec![],
+        };
+    }
+    if let Some(t) = env_terminal.filter(|v| !v.is_empty()) {
+        return TerminalSpawn {
+            program: t.to_string(),
+            args_before_exec: vec!["-e"],
+        };
+    }
+    TerminalSpawn {
+        program: "xterm".to_string(),
+        args_before_exec: vec!["-e"],
+    }
+}
+
+fn terminal_spawn() -> TerminalSpawn {
+    let on_path = std::env::var_os("PATH")
+        .map(|paths| {
+            std::env::split_paths(&paths).any(|p| p.join("xdg-terminal-exec").is_file())
+        })
+        .unwrap_or(false);
+    resolve_terminal_spawn(on_path, std::env::var("TERMINAL").ok().as_deref())
+}
+
 fn show_in_file_manager(path: &std::path::Path) -> Result<()> {
     let abs = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let uri = file_uri(&abs);
@@ -71,9 +123,10 @@ pub(crate) fn execute_action(hit: &Hit) -> Result<()> {
             }
 
             if *terminal {
-                let mut args: Vec<&str> = vec!["-e"];
+                let spawn = terminal_spawn();
+                let mut args: Vec<&str> = spawn.args_before_exec.clone();
                 args.extend(exec.split_whitespace());
-                std::process::Command::new("alacritty")
+                std::process::Command::new(&spawn.program)
                     .args(&args)
                     .spawn()?;
             } else {
@@ -253,8 +306,43 @@ pub(crate) fn copy_to_clipboard(hit: &Hit) {
 
 #[cfg(test)]
 mod tests {
-    use super::file_uri;
+    use super::{file_uri, resolve_terminal_spawn};
     use std::path::Path;
+
+    #[test]
+    fn terminal_prefers_xdg_terminal_exec_when_present() {
+        let spawn = resolve_terminal_spawn(true, Some("foot"));
+        assert_eq!(spawn.program, "xdg-terminal-exec");
+        assert!(spawn.args_before_exec.is_empty());
+    }
+
+    #[test]
+    fn terminal_xdg_exec_wins_even_if_no_env() {
+        let spawn = resolve_terminal_spawn(true, None);
+        assert_eq!(spawn.program, "xdg-terminal-exec");
+        assert!(spawn.args_before_exec.is_empty());
+    }
+
+    #[test]
+    fn terminal_uses_env_value_when_xdg_exec_absent() {
+        let spawn = resolve_terminal_spawn(false, Some("foot"));
+        assert_eq!(spawn.program, "foot");
+        assert_eq!(spawn.args_before_exec, vec!["-e"]);
+    }
+
+    #[test]
+    fn terminal_falls_back_to_xterm_when_all_absent() {
+        let spawn = resolve_terminal_spawn(false, None);
+        assert_eq!(spawn.program, "xterm");
+        assert_eq!(spawn.args_before_exec, vec!["-e"]);
+    }
+
+    #[test]
+    fn terminal_falls_back_to_xterm_when_env_empty() {
+        let spawn = resolve_terminal_spawn(false, Some(""));
+        assert_eq!(spawn.program, "xterm");
+        assert_eq!(spawn.args_before_exec, vec!["-e"]);
+    }
 
     #[test]
     fn test_file_uri_ascii() {
