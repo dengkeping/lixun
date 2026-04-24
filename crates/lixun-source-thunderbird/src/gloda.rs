@@ -268,7 +268,9 @@ pub fn query_messages(conn: &Connection, last_key: u64, limit: u32) -> rusqlite:
             path: format!("thunderbird:{}", id),
             mtime: 0,
             size: 0,
-            action: Action::OpenMail { message_id },
+            action: Action::OpenUri {
+                uri: format!("mid:{}", message_id),
+            },
             extract_fail: false,
             sender: author_clean,
             recipients: recipients_clean,
@@ -483,8 +485,8 @@ mod tests {
         assert!(d.body.is_some());
         assert!(d.body.as_ref().unwrap().contains("Hello body"));
         match &d.action {
-            Action::OpenMail { message_id } => assert_eq!(message_id, "abc@example.com"),
-            _ => panic!("expected OpenMail action"),
+            Action::OpenUri { uri } => assert_eq!(uri, "mid:abc@example.com"),
+            _ => panic!("expected OpenUri action"),
         }
     }
 
@@ -558,8 +560,8 @@ mod tests {
         let docs = query_messages(&conn, 0, 1000).unwrap();
         assert_eq!(docs.len(), 1);
         match &docs[0].action {
-            Action::OpenMail { message_id } => assert_eq!(message_id, "42"),
-            _ => panic!("expected OpenMail action"),
+            Action::OpenUri { uri } => assert_eq!(uri, "mid:42"),
+            _ => panic!("expected OpenUri action"),
         }
     }
 
