@@ -466,3 +466,22 @@ max_file_size_mb = 200
 # The plugin has no configurable options; presence of this empty stanza
 # is what enables it. Remove the `[calculator]` line to disable.
 [calculator]
+
+# ───────────────────────────────────────────────────────────────────
+# Shell plugin
+# ───────────────────────────────────────────────────────────────────
+# Inline command runner. Queries that begin with `>` are handed to this
+# plugin; e.g. `> ls`, `> git status`. Pressing Enter on the result
+# executes `sh -c <cmd>` in the configured working directory. Shell
+# queries are never recorded in the frecency log.
+#
+# Risky commands (sudo, rm -rf, mkfs, dd) surface with a ⚠ badge and
+# emit a warn-level trace. Under `strict_mode = true` the plugin refuses
+# to return a hit for risky commands at all.
+#
+# Presence of the `[shell]` header enables the plugin. All keys below
+# are optional.
+[shell]
+# working_dir = "~"            # `~` expands to $HOME; absolute path also OK
+# strict_mode = false          # set true to block risky commands entirely
+# trigger_prefix = ">"         # reserved, not yet configurable — v1 hard-codes `>`
