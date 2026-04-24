@@ -138,6 +138,7 @@ impl MaildirSource {
             Action::Exec {
                 cmdline: rendered,
                 working_dir: None,
+                terminal: false,
             }
         } else {
             Action::OpenFile {

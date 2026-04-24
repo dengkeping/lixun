@@ -131,9 +131,19 @@ pub enum Action {
     /// Replace the current search query with this text (used for recent-query hits).
     ReplaceQuery { q: String },
     /// Execute an arbitrary command. Generic escape hatch for plugin sources.
+    ///
+    /// `terminal: true` asks the host to wrap the spawn in a terminal
+    /// emulator (freedesktop XDG Default Terminal Execution; falls
+    /// back to `$TERMINAL -e …` then `xterm -e …`) so stdout/stderr
+    /// land in a visible window. Plain CLI commands (e.g. `ls`,
+    /// `echo`) need this; GUI commands (e.g. `firefox`) do not.
+    /// Defaults to `false` for backward wire compatibility with
+    /// older clients.
     Exec {
         cmdline: Vec<String>,
         working_dir: Option<PathBuf>,
+        #[serde(default)]
+        terminal: bool,
     },
     /// Open an arbitrary URI via the OS (xdg-open on Linux). Generic
     /// primitive for URI-dispatchable actions (e.g. `mid:<message-id>`,
@@ -322,6 +332,7 @@ mod tests {
             Action::Exec {
                 cmdline: vec!["neomutt".into(), "-f".into(), "/home/me/Mail".into()],
                 working_dir: Some(PathBuf::from("/home/me")),
+                terminal: true,
             },
             Action::OpenUri {
                 uri: "mid:abc@example.org".to_string(),
@@ -373,20 +384,34 @@ mod tests {
                     Action::Exec {
                         cmdline: c1,
                         working_dir: wd1,
+                        terminal: t1,
                     },
                     Action::Exec {
                         cmdline: c2,
                         working_dir: wd2,
+                        terminal: t2,
                     },
                 ) => {
                     assert_eq!(c1, c2);
                     assert_eq!(wd1, wd2);
+                    assert_eq!(t1, t2);
                 }
                 (Action::OpenUri { uri: u1 }, Action::OpenUri { uri: u2 }) => {
                     assert_eq!(u1, u2);
                 }
                 _ => panic!("Action variant mismatch"),
             }
+        }
+    }
+
+    #[test]
+    fn test_action_exec_terminal_default_false_for_legacy_wire() {
+        let legacy_json =
+            r#"{"Exec":{"cmdline":["ls"],"working_dir":null}}"#;
+        let decoded: Action = serde_json::from_str(legacy_json).unwrap();
+        match decoded {
+            Action::Exec { terminal, .. } => assert!(!terminal),
+            _ => panic!("expected Action::Exec"),
         }
     }
 
