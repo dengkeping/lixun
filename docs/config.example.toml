@@ -479,6 +479,11 @@ max_file_size_mb = 200
 # emit a warn-level trace. Under `strict_mode = true` the plugin refuses
 # to return a hit for risky commands at all.
 #
+# Runtime requirement: a terminal launcher must be resolvable. Lixun
+# tries `xdg-terminal-exec` first (honours ~/.config/xdg-terminals.list),
+# then `$TERMINAL`, then `xterm`. Install `xdg-terminal-exec` for the
+# best experience; otherwise export `TERMINAL` to your terminal binary.
+#
 # Presence of the `[shell]` header enables the plugin. All keys below
 # are optional.
 [shell]

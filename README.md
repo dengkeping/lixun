@@ -67,6 +67,11 @@ all three are in `extra/`. Without them, preview still works for
 text/code/pdf/email/office/static-image content, but the av plugin
 cannot decode MP3/MP4/etc. and animated images silently render as
 blank paintables.
+**Optional (shell plugin):** `xdg-terminal-exec` — required by the
+`> cmd` shell trigger to spawn the user's terminal emulator. Reads
+`~/.config/xdg-terminals.list` (and `$TERMINAL`) to pick the right
+program. Without it, lixun falls back to `$TERMINAL` then `xterm`;
+if none of those resolve, the shell hit's spawn silently fails.
 
 ---
 
