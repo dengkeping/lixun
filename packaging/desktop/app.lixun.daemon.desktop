@@ -4,6 +4,5 @@ Name=Lixun
 Comment=Spotlight-like launcher for Linux
 Icon=app.lixun.daemon
 Exec=/usr/bin/lixund
-Hidden=true
 NoDisplay=true
 X-GNOME-Autostart-enabled=true
