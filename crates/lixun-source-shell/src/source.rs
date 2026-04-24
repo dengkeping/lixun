@@ -10,6 +10,18 @@ static RISKY_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^(?:sudo\b|rm\s+-rf\b|mkfs\b|dd\s)").unwrap()
 });
 
+/// Wrap the user's shell command in a hold-after-exit sentinel so the
+/// terminal window stays open until the user presses Enter. Without
+/// this, terminals close the moment the wrapped command exits and the
+/// user never sees stdout/stderr (or the exit code) for short-running
+/// commands like `> echo hello`. Universal across xdg-terminal-exec /
+/// `$TERMINAL` / xterm fallbacks (no terminal-specific flag needed).
+fn wrap_with_hold(cmd: &str) -> String {
+    format!(
+        "{cmd}\nec=$?\nprintf '\\n[exit %s \u{2014} press Enter to close] ' \"$ec\"\nread -r _\n"
+    )
+}
+
 pub struct ShellSource {
     pub working_dir: PathBuf,
     pub strict_mode: bool,
@@ -52,7 +64,7 @@ impl IndexerSource for ShellSource {
             kind_label: Some("Shell".into()),
             score: 900.0,
             action: Action::Exec {
-                cmdline: vec!["sh".into(), "-c".into(), cmd.to_string()],
+                cmdline: vec!["sh".into(), "-c".into(), wrap_with_hold(cmd)],
                 working_dir: Some(self.working_dir.clone()),
                 terminal: true,
             },
@@ -137,5 +149,28 @@ mod tests {
         assert!(s.excludes_from_query_log(" > ls"));
         assert!(!s.excludes_from_query_log("ls"));
         assert!(!s.excludes_from_query_log(""));
+    }
+
+    #[test]
+    fn wrap_with_hold_includes_command_exit_capture_and_read() {
+        let wrapped = wrap_with_hold("echo hello");
+        assert!(wrapped.starts_with("echo hello\n"));
+        assert!(wrapped.contains("ec=$?"));
+        assert!(wrapped.contains("press Enter to close"));
+        assert!(wrapped.trim_end().ends_with("read -r _"));
+    }
+
+    #[test]
+    fn on_query_emits_wrapped_cmdline() {
+        let hits = src(false).on_query("> echo hello", &ctx());
+        assert_eq!(hits.len(), 1);
+        let Action::Exec { cmdline, terminal, .. } = &hits[0].action else {
+            panic!("expected Action::Exec");
+        };
+        assert!(*terminal);
+        assert_eq!(cmdline[0], "sh");
+        assert_eq!(cmdline[1], "-c");
+        assert!(cmdline[2].starts_with("echo hello\n"));
+        assert!(cmdline[2].contains("read -r _"));
     }
 }
