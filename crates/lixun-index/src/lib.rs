@@ -1,6 +1,5 @@
 //! Lixun Index — Tantivy wrapper: schema, writer, searcher.
 
-pub mod calculator;
 pub mod normalize;
 pub mod plugin_schema;
 pub mod scoring;
