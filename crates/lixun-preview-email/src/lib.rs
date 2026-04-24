@@ -179,7 +179,7 @@ fn build_from_hit_fields(hit: &Hit) -> gtk::Widget {
     let body_text = hit
         .body
         .clone()
-        .unwrap_or_else(|| "(body not available — gloda index stores a snippet only; open the message in Thunderbird for the full body)".into());
+        .unwrap_or_else(|| "(body not available — gloda index stores a snippet only; open the message in your mail client for the full body)".into());
     let buffer = gtk::TextBuffer::new(None);
     buffer.set_text(&body_text);
     let view = gtk::TextView::with_buffer(&buffer);
@@ -445,8 +445,8 @@ mod tests {
             icon_name: None,
             kind_label: None,
             score: 1.0,
-            action: Action::OpenMail {
-                message_id: "msg-1".into(),
+            action: Action::OpenUri {
+                uri: "mid:msg-1".into(),
             },
             extract_fail: false,
             sender: None,
@@ -542,8 +542,8 @@ mod tests {
             icon_name: None,
             kind_label: Some("Email".into()),
             score: 1.0,
-            action: Action::OpenMail {
-                message_id: "20160426103745.E36A4340033@cron001.example.com".into(),
+            action: Action::OpenUri {
+                uri: "mid:20160426103745.E36A4340033@cron001.example.com".into(),
             },
             extract_fail: false,
             sender: Some("alice@example.com".into()),
