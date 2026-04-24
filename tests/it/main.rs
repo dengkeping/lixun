@@ -1,7 +1,7 @@
 use std::process::Command;
 
 use lixun_core::{Action, Category, DocId, Document, Query, RankingConfig};
-use lixun_index::{LixunIndex, calculator};
+use lixun_index::LixunIndex;
 
 #[test]
 fn test_lixun_help() {
@@ -121,19 +121,6 @@ fn spotlight_camelcase_splits() {
     upsert_docs(&mut idx, &[make_doc("1", "MyFileName.txt", None)]);
     let titles = search(&idx, "file");
     assert!(titles.iter().any(|t| t == "MyFileName.txt"));
-}
-
-#[test]
-fn calculator_detects_arithmetic() {
-    let calc = calculator::detect("2+2").expect("detect returns Some");
-    assert_eq!(calc.result, "4");
-}
-
-#[test]
-fn calculator_ignores_non_math() {
-    assert!(calculator::detect("firefox").is_none());
-    assert!(calculator::detect("hello world").is_none());
-    assert!(calculator::detect("").is_none());
 }
 
 #[test]
