@@ -12,7 +12,8 @@ optdepends=("antiword: .doc extraction"
             "libreoffice-fresh: .docx/.xlsx/.pptx extraction + preview"
             "gst-plugins-base: GStreamer foundation (preview plugin: av, animated images)"
             "gst-plugins-good: common codecs (preview plugin: av, animated images)"
-            "gst-libav: FFmpeg-backed decoders (preview plugin: GIF/WebP animation, MP3/MP4 playback)")
+            "gst-libav: FFmpeg-backed decoders (preview plugin: GIF/WebP animation, MP3/MP4 playback)"
+            "xdg-terminal-exec: required by the shell plugin (> prefix) to launch commands in the user's terminal emulator; honours \$TERMINAL and ~/.config/xdg-terminals.list")
 provides=("lixun")
 conflicts=("lixun" "lupa" "lupa-bin")
 
