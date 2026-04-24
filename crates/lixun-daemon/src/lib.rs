@@ -1,6 +1,7 @@
 pub mod config;
 pub mod gui_control;
 pub mod hotkeys;
+pub mod portal_identity;
 pub mod preview_spawn;
 pub mod session_env;
 
