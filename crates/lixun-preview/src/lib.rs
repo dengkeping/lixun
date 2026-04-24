@@ -186,6 +186,11 @@ pub fn default_launch(hit: &lixun_core::Hit) -> anyhow::Result<()> {
             std::process::Command::new(program).args(args).spawn()?;
             Ok(())
         }
+        Action::OpenUri { uri } => {
+            tracing::debug!(uri = %uri, "default_launch: dispatching via xdg-open");
+            std::process::Command::new("xdg-open").arg(uri).spawn()?;
+            Ok(())
+        }
         Action::OpenMail { .. }
         | Action::OpenParentMail { .. }
         | Action::OpenAttachment { .. } => {
@@ -274,6 +279,7 @@ mod tests {
             sender: None,
             recipients: None,
             body: None,
+            secondary_action: None,
         }
     }
 

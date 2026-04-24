@@ -134,6 +134,11 @@ pub enum Action {
         cmdline: Vec<String>,
         working_dir: Option<PathBuf>,
     },
+    /// Open an arbitrary URI via the OS (xdg-open on Linux). Generic
+    /// primitive for URI-dispatchable actions (e.g. `mid:<message-id>`,
+    /// `mailto:`, `https:`). Plugin-agnostic: the host does not know
+    /// which application will handle the scheme.
+    OpenUri { uri: String },
 }
 
 /// A search result.
@@ -165,6 +170,12 @@ pub struct Hit {
     /// source; do not assume the full message.
     #[serde(default)]
     pub body: Option<String>,
+    /// Optional secondary action invoked via right-click or other
+    /// non-primary affordances. `Box` keeps `Hit` size stable since
+    /// `Action` is a sizable enum. `None` means no secondary action;
+    /// the host hides the corresponding menu entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secondary_action: Option<Box<Action>>,
 }
 
 /// Inline calculator result (for Spotlight-style "2+2 = 4" display).
@@ -197,6 +208,7 @@ pub struct Document {
     /// Used to purge all docs from a removed/disabled source instance.
     pub source_instance: String,
     pub extra: Vec<ExtraFieldValue>,
+    pub secondary_action: Option<Action>,
 }
 
 #[derive(Debug, Clone)]
@@ -311,6 +323,9 @@ mod tests {
                 cmdline: vec!["neomutt".into(), "-f".into(), "/home/me/Mail".into()],
                 working_dir: Some(PathBuf::from("/home/me")),
             },
+            Action::OpenUri {
+                uri: "mid:abc@example.org".to_string(),
+            },
         ];
 
         for action in actions {
@@ -369,6 +384,9 @@ mod tests {
                 ) => {
                     assert_eq!(c1, c2);
                     assert_eq!(wd1, wd2);
+                }
+                (Action::OpenUri { uri: u1 }, Action::OpenUri { uri: u2 }) => {
+                    assert_eq!(u1, u2);
                 }
                 _ => panic!("Action variant mismatch"),
             }

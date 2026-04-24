@@ -193,6 +193,7 @@ impl MaildirSource {
                 Some(recipients_all)
             },
             source_instance: String::new(),
+            secondary_action: None,
             extra,
         }))
     }

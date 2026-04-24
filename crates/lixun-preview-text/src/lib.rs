@@ -246,6 +246,7 @@ mod tests {
             sender: None,
             recipients: None,
             body: None,
+            secondary_action: None,
         }
     }
 
@@ -308,6 +309,7 @@ mod tests {
             sender: None,
             recipients: None,
             body: None,
+            secondary_action: None,
         };
         assert_eq!(TextPreview.match_score(&hit), 0);
     }

@@ -99,7 +99,11 @@ fn show_in_file_manager(path: &std::path::Path) -> Result<()> {
 }
 
 pub(crate) fn execute_action(hit: &Hit) -> Result<()> {
-    match &hit.action {
+    dispatch_action(&hit.action)
+}
+
+fn dispatch_action(action: &Action) -> Result<()> {
+    match action {
         Action::Launch {
             exec,
             terminal,
@@ -196,6 +200,11 @@ pub(crate) fn execute_action(hit: &Hit) -> Result<()> {
                 .spawn()?;
             Ok(())
         }
+        Action::OpenUri { uri } => {
+            tracing::debug!(uri = %uri, "execute_action: dispatching via xdg-open");
+            std::process::Command::new("xdg-open").arg(uri).spawn()?;
+            Ok(())
+        }
         Action::ReplaceQuery { .. } => Ok(()),
         Action::Exec {
             cmdline,
@@ -216,6 +225,9 @@ pub(crate) fn execute_action(hit: &Hit) -> Result<()> {
 }
 
 pub(crate) fn execute_secondary_action(hit: &Hit) -> Result<()> {
+    if let Some(secondary) = hit.secondary_action.as_deref() {
+        return dispatch_action(secondary);
+    }
     match &hit.action {
         Action::OpenFile { path } | Action::ShowInFileManager { path } => {
             if path.is_dir() {

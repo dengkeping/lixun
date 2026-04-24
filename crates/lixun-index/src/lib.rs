@@ -29,7 +29,7 @@ use lixun_core::{
 };
 use normalize::normalize_for_match;
 
-const INDEX_VERSION: u32 = 7;
+const INDEX_VERSION: u32 = 8;
 const INDEX_VERSION_FILE: &str = "index_version.txt";
 
 /// Tantivy schema fields.
@@ -49,6 +49,7 @@ pub struct LixunSchema {
     pub mtime: tantivy::schema::Field,
     pub size: tantivy::schema::Field,
     pub action: tantivy::schema::Field,
+    pub secondary_action: tantivy::schema::Field,
     pub extract_fail: tantivy::schema::Field,
     pub sender: tantivy::schema::Field,
     pub recipients: tantivy::schema::Field,
@@ -92,6 +93,7 @@ impl LixunSchema {
         let mtime = builder.add_i64_field("mtime", STORED);
         let size = builder.add_u64_field("size", STORED);
         let action = builder.add_text_field("action", STORED);
+        let secondary_action = builder.add_text_field("secondary_action", STORED);
         let extract_fail = builder.add_bool_field("extract_fail", STORED);
         let sender = builder.add_text_field("sender", stored_spotlight_text());
         let recipients = builder.add_text_field("recipients", stored_spotlight_text());
@@ -119,6 +121,7 @@ impl LixunSchema {
                 mtime,
                 size,
                 action,
+                secondary_action,
                 extract_fail,
                 sender,
                 recipients,
@@ -215,6 +218,12 @@ impl LixunIndex {
         writer.delete_term(term);
 
         let action_json = serde_json::to_string(&doc.action)?;
+        let secondary_action_json = doc
+            .secondary_action
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?
+            .unwrap_or_default();
         let title_split = tokenizer::split_identifiers(&doc.title);
         let title_initials_indexed = scoring::acronym_initials_indexed(&doc.title);
         let title_prefixes_indexed = scoring::compute_title_prefixes(&doc.title);
@@ -234,6 +243,7 @@ impl LixunIndex {
             s.mtime => doc.mtime,
             s.size => doc.size,
             s.action => action_json.as_str(),
+            s.secondary_action => secondary_action_json.as_str(),
             s.extract_fail => doc.extract_fail,
             s.sender => doc.sender.as_deref().unwrap_or(""),
             s.recipients => doc.recipients.as_deref().unwrap_or(""),
@@ -351,6 +361,18 @@ impl LixunIndex {
             let action: lixun_core::Action = serde_json::from_str(action_json)
                 .unwrap_or(lixun_core::Action::OpenFile { path: "".into() });
 
+            let secondary_action_raw = doc
+                .get_first(s.secondary_action)
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            let secondary_action = if secondary_action_raw.is_empty() {
+                None
+            } else {
+                serde_json::from_str::<lixun_core::Action>(secondary_action_raw)
+                    .ok()
+                    .map(Box::new)
+            };
+
             let extract_fail = doc
                 .get_first(s.extract_fail)
                 .and_then(|value| value.as_bool())
@@ -383,6 +405,7 @@ impl LixunIndex {
                 sender,
                 recipients,
                 body,
+                secondary_action,
             });
         }
 
@@ -570,6 +593,7 @@ mod tests {
             sender: None,
             recipients: None,
             source_instance: "test".into(),
+            secondary_action: None,
             extra: Vec::new(),
         }
     }
