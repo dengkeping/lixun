@@ -60,6 +60,13 @@ async fn setup_and_run(
         .await
         .context("connecting to session bus")?;
 
+    crate::portal_identity::register(&conn, crate::portal_identity::DAEMON_APP_ID).await?;
+    crate::portal_identity::spawn_reregister_watcher(
+        conn.clone(),
+        crate::portal_identity::DAEMON_APP_ID.to_string(),
+    )
+    .await?;
+
     let session_handle = create_session(&conn, &token).await?;
     tracing::info!(
         "hotkeys: session established at {} (token {})",
