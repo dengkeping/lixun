@@ -290,15 +290,6 @@ Zero changes to `lixund`. Config-driven, auto-registered.
 
 ---
 
-## Migration from Lupa
-
-Previous versions shipped under the name **Lupa**. If you are upgrading from
-`v0.2.x`, follow [`docs/migration-lupa-to-lixun.md`](docs/migration-lupa-to-lixun.md):
-binary names, config dir, IPC socket, systemd unit, GTK app id, and
-Arch package all changed.
-
----
-
 ## License
 
 MIT. See [`LICENSE`](LICENSE) (when present) or the `license` field in

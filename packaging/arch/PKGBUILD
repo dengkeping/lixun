@@ -15,7 +15,7 @@ optdepends=("antiword: .doc extraction"
             "gst-libav: FFmpeg-backed decoders (preview plugin: GIF/WebP animation, MP3/MP4 playback)"
             "xdg-terminal-exec: required by the shell plugin (> prefix) to launch commands in the user's terminal emulator; honours \$TERMINAL and ~/.config/xdg-terminals.list")
 provides=("lixun")
-conflicts=("lixun" "lupa" "lupa-bin")
+conflicts=("lixun")
 
 # Local tarball — replace with release URL for distribution:
 # source=("https://repo.dkp.hk/lixun/lixun-${pkgver}-x86_64.tar.gz")
