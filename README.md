@@ -191,6 +191,7 @@ all widgets of a kind.
     ┌───────┴────────────────────────────┐
     │  lixun-source-thunderbird  (gloda + attachments)
     │  lixun-source-maildir
+    │  lixun-source-calculator  (= prefix)
     │  … (add your own: see below)
     └────────────────────────────────────┘
 ```
@@ -216,6 +217,7 @@ A source plugin is loaded **if and only if** its config section is present:
 
 - `[thunderbird]` → `lixun-source-thunderbird` registered
 - `[[maildir]]` → `lixun-source-maildir` registered (one instance per block)
+- `[calculator]` → `lixun-source-calculator` registered (singleton)
 - Nothing → plugin stays dormant, zero runtime cost
 
 No code in `lixund` names any plugin. The daemon iterates
@@ -247,6 +249,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 | `lixun-cli` | `lixun` command |
 | `lixun-source-maildir` | Maildir plugin |
 | `lixun-source-thunderbird` | Gloda + mbox attachments |
+| `lixun-source-calculator` | Calculator plugin (`=` prefix) |
 | `lixun-plugin-bundle` | Linker anchor (holds `use lixun_source_X as _`) |
 | `lixun-preview` | `PreviewPlugin` trait + `select_plugin` + shared CSS helper |
 | `lixun-preview-bundle` | Linker anchor for preview format plugins |

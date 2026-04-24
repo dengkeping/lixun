@@ -10,6 +10,7 @@ use chrono::Utc;
 use futures::StreamExt;
 use lixun_ipc::gui::{GuiCommand, GuiResponse};
 use lixun_ipc::{MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, Request, Response, socket_path};
+use lixun_sources::QueryContext;
 use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -493,6 +494,16 @@ async fn handle_client(
                         hit.score *= clamp_stage2_mult(stage2, total_cap);
                     }
                 }
+                // Fan-out `on_query` to every registered source plugin.
+                // Plugins set their own scores; frecency and latch do not
+                // apply. Host names no plugin (AGENTS.md hard-modularity).
+                for inst in registry.instances.iter() {
+                    let qctx = QueryContext {
+                        instance_id: inst.instance_id.as_str(),
+                        state_dir: &inst.state_dir,
+                    };
+                    hits.extend(inst.source.on_query(&q, &qctx));
+                }
                 hits.sort_by(compare_hits_for_ranking);
                 let decision = {
                     let frecency = frecency.read().await;
@@ -520,7 +531,7 @@ async fn handle_client(
                     "top_hit selection"
                 );
                 let top_hit_id = decision.id;
-                let calculation = lixun_index::calculator::detect(&q);
+                let calculation: Option<lixun_core::Calculation> = None;
                 match negotiated_version {
                     1 => Response::Hits(hits),
                     2 => Response::HitsWithExtras { hits, calculation },
@@ -614,7 +625,11 @@ async fn handle_client(
             Response::Ok
         }
         Request::RecordQuery { q } => {
-            if lixun_index::calculator::detect(&q).is_some() {
+            let excluded = registry
+                .instances
+                .iter()
+                .any(|inst| inst.source.excludes_from_query_log(&q));
+            if excluded {
                 Response::Ok
             } else {
                 let mut log = query_log.write().await;
@@ -628,7 +643,11 @@ async fn handle_client(
                 let mut latch = query_latch.write().await;
                 latch.record(&query, &doc_id, now);
             }
-            if lixun_index::calculator::detect(&query).is_none() {
+            let excluded = registry
+                .instances
+                .iter()
+                .any(|inst| inst.source.excludes_from_query_log(&query));
+            if !excluded {
                 let mut log = query_log.write().await;
                 log.record_query(&query);
             }
