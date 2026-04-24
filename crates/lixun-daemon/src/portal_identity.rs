@@ -36,7 +36,14 @@ use zbus::zvariant::Value;
 pub const DAEMON_APP_ID: &str = "app.lixun.daemon";
 
 const PORTAL_SERVICE: &str = "org.freedesktop.portal.Desktop";
-const REGISTRY_PATH: &str = "/org/freedesktop/host/portal/Registry";
+// The interface name is `org.freedesktop.host.portal.Registry` but the
+// method is exposed at the main portal object path
+// `/org/freedesktop/portal/desktop` alongside the other portal
+// interfaces — NOT at an object called `/…/host/portal/Registry`
+// (that path exists on the bus but is empty). Verified by
+// `gdbus introspect --session --dest org.freedesktop.portal.Desktop
+// --object-path / --recurse`.
+const REGISTRY_PATH: &str = "/org/freedesktop/portal/desktop";
 const REGISTRY_IFACE: &str = "org.freedesktop.host.portal.Registry";
 
 /// Register this connection with the portal Registry. Idempotent from
@@ -132,6 +139,6 @@ mod tests {
     #[test]
     fn registry_iface_matches_upstream_spec() {
         assert_eq!(REGISTRY_IFACE, "org.freedesktop.host.portal.Registry");
-        assert_eq!(REGISTRY_PATH, "/org/freedesktop/host/portal/Registry");
+        assert_eq!(REGISTRY_PATH, "/org/freedesktop/portal/desktop");
     }
 }
