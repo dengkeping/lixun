@@ -30,7 +30,7 @@ use lixun_preview_bundle as _;
 #[cfg(feature = "stub")]
 mod stub;
 
-const APP_ID: &str = "hk.dkp.lixun.preview";
+const APP_ID: &str = "app.lixun.preview";
 const DEFAULT_WIDTH: i32 = 960;
 const DEFAULT_HEIGHT: i32 = 720;
 const MIN_WIDTH: i32 = 600;
