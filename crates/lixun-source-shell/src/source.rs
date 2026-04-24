@@ -54,6 +54,7 @@ impl IndexerSource for ShellSource {
             action: Action::Exec {
                 cmdline: vec!["sh".into(), "-c".into(), cmd.to_string()],
                 working_dir: Some(self.working_dir.clone()),
+                terminal: true,
             },
             extract_fail: false,
             sender: None,
