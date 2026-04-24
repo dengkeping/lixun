@@ -129,6 +129,7 @@ impl ThunderbirdAttachmentsSource {
                         sender: None,
                         recipients: None,
                         source_instance: "builtin:tb_attachments".into(),
+                        secondary_action: None,
                         extra: Vec::new(),
                     });
                 }

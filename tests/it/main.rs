@@ -33,6 +33,7 @@ fn make_doc(id: &str, title: &str, body: Option<&str>) -> Document {
         sender: None,
         recipients: None,
         source_instance: "test".into(),
+        secondary_action: None,
         extra: Vec::new(),
     }
 }

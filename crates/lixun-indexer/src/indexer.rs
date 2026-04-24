@@ -321,6 +321,7 @@ mod tests {
                 sender: None,
                 recipients: None,
                 source_instance: ctx.instance_id.to_string(),
+                secondary_action: None,
                 extra: Vec::new(),
             };
             sink.emit(SourceMutation::Upsert(Box::new(doc)))?;
@@ -358,6 +359,7 @@ mod tests {
             sender: None,
             recipients: None,
             source_instance: "x".into(),
+            secondary_action: None,
             extra: Vec::new(),
         };
         sink.emit(SourceMutation::Upsert(Box::new(doc))).unwrap();
@@ -387,6 +389,7 @@ mod tests {
             sender: None,
             recipients: None,
             source_instance: "x".into(),
+            secondary_action: None,
             extra: Vec::new(),
         };
         sink.emit(SourceMutation::UpsertMany(vec![

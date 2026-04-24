@@ -277,6 +277,7 @@ mod tests {
             sender: None,
             recipients: None,
             body: None,
+            secondary_action: None,
         }
     }
 
@@ -307,6 +308,7 @@ mod tests {
             subtitle: String::new(),
             icon_name: None,
             kind_label: None,
+            secondary_action: None,
             score: 1.0,
             action: Action::Launch {
                 exec: "firefox".into(),

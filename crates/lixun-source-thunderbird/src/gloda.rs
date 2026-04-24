@@ -273,6 +273,7 @@ pub fn query_messages(conn: &Connection, last_key: u64, limit: u32) -> rusqlite:
             sender: author_clean,
             recipients: recipients_clean,
             source_instance: "builtin:gloda".into(),
+            secondary_action: None,
             extra: Vec::new(),
         });
     }

@@ -171,6 +171,7 @@ impl AppsSource {
                         path: path.to_string_lossy().to_string(),
                         mtime: 0,
                         size: 0,
+                        secondary_action: None,
                         action: Action::Launch {
                             exec: entry.exec,
                             terminal: entry.terminal,

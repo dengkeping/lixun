@@ -415,6 +415,7 @@ mod tests {
             sender: None,
             recipients: None,
             source_instance: "test".into(),
+            secondary_action: None,
             extra: Vec::new(),
         }
     }
