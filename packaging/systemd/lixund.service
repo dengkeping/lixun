@@ -1,6 +1,13 @@
 [Unit]
 Description=Lixun Search Daemon
-After=graphical-session.target
+# Wait for the XDG desktop portal to be up before we try to register an
+# application identity and bind global shortcuts. Without this ordering,
+# lixund races the portal's DBus activation during login and can hit
+# `org.freedesktop.DBus.Error.UnknownMethod: No such interface
+# "org.freedesktop.portal.GlobalShortcuts"` because the KDE backend has not
+# yet exported the interface on `org.freedesktop.portal.Desktop`.
+After=graphical-session.target xdg-desktop-portal.service
+Wants=xdg-desktop-portal.service
 PartOf=graphical-session.target
 
 [Service]
