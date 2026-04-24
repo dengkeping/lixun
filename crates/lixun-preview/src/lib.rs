@@ -75,11 +75,11 @@ pub enum SizingPreference {
 ///   must return a placeholder widget immediately and offload
 ///   to a worker thread via `gio::spawn_blocking` +
 ///   `glib::MainContext::spawn_local`.
-/// - Override `launch()` if the hit's default handler is NOT the
-///   XDG default handler for a file path (mail messages are the
-///   canonical example: `Action::OpenMail { message_id }` needs
-///   `thunderbird mid:{id}`, which only the email plugin knows;
-///   the preview host must NOT hardcode that).
+/// - Override `launch()` only if the hit needs plugin-internal
+///   state the default cannot reach (e.g. mail attachments that
+///   must be sliced out of an mbox before `xdg-open`); most
+///   plugins can produce `Action::OpenUri { uri }` or
+///   `Action::Exec` and let the default handle dispatch.
 pub trait PreviewPlugin: Send + Sync + 'static {
     fn id(&self) -> &'static str;
 
@@ -121,11 +121,12 @@ pub trait PreviewPlugin: Send + Sync + 'static {
     /// clears the launcher session.
     ///
     /// Default implementation handles the generic path-based
-    /// variants via `xdg-open` / `gio launch_default_for_uri` and
-    /// the generic command-line variants (`Launch`, `Exec`) via
-    /// `std::process::Command`. Plugins whose domain has a
-    /// non-filesystem launch path (mail: `thunderbird mid:{id}`)
-    /// MUST override this.
+    /// variants via `xdg-open` / `gio launch_default_for_uri`,
+    /// generic URI dispatch (`Action::OpenUri { uri }`) via
+    /// `xdg-open uri`, and the generic command-line variants
+    /// (`Launch`, `Exec`) via `std::process::Command`. Plugins
+    /// whose domain needs plugin-internal state the default cannot
+    /// reach (e.g. mbox attachment extraction) MUST override this.
     ///
     /// Returning `Err` keeps the preview window open so the user
     /// can Escape cleanly; the host logs the error.
@@ -137,9 +138,8 @@ pub trait PreviewPlugin: Send + Sync + 'static {
 /// Generic launch logic used by the `PreviewPlugin::launch` default
 /// implementation. Exposed as a free function so plugin overrides
 /// can fall through to it for action variants they don't specialise
-/// (e.g. `lixun-preview-email` overrides only `OpenMail` /
-/// `OpenParentMail` and calls back to `default_launch` for an
-/// `OpenFile` hit pointing at a `.eml` on disk).
+/// (e.g. a plugin that extracts a file and then wants the generic
+/// `OpenFile` dispatch).
 pub fn default_launch(hit: &lixun_core::Hit) -> anyhow::Result<()> {
     use gtk::prelude::FileExt;
     use lixun_core::Action;
@@ -191,9 +191,7 @@ pub fn default_launch(hit: &lixun_core::Hit) -> anyhow::Result<()> {
             std::process::Command::new("xdg-open").arg(uri).spawn()?;
             Ok(())
         }
-        Action::OpenMail { .. }
-        | Action::OpenParentMail { .. }
-        | Action::OpenAttachment { .. } => {
+        Action::OpenAttachment { .. } => {
             anyhow::bail!(
                 "default_launch: {:?} is plugin-specific and has no generic fallback; \
                  the plugin must override PreviewPlugin::launch",

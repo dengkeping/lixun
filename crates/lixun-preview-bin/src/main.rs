@@ -310,12 +310,12 @@ fn build_header(
 }
 
 /// Delegate the launch to the plugin that rendered the hit. The
-/// plugin owns the launch semantics for its domain (e.g. the email
-/// plugin knows about `thunderbird mid:{id}`; the host binary does
-/// NOT). On success, exit with `EXIT_CODE_LAUNCHED` so the daemon's
-/// PreviewSpawner dispatches `GuiCommand::ClearSession` instead of
-/// re-showing the launcher. On failure, keep the window open and
-/// let the user Escape cleanly.
+/// plugin owns the launch semantics for its domain; the host binary
+/// stays agnostic and does not inspect the action. On success, exit
+/// with `EXIT_CODE_LAUNCHED` so the daemon's PreviewSpawner
+/// dispatches `GuiCommand::ClearSession` instead of re-showing the
+/// launcher. On failure, keep the window open and let the user
+/// Escape cleanly.
 fn run_plugin_launch(plugin: &Rc<dyn PreviewPlugin>, hit: &Hit, app: &gtk::Application) {
     match plugin.launch(hit) {
         Ok(()) => {

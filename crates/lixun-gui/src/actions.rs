@@ -1,5 +1,5 @@
 //! User-facing actions: open file, launch app, reveal in file manager,
-//! open mail, open attachment, copy to clipboard.
+//! open URI (xdg-open), open attachment, copy to clipboard.
 
 use anyhow::Result;
 use gtk::gio;
@@ -168,12 +168,6 @@ fn dispatch_action(action: &Action) -> Result<()> {
             }
             Ok(())
         }
-        Action::OpenMail { message_id } => {
-            std::process::Command::new("thunderbird")
-                .arg(format!("mid:{}", message_id))
-                .spawn()?;
-            Ok(())
-        }
         Action::OpenAttachment {
             mbox_path,
             byte_offset,
@@ -191,12 +185,6 @@ fn dispatch_action(action: &Action) -> Result<()> {
             )?;
             std::process::Command::new("xdg-open")
                 .arg(&target)
-                .spawn()?;
-            Ok(())
-        }
-        Action::OpenParentMail { message_id } => {
-            std::process::Command::new("thunderbird")
-                .arg(format!("mid:{}", message_id))
                 .spawn()?;
             Ok(())
         }
@@ -228,34 +216,7 @@ pub(crate) fn execute_secondary_action(hit: &Hit) -> Result<()> {
     if let Some(secondary) = hit.secondary_action.as_deref() {
         return dispatch_action(secondary);
     }
-    match &hit.action {
-        Action::OpenFile { path } | Action::ShowInFileManager { path } => {
-            if path.is_dir() {
-                std::process::Command::new("xdg-open").arg(path).spawn()?;
-            } else {
-                match show_in_file_manager(path) {
-                    Ok(()) => {}
-                    Err(e) => {
-                        tracing::debug!(
-                            "FileManager1 DBus call failed: {e}; falling back to xdg-open"
-                        );
-                        if let Some(parent) = path.parent() {
-                            std::process::Command::new("xdg-open").arg(parent).spawn()?;
-                        }
-                    }
-                }
-            }
-            Ok(())
-        }
-        Action::OpenParentMail { message_id } => {
-            std::process::Command::new("thunderbird")
-                .arg("-message")
-                .arg(message_id)
-                .spawn()?;
-            Ok(())
-        }
-        _ => Ok(()),
-    }
+    Ok(())
 }
 
 fn extract_attachment_to_temp(
@@ -302,9 +263,6 @@ pub(crate) fn copy_to_clipboard(hit: &Hit) {
     let text = match &hit.action {
         Action::OpenFile { path } | Action::ShowInFileManager { path } => {
             path.to_string_lossy().to_string()
-        }
-        Action::OpenMail { message_id } | Action::OpenParentMail { message_id } => {
-            message_id.clone()
         }
         Action::OpenUri { uri } => uri.clone(),
         Action::OpenAttachment { .. } => hit.title.clone(),
