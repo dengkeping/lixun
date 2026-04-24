@@ -19,7 +19,7 @@ conflicts=("lixun" "lupa" "lupa-bin")
 
 # Local tarball — replace with release URL for distribution:
 # source=("https://repo.dkp.hk/lixun/lixun-${pkgver}-x86_64.tar.gz")
-source=("lixun-${pkgver}-x86_64.tar.gz::file:///home/cryptobroiler/Developer/lixun/packaging/arch/lixun-${pkgver}-x86_64.tar.gz" "systemd-lixund.service" "lixun.desktop")
+source=("lixun-${pkgver}-x86_64.tar.gz::file:///home/cryptobroiler/Developer/lixun/packaging/arch/lixun-${pkgver}-x86_64.tar.gz" "systemd-lixund.service" "app.lixun.daemon.desktop")
 md5sums=("SKIP" "SKIP" "SKIP")
 
 package() {
@@ -28,5 +28,5 @@ package() {
   install -Dm755 "lixun-gui" "$pkgdir/usr/bin/lixun-gui"
   install -Dm755 "lixun-preview" "$pkgdir/usr/bin/lixun-preview"
   install -Dm644 "${srcdir}/systemd-lixund.service" "$pkgdir/usr/lib/systemd/user/lixund.service"
-  install -Dm644 "${srcdir}/lixun.desktop" "$pkgdir/usr/share/applications/lixun.desktop"
+  install -Dm644 "${srcdir}/app.lixun.daemon.desktop" "$pkgdir/usr/share/applications/app.lixun.daemon.desktop"
 }
