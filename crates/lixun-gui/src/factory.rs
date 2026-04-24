@@ -405,6 +405,13 @@ pub(crate) fn create_list_factory(entry: gtk::Entry) -> gtk::SignalListItemFacto
         // feedback — same UX as the old "install only for
         // File/Attachment" code path. The key difference is no
         // per-bind add_controller churn.
+        //
+        // For file rows we hand GTK4 a GdkFileList wrapped in a
+        // ContentProvider. GdkFileList registers the provider under
+        // both `text/uri-list` and `application/vnd.portal.filetransfer`,
+        // which is what Nautilus / Dolphin / Thunar / Files accept.
+        // Passing a bare GString URI instead (as we used to) resolves
+        // to `text/plain`, which every file manager silently rejects.
         let drag_state = Rc::clone(&state);
         let drag = gtk::DragSource::new();
         drag.set_actions(gdk::DragAction::COPY);
@@ -413,8 +420,8 @@ pub(crate) fn create_list_factory(entry: gtk::Entry) -> gtk::SignalListItemFacto
             let hit = cached_hit_by_id(&doc_id)?;
             let path = hit_file_path(&hit)?;
             let file = gio::File::for_path(&path);
-            let uri = file.uri();
-            let content = gdk::ContentProvider::for_value(&uri.to_value());
+            let file_list = gdk::FileList::from_array(&[file]);
+            let content = gdk::ContentProvider::for_value(&file_list.to_value());
             if let Some(paintable) = resolve_icon(&hit, ICON_SIZE_NORMAL) {
                 source.set_icon(Some(&paintable), 0, 0);
             }
