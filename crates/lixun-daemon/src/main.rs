@@ -750,6 +750,7 @@ mod tests {
             sender: None,
             recipients: None,
             body: None,
+            secondary_action: None,
         }
     }
 

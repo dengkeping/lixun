@@ -467,6 +467,7 @@ mod tests {
             sender: None,
             recipients: None,
             body: None,
+            secondary_action: None,
         }
     }
 
@@ -493,6 +494,7 @@ mod tests {
             sender: None,
             recipients: None,
             body: None,
+            secondary_action: None,
         };
         assert_eq!(EmailPreview.match_score(&hit), 60);
     }
@@ -524,6 +526,7 @@ mod tests {
             sender: None,
             recipients: None,
             body: None,
+            secondary_action: None,
         };
         assert_eq!(EmailPreview.match_score(&hit), 0);
     }
@@ -588,6 +591,7 @@ mod tests {
             sender: Some("alice@example.com".into()),
             recipients: Some("bob@example.com".into()),
             body: Some("gloda-stored body snippet".into()),
+            secondary_action: None,
         };
         assert!(
             EmailPreview.match_score(&hit) >= 60,

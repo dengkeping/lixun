@@ -129,6 +129,7 @@ pub(crate) fn synthetic_history_hits(queries: &[String]) -> Vec<Hit> {
             sender: None,
             recipients: None,
             body: None,
+            secondary_action: None,
         })
         .collect()
 }

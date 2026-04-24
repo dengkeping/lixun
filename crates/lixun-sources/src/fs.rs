@@ -113,7 +113,8 @@ impl FsSource {
             // (nautilus/dolphin/nemo/...), so the same OpenFile
             // variant works for both files and dirs without needing
             // a separate OpenFolder action.
-            action: Action::OpenFile { path: meta.path },
+            action: Action::OpenFile { path: meta.path.clone() },
+            secondary_action: Some(Action::ShowInFileManager { path: meta.path }),
             sender: None,
             recipients: None,
             extract_fail,
