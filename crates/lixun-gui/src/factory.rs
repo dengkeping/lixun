@@ -134,9 +134,30 @@ pub(crate) fn synthetic_history_hits(queries: &[String]) -> Vec<Hit> {
         .collect()
 }
 
-fn build_menu_for(category: &Category) -> gio::Menu {
+fn placeholder_file_hit() -> Hit {
+    use lixun_core::{Action, DocId};
+    Hit {
+        id: DocId(String::new()),
+        category: Category::File,
+        title: String::new(),
+        subtitle: String::new(),
+        icon_name: None,
+        kind_label: None,
+        score: 0.0,
+        action: Action::OpenFile {
+            path: std::path::PathBuf::new(),
+        },
+        extract_fail: false,
+        sender: None,
+        recipients: None,
+        body: None,
+        secondary_action: None,
+    }
+}
+
+fn build_menu_for(hit: &Hit) -> gio::Menu {
     let menu = gio::Menu::new();
-    match category {
+    match hit.category {
         Category::App => {
             menu.append(Some("Launch"), Some("row.open"));
             menu.append(Some("Copy name"), Some("row.copy"));
@@ -149,14 +170,16 @@ fn build_menu_for(category: &Category) -> gio::Menu {
             menu.append(Some("Get Info"), Some("row.info"));
         }
         Category::Mail => {
-            menu.append(Some("Open in Thunderbird"), Some("row.open"));
+            menu.append(Some("Open mail"), Some("row.open"));
             menu.append(Some("Copy subject"), Some("row.copy"));
         }
         Category::Attachment => {
             menu.append(Some("Open"), Some("row.open"));
             menu.append(Some("Quick Look"), Some("row.quicklook"));
             menu.append(Some("Copy filename"), Some("row.copy"));
-            menu.append(Some("Open parent mail"), Some("row.reveal"));
+            if hit.secondary_action.is_some() {
+                menu.append(Some("Open parent mail"), Some("row.reveal"));
+            }
         }
     }
     menu
@@ -349,12 +372,13 @@ pub(crate) fn create_list_factory(entry: gtk::Entry) -> gtk::SignalListItemFacto
         row.insert_action_group("row", Some(&group));
 
         // ===== Right-click popover (persistent, menu model swapped on bind) =====
-        // PopoverMenu is built once with the File-category menu
-        // as a placeholder; connect_bind swaps the model via
-        // set_menu_model(Some(&build_menu_for(&cat))) to match
-        // the currently-bound hit. Parented once; never rebuilt.
+        // PopoverMenu is built once with a File-shaped placeholder
+        // menu; connect_bind swaps the model via
+        // set_menu_model(Some(&build_menu_for(hit))) to match the
+        // currently-bound hit. Parented once; never rebuilt.
+        let placeholder_hit = placeholder_file_hit();
         let right_click_popover =
-            gtk::PopoverMenu::from_model(Some(&build_menu_for(&Category::File)));
+            gtk::PopoverMenu::from_model(Some(&build_menu_for(&placeholder_hit)));
         right_click_popover.set_parent(&row);
         right_click_popover.set_has_arrow(false);
 
@@ -544,7 +568,7 @@ fn on_item_notify(
                 .unwrap_or_else(|| category_kind_fallback(&hit.category).to_string());
             kind.set_text(&kind_text);
 
-            right_click_popover.set_menu_model(Some(&build_menu_for(&hit.category)));
+            right_click_popover.set_menu_model(Some(&build_menu_for(hit)));
 
             let mut s = state.borrow_mut();
             s.doc_id = Some(doc_id);
@@ -622,27 +646,59 @@ fn apply_top_hit_styling(list_item: &gtk::ListItem) {
 mod tests {
     use super::*;
 
+    fn hit_with(category: Category, secondary: Option<Action>) -> Hit {
+        use lixun_core::DocId;
+        Hit {
+            id: DocId(String::new()),
+            category,
+            title: String::new(),
+            subtitle: String::new(),
+            icon_name: None,
+            kind_label: None,
+            score: 0.0,
+            action: Action::OpenFile {
+                path: std::path::PathBuf::new(),
+            },
+            extract_fail: false,
+            sender: None,
+            recipients: None,
+            body: None,
+            secondary_action: secondary.map(Box::new),
+        }
+    }
+
     #[test]
     fn menu_for_file_has_expected_items() {
-        let menu = build_menu_for(&Category::File);
+        let menu = build_menu_for(&hit_with(Category::File, None));
         assert_eq!(menu.n_items(), 5);
     }
 
     #[test]
     fn menu_for_app_has_expected_items() {
-        let menu = build_menu_for(&Category::App);
+        let menu = build_menu_for(&hit_with(Category::App, None));
         assert_eq!(menu.n_items(), 2);
     }
 
     #[test]
     fn menu_for_mail_has_expected_items() {
-        let menu = build_menu_for(&Category::Mail);
+        let menu = build_menu_for(&hit_with(Category::Mail, None));
         assert_eq!(menu.n_items(), 2);
     }
 
     #[test]
-    fn menu_for_attachment_has_expected_items() {
-        let menu = build_menu_for(&Category::Attachment);
+    fn menu_for_attachment_without_secondary_omits_parent_mail() {
+        let menu = build_menu_for(&hit_with(Category::Attachment, None));
+        assert_eq!(menu.n_items(), 3);
+    }
+
+    #[test]
+    fn menu_for_attachment_with_secondary_has_parent_mail() {
+        let menu = build_menu_for(&hit_with(
+            Category::Attachment,
+            Some(Action::OpenUri {
+                uri: "mid:parent@example.com".into(),
+            }),
+        ));
         assert_eq!(menu.n_items(), 4);
     }
 

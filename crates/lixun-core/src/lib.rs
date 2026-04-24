@@ -114,8 +114,6 @@ pub enum Action {
     OpenFile { path: PathBuf },
     /// Show file in file manager.
     ShowInFileManager { path: PathBuf },
-    /// Open a mail message in Thunderbird.
-    OpenMail { message_id: String },
     /// Extract an attachment to a temp file and open it.
     OpenAttachment {
         mbox_path: PathBuf,
@@ -125,8 +123,6 @@ pub enum Action {
         encoding: String,
         suggested_filename: String,
     },
-    /// Open the parent mail for an attachment.
-    OpenParentMail { message_id: String },
     /// Replace the current search query with this text (used for recent-query hits).
     ReplaceQuery { q: String },
     /// Execute an arbitrary command. Generic escape hatch for plugin sources.
@@ -308,9 +304,6 @@ mod tests {
             Action::ShowInFileManager {
                 path: PathBuf::from("/tmp"),
             },
-            Action::OpenMail {
-                message_id: "12345".to_string(),
-            },
             Action::OpenAttachment {
                 mbox_path: PathBuf::from("/tmp/mail.mbox"),
                 byte_offset: 100,
@@ -343,9 +336,6 @@ mod tests {
                     Action::ShowInFileManager { path: p2 },
                 ) => {
                     assert_eq!(p1, p2);
-                }
-                (Action::OpenMail { message_id: m1 }, Action::OpenMail { message_id: m2 }) => {
-                    assert_eq!(m1, m2);
                 }
                 (
                     Action::OpenAttachment {
