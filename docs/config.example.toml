@@ -454,3 +454,15 @@ max_file_size_mb = 200
 # # your mailbox is huge and search across attachment bodies isn't worth
 # # the disk I/O; gloda message search continues to work either way.
 # # attachments = true
+
+# ───────────────────────────────────────────────────────────────────
+# Calculator plugin
+# ───────────────────────────────────────────────────────────────────
+# Inline math evaluator. Queries that begin with `=` are handed to this
+# plugin; e.g. `= 2+2`, `= sqrt(16)+pi`. Pressing Enter on the result
+# replaces the query with the computed value. Calculator queries are
+# never recorded in the frecency log.
+#
+# The plugin has no configurable options; presence of this empty stanza
+# is what enables it. Remove the `[calculator]` line to disable.
+[calculator]

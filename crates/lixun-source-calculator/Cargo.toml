@@ -1,0 +1,17 @@
+[package]
+name = "lixun-source-calculator"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "lixun_source_calculator"
+path = "src/lib.rs"
+
+[dependencies]
+lixun-core = { path = "../lixun-core" }
+lixun-sources = { path = "../lixun-sources" }
+anyhow.workspace = true
+serde.workspace = true
+toml = "0.8"
+tracing.workspace = true
+meval = "0.2"                     # unmaintained; tracked in plan R7
