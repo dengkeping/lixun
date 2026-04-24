@@ -16,3 +16,7 @@ use lixun_source_maildir as _;
 #[cfg(feature = "thunderbird")]
 #[allow(unused_imports)]
 use lixun_source_thunderbird as _;
+
+#[cfg(feature = "calculator")]
+#[allow(unused_imports)]
+use lixun_source_calculator as _;

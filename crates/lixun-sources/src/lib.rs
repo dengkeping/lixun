@@ -13,5 +13,5 @@ pub mod source;
 pub use inventory;
 pub use source::{
     IndexerSource, Mutation, MutationSink, PluginBuildContext, PluginFactory, PluginFactoryEntry,
-    PluginInstance, SourceContext, SourceEvent, SourceEventKind, WatchSpec,
+    PluginInstance, QueryContext, SourceContext, SourceEvent, SourceEventKind, WatchSpec,
 };
