@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg"
+     viewBox="0 0 512 512"
+     width="512" height="512">
+  <title>Lixun</title>
+
+  <!-- Navy backdrop with slight rounding so it seats well on every launcher -->
+  <rect x="0" y="0" width="512" height="512" rx="96" ry="96" fill="#1a2332"/>
+
+  <!-- Magnifying-glass handle, laid down first so the lens rim covers its tip -->
+  <line x1="350" y1="350" x2="460" y2="460"
+        stroke="#d4af37" stroke-width="40" stroke-linecap="round"/>
+
+  <!-- Magnifying-glass lens: hollow gold ring with a faint interior wash so the
+       characters read against the navy while still feeling 'inside' the lens -->
+  <circle cx="212" cy="212" r="150"
+          fill="#1a2332"
+          stroke="#d4af37" stroke-width="20"/>
+
+  <!-- 利寻 — Chinese reading of Lixun. Stacked vertically, gold on navy.
+       Noto / CJK fallback chain covers every Linux distro we target;
+       serif family gives the stroke weight enough presence at small sizes. -->
+  <text x="212" y="188"
+        text-anchor="middle"
+        font-family="'Noto Serif CJK SC', 'Source Han Serif SC', 'Noto Sans CJK SC', serif"
+        font-size="110"
+        font-weight="700"
+        fill="#d4af37">利</text>
+  <text x="212" y="290"
+        text-anchor="middle"
+        font-family="'Noto Serif CJK SC', 'Source Han Serif SC', 'Noto Sans CJK SC', serif"
+        font-size="110"
+        font-weight="700"
+        fill="#d4af37">寻</text>
+</svg>
