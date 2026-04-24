@@ -129,7 +129,12 @@ impl ThunderbirdAttachmentsSource {
                         sender: None,
                         recipients: None,
                         source_instance: "builtin:tb_attachments".into(),
-                        secondary_action: None,
+                        secondary_action: part
+                            .message_id
+                            .as_ref()
+                            .map(|mid| Action::OpenUri {
+                                uri: format!("mid:{mid}"),
+                            }),
                         extra: Vec::new(),
                     });
                 }
@@ -244,5 +249,58 @@ mod tests {
         let (icon_name, kind_label) = attachment_metadata("application/pdf");
         assert_eq!(icon_name.as_deref(), Some("application-pdf"));
         assert_eq!(kind_label.as_deref(), Some("Attachment · PDF Document"));
+    }
+
+    #[test]
+    fn attachment_with_message_id_has_openuri_secondary() {
+        let dir = tempdir().unwrap();
+        let profile = dir.path();
+        let inbox_dir = profile.join("Mail").join("Local Folders");
+        std::fs::create_dir_all(&inbox_dir).unwrap();
+
+        let body = base64::engine::general_purpose::STANDARD.encode("payload");
+        let mbox = format!(
+            "From alice@example.com Wed Jan 01 00:00:00 2025\nFrom: alice@example.com\nSubject: With id\nMessage-ID: <mid-present@example.com>\nContent-Type: multipart/mixed; boundary=\"BB\"\nMIME-Version: 1.0\n\n--BB\nContent-Type: text/plain\n\nhi\n--BB\nContent-Type: text/plain; name=\"a.txt\"\nContent-Disposition: attachment; filename=\"a.txt\"\nContent-Transfer-Encoding: base64\n\n{body}\n--BB--\n"
+        );
+        std::fs::write(inbox_dir.join("Inbox"), mbox).unwrap();
+
+        let source = ThunderbirdAttachmentsSource::new(profile.to_path_buf(), 100 * 1024 * 1024);
+        let docs = source.index_all().unwrap();
+        let attachment = docs
+            .iter()
+            .find(|d| matches!(d.category, Category::Attachment))
+            .expect("attachment document present");
+        match &attachment.secondary_action {
+            Some(Action::OpenUri { uri }) => {
+                assert_eq!(uri, "mid:mid-present@example.com");
+            }
+            other => panic!("expected OpenUri secondary, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn attachment_without_message_id_has_no_secondary() {
+        let dir = tempdir().unwrap();
+        let profile = dir.path();
+        let inbox_dir = profile.join("Mail").join("Local Folders");
+        std::fs::create_dir_all(&inbox_dir).unwrap();
+
+        let body = base64::engine::general_purpose::STANDARD.encode("payload");
+        let mbox = format!(
+            "From alice@example.com Wed Jan 01 00:00:00 2025\nFrom: alice@example.com\nSubject: No id\nContent-Type: multipart/mixed; boundary=\"BB\"\nMIME-Version: 1.0\n\n--BB\nContent-Type: text/plain\n\nhi\n--BB\nContent-Type: text/plain; name=\"a.txt\"\nContent-Disposition: attachment; filename=\"a.txt\"\nContent-Transfer-Encoding: base64\n\n{body}\n--BB--\n"
+        );
+        std::fs::write(inbox_dir.join("Inbox"), mbox).unwrap();
+
+        let source = ThunderbirdAttachmentsSource::new(profile.to_path_buf(), 100 * 1024 * 1024);
+        let docs = source.index_all().unwrap();
+        let attachment = docs
+            .iter()
+            .find(|d| matches!(d.category, Category::Attachment))
+            .expect("attachment document present");
+        assert!(
+            attachment.secondary_action.is_none(),
+            "expected no secondary when Message-ID header absent, got {:?}",
+            attachment.secondary_action
+        );
     }
 }
