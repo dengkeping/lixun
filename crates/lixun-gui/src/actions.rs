@@ -197,16 +197,29 @@ fn dispatch_action(action: &Action) -> Result<()> {
         Action::Exec {
             cmdline,
             working_dir,
+            terminal,
         } => {
             let Some((program, args)) = cmdline.split_first() else {
                 anyhow::bail!("Action::Exec has empty cmdline");
             };
-            let mut cmd = std::process::Command::new(program);
-            cmd.args(args);
-            if let Some(dir) = working_dir {
-                cmd.current_dir(dir);
+            if *terminal {
+                let spawn = terminal_spawn();
+                let mut term_cmd = std::process::Command::new(&spawn.program);
+                term_cmd.args(&spawn.args_before_exec);
+                term_cmd.arg(program);
+                term_cmd.args(args);
+                if let Some(dir) = working_dir {
+                    term_cmd.current_dir(dir);
+                }
+                term_cmd.spawn()?;
+            } else {
+                let mut cmd = std::process::Command::new(program);
+                cmd.args(args);
+                if let Some(dir) = working_dir {
+                    cmd.current_dir(dir);
+                }
+                cmd.spawn()?;
             }
-            cmd.spawn()?;
             Ok(())
         }
     }
