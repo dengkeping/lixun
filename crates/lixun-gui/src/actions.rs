@@ -164,7 +164,7 @@ pub(crate) fn execute_action(hit: &Hit) -> Result<()> {
 
 pub(crate) fn execute_secondary_action(hit: &Hit) -> Result<()> {
     match &hit.action {
-        Action::ShowInFileManager { path } => {
+        Action::OpenFile { path } | Action::ShowInFileManager { path } => {
             if path.is_dir() {
                 std::process::Command::new("xdg-open").arg(path).spawn()?;
             } else {
