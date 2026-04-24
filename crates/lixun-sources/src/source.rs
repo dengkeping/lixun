@@ -1,10 +1,18 @@
 use anyhow::Result;
-use lixun_core::{Document, PluginFieldSpec};
+use lixun_core::{Document, Hit, PluginFieldSpec};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 pub struct SourceContext<'a> {
+    pub instance_id: &'a str,
+    pub state_dir: &'a Path,
+}
+
+/// Per-query context passed to `IndexerSource::on_query`. Mirrors
+/// `SourceContext` but scoped to a single synchronous search. Plugins
+/// may use `state_dir` for per-instance caches keyed by query.
+pub struct QueryContext<'a> {
     pub instance_id: &'a str,
     pub state_dir: &'a Path,
 }
@@ -76,6 +84,26 @@ pub trait IndexerSource: Send + Sync {
 
     fn extra_fields(&self) -> &'static [PluginFieldSpec] {
         &[]
+    }
+
+    /// Synchronous per-query hook. Called once per search after the
+    /// Tantivy pass returns and per-category multipliers have been
+    /// applied. Plugins return extra `Hit`s with scores set
+    /// explicitly (not subject to ranking multipliers). Default
+    /// returns no hits — plugins that don't need query-time
+    /// augmentation can ignore this method.
+    fn on_query(&self, _query: &str, _ctx: &QueryContext) -> Vec<Hit> {
+        Vec::new()
+    }
+
+    /// Whether `query` should be excluded from the frecency log.
+    /// The daemon fans out to every plugin in `RecordQuery` /
+    /// `RecordQueryClick` paths; if any plugin returns `true`, the
+    /// query is not recorded. Used by calculator (`= 2+2`) and
+    /// shell (`> ls`) prefixes to keep computational queries out of
+    /// the frecency history. Default returns `false`.
+    fn excludes_from_query_log(&self, _query: &str) -> bool {
+        false
     }
 }
 

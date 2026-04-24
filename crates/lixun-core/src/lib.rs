@@ -10,6 +10,8 @@ pub enum Category {
     File,
     Mail,
     Attachment,
+    Calculator,
+    Shell,
 }
 
 impl Category {
@@ -19,6 +21,8 @@ impl Category {
             Category::File => "file",
             Category::Mail => "mail",
             Category::Attachment => "attachment",
+            Category::Calculator => "calculator",
+            Category::Shell => "shell",
         }
     }
 }
@@ -90,6 +94,7 @@ impl RankingConfig {
             Category::File => self.files,
             Category::Mail => self.mail,
             Category::Attachment => self.attachments,
+            Category::Calculator | Category::Shell => 1.0,
         }
     }
 }
@@ -269,6 +274,8 @@ mod tests {
         assert_eq!(Category::File.as_str(), "file");
         assert_eq!(Category::Mail.as_str(), "mail");
         assert_eq!(Category::Attachment.as_str(), "attachment");
+        assert_eq!(Category::Calculator.as_str(), "calculator");
+        assert_eq!(Category::Shell.as_str(), "shell");
     }
 
     #[test]

@@ -24,6 +24,8 @@ fn category_fallback(cat: &Category) -> &'static str {
         Category::File => "text-x-generic",
         Category::Mail => "mail-message",
         Category::Attachment => "mail-attachment",
+        Category::Calculator => "accessories-calculator",
+        Category::Shell => "utilities-terminal",
     }
 }
 
