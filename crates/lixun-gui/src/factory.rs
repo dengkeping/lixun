@@ -40,6 +40,8 @@ fn category_kind_fallback(cat: &Category) -> &'static str {
         Category::File => "File",
         Category::Mail => "Email",
         Category::Attachment => "Attachment",
+        Category::Calculator => "Calculator",
+        Category::Shell => "Shell",
     }
 }
 
@@ -180,6 +182,12 @@ fn build_menu_for(hit: &Hit) -> gio::Menu {
             if hit.secondary_action.is_some() {
                 menu.append(Some("Open parent mail"), Some("row.reveal"));
             }
+        }
+        Category::Calculator => {
+            menu.append(Some("Copy result"), Some("row.copy"));
+        }
+        Category::Shell => {
+            menu.append(Some("Copy command"), Some("row.copy"));
         }
     }
     menu
@@ -636,6 +644,8 @@ fn apply_top_hit_styling(list_item: &gtk::ListItem) {
                     Category::File => "text-x-generic",
                     Category::Mail => "mail-message",
                     Category::Attachment => "mail-attachment",
+                    Category::Calculator => "accessories-calculator",
+                    Category::Shell => "utilities-terminal",
                 }));
             }
         }
