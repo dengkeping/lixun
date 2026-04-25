@@ -404,13 +404,14 @@ inventory::submit! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lixun_core::paths::canonical_fs_doc_id;
     use lixun_core::DocId;
     use std::path::PathBuf;
 
     fn eml_hit(path: impl Into<PathBuf>) -> Hit {
         let path = path.into();
         Hit {
-            id: DocId(format!("fs:{}", path.display())),
+            id: DocId(canonical_fs_doc_id(&path)),
             category: Category::File,
             title: path
                 .file_name()

@@ -5,6 +5,7 @@
 //! 2. **Content pass** (rayon pool): extracts body text in parallel.
 
 use anyhow::Result;
+use lixun_core::paths::{canonical_fs_doc_id, canonical_fs_path_str};
 use lixun_core::{Action, Category, DocId, Document};
 use lixun_extract::ExtractorCapabilities;
 use rayon::prelude::*;
@@ -198,6 +199,10 @@ impl FsSource {
 
         Document {
             id: DocId(format!("fs:{}", meta.path_str)),
+            // meta.path_str is already canonical (set in
+            // index_incremental_batched / index_all), so this is
+            // equivalent to canonical_fs_doc_id(&meta.path) but
+            // avoids re-running canonicalize on every document.
             category: Category::File,
             title: meta.filename,
             subtitle: meta.path_str.clone(),
@@ -284,10 +289,10 @@ impl FsSource {
                     })
                     .unwrap_or(0);
 
-                let path_str = path.to_string_lossy().to_string();
+                let path_str = canonical_fs_path_str(path);
                 current_files.insert(path_str.clone());
 
-                let doc_id = format!("fs:{}", path_str);
+                let doc_id = canonical_fs_doc_id(path);
                 let in_index = indexed_ids.contains(&doc_id);
                 if manifest.is_unchanged(&path_str, mtime) && in_index {
                     continue;
@@ -320,7 +325,7 @@ impl FsSource {
         let deleted_ids: Vec<String> = manifest
             .known_paths()
             .filter(|p| !current_files.contains(*p))
-            .map(|p| format!("fs:{}", p))
+            .map(|p| format!("fs:{p}"))
             .collect();
 
         for path in &deleted_ids {
@@ -457,7 +462,7 @@ impl FsSource {
 
                 metas.push(FileMeta {
                     path: path.to_path_buf(),
-                    path_str: path.to_string_lossy().to_string(),
+                    path_str: canonical_fs_path_str(path),
                     filename: path
                         .file_name()
                         .map(|n| n.to_string_lossy().to_string())
@@ -590,7 +595,7 @@ fn maybe_enqueue_ocr(
     if !lixun_extract::ocr::is_ocr_candidate(&ext) {
         return;
     }
-    let doc_id = format!("fs:{}", path.to_string_lossy());
+    let doc_id = canonical_fs_doc_id(path);
     // DB-16: skip enqueue when a prior OCR pass already populated the
     // body in Tantivy. Probe errors fall through to enqueue — the
     // OcrQueue's INSERT OR IGNORE still dedups at the DB layer, so
@@ -726,7 +731,7 @@ mod tests {
             let calls = mock.calls.lock().unwrap();
             assert_eq!(calls.len(), 1, "exactly one enqueue expected");
             let (doc_id, path, _mtime, size, ext) = &calls[0];
-            assert_eq!(doc_id, &format!("fs:{}", png.to_string_lossy()));
+            assert_eq!(doc_id, &canonical_fs_doc_id(&png));
             assert_eq!(path, &png);
             assert_eq!(ext, "png");
             assert!(*size > 0);
@@ -809,8 +814,7 @@ mod tests {
             let sink: Arc<dyn OcrEnqueue> = mock_enq.clone();
 
             let mut body = MockHasBody::default();
-            body.has_body_for
-                .insert(format!("fs:{}", png.to_string_lossy()));
+            body.has_body_for.insert(canonical_fs_doc_id(&png));
             let body: Arc<dyn HasBody> = Arc::new(body);
 
             let _ = FsSource::extract_content(
@@ -965,6 +969,46 @@ mod tests {
             mock.calls.lock().unwrap().len(),
             1,
             "min=0 must preserve v1.1 unconditional-enqueue behaviour",
+        );
+    }
+
+    // Finding 2 regression guard: when a user-visible alias such as
+    // `~/Documents` is a symlink into a canonical root like
+    // `~/Nextcloud/Documents`, indexing the file through each path must
+    // yield exactly one doc id. Until we switched to
+    // `canonical_fs_doc_id`, the enqueue side saw `fs:<alias>/scan.png`
+    // and the upsert side later recorded `fs:<canonical>/scan.png`,
+    // producing double-OCR and a ghost row.
+    #[test]
+    fn maybe_enqueue_ocr_uses_canonical_doc_id_through_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real_dir = tmp.path().join("real");
+        std::fs::create_dir(&real_dir).unwrap();
+        let alias_dir = tmp.path().join("alias");
+        std::os::unix::fs::symlink(&real_dir, &alias_dir).unwrap();
+
+        let real_png = real_dir.join("scan.png");
+        write_png(&real_png, 512, 512);
+        let alias_png = alias_dir.join("scan.png");
+
+        let caps = ExtractorCapabilities::all_available_no_timeout();
+        let mock: Arc<MockEnqueue> = Arc::new(MockEnqueue::default());
+        let sink: Arc<dyn OcrEnqueue> = mock.clone();
+
+        super::maybe_enqueue_ocr(&alias_png, &caps, Some(sink.as_ref()), None, 0);
+
+        let calls = mock.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "alias path must enqueue once");
+        let (doc_id, _path, _mtime, _size, _ext) = &calls[0];
+        assert_eq!(
+            doc_id,
+            &canonical_fs_doc_id(&real_png),
+            "doc_id must canonicalize the symlinked ancestor",
+        );
+        assert_eq!(
+            doc_id,
+            &canonical_fs_doc_id(&alias_png),
+            "alias and real paths must map to the same doc_id",
         );
     }
 
