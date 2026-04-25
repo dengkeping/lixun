@@ -21,3 +21,6 @@ Cargo.lock
 # Local reference documents (PDFs, etc.) used for design research
 /docs/references/
 
+# Local knowledge-graph index caches (not distributed)
+/.gitnexus/
+/.code-review-graph/
