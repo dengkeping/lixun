@@ -214,12 +214,15 @@ pub fn cached_extract_bytes(
     Ok(text_to_option(text))
 }
 
+/// Convert a raw extractor result into the `Option<String>` the
+/// callers downstream expect. Whitespace-only outputs count as
+/// empty: pdftotext on a scan-only PDF emits a lone form-feed
+/// per page (`\x0c`), not a zero-length string, and must be
+/// treated as "no text recovered" so the OCR enqueue path in
+/// DB-13 can fire. The same normalisation applies to any other
+/// extractor whose failure mode is "produced whitespace only".
 fn text_to_option(s: String) -> Option<String> {
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
-    }
+    if s.trim().is_empty() { None } else { Some(s) }
 }
 
 #[cfg(test)]
@@ -385,6 +388,15 @@ mod tests {
             assert_eq!(stored.as_deref(), Some(""));
             assert_eq!(text_to_option(stored.unwrap()), None);
         });
+    }
+
+    #[test]
+    fn whitespace_only_text_counts_as_empty() {
+        assert_eq!(text_to_option("\x0c".into()), None);
+        assert_eq!(text_to_option("\x0c\n\x0c\n".into()), None);
+        assert_eq!(text_to_option("   \t\n".into()), None);
+        assert_eq!(text_to_option("hello".into()), Some("hello".into()));
+        assert_eq!(text_to_option(" hi ".into()), Some(" hi ".into()));
     }
 
     #[test]

@@ -38,13 +38,26 @@ pub trait IdleGate: Send + Sync + 'static {
 /// Target of the body mutation produced by each drained job.
 /// Abstracted out so unit tests can capture calls without spinning
 /// up a real `IndexWriter`. Production uses [`WriterSink`].
+///
+/// Async because [`tick_once`] runs on a tokio worker thread and
+/// the production implementation writes to the writer_loop mpsc
+/// with `tx.send(...).await`. A sync trait would force a nested
+/// `block_on` which panics at runtime.
 pub trait UpsertBodySink: Send + Sync + 'static {
-    fn upsert_body(&self, doc_id: &str, body: &str) -> Result<()>;
+    fn upsert_body<'a>(
+        &'a self,
+        doc_id: &'a str,
+        body: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>;
 }
 
 impl UpsertBodySink for WriterSink {
-    fn upsert_body(&self, doc_id: &str, body: &str) -> Result<()> {
-        WriterSink::upsert_body(self, doc_id, body)
+    fn upsert_body<'a>(
+        &'a self,
+        doc_id: &'a str,
+        body: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(WriterSink::upsert_body(self, doc_id, body))
     }
 }
 
@@ -151,7 +164,7 @@ where
                     let cur_mtime = filetime_secs(&md);
                     let cur_size = md.len();
                     if cur_mtime == expected_mtime && cur_size == expected_size {
-                        if let Err(e) = sink.upsert_body(&doc_id, &text) {
+                        if let Err(e) = sink.upsert_body(&doc_id, &text).await {
                             tracing::warn!("ocr: upsert_body failed for {doc_id}: {e:#}");
                             return TickOutcome::Failed {
                                 doc_id,
@@ -334,12 +347,17 @@ mod tests {
     }
 
     impl UpsertBodySink for CapturingSink {
-        fn upsert_body(&self, doc_id: &str, body: &str) -> Result<()> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push((doc_id.to_string(), body.to_string()));
-            Ok(())
+        fn upsert_body<'a>(
+            &'a self,
+            doc_id: &'a str,
+            body: &'a str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+            let doc_id = doc_id.to_string();
+            let body = body.to_string();
+            Box::pin(async move {
+                self.calls.lock().unwrap().push((doc_id, body));
+                Ok(())
+            })
         }
     }
 
