@@ -5,6 +5,7 @@ use std::path::Path;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+pub mod cache;
 pub mod shell;
 
 pub trait Extractor {
@@ -19,6 +20,23 @@ pub struct ExtractorCapabilities {
     pub has_antiword: bool,
     pub has_catdoc: bool,
     pub has_libreoffice: bool,
+    /// Tesseract OCR binary probed via `which`. When `false`, the OCR
+    /// worker never spawns and enqueue decisions short-circuit to "no".
+    pub has_tesseract: bool,
+    /// `pdftoppm` (from poppler-utils). Required to rasterize scan PDFs
+    /// before handing pages to tesseract. When `false`, PDF OCR is
+    /// unavailable even if tesseract is installed; image OCR still works.
+    pub has_pdftoppm: bool,
+    /// Language codes reported by `tesseract --list-langs`, sorted.
+    /// Empty when `has_tesseract == false`. Used by the OCR module to
+    /// filter user-requested langs and compute the cache engine tag.
+    pub tesseract_langs: Vec<String>,
+    /// Mirrors `[ocr].enabled` from daemon config. Defaults to `false`;
+    /// the daemon sets this explicitly at `init_capabilities` time when
+    /// the user has opted in. Kept as part of capabilities (not a
+    /// separate global) so every extraction call sees a consistent
+    /// snapshot without locking.
+    pub ocr_enabled: bool,
 }
 
 impl ExtractorCapabilities {
@@ -31,6 +49,10 @@ impl ExtractorCapabilities {
             has_antiword: true,
             has_catdoc: true,
             has_libreoffice: true,
+            has_tesseract: true,
+            has_pdftoppm: true,
+            tesseract_langs: vec!["chi_sim".into(), "eng".into(), "rus".into()],
+            ocr_enabled: true,
         }
     }
 
@@ -38,29 +60,158 @@ impl ExtractorCapabilities {
     /// Missing tools are logged at `warn` and disable their corresponding
     /// extractor; found tools log at `info` with the resolved path.
     pub fn probe(timeout: Duration) -> Self {
-        fn probe_tool(name: &str) -> bool {
-            match which::which(name) {
-                Ok(p) => {
-                    tracing::info!("extractor tool {}: found at {}", name, p.display());
-                    true
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        "extractor tool {}: NOT found — related content search disabled",
-                        name
-                    );
-                    false
-                }
+        Self::probe_with(timeout, which_command_exists, probe_tesseract_langs_system)
+    }
+
+    /// Testable core of `probe`: takes an injectable `command_exists`
+    /// predicate and a langs probe closure so unit tests can run without
+    /// relying on the host's installed binaries. Kept on the public type
+    /// rather than a free fn because `#[cfg(test)]` helpers need access
+    /// to all the private field assembly; exposing it outside the crate
+    /// would be a footgun (callers should use `probe`).
+    pub(crate) fn probe_with(
+        timeout: Duration,
+        command_exists: fn(&str) -> bool,
+        langs_probe: fn() -> Vec<String>,
+    ) -> Self {
+        fn log_probe(name: &str, found: bool) -> bool {
+            if found {
+                tracing::info!("extractor tool {}: found", name);
+            } else {
+                tracing::warn!(
+                    "extractor tool {}: NOT found — related content search disabled",
+                    name
+                );
             }
+            found
         }
+        let has_tesseract = log_probe("tesseract", command_exists("tesseract"));
+        let tesseract_langs = if has_tesseract {
+            let langs = langs_probe();
+            if langs.is_empty() {
+                tracing::warn!(
+                    "tesseract found but --list-langs parse yielded 0 langs — disabling OCR"
+                );
+            } else {
+                tracing::info!("tesseract found: {} langs ({:?})", langs.len(), langs);
+            }
+            langs
+        } else {
+            Vec::new()
+        };
+        // If langs probe returned empty, treat tesseract as absent — no
+        // point keeping the binary claim when we can't actually OCR.
+        let has_tesseract = has_tesseract && !tesseract_langs.is_empty();
         Self {
             timeout,
-            has_pdftotext: probe_tool("pdftotext"),
-            has_antiword: probe_tool("antiword"),
-            has_catdoc: probe_tool("catdoc"),
-            has_libreoffice: probe_tool("libreoffice"),
+            has_pdftotext: log_probe("pdftotext", command_exists("pdftotext")),
+            has_antiword: log_probe("antiword", command_exists("antiword")),
+            has_catdoc: log_probe("catdoc", command_exists("catdoc")),
+            has_libreoffice: log_probe("libreoffice", command_exists("libreoffice")),
+            has_tesseract,
+            has_pdftoppm: log_probe("pdftoppm", command_exists("pdftoppm")),
+            tesseract_langs,
+            ocr_enabled: false,
         }
     }
+}
+
+fn which_command_exists(name: &str) -> bool {
+    which::which(name).is_ok()
+}
+
+/// Run `tesseract --list-langs` with a hard 5-second timeout and return
+/// the sorted, de-duplicated list of language codes. Parses both stdout
+/// and stderr: tesseract 3.x historically printed langs to stderr,
+/// modern 4.x/5.x print to stdout; concatenating covers both.
+///
+/// Filtering uses a strict `^[a-z][a-z_]+$` shape — matches `eng`,
+/// `rus`, `chi_sim`; rejects the header line `List of available
+/// languages (N):` and stray blank lines. Returns an empty vec on any
+/// execution error so the caller can degrade gracefully (treat as "no
+/// tesseract").
+fn probe_tesseract_langs_system() -> Vec<String> {
+    use std::io::Read;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+    use std::thread;
+    use wait_timeout::ChildExt;
+
+    let mut child = match Command::new("tesseract")
+        .arg("--list-langs")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("tesseract --list-langs spawn failed: {e}");
+            return Vec::new();
+        }
+    };
+    let mut stdout_pipe = child.stdout.take().expect("piped stdout");
+    let mut stderr_pipe = child.stderr.take().expect("piped stderr");
+    let so = thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut buf);
+        buf
+    });
+    let se = thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut buf);
+        buf
+    });
+    match child.wait_timeout(Duration::from_secs(5)) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            let _ = unsafe { libc::killpg(child.id() as i32, libc::SIGKILL) };
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = so.join();
+            let _ = se.join();
+            tracing::warn!("tesseract --list-langs timed out after 5s");
+            return Vec::new();
+        }
+        Err(e) => {
+            tracing::warn!("tesseract --list-langs wait failed: {e}");
+            return Vec::new();
+        }
+    }
+    let stdout_bytes = so.join().unwrap_or_default();
+    let stderr_bytes = se.join().unwrap_or_default();
+    parse_tesseract_langs(&stdout_bytes, &stderr_bytes)
+}
+
+/// Pure parser for `tesseract --list-langs` output. Separated from the
+/// subprocess call so unit tests can exercise edge cases (stderr-only
+/// output, mixed header lines, duplicates) without spawning anything.
+fn parse_tesseract_langs(stdout: &[u8], stderr: &[u8]) -> Vec<String> {
+    let mut langs: Vec<String> = Vec::new();
+    for stream in [stdout, stderr] {
+        let s = String::from_utf8_lossy(stream);
+        for line in s.lines() {
+            let line = line.trim();
+            // ^[a-z][a-z_]+$ — lower-case ASCII, at least 2 chars,
+            // letters and underscore only. Accepts `eng`, `chi_sim`;
+            // rejects `List of available languages (3):`, blank lines,
+            // stray whitespace.
+            let bytes = line.as_bytes();
+            if bytes.len() < 2 {
+                continue;
+            }
+            let shape_ok = bytes[0].is_ascii_lowercase()
+                && bytes
+                    .iter()
+                    .all(|b| b.is_ascii_lowercase() || *b == b'_');
+            if shape_ok {
+                langs.push(line.to_string());
+            }
+        }
+    }
+    langs.sort();
+    langs.dedup();
+    langs
 }
 
 static EXTRACTOR_CAPS: OnceLock<ExtractorCapabilities> = OnceLock::new();
@@ -539,6 +690,10 @@ mod tests {
             has_antiword: false,
             has_catdoc: false,
             has_libreoffice: false,
+            has_tesseract: false,
+            has_pdftoppm: false,
+            tesseract_langs: Vec::new(),
+            ocr_enabled: false,
         };
         assert!(extractor_for_ext_with_caps("pdf", &caps).is_none());
         assert!(extractor_for_ext_with_caps("doc", &caps).is_none());
@@ -556,5 +711,106 @@ mod tests {
         assert!(extractor_for_ext_with_caps("doc", &caps).is_some());
         assert!(extractor_for_ext_with_caps("rtf", &caps).is_some());
         assert!(extractor_for_ext_with_caps("xyz", &caps).is_none());
+    }
+
+    #[test]
+    fn all_available_no_timeout_sets_ocr_true() {
+        let caps = ExtractorCapabilities::all_available_no_timeout();
+        assert!(caps.has_tesseract);
+        assert!(caps.has_pdftoppm);
+        assert!(caps.ocr_enabled);
+        assert!(!caps.tesseract_langs.is_empty());
+        assert!(caps.tesseract_langs.contains(&"eng".to_string()));
+        assert!(caps.tesseract_langs.contains(&"rus".to_string()));
+        assert!(caps.tesseract_langs.contains(&"chi_sim".to_string()));
+        let mut sorted = caps.tesseract_langs.clone();
+        sorted.sort();
+        assert_eq!(caps.tesseract_langs, sorted);
+    }
+
+    fn no_command_exists(_: &str) -> bool {
+        false
+    }
+    fn all_commands_exist(_: &str) -> bool {
+        true
+    }
+    fn only_tesseract_exists(name: &str) -> bool {
+        name == "tesseract"
+    }
+    fn langs_empty() -> Vec<String> {
+        Vec::new()
+    }
+    fn langs_eng_rus() -> Vec<String> {
+        vec!["eng".into(), "rus".into()]
+    }
+
+    #[test]
+    fn probe_without_tesseract_zeroes_ocr_fields() {
+        let caps =
+            ExtractorCapabilities::probe_with(Duration::from_secs(15), no_command_exists, langs_empty);
+        assert!(!caps.has_tesseract);
+        assert!(!caps.has_pdftoppm);
+        assert!(caps.tesseract_langs.is_empty());
+        assert!(!caps.ocr_enabled);
+        assert!(!caps.has_pdftotext);
+    }
+
+    #[test]
+    fn probe_with_tesseract_populates_langs() {
+        let caps = ExtractorCapabilities::probe_with(
+            Duration::from_secs(15),
+            all_commands_exist,
+            langs_eng_rus,
+        );
+        assert!(caps.has_tesseract);
+        assert!(caps.has_pdftoppm);
+        assert_eq!(caps.tesseract_langs, vec!["eng", "rus"]);
+        assert!(!caps.ocr_enabled, "ocr_enabled stays false until daemon flips it");
+    }
+
+    #[test]
+    fn probe_with_tesseract_but_empty_langs_disables_ocr() {
+        let caps = ExtractorCapabilities::probe_with(
+            Duration::from_secs(15),
+            only_tesseract_exists,
+            langs_empty,
+        );
+        assert!(
+            !caps.has_tesseract,
+            "empty langs must downgrade to has_tesseract=false"
+        );
+        assert!(caps.tesseract_langs.is_empty());
+    }
+
+    #[test]
+    fn parse_tesseract_langs_stdout_modern() {
+        let stdout = b"List of available languages (3):\neng\nrus\nchi_sim\n";
+        let langs = parse_tesseract_langs(stdout, b"");
+        assert_eq!(langs, vec!["chi_sim", "eng", "rus"]);
+    }
+
+    #[test]
+    fn parse_tesseract_langs_stderr_legacy() {
+        let stderr = b"List of available languages (2):\neng\nrus\n";
+        let langs = parse_tesseract_langs(b"", stderr);
+        assert_eq!(langs, vec!["eng", "rus"]);
+    }
+
+    #[test]
+    fn parse_tesseract_langs_dedups_across_streams() {
+        let langs = parse_tesseract_langs(b"eng\nrus\n", b"eng\nchi_sim\n");
+        assert_eq!(langs, vec!["chi_sim", "eng", "rus"]);
+    }
+
+    #[test]
+    fn parse_tesseract_langs_rejects_headers_and_noise() {
+        let stdout =
+            b"List of available languages (3):\neng\n  rus  \nABC\n123\n\nchi_sim\nosd\n";
+        let langs = parse_tesseract_langs(stdout, b"");
+        assert_eq!(
+            langs,
+            vec!["chi_sim", "eng", "osd", "rus"],
+            "uppercase `ABC`, digits `123`, header line and blanks must be rejected; `rus` passes after trim"
+        );
     }
 }
