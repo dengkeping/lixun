@@ -464,6 +464,31 @@ impl LixunIndex {
         Ok(Some(self.doc_from_tantivy(&tdoc)))
     }
 
+    /// Fetch just the `body` field for the doc with the given `id`.
+    /// Returns `Ok(Some(body))` only when a live doc matches AND its
+    /// stored body is non-empty after trimming; otherwise `Ok(None)`.
+    ///
+    /// Used by the DB-16 OCR enqueue short-circuit: if a prior OCR
+    /// pass already populated the body, re-crawling the document must
+    /// not re-enqueue it. Cheaper than `get_doc_by_id` — only looks at
+    /// one stored field instead of reconstructing the full `Document`.
+    pub fn get_body_by_id(&self, id: &str) -> Result<Option<String>> {
+        let reader = self.index.reader()?;
+        let searcher = reader.searcher();
+        let term = Term::from_field_text(self.schema.id, id);
+        let query = TermQuery::new(term, IndexRecordOption::Basic);
+        let top_docs = searcher.search(&query, &TopDocs::with_limit(1))?;
+        let Some((_, addr)) = top_docs.first() else {
+            return Ok(None);
+        };
+        let tdoc: TantivyDocument = searcher.doc(*addr)?;
+        let body = stored_optional_text(&tdoc, self.schema.body);
+        match body {
+            Some(text) if !text.trim().is_empty() => Ok(Some(text)),
+            _ => Ok(None),
+        }
+    }
+
     fn doc_from_tantivy(&self, tdoc: &TantivyDocument) -> Document {
         let s = &self.schema;
         let id = tdoc
@@ -1265,6 +1290,42 @@ mod tests {
         let path = tmp.path().to_str().unwrap();
         let index = LixunIndex::create_or_open(path, RankingConfig::default()).unwrap();
         assert!(index.get_doc_by_id("fs:/nope").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_get_body_by_id_returns_body_when_present() {
+        let doc = sample_document(
+            "fs:/tmp/withbody.txt",
+            "withbody.txt",
+            "the recovered body from a prior ocr pass",
+        );
+        let (_tmp, index) = create_index_with_docs(&[doc]);
+
+        let body = index
+            .get_body_by_id("fs:/tmp/withbody.txt")
+            .unwrap()
+            .expect("body must be present");
+        assert_eq!(body, "the recovered body from a prior ocr pass");
+    }
+
+    #[test]
+    fn test_get_body_by_id_returns_none_when_empty_or_missing() {
+        let empty = sample_document("fs:/tmp/empty.txt", "empty.txt", "");
+        let whitespace = sample_document("fs:/tmp/ws.txt", "ws.txt", "   \t\n  ");
+        let (_tmp, index) = create_index_with_docs(&[empty, whitespace]);
+
+        assert!(
+            index.get_body_by_id("fs:/tmp/empty.txt").unwrap().is_none(),
+            "empty body must surface as None"
+        );
+        assert!(
+            index.get_body_by_id("fs:/tmp/ws.txt").unwrap().is_none(),
+            "whitespace-only body must surface as None"
+        );
+        assert!(
+            index.get_body_by_id("fs:/nope").unwrap().is_none(),
+            "missing doc must surface as None"
+        );
     }
 
     #[test]

@@ -284,6 +284,7 @@ pub struct Config {
     pub plugin_sections: BTreeMap<String, toml::Value>,
     pub extractor_caps: std::sync::OnceLock<std::sync::Arc<lixun_extract::ExtractorCapabilities>>,
     pub ocr_enqueue: std::sync::OnceLock<std::sync::Arc<dyn lixun_sources::OcrEnqueue>>,
+    pub body_checker: std::sync::OnceLock<std::sync::Arc<dyn lixun_sources::HasBody>>,
 }
 
 /// Launcher + preview window sizing policy. Percentages are of the
@@ -357,6 +358,7 @@ impl Default for Config {
             plugin_sections: BTreeMap::new(),
             extractor_caps: std::sync::OnceLock::new(),
             ocr_enqueue: std::sync::OnceLock::new(),
+            body_checker: std::sync::OnceLock::new(),
         }
     }
 }
@@ -584,7 +586,8 @@ impl Config {
             self.max_file_size_mb,
             self.caps_arc(),
             self.ocr_enqueue.get().cloned(),
-        ))
+        )
+        .with_body_checker(self.body_checker.get().cloned()))
     }
 
     pub fn caps_arc(&self) -> std::sync::Arc<lixun_extract::ExtractorCapabilities> {
@@ -649,6 +652,9 @@ impl lixun_indexer::IndexerSources for Config {
     }
     fn ocr_enqueue(&self) -> Option<std::sync::Arc<dyn lixun_sources::OcrEnqueue>> {
         self.ocr_enqueue.get().cloned()
+    }
+    fn body_checker(&self) -> Option<std::sync::Arc<dyn lixun_sources::HasBody>> {
+        self.body_checker.get().cloned()
     }
 }
 

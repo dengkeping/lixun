@@ -14,8 +14,8 @@
 use crate::index_service::{IndexMutationTx, Mutation, fs_doc_id, index_file};
 use anyhow::Result;
 use lixun_extract::ExtractorCapabilities;
-use lixun_sources::OcrEnqueue;
 use lixun_sources::exclude::path_excluded;
+use lixun_sources::{HasBody, OcrEnqueue};
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -71,6 +71,7 @@ pub fn stats() -> (u64, u64, u64, u64) {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn start(
     roots: Vec<PathBuf>,
     exclude: Vec<String>,
@@ -78,6 +79,7 @@ pub async fn start(
     max_file_size_mb: u64,
     caps: Arc<ExtractorCapabilities>,
     ocr_enqueue: Option<Arc<dyn OcrEnqueue>>,
+    body_checker: Option<Arc<dyn HasBody>>,
     mutation_tx: IndexMutationTx,
 ) -> Result<()> {
     let (raw_tx, raw_rx) = mpsc::channel::<RawEvent>(RAW_EVENT_QUEUE_CAP);
@@ -112,6 +114,7 @@ pub async fn start(
             max_file_size_mb,
             caps: Arc::clone(&caps),
             ocr_enqueue: ocr_enqueue.clone(),
+            body_checker: body_checker.clone(),
         };
         tokio::spawn(resolver_task(worker_id, rx, mutation_tx, ctrl_tx, refresh_tx, env));
     }
@@ -323,6 +326,7 @@ struct ResolverEnv {
     max_file_size_mb: u64,
     caps: Arc<ExtractorCapabilities>,
     ocr_enqueue: Option<Arc<dyn OcrEnqueue>>,
+    body_checker: Option<Arc<dyn HasBody>>,
 }
 
 async fn resolver_task(
@@ -345,6 +349,7 @@ async fn resolver_task(
                 let path_blocking = path.clone();
                 let caps_b = Arc::clone(&env.caps);
                 let enq_b = env.ocr_enqueue.clone();
+                let body_b = env.body_checker.clone();
                 let max_size = env.max_file_size_mb;
                 let result = tokio::task::spawn_blocking(move || {
                     resolve_refresh(
@@ -353,6 +358,7 @@ async fn resolver_task(
                         max_size,
                         &caps_b,
                         enq_b.as_ref().map(|a| a.as_ref() as &dyn OcrEnqueue),
+                        body_b.as_ref().map(|a| a.as_ref() as &dyn HasBody),
                     )
                 })
                 .await;
@@ -417,6 +423,7 @@ fn resolve_refresh(
     max_file_size_mb: u64,
     caps: &ExtractorCapabilities,
     ocr_enqueue: Option<&dyn OcrEnqueue>,
+    body_checker: Option<&dyn HasBody>,
 ) -> Resolved {
     let Ok(meta) = std::fs::metadata(path) else {
         return Resolved::Gone;
@@ -425,7 +432,7 @@ fn resolve_refresh(
         return Resolved::Skip;
     }
     if meta.is_file() {
-        match index_file(path, max_file_size_mb, caps, ocr_enqueue) {
+        match index_file(path, max_file_size_mb, caps, ocr_enqueue, body_checker) {
             Ok(doc) => Resolved::File(Box::new(doc)),
             Err(_) => Resolved::Skip,
         }

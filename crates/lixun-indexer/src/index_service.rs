@@ -108,6 +108,15 @@ impl SearchHandle {
         let idx = self.index.lock().await;
         idx.all_doc_ids()
     }
+
+    /// Returns true when the doc identified by `doc_id` exists in the
+    /// live index AND has a non-empty stored body. Used by the DB-16
+    /// OCR enqueue short-circuit so a fresh reindex does not re-queue
+    /// documents whose body was recovered in a prior OCR pass.
+    pub async fn has_body(&self, doc_id: &str) -> Result<bool> {
+        let idx = self.index.lock().await;
+        Ok(idx.get_body_by_id(doc_id)?.is_some())
+    }
 }
 
 pub fn spawn_writer_service(
@@ -409,6 +418,7 @@ pub fn index_file(
     max_file_size_mb: u64,
     caps: &lixun_extract::ExtractorCapabilities,
     enqueue: Option<&dyn lixun_sources::OcrEnqueue>,
+    body_checker: Option<&dyn lixun_sources::HasBody>,
 ) -> Result<Document> {
     use lixun_core::{Action, Category, DocId};
 
@@ -434,7 +444,7 @@ pub fn index_file(
     let (body, extract_fail) = if is_dir {
         (None, false)
     } else if size <= max_size {
-        match lixun_sources::fs::FsSource::extract_content(path, caps, enqueue) {
+        match lixun_sources::fs::FsSource::extract_content(path, caps, enqueue, body_checker) {
             Ok(Some(text)) => (Some(text), false),
             Ok(None) => (None, false),
             Err(_) => (None, true),
