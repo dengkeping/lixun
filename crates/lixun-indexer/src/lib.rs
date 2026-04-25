@@ -2,6 +2,7 @@ pub mod index_service;
 pub mod indexer;
 pub mod ocr_tick;
 pub mod plugin_fs_watcher;
+pub mod psi_gate;
 pub mod registry;
 pub mod sources_api;
 pub mod tick_scheduler;

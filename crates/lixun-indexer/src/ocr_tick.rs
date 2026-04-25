@@ -56,6 +56,11 @@ pub struct OcrWorkerCfg {
     pub min_image_side_px: u32,
     pub max_pages_per_pdf: Option<usize>,
     pub max_attempts: u32,
+    /// `Some((nice, ioprio_idle))` when `[ocr].adaptive_throttle =
+    /// true`. Drives per-job `SystemRunner::with_low_priority` so
+    /// tesseract/pdftoppm spawn with reduced CPU and (optionally)
+    /// I/O priority (DB-15).
+    pub throttle: Option<(i32, bool)>,
 }
 
 /// Outcome of a single [`tick_once`] call. Enum shape supports
@@ -243,6 +248,7 @@ pub fn spawn(
         loop {
             timer.tick().await;
 
+            let throttle = cfg.throttle;
             let run_ocr =
                 |path: &Path,
                  ext: &str,
@@ -256,14 +262,29 @@ pub fn spawn(
                     let path_owned = path.to_path_buf();
                     let ext_owned = ext.to_string();
                     tokio::task::block_in_place(|| {
-                        lixun_extract::ocr::run_ocr_job(
-                            &path_owned,
-                            &ext_owned,
-                            &langs_vec,
-                            &caps_clone,
-                            min_side,
-                            max_pages,
-                        )
+                        if let Some((nice, ioprio_idle)) = throttle {
+                            let runner = lixun_extract::shell::SystemRunner::new(
+                                caps_clone.timeout.as_secs(),
+                            )
+                            .with_low_priority(nice, ioprio_idle);
+                            lixun_extract::ocr::run_ocr_job_with(
+                                &path_owned,
+                                &ext_owned,
+                                &langs_vec,
+                                min_side,
+                                max_pages,
+                                &runner,
+                            )
+                        } else {
+                            lixun_extract::ocr::run_ocr_job(
+                                &path_owned,
+                                &ext_owned,
+                                &langs_vec,
+                                &caps_clone,
+                                min_side,
+                                max_pages,
+                            )
+                        }
                     })
                 };
 
@@ -338,6 +359,7 @@ mod tests {
             min_image_side_px: 200,
             max_pages_per_pdf: None,
             max_attempts: 3,
+            throttle: None,
         }
     }
 

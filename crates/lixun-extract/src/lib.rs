@@ -333,7 +333,7 @@ pub struct PdfExtractor {
 impl PdfExtractor {
     pub fn new(timeout: Duration) -> Self {
         Self {
-            runner: shell::SystemRunner { timeout },
+            runner: shell::SystemRunner::new(timeout.as_secs()),
         }
     }
 }
@@ -482,7 +482,7 @@ pub struct ShellDocExtractor {
 impl ShellDocExtractor {
     pub fn new(timeout: Duration) -> Self {
         Self {
-            runner: shell::SystemRunner { timeout },
+            runner: shell::SystemRunner::new(timeout.as_secs()),
         }
     }
 }
@@ -503,7 +503,7 @@ pub struct ShellXlsExtractor {
 impl ShellXlsExtractor {
     pub fn new(timeout: Duration) -> Self {
         Self {
-            runner: shell::SystemRunner { timeout },
+            runner: shell::SystemRunner::new(timeout.as_secs()),
         }
     }
 }
@@ -524,7 +524,7 @@ pub struct ShellPptExtractor {
 impl ShellPptExtractor {
     pub fn new(timeout: Duration) -> Self {
         Self {
-            runner: shell::SystemRunner { timeout },
+            runner: shell::SystemRunner::new(timeout.as_secs()),
         }
     }
 }
