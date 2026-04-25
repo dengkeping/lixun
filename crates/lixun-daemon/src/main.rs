@@ -269,6 +269,8 @@ async fn main() -> Result<()> {
         ocr_queue.clone(),
     );
 
+    spawn_cache_sweep_worker(Arc::clone(&shared_config), ocr_queue.clone());
+
     {
         let pfw_registry = Arc::clone(&registry);
         let pfw_sink = indexer_sink.clone();
@@ -881,6 +883,36 @@ fn spawn_ocr_worker(
         Arc::new(StatsIdleGate { stats })
     };
     let handle = lixun_indexer::ocr_tick::spawn(queue, idle, sink, Arc::new(caps), cfg);
+    std::mem::forget(handle);
+}
+
+/// Adapter exposing the OCR queue's zombie-reap query behind the
+/// indexer's generic `ZombieReaper` trait. Kept local to the daemon
+/// so the indexer crate remains unaware of the concrete queue type.
+struct OcrQueueReaper(Arc<lixun_extract::ocr_queue::OcrQueue>);
+
+impl lixun_indexer::cache_sweep::ZombieReaper for OcrQueueReaper {
+    fn reap(&self, max_attempts: u32, older_than_secs: i64) -> Result<u64> {
+        self.0.reap_zombies(max_attempts, older_than_secs)
+    }
+}
+
+fn spawn_cache_sweep_worker(
+    config: Arc<config::Config>,
+    queue: Option<Arc<lixun_extract::ocr_queue::OcrQueue>>,
+) {
+    let cfg = lixun_indexer::cache_sweep::CacheSweepCfg {
+        cache_root: lixun_extract::cache::cache_root(),
+        max_bytes: config.extract.cache_max_mb * 1024 * 1024,
+        interval: std::time::Duration::from_secs(config.extract.cache_sweep_interval_secs),
+        tmp_max_age: std::time::Duration::from_secs(3600),
+        zombie_max_attempts: 3,
+        zombie_max_age: std::time::Duration::from_secs(30 * 86_400),
+    };
+    let reaper: Option<Arc<dyn lixun_indexer::cache_sweep::ZombieReaper>> = queue.map(|q| {
+        Arc::new(OcrQueueReaper(q)) as Arc<dyn lixun_indexer::cache_sweep::ZombieReaper>
+    });
+    let handle = lixun_indexer::cache_sweep::spawn(cfg, reaper);
     std::mem::forget(handle);
 }
 
