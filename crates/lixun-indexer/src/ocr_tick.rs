@@ -107,6 +107,12 @@ pub struct OcrWorkerCfg {
     pub min_image_side_px: u32,
     pub max_pages_per_pdf: Option<usize>,
     pub max_attempts: u32,
+    /// How many queue rows to drain per wake-up before sleeping
+    /// until the next tick. Values `< 1` are treated as `1`. The
+    /// inner loop stops early if the queue empties or the system
+    /// reports non-idle, so the worker still respects backpressure
+    /// within a single wake (OCR-v1.2 F4).
+    pub jobs_per_tick: usize,
     /// `Some((nice, ioprio_idle))` when `[ocr].adaptive_throttle =
     /// true`. Drives per-job `SystemRunner::with_low_priority` so
     /// tesseract/pdftoppm spawn with reduced CPU and (optionally)
@@ -295,11 +301,13 @@ pub fn spawn(
         let mut timer = tokio::time::interval(cfg.interval);
         timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
         tracing::info!(
-            "ocr worker: started, interval={:?}, langs={:?}, max_attempts={}",
+            "ocr worker: started, interval={:?}, langs={:?}, max_attempts={}, jobs_per_tick={}",
             cfg.interval,
             cfg.langs,
-            cfg.max_attempts
+            cfg.max_attempts,
+            cfg.jobs_per_tick
         );
+        let batch_size = cfg.jobs_per_tick.max(1);
         loop {
             timer.tick().await;
 
@@ -343,38 +351,47 @@ pub fn spawn(
                     })
                 };
 
-            let outcome = tick_once(
-                queue.as_ref(),
-                idle.as_ref(),
-                sink.as_ref(),
-                caps.as_ref(),
-                &cfg,
-                run_ocr,
-            )
-            .await;
+            let mut last_outcome: Option<TickOutcome> = None;
+            for _ in 0..batch_size {
+                let outcome = tick_once(
+                    queue.as_ref(),
+                    idle.as_ref(),
+                    sink.as_ref(),
+                    caps.as_ref(),
+                    &cfg,
+                    run_ocr,
+                )
+                .await;
 
-            if matches!(outcome, TickOutcome::Drained { .. }) {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0);
-                stats.last_drain_at.store(now, Ordering::Relaxed);
-                let n = stats.drained_total.fetch_add(1, Ordering::Relaxed) + 1;
-                if n.is_multiple_of(PROGRESS_LOG_EVERY_N_DRAINED) {
-                    match queue.stats(cfg.max_attempts) {
-                        Ok(qs) => tracing::info!(
-                            "ocr progress: drained={n} pending={} failed={}",
-                            qs.pending,
-                            qs.failed
-                        ),
-                        Err(e) => tracing::warn!(
-                            "ocr progress: drained={n} (queue stats unavailable: {e:#})"
-                        ),
+                let drained = matches!(outcome, TickOutcome::Drained { .. });
+                if drained {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    stats.last_drain_at.store(now, Ordering::Relaxed);
+                    let n = stats.drained_total.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n.is_multiple_of(PROGRESS_LOG_EVERY_N_DRAINED) {
+                        match queue.stats(cfg.max_attempts) {
+                            Ok(qs) => tracing::info!(
+                                "ocr progress: drained={n} pending={} failed={}",
+                                qs.pending,
+                                qs.failed
+                            ),
+                            Err(e) => tracing::warn!(
+                                "ocr progress: drained={n} (queue stats unavailable: {e:#})"
+                            ),
+                        }
                     }
+                }
+
+                last_outcome = Some(outcome);
+                if !drained {
+                    break;
                 }
             }
 
-            tracing::trace!(?outcome, "ocr worker: tick complete");
+            tracing::trace!(?last_outcome, "ocr worker: tick complete");
         }
     })
 }
@@ -440,6 +457,7 @@ mod tests {
             min_image_side_px: 200,
             max_pages_per_pdf: None,
             max_attempts: 3,
+            jobs_per_tick: 1,
             throttle: None,
         }
     }
@@ -635,5 +653,177 @@ mod tests {
         );
         assert!(sink.calls().is_empty());
         assert_eq!(queue.len().unwrap(), 0);
+    }
+
+    // -- F4: batch-drain semantics --------------------------------------
+    //
+    // `spawn` calls `tick_once` in a bounded inner loop of length
+    // `jobs_per_tick.max(1)`, breaking on the first non-Drained outcome.
+    // `spawn` itself runs forever and has no shutdown hook, so these
+    // tests exercise the same repeated-invocation pattern against a
+    // shared queue + idle-gate to prove the batch loop's correctness
+    // invariants: (1) consecutive Drained outcomes when work is
+    // available, (2) Empty termination once the queue is exhausted,
+    // (3) NoIdle termination when the gate flips mid-batch.
+    //
+    // Helper mirrors the inner for-loop in `spawn` so the test reads
+    // like the production site.
+    async fn drain_batch<S, G, F>(
+        queue: &OcrQueue,
+        idle: &G,
+        sink: &S,
+        caps: &ExtractorCapabilities,
+        cfg: &OcrWorkerCfg,
+        run_ocr: F,
+        max_iters: usize,
+    ) -> Vec<TickOutcome>
+    where
+        S: UpsertBodySink + ?Sized,
+        G: IdleGate + ?Sized,
+        F: Fn(
+                &Path,
+                &str,
+                &[String],
+                &ExtractorCapabilities,
+                u32,
+                Option<usize>,
+            ) -> Result<Option<String>>
+            + Copy
+            + Send,
+    {
+        let mut out = Vec::new();
+        for _ in 0..max_iters.max(1) {
+            let outcome = tick_once(queue, idle, sink, caps, cfg, run_ocr).await;
+            let drained = matches!(outcome, TickOutcome::Drained { .. });
+            out.push(outcome);
+            if !drained {
+                break;
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn batch_drains_multiple_when_jobs_available() {
+        let queue = mem_queue();
+        let dir = tempfile::tempdir().unwrap();
+        let p1 = dir.path().join("a.png");
+        let p2 = dir.path().join("b.png");
+        std::fs::write(&p1, b"one").unwrap();
+        std::fs::write(&p2, b"two").unwrap();
+        enqueue_for_existing_file(&queue, "fs:/a", &p1);
+        enqueue_for_existing_file(&queue, "fs:/b", &p2);
+
+        let sink = CapturingSink::new();
+        let idle = FixedIdle(true);
+        let caps = test_caps();
+        let cfg = test_cfg();
+        let run_ocr = |_p: &Path,
+                       _e: &str,
+                       _l: &[String],
+                       _c: &ExtractorCapabilities,
+                       _m: u32,
+                       _mp: Option<usize>|
+         -> Result<Option<String>> { Ok(Some("BODY".into())) };
+
+        let outcomes = drain_batch(&queue, &idle, &sink, &caps, &cfg, run_ocr, 2).await;
+
+        assert_eq!(outcomes.len(), 2);
+        assert!(
+            matches!(&outcomes[0], TickOutcome::Drained { doc_id } if doc_id == "fs:/a"),
+            "first outcome was {:?}",
+            outcomes[0]
+        );
+        assert!(
+            matches!(&outcomes[1], TickOutcome::Drained { doc_id } if doc_id == "fs:/b"),
+            "second outcome was {:?}",
+            outcomes[1]
+        );
+        assert_eq!(queue.len().unwrap(), 0);
+        let calls = sink.calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, "fs:/a");
+        assert_eq!(calls[1].0, "fs:/b");
+    }
+
+    #[tokio::test]
+    async fn batch_stops_early_on_empty_queue() {
+        let queue = mem_queue();
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("only.png");
+        std::fs::write(&p, b"solo").unwrap();
+        enqueue_for_existing_file(&queue, "fs:/only", &p);
+
+        let sink = CapturingSink::new();
+        let idle = FixedIdle(true);
+        let caps = test_caps();
+        let cfg = test_cfg();
+        let run_ocr = |_p: &Path,
+                       _e: &str,
+                       _l: &[String],
+                       _c: &ExtractorCapabilities,
+                       _m: u32,
+                       _mp: Option<usize>|
+         -> Result<Option<String>> { Ok(Some("BODY".into())) };
+
+        // 5 slots offered, only 1 row: expect Drained then Empty, not 5 calls.
+        let outcomes = drain_batch(&queue, &idle, &sink, &caps, &cfg, run_ocr, 5).await;
+
+        assert_eq!(outcomes.len(), 2, "batch did not break on Empty: {outcomes:?}");
+        assert!(matches!(&outcomes[0], TickOutcome::Drained { doc_id } if doc_id == "fs:/only"));
+        assert_eq!(outcomes[1], TickOutcome::Empty);
+        assert_eq!(queue.len().unwrap(), 0);
+        assert_eq!(sink.calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn batch_stops_early_when_idle_flips_off() {
+        // Gate flips idle-off after first completed tick: models desktop regaining focus
+        // mid-batch. tick_once polls is_idle twice per row (entry gate + AM-6 post-ocr
+        // race check), so we return true for the first 2 polls, then false forever.
+        struct FlipIdle {
+            polls: std::sync::atomic::AtomicUsize,
+        }
+        impl IdleGate for FlipIdle {
+            fn is_idle(&self) -> bool {
+                let n = self
+                    .polls
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                n < 2
+            }
+        }
+
+        let queue = mem_queue();
+        let dir = tempfile::tempdir().unwrap();
+        let p1 = dir.path().join("first.png");
+        let p2 = dir.path().join("second.png");
+        std::fs::write(&p1, b"one").unwrap();
+        std::fs::write(&p2, b"two").unwrap();
+        enqueue_for_existing_file(&queue, "fs:/first", &p1);
+        enqueue_for_existing_file(&queue, "fs:/second", &p2);
+
+        let sink = CapturingSink::new();
+        let idle = FlipIdle {
+            polls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let caps = test_caps();
+        let cfg = test_cfg();
+        let run_ocr = |_p: &Path,
+                       _e: &str,
+                       _l: &[String],
+                       _c: &ExtractorCapabilities,
+                       _m: u32,
+                       _mp: Option<usize>|
+         -> Result<Option<String>> { Ok(Some("BODY".into())) };
+
+        let outcomes = drain_batch(&queue, &idle, &sink, &caps, &cfg, run_ocr, 5).await;
+
+        assert_eq!(outcomes.len(), 2, "batch did not break on NoIdle: {outcomes:?}");
+        assert!(matches!(&outcomes[0], TickOutcome::Drained { doc_id } if doc_id == "fs:/first"));
+        assert_eq!(outcomes[1], TickOutcome::NoIdle);
+        assert_eq!(queue.len().unwrap(), 1);
+        let remaining = queue.peek_next(10).unwrap().unwrap();
+        assert_eq!(remaining.doc_id, "fs:/second");
+        assert_eq!(sink.calls().len(), 1);
     }
 }

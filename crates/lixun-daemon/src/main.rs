@@ -1018,6 +1018,7 @@ fn spawn_ocr_worker(
         min_image_side_px: config.ocr.min_image_side_px,
         max_pages_per_pdf: config.ocr.max_pages_per_pdf,
         max_attempts: OCR_MAX_ATTEMPTS,
+        jobs_per_tick: config.ocr.jobs_per_tick as usize,
         throttle,
     };
     let idle: Arc<dyn lixun_indexer::ocr_tick::IdleGate> = if config.ocr.adaptive_throttle {
