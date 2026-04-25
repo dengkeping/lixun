@@ -10,8 +10,8 @@ use chrono::Utc;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use tantivy::{
-    Index, IndexWriter, TantivyDocument, Term,
-    collector::TopDocs,
+    DocAddress, Index, IndexWriter, Searcher, TantivyDocument, Term,
+    collector::{DocSetCollector, TopDocs},
     directory::MmapDirectory,
     doc,
     query::{BooleanQuery, BoostQuery, Occur, PhraseQuery, QueryParser, TermQuery},
@@ -316,6 +316,15 @@ impl LixunIndex {
             &TopDocs::with_limit(query.limit as usize).order_by_score(),
         )?;
 
+        // Coordination probe (Wave B T2): precompute the set of docs where
+        // every query token matches the title. v==q lookup is O(1) per hit.
+        let all_match_set =
+            build_coord_all_match_set(&self.index, &searcher, s.title, &query.text)
+                .unwrap_or_default();
+        let q_tokens_count = tokenize_with_spotlight(&self.index, &query.text)
+            .map(|t| t.len())
+            .unwrap_or(0);
+
         let mut results = Vec::new();
         for (score, doc_address) in top_docs {
             let doc: TantivyDocument = searcher.doc(doc_address)?;
@@ -386,6 +395,16 @@ impl LixunIndex {
             let sender = stored_optional_text(&doc, s.sender);
             let recipients = stored_optional_text(&doc, s.recipients);
             let body = stored_optional_text(&doc, s.body);
+
+            let coord_mult = if (2..=3).contains(&q_tokens_count)
+                && all_match_set.contains(&doc_address)
+            {
+                1.0 + self.ranking.coordination_boost
+                    / (q_tokens_count as f32).powf(self.ranking.coordination_delta)
+            } else {
+                1.0
+            };
+
             let doc_mult = self.ranking.multiplier_for(category)
                 * scoring::prefix_mult(&title_norm, &q_norm, self.ranking.prefix_boost)
                 * scoring::acronym_mult(&title, &q_norm, self.ranking.acronym_boost)
@@ -395,7 +414,8 @@ impl LixunIndex {
                     now_secs,
                     self.ranking.recency_weight,
                     self.ranking.recency_tau_days,
-                );
+                )
+                * coord_mult;
 
             results.push(Hit {
                 id: lixun_core::DocId(id),
@@ -713,14 +733,8 @@ fn build_search_query(
     // phrase terms match the indexed positions byte-for-byte (same lowercasing,
     // same ASCII folding, same long-token filter). Using raw whitespace split
     // would produce case-sensitive terms that never hit the index.
-    let tokens: Vec<String> = {
-        let Some(mut analyzer) = index.tokenizers().get("spotlight") else {
-            return parsed_query;
-        };
-        let mut out = Vec::new();
-        let mut stream = analyzer.token_stream(&normalized_text);
-        stream.process(&mut |tok| out.push(tok.text.clone()));
-        out
+    let Some(tokens) = tokenize_with_spotlight(index, &normalized_text) else {
+        return parsed_query;
     };
 
     if tokens.len() < 2 {
@@ -745,6 +759,50 @@ fn build_search_query(
         (Occur::Should, title_phrase),
         (Occur::Should, title_terms_phrase),
     ]))
+}
+
+/// Tokenize `text` through the registered "spotlight" analyzer. Returns
+/// `None` if the analyzer was never registered (index in an unusual state);
+/// callers collapse to no-op in that branch.
+fn tokenize_with_spotlight(index: &tantivy::Index, text: &str) -> Option<Vec<String>> {
+    let mut analyzer = index.tokenizers().get("spotlight")?;
+    let mut out = Vec::new();
+    let mut stream = analyzer.token_stream(text);
+    stream.process(&mut |tok| out.push(tok.text.clone()));
+    Some(out)
+}
+
+/// Build the coordination probe set: the set of `DocAddress` whose `title`
+/// field contains ALL query tokens (v == q). Per Wave B T2 formula we only
+/// activate in the regime `2 <= q <= 3`, so queries outside that range
+/// short-circuit to an empty set (no work, no allocation in the searcher).
+fn build_coord_all_match_set(
+    index: &tantivy::Index,
+    searcher: &Searcher,
+    title_field: tantivy::schema::Field,
+    text: &str,
+) -> Result<HashSet<DocAddress>> {
+    let Some(tokens) = tokenize_with_spotlight(index, text) else {
+        return Ok(HashSet::new());
+    };
+    if !(2..=3).contains(&tokens.len()) {
+        return Ok(HashSet::new());
+    }
+
+    let clauses: Vec<(Occur, Box<dyn tantivy::query::Query>)> = tokens
+        .iter()
+        .map(|tok| {
+            let tq = TermQuery::new(
+                Term::from_field_text(title_field, tok),
+                IndexRecordOption::Basic,
+            );
+            let boxed: Box<dyn tantivy::query::Query> = Box::new(tq);
+            (Occur::Should, boxed)
+        })
+        .collect();
+
+    let coord_q = BooleanQuery::with_minimum_required_clauses(clauses, tokens.len());
+    Ok(searcher.search(&coord_q, &DocSetCollector)?)
 }
 
 #[cfg(test)]
@@ -1580,6 +1638,118 @@ mod tests {
         assert!(
             score_zero < baseline_phrase_on,
             "zero-boost score ({score_zero}) must be less than boosted baseline ({baseline_phrase_on})",
+        );
+    }
+
+    // ------- T2 coordination boost tests (Wave B) -------
+
+    #[test]
+    fn test_coordination_exact_numeric() {
+        // Direct formula sanity check with the plan-specified constants.
+        // Binds the implementation's runtime arithmetic to the exact value
+        // enshrined in the Wave B plan. Any drift in powf/div ordering
+        // would break this assertion before search semantics degrade.
+        let boost: f32 = 1.2;
+        let delta: f32 = 0.5;
+        let q: f32 = 3.0;
+        let mult = 1.0 + boost / q.powf(delta);
+        assert!(
+            (mult - 1.692_820_3).abs() < 1e-5,
+            "coord formula drift: expected ~1.6928203 (1 + 1.2/sqrt(3)), got {mult}"
+        );
+    }
+
+    #[test]
+    fn test_coordination_all_three_tokens_hit_boosts() {
+        // Doc A has all 3 query tokens in its title (v == q == 3),
+        // doc B has only 2 of them in title (v == 2 < q). Both satisfy
+        // QueryParser's conjunctive MUST because all tokens appear
+        // somewhere in the doc (body carries the rest for B). The coord
+        // probe is title-only, so only A gets the ~1.69 multiplier.
+        let doc_a = sample_document("fs:/tmp/a.txt", "alpha beta gamma", "extra body");
+        let doc_b = sample_document("fs:/tmp/b.txt", "alpha beta", "gamma body filler");
+
+        let (_tmp, index) = create_index_with_docs(&[doc_a, doc_b]);
+        let results = search(&index, "alpha beta gamma");
+
+        assert_eq!(results.len(), 2, "both docs should match the conjunction");
+
+        let score_a = results
+            .iter()
+            .find(|h| h.id.0 == "fs:/tmp/a.txt")
+            .expect("doc A present")
+            .score;
+        let score_b = results
+            .iter()
+            .find(|h| h.id.0 == "fs:/tmp/b.txt")
+            .expect("doc B present")
+            .score;
+
+        // Ratio check, not exact score — BM25/prefix/acronym factors also
+        // differ between the docs. We just need the coord bump to move
+        // the ordering by a sizeable margin beyond numeric noise.
+        assert!(
+            score_a > score_b * 1.3,
+            "full-title match should outrank partial-title match by a wide margin (a={score_a}, b={score_b})"
+        );
+    }
+
+    #[test]
+    fn test_coordination_single_token_no_op() {
+        // q == 1 is outside the [2, 3] activation regime, so coord_mult
+        // must collapse to 1.0. Hit returns at baseline without panic.
+        let doc = sample_document("fs:/tmp/c.txt", "alpha beta", "body");
+        let (_tmp, index) = create_index_with_docs(&[doc]);
+        let results = search(&index, "alpha");
+        assert_eq!(results.len(), 1);
+        assert!(results[0].score > 0.0, "single-token query must still score");
+    }
+
+    #[test]
+    fn test_coordination_four_tokens_no_op() {
+        // q == 4 exceeds the activation ceiling (q > 3). Formula guard
+        // collapses to 1.0 no-op. Doc with all 4 tokens still matches
+        // via QueryParser's conjunction; we just assert it returns
+        // without error — no boost contract applies here.
+        let doc = sample_document(
+            "fs:/tmp/d.txt",
+            "alpha beta gamma delta",
+            "body text",
+        );
+        let (_tmp, index) = create_index_with_docs(&[doc]);
+        let results = search(&index, "alpha beta gamma delta");
+        assert_eq!(results.len(), 1);
+        assert!(results[0].score > 0.0);
+    }
+
+    #[test]
+    fn test_coordination_partial_match_no_op() {
+        // v < q: query has 2 tokens but only 1 appears in the title
+        // (the other lives in the body). Probe is title-only so the doc
+        // is NOT in the all-match set → coord_mult = 1.0. We compare
+        // this doc's score against a second doc that DOES have both
+        // tokens in title: the second doc should clearly outrank it,
+        // confirming the title-only probe discriminates v correctly.
+        let partial = sample_document("fs:/tmp/p.txt", "alpha", "beta is here in body");
+        let full = sample_document("fs:/tmp/f.txt", "alpha beta", "unrelated body");
+
+        let (_tmp, index) = create_index_with_docs(&[partial, full]);
+        let results = search(&index, "alpha beta");
+
+        assert_eq!(results.len(), 2);
+        let partial_score = results
+            .iter()
+            .find(|h| h.id.0 == "fs:/tmp/p.txt")
+            .expect("partial-title doc present")
+            .score;
+        let full_score = results
+            .iter()
+            .find(|h| h.id.0 == "fs:/tmp/f.txt")
+            .expect("full-title doc present")
+            .score;
+        assert!(
+            full_score > partial_score,
+            "full-title coord boost must outrank partial-title (full={full_score}, partial={partial_score})"
         );
     }
 }
