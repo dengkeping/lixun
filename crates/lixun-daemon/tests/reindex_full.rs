@@ -35,6 +35,8 @@ fn test_config(root: std::path::PathBuf, state_dir: std::path::PathBuf) -> Confi
         ocr: OcrConfig::default(),
         state_dir,
         plugin_sections: BTreeMap::new(),
+        extractor_caps: std::sync::OnceLock::new(),
+        ocr_enqueue: std::sync::OnceLock::new(),
     }
 }
 

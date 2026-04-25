@@ -6,12 +6,15 @@
 
 use anyhow::Result;
 use lixun_core::{Action, Category, DocId, Document};
+use lixun_extract::ExtractorCapabilities;
 use rayon::prelude::*;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::manifest::Manifest;
 use crate::mime_icons;
+use crate::ocr_enqueue::OcrEnqueue;
 
 /// Filesystem source configuration.
 pub struct FsSource {
@@ -19,6 +22,8 @@ pub struct FsSource {
     pub exclude: Vec<String>,
     pub exclude_regex: Vec<regex::Regex>,
     pub max_file_size_mb: u64,
+    pub caps: Arc<ExtractorCapabilities>,
+    pub ocr_enqueue: Option<Arc<dyn OcrEnqueue>>,
 }
 
 /// Intermediate metadata collected during the first pass.
@@ -38,6 +43,8 @@ impl FsSource {
             exclude,
             exclude_regex: Vec::new(),
             max_file_size_mb,
+            caps: Arc::new(ExtractorCapabilities::all_available_no_timeout()),
+            ocr_enqueue: None,
         }
     }
 
@@ -52,6 +59,43 @@ impl FsSource {
             exclude,
             exclude_regex,
             max_file_size_mb,
+            caps: Arc::new(ExtractorCapabilities::all_available_no_timeout()),
+            ocr_enqueue: None,
+        }
+    }
+
+    pub fn new_with_ocr(
+        roots: Vec<PathBuf>,
+        exclude: Vec<String>,
+        max_file_size_mb: u64,
+        caps: Arc<ExtractorCapabilities>,
+        ocr_enqueue: Option<Arc<dyn OcrEnqueue>>,
+    ) -> Self {
+        Self {
+            roots,
+            exclude,
+            exclude_regex: Vec::new(),
+            max_file_size_mb,
+            caps,
+            ocr_enqueue,
+        }
+    }
+
+    pub fn with_regex_and_ocr(
+        roots: Vec<PathBuf>,
+        exclude: Vec<String>,
+        exclude_regex: Vec<regex::Regex>,
+        max_file_size_mb: u64,
+        caps: Arc<ExtractorCapabilities>,
+        ocr_enqueue: Option<Arc<dyn OcrEnqueue>>,
+    ) -> Self {
+        Self {
+            roots,
+            exclude,
+            exclude_regex,
+            max_file_size_mb,
+            caps,
+            ocr_enqueue,
         }
     }
 
@@ -59,16 +103,26 @@ impl FsSource {
         crate::exclude::path_excluded(path, &self.exclude, &self.exclude_regex)
     }
 
-    /// Extract content from a file. Public for the watcher to reuse.
-    pub fn extract_content(path: &Path) -> Result<Option<String>> {
-        let text = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            lixun_extract::extract_path(path)
+    /// Extract content from a file, going through the T1 bytes cache so
+    /// unchanged files skip the extractor subprocess on the second and
+    /// later runs. On an empty result for an OCR-candidate extension,
+    /// emits an enqueue request on `enqueue` (if supplied) per DB-13.
+    /// Enqueue failures log-and-swallow: a queue write error must never
+    /// fail the extraction path.
+    pub fn extract_content(
+        path: &Path,
+        caps: &ExtractorCapabilities,
+        enqueue: Option<&dyn OcrEnqueue>,
+    ) -> Result<Option<String>> {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            lixun_extract::cache::cached_extract_path(path, caps)
         }))
         .map_err(|_| anyhow::anyhow!("extractor panicked"))??;
-        if text.is_empty() {
-            return Ok(None);
+
+        if result.is_none() {
+            maybe_enqueue_ocr(path, caps, enqueue);
         }
-        Ok(Some(text))
+        Ok(result)
     }
 
     /// Build a rayon thread pool sized to min(num_cpus, 4).
@@ -249,9 +303,13 @@ impl FsSource {
         let total = changed_metas.len();
         let mut extract_fails: u64 = 0;
         let mut processed: usize = 0;
+        let caps = Arc::clone(&self.caps);
+        let enqueue = self.ocr_enqueue.clone();
         while !changed_metas.is_empty() {
             let take_n = Self::BATCH_SIZE.min(changed_metas.len());
             let chunk: Vec<FileMeta> = changed_metas.drain(..take_n).collect();
+            let caps_loop = Arc::clone(&caps);
+            let enqueue_loop = enqueue.clone();
             let docs: Vec<Document> = pool.install(|| {
                 chunk
                     .into_par_iter()
@@ -261,7 +319,10 @@ impl FsSource {
                         let (body, extract_fail) = if meta.is_dir {
                             (None, false)
                         } else if meta.size <= max_size {
-                            match Self::extract_content(&meta.path) {
+                            let enq_ref = enqueue_loop
+                                .as_ref()
+                                .map(|a| a.as_ref() as &dyn OcrEnqueue);
+                            match Self::extract_content(&meta.path, &caps_loop, enq_ref) {
                                 Ok(Some(text)) => (Some(text), false),
                                 Ok(None) => (None, false),
                                 Err(_) => (None, true),
@@ -356,6 +417,8 @@ impl FsSource {
         );
 
         let pool = Self::build_pool();
+        let caps = Arc::clone(&self.caps);
+        let enqueue = self.ocr_enqueue.clone();
         let docs: Vec<Document> = pool.install(|| {
             metas
                 .into_par_iter()
@@ -363,7 +426,10 @@ impl FsSource {
                     let (body, extract_fail) = if meta.is_dir {
                         (None, false)
                     } else if meta.size <= max_size {
-                        match Self::extract_content(&meta.path) {
+                        let enq_ref = enqueue
+                            .as_ref()
+                            .map(|a| a.as_ref() as &dyn OcrEnqueue);
+                        match Self::extract_content(&meta.path, &caps, enq_ref) {
                             Ok(Some(text)) => (Some(text), false),
                             Ok(None) => (None, false),
                             Err(_) => (None, true),
@@ -434,9 +500,191 @@ impl crate::source::IndexerSource for FsSource {
     }
 }
 
+fn maybe_enqueue_ocr(
+    path: &Path,
+    caps: &ExtractorCapabilities,
+    enqueue: Option<&dyn OcrEnqueue>,
+) {
+    let Some(enqueuer) = enqueue else { return };
+    if !caps.has_tesseract || !caps.ocr_enabled {
+        return;
+    }
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    if !lixun_extract::ocr::is_ocr_candidate(&ext) {
+        return;
+    }
+    // TODO(OCR-v1.1): DB-16 short-circuit via SearchHandle::has_body(doc_id)
+    // to avoid re-enqueueing files whose body was already recovered in a
+    // prior OCR pass. For v1 we rely on OcrQueue's INSERT OR IGNORE (T5)
+    // to dedup at the DB layer; the worst case is a cheap attempts-preserved
+    // re-enqueue, not a redundant OCR run (because OcrQueue.peek_next still
+    // returns Some but then the upsert_body via T6 may overwrite with the
+    // same body — acceptable cost for v1).
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!("ocr enqueue: stat {} failed: {e}", path.display());
+            return;
+        }
+    };
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let doc_id = format!("fs:{}", path.to_string_lossy());
+    if let Err(e) = enqueuer.enqueue(&doc_id, path, mtime, meta.len(), &ext) {
+        tracing::warn!("ocr enqueue for {} failed: {e}", path.display());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    static HOME_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn with_isolated_cache<F, R>(f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        let lock = HOME_LOCK.get_or_init(|| Mutex::new(()));
+        let _g = lock.lock().unwrap();
+        let td = tempfile::TempDir::new().unwrap();
+        let old_xdg = std::env::var_os("XDG_CACHE_HOME");
+        let old_home = std::env::var_os("HOME");
+        // SAFETY: env is process-global; HOME_LOCK serializes every test
+        // in this module that touches the cache and no other code in the
+        // crate reads these vars during the test window.
+        unsafe {
+            std::env::set_var("XDG_CACHE_HOME", td.path());
+            std::env::set_var("HOME", td.path());
+        }
+        let out = f();
+        unsafe {
+            match old_xdg {
+                Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
+                None => std::env::remove_var("XDG_CACHE_HOME"),
+            }
+            match old_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        drop(td);
+        out
+    }
+
+    type EnqueueCall = (String, PathBuf, i64, u64, String);
+
+    #[derive(Default)]
+    struct MockEnqueue {
+        calls: Mutex<Vec<EnqueueCall>>,
+    }
+
+    impl OcrEnqueue for MockEnqueue {
+        fn enqueue(
+            &self,
+            doc_id: &str,
+            path: &Path,
+            mtime: i64,
+            size: u64,
+            ext: &str,
+        ) -> Result<()> {
+            self.calls.lock().unwrap().push((
+                doc_id.to_string(),
+                path.to_path_buf(),
+                mtime,
+                size,
+                ext.to_string(),
+            ));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn extract_content_enqueues_on_empty_ocr_candidate() {
+        with_isolated_cache(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let png = tmp.path().join("scan.png");
+            // Non-empty bytes that utf8-sniff will treat as binary,
+            // so cached_extract_path returns Ok(None).
+            std::fs::write(&png, b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR").unwrap();
+
+            let caps = Arc::new(ExtractorCapabilities::all_available_no_timeout());
+            let mock: Arc<MockEnqueue> = Arc::new(MockEnqueue::default());
+            let sink: Arc<dyn OcrEnqueue> = mock.clone();
+
+            let result = FsSource::extract_content(
+                &png,
+                &caps,
+                Some(sink.as_ref()),
+            )
+            .unwrap();
+            assert!(result.is_none(), "png has no text-layer body");
+
+            let calls = mock.calls.lock().unwrap();
+            assert_eq!(calls.len(), 1, "exactly one enqueue expected");
+            let (doc_id, path, _mtime, size, ext) = &calls[0];
+            assert_eq!(doc_id, &format!("fs:{}", png.to_string_lossy()));
+            assert_eq!(path, &png);
+            assert_eq!(ext, "png");
+            assert!(*size > 0);
+        });
+    }
+
+    #[test]
+    fn extract_content_skips_enqueue_when_caps_off() {
+        with_isolated_cache(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let png = tmp.path().join("scan.png");
+            std::fs::write(&png, b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR").unwrap();
+
+            let mut caps_plain = ExtractorCapabilities::all_available_no_timeout();
+            caps_plain.ocr_enabled = false;
+            let caps = Arc::new(caps_plain);
+            let mock: Arc<MockEnqueue> = Arc::new(MockEnqueue::default());
+            let sink: Arc<dyn OcrEnqueue> = mock.clone();
+
+            let _ = FsSource::extract_content(&png, &caps, Some(sink.as_ref())).unwrap();
+            assert!(mock.calls.lock().unwrap().is_empty(), "no enqueue when ocr_enabled=false");
+
+            let mut caps_no_tess = ExtractorCapabilities::all_available_no_timeout();
+            caps_no_tess.has_tesseract = false;
+            let caps = Arc::new(caps_no_tess);
+            let _ = FsSource::extract_content(&png, &caps, Some(sink.as_ref())).unwrap();
+            assert!(
+                mock.calls.lock().unwrap().is_empty(),
+                "no enqueue when has_tesseract=false"
+            );
+        });
+    }
+
+    #[test]
+    fn extract_content_skips_enqueue_on_non_candidate_ext() {
+        with_isolated_cache(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let bin = tmp.path().join("blob.docx");
+            // Empty/invalid docx — zip parsing will fail, extractor
+            // falls through returning empty. Not an OCR candidate ext.
+            std::fs::write(&bin, b"not a real docx").unwrap();
+
+            let caps = Arc::new(ExtractorCapabilities::all_available_no_timeout());
+            let mock: Arc<MockEnqueue> = Arc::new(MockEnqueue::default());
+            let sink: Arc<dyn OcrEnqueue> = mock.clone();
+
+            let _ = FsSource::extract_content(&bin, &caps, Some(sink.as_ref()));
+            assert!(
+                mock.calls.lock().unwrap().is_empty(),
+                "non-candidate ext must not enqueue even on empty extraction"
+            );
+        });
+    }
 
     #[test]
     fn test_index_all_sets_pdf_icon_and_kind() {

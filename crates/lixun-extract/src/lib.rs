@@ -227,7 +227,7 @@ pub fn init_capabilities(caps: ExtractorCapabilities) {
     }
 }
 
-fn capabilities() -> ExtractorCapabilities {
+pub fn capabilities() -> ExtractorCapabilities {
     EXTRACTOR_CAPS
         .get()
         .cloned()

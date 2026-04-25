@@ -282,6 +282,8 @@ pub struct Config {
     pub ocr: OcrConfig,
     pub state_dir: PathBuf,
     pub plugin_sections: BTreeMap<String, toml::Value>,
+    pub extractor_caps: std::sync::OnceLock<std::sync::Arc<lixun_extract::ExtractorCapabilities>>,
+    pub ocr_enqueue: std::sync::OnceLock<std::sync::Arc<dyn lixun_sources::OcrEnqueue>>,
 }
 
 /// Launcher + preview window sizing policy. Percentages are of the
@@ -353,6 +355,8 @@ impl Default for Config {
             ocr: OcrConfig::default(),
             state_dir: state_dir(),
             plugin_sections: BTreeMap::new(),
+            extractor_caps: std::sync::OnceLock::new(),
+            ocr_enqueue: std::sync::OnceLock::new(),
         }
     }
 }
@@ -576,12 +580,25 @@ impl Config {
     }
 
     pub fn build_fs_source(&self) -> Result<lixun_sources::fs::FsSource> {
-        Ok(lixun_sources::fs::FsSource::with_regex(
+        Ok(lixun_sources::fs::FsSource::with_regex_and_ocr(
             self.roots.clone(),
             self.exclude.clone(),
             self.exclude_regex.clone(),
             self.max_file_size_mb,
+            self.caps_arc(),
+            self.ocr_enqueue.get().cloned(),
         ))
+    }
+
+    pub fn caps_arc(&self) -> std::sync::Arc<lixun_extract::ExtractorCapabilities> {
+        self.extractor_caps
+            .get()
+            .cloned()
+            .unwrap_or_else(|| {
+                std::sync::Arc::new(
+                    lixun_extract::ExtractorCapabilities::all_available_no_timeout(),
+                )
+            })
     }
 
     pub fn ranking_config(&self) -> lixun_core::RankingConfig {
@@ -634,6 +651,12 @@ impl lixun_indexer::IndexerSources for Config {
     }
     fn max_file_size_mb(&self) -> u64 {
         self.max_file_size_mb
+    }
+    fn caps(&self) -> std::sync::Arc<lixun_extract::ExtractorCapabilities> {
+        self.caps_arc()
+    }
+    fn ocr_enqueue(&self) -> Option<std::sync::Arc<dyn lixun_sources::OcrEnqueue>> {
+        self.ocr_enqueue.get().cloned()
     }
 }
 

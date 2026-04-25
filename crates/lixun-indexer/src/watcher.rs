@@ -13,6 +13,8 @@
 
 use crate::index_service::{IndexMutationTx, Mutation, fs_doc_id, index_file};
 use anyhow::Result;
+use lixun_extract::ExtractorCapabilities;
+use lixun_sources::OcrEnqueue;
 use lixun_sources::exclude::path_excluded;
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
@@ -74,6 +76,8 @@ pub async fn start(
     exclude: Vec<String>,
     exclude_regex: Vec<regex::Regex>,
     max_file_size_mb: u64,
+    caps: Arc<ExtractorCapabilities>,
+    ocr_enqueue: Option<Arc<dyn OcrEnqueue>>,
     mutation_tx: IndexMutationTx,
 ) -> Result<()> {
     let (raw_tx, raw_rx) = mpsc::channel::<RawEvent>(RAW_EVENT_QUEUE_CAP);
@@ -103,15 +107,13 @@ pub async fn start(
         let ctrl_tx = ctrl_tx.clone();
         let exclude = Arc::clone(&exclude_arc);
         let refresh_tx = refresh_tx.clone();
-        tokio::spawn(resolver_task(
-            worker_id,
-            rx,
-            mutation_tx,
-            ctrl_tx,
-            refresh_tx,
+        let env = ResolverEnv {
             exclude,
             max_file_size_mb,
-        ));
+            caps: Arc::clone(&caps),
+            ocr_enqueue: ocr_enqueue.clone(),
+        };
+        tokio::spawn(resolver_task(worker_id, rx, mutation_tx, ctrl_tx, refresh_tx, env));
     }
 
     Ok(())
@@ -316,14 +318,20 @@ async fn coalescer_task(
     }
 }
 
+struct ResolverEnv {
+    exclude: Arc<ExcludeSet>,
+    max_file_size_mb: u64,
+    caps: Arc<ExtractorCapabilities>,
+    ocr_enqueue: Option<Arc<dyn OcrEnqueue>>,
+}
+
 async fn resolver_task(
     worker_id: usize,
     rx: async_channel::Receiver<RefreshJob>,
     mutation_tx: IndexMutationTx,
     ctrl_tx: std::sync::mpsc::SyncSender<Control>,
     refresh_tx: async_channel::Sender<RefreshJob>,
-    exclude: Arc<ExcludeSet>,
-    max_file_size_mb: u64,
+    env: ResolverEnv,
 ) {
     while let Ok(job) = rx.recv().await {
         match job {
@@ -333,10 +341,19 @@ async fn resolver_task(
                 }
             }
             RefreshJob::Refresh(path) => {
-                let exclude = Arc::clone(&exclude);
+                let exclude = Arc::clone(&env.exclude);
                 let path_blocking = path.clone();
+                let caps_b = Arc::clone(&env.caps);
+                let enq_b = env.ocr_enqueue.clone();
+                let max_size = env.max_file_size_mb;
                 let result = tokio::task::spawn_blocking(move || {
-                    resolve_refresh(&path_blocking, &exclude, max_file_size_mb)
+                    resolve_refresh(
+                        &path_blocking,
+                        &exclude,
+                        max_size,
+                        &caps_b,
+                        enq_b.as_ref().map(|a| a.as_ref() as &dyn OcrEnqueue),
+                    )
                 })
                 .await;
                 let resolved = match result {
@@ -394,7 +411,13 @@ enum Resolved {
     Skip,
 }
 
-fn resolve_refresh(path: &Path, exclude: &ExcludeSet, max_file_size_mb: u64) -> Resolved {
+fn resolve_refresh(
+    path: &Path,
+    exclude: &ExcludeSet,
+    max_file_size_mb: u64,
+    caps: &ExtractorCapabilities,
+    ocr_enqueue: Option<&dyn OcrEnqueue>,
+) -> Resolved {
     let Ok(meta) = std::fs::metadata(path) else {
         return Resolved::Gone;
     };
@@ -402,7 +425,7 @@ fn resolve_refresh(path: &Path, exclude: &ExcludeSet, max_file_size_mb: u64) -> 
         return Resolved::Skip;
     }
     if meta.is_file() {
-        match index_file(path, max_file_size_mb) {
+        match index_file(path, max_file_size_mb, caps, ocr_enqueue) {
             Ok(doc) => Resolved::File(Box::new(doc)),
             Err(_) => Resolved::Skip,
         }
