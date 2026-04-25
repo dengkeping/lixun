@@ -18,7 +18,15 @@ fn icon_theme() -> Option<gtk::IconTheme> {
     })
 }
 
-fn category_fallback(cat: &Category) -> &'static str {
+/// Default icon name for a hit category. Used as a last-resort
+/// fallback when a source does not declare its own `icon_name`
+/// and no theme-matched icon is available. Category is intentional
+/// here because it classifies the hit semantically (app, file,
+/// mail, ...) — not its originating plugin. Host code that needs
+/// an icon-name fallback should call this function rather than
+/// reinventing the mapping, to keep the category → icon contract
+/// in one place.
+pub(crate) fn category_fallback(cat: &Category) -> &'static str {
     match cat {
         Category::App => "application-x-executable",
         Category::File => "text-x-generic",

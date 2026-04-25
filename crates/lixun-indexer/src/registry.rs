@@ -1,4 +1,4 @@
-use lixun_core::PluginFieldSpec;
+use lixun_core::{PluginFieldSpec, RowMenuDef};
 use lixun_sources::IndexerSource;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -21,6 +21,19 @@ impl SourceRegistry {
             instances: Vec::new(),
             plugin_fields_by_kind: BTreeMap::new(),
         }
+    }
+
+    /// Look up the row-menu declaration for a given `instance_id`.
+    ///
+    /// Returns `None` if no instance with that id is registered. The daemon
+    /// uses this to stamp `Hit::row_menu` after the plugin-agnostic search
+    /// layer returns hits, preserving `AGENTS.md` hard-modularity (host
+    /// never names concrete plugins; it dispatches by opaque instance_id).
+    pub fn row_menu_for(&self, instance_id: &str) -> Option<RowMenuDef> {
+        self.instances
+            .iter()
+            .find(|inst| inst.instance_id == instance_id)
+            .map(|inst| inst.source.row_menu())
     }
 
     pub fn register(

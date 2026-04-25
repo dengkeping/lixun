@@ -10,6 +10,7 @@ use lixun_core::{Action, Hit};
 use crate::attachments::{
     decode_attachment, sanitize_filename, secure_runtime_dir_from_env, sweep_stale_attachments,
 };
+use crate::reaper::spawn_reaped;
 
 pub(crate) fn file_uri(abs: &std::path::Path) -> String {
     let mut out = String::from("file://");
@@ -130,9 +131,9 @@ fn dispatch_action(action: &Action) -> Result<()> {
                 let spawn = terminal_spawn();
                 let mut args: Vec<&str> = spawn.args_before_exec.clone();
                 args.extend(exec.split_whitespace());
-                std::process::Command::new(&spawn.program)
-                    .args(&args)
-                    .spawn()?;
+                let mut builder = std::process::Command::new(&spawn.program);
+                builder.args(&args);
+                spawn_reaped(&mut builder)?;
             } else {
                 let mut parts = exec.split_whitespace();
                 if let Some(cmd) = parts.next() {
@@ -141,18 +142,22 @@ fn dispatch_action(action: &Action) -> Result<()> {
                     if let Some(dir) = working_dir {
                         builder.current_dir(dir);
                     }
-                    builder.spawn()?;
+                    spawn_reaped(&mut builder)?;
                 }
             }
             Ok(())
         }
         Action::OpenFile { path } => {
-            std::process::Command::new("xdg-open").arg(path).spawn()?;
+            let mut builder = std::process::Command::new("xdg-open");
+            builder.arg(path);
+            spawn_reaped(&mut builder)?;
             Ok(())
         }
         Action::ShowInFileManager { path } => {
             if path.is_dir() {
-                std::process::Command::new("xdg-open").arg(path).spawn()?;
+                let mut builder = std::process::Command::new("xdg-open");
+                builder.arg(path);
+                spawn_reaped(&mut builder)?;
             } else {
                 match show_in_file_manager(path) {
                     Ok(()) => {}
@@ -161,7 +166,9 @@ fn dispatch_action(action: &Action) -> Result<()> {
                             "FileManager1 DBus call failed: {e}; falling back to xdg-open"
                         );
                         if let Some(parent) = path.parent() {
-                            std::process::Command::new("xdg-open").arg(parent).spawn()?;
+                            let mut builder = std::process::Command::new("xdg-open");
+                            builder.arg(parent);
+                            spawn_reaped(&mut builder)?;
                         }
                     }
                 }
@@ -183,14 +190,16 @@ fn dispatch_action(action: &Action) -> Result<()> {
                 encoding,
                 suggested_filename,
             )?;
-            std::process::Command::new("xdg-open")
-                .arg(&target)
-                .spawn()?;
+            let mut builder = std::process::Command::new("xdg-open");
+            builder.arg(&target);
+            spawn_reaped(&mut builder)?;
             Ok(())
         }
         Action::OpenUri { uri } => {
             tracing::debug!(uri = %uri, "execute_action: dispatching via xdg-open");
-            std::process::Command::new("xdg-open").arg(uri).spawn()?;
+            let mut builder = std::process::Command::new("xdg-open");
+            builder.arg(uri);
+            spawn_reaped(&mut builder)?;
             Ok(())
         }
         Action::ReplaceQuery { .. } => Ok(()),
@@ -211,14 +220,14 @@ fn dispatch_action(action: &Action) -> Result<()> {
                 if let Some(dir) = working_dir {
                     term_cmd.current_dir(dir);
                 }
-                term_cmd.spawn()?;
+                spawn_reaped(&mut term_cmd)?;
             } else {
                 let mut cmd = std::process::Command::new(program);
                 cmd.args(args);
                 if let Some(dir) = working_dir {
                     cmd.current_dir(dir);
                 }
-                cmd.spawn()?;
+                spawn_reaped(&mut cmd)?;
             }
             Ok(())
         }

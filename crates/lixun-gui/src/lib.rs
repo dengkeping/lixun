@@ -13,6 +13,7 @@ mod gui_server;
 mod icons;
 mod ipc;
 mod keymap;
+mod reaper;
 mod status;
 mod window;
 

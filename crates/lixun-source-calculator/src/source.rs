@@ -1,6 +1,6 @@
 use crate::detect;
 use anyhow::Result;
-use lixun_core::{Action, Category, DocId, Hit, PluginFieldSpec};
+use lixun_core::{Action, Category, DocId, Hit, PluginFieldSpec, RowMenuDef, RowMenuItem, RowMenuVerb};
 use lixun_sources::{IndexerSource, MutationSink, QueryContext, SourceContext};
 
 pub struct CalculatorSource;
@@ -18,7 +18,7 @@ impl IndexerSource for CalculatorSource {
         Ok(())
     }
 
-    fn on_query(&self, query: &str, _ctx: &QueryContext) -> Vec<Hit> {
+    fn on_query(&self, query: &str, ctx: &QueryContext) -> Vec<Hit> {
         let Some(rest) = query.strip_prefix('=') else {
             return Vec::new();
         };
@@ -41,11 +41,23 @@ impl IndexerSource for CalculatorSource {
             recipients: None,
             body: None,
             secondary_action: None,
+            source_instance: ctx.instance_id.to_string(),
+            row_menu: RowMenuDef::empty(),
         }]
     }
 
     fn excludes_from_query_log(&self, query: &str) -> bool {
         query.trim_start().starts_with('=')
+    }
+
+    fn row_menu(&self) -> RowMenuDef {
+        RowMenuDef {
+            items: vec![RowMenuItem {
+                label: "Copy result".into(),
+                verb: RowMenuVerb::Copy,
+                visibility: Default::default(),
+            }],
+        }
     }
 }
 

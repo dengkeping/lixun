@@ -2,7 +2,9 @@
 
 use crate::mbox;
 use anyhow::Result;
-use lixun_core::{Action, Category, DocId, Document};
+use lixun_core::{
+    Action, Category, DocId, Document, RowMenuDef, RowMenuItem, RowMenuVerb, RowMenuVisibility,
+};
 use lixun_sources::mime_icons;
 use mime_guess::Mime;
 use std::path::PathBuf;
@@ -150,6 +152,38 @@ impl ThunderbirdAttachmentsSource {
 impl lixun_sources::source::IndexerSource for ThunderbirdAttachmentsSource {
     fn kind(&self) -> &'static str {
         "tb_attachments"
+    }
+
+    fn row_menu(&self) -> RowMenuDef {
+        RowMenuDef {
+            items: vec![
+                RowMenuItem {
+                    label: "Open".into(),
+                    verb: RowMenuVerb::Open,
+                    visibility: Default::default(),
+                },
+                RowMenuItem {
+                    label: "Copy path".into(),
+                    verb: RowMenuVerb::Copy,
+                    visibility: Default::default(),
+                },
+                RowMenuItem {
+                    label: "Quick Look".into(),
+                    verb: RowMenuVerb::QuickLook,
+                    visibility: Default::default(),
+                },
+                RowMenuItem {
+                    label: "Info".into(),
+                    verb: RowMenuVerb::Info,
+                    visibility: Default::default(),
+                },
+                RowMenuItem {
+                    label: "Open parent mail".into(),
+                    verb: RowMenuVerb::Secondary,
+                    visibility: RowMenuVisibility::RequiresSecondaryAction,
+                },
+            ],
+        }
     }
 
     fn watch_paths(

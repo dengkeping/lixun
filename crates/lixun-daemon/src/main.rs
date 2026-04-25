@@ -701,6 +701,20 @@ async fn handle_client(
                         }
                         hits.extend(plugin_hits);
                     }
+                    // Stamp row_menu onto every hit by looking up its
+                    // opaque source_instance in the registry. This keeps
+                    // the host from naming any concrete plugin while
+                    // giving the GUI a cache key + menu schema per row.
+                    // Hits with an empty source_instance (legacy / test
+                    // fixtures) keep RowMenuDef::empty().
+                    for hit in hits.iter_mut() {
+                        if hit.source_instance.is_empty() {
+                            continue;
+                        }
+                        if let Some(menu) = registry.row_menu_for(&hit.source_instance) {
+                            hit.row_menu = menu;
+                        }
+                    }
                     // Sort hits + breakdowns together by building a paired
                     // index and permuting both vectors. Ensures breakdowns
                     // stay 1:1 with hits after ranking reorders them.
@@ -1213,6 +1227,8 @@ mod tests {
             recipients: None,
             body: None,
             secondary_action: None,
+            source_instance: String::new(),
+            row_menu: lixun_core::RowMenuDef::empty(),
         }
     }
 

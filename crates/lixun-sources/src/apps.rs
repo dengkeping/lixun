@@ -1,7 +1,7 @@
 //! Applications source — scan .desktop files.
 
 use anyhow::Result;
-use lixun_core::{Action, Category, DocId, Document};
+use lixun_core::{Action, Category, DocId, Document, RowMenuDef, RowMenuItem, RowMenuVerb};
 use std::path::{Path, PathBuf};
 
 struct DesktopEntry {
@@ -197,6 +197,23 @@ impl AppsSource {
 impl crate::source::IndexerSource for AppsSource {
     fn kind(&self) -> &'static str {
         "apps"
+    }
+
+    fn row_menu(&self) -> RowMenuDef {
+        RowMenuDef {
+            items: vec![
+                RowMenuItem {
+                    label: "Launch".into(),
+                    verb: RowMenuVerb::Open,
+                    visibility: Default::default(),
+                },
+                RowMenuItem {
+                    label: "Copy name".into(),
+                    verb: RowMenuVerb::Copy,
+                    visibility: Default::default(),
+                },
+            ],
+        }
     }
 
     fn watch_paths(
