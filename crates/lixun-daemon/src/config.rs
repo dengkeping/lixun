@@ -15,6 +15,8 @@ const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "keybindings",
     "preview",
     "gui",
+    "extract",
+    "ocr",
 ];
 
 #[derive(Debug, Deserialize)]
@@ -28,6 +30,8 @@ struct ConfigToml {
     keybindings: Option<KeybindingsToml>,
     preview: Option<PreviewToml>,
     gui: Option<GuiToml>,
+    extract: Option<ExtractConfig>,
+    ocr: Option<OcrConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -40,6 +44,101 @@ struct GuiToml {
     preview_height_percent: Option<u8>,
     preview_max_width_px: Option<i32>,
     preview_max_height_px: Option<i32>,
+}
+
+/// Text-extraction cache configuration. Shared by every extractor
+/// (pdftotext, OOXML, OCR) — lives under `~/.cache/lixun/extract/v1/`.
+/// Cache sweep is a tick-scheduled LRU eviction keyed by file mtime.
+/// `cache_max_mb = 0` disables the sweep tick (valid config, no warn).
+#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq, Eq)]
+pub struct ExtractConfig {
+    #[serde(default = "default_cache_max_mb")]
+    pub cache_max_mb: u64,
+    #[serde(default = "default_cache_sweep_interval_secs")]
+    pub cache_sweep_interval_secs: u64,
+}
+
+impl Default for ExtractConfig {
+    fn default() -> Self {
+        Self {
+            cache_max_mb: default_cache_max_mb(),
+            cache_sweep_interval_secs: default_cache_sweep_interval_secs(),
+        }
+    }
+}
+
+fn default_cache_max_mb() -> u64 {
+    500
+}
+fn default_cache_sweep_interval_secs() -> u64 {
+    600
+}
+
+/// OCR configuration. Disabled by default. Enabling requires
+/// `tesseract` + at least one language pack installed on the host.
+/// OCR runs deferred on a tick worker that drains a persistent queue
+/// at `~/.local/state/lixun/ocr-queue.db`. Adaptive throttle fields
+/// (`adaptive_throttle`, `max_cpu_pressure_avg10`, `nice_level`,
+/// `io_class_idle`) are Linux-only (DB-15); on other platforms they
+/// are accepted but ignored.
+#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq)]
+pub struct OcrConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub languages: Vec<String>,
+    #[serde(default = "default_max_pages_per_pdf")]
+    pub max_pages_per_pdf: Option<usize>,
+    #[serde(default = "default_min_image_side_px")]
+    pub min_image_side_px: u32,
+    #[serde(default = "default_ocr_timeout_secs")]
+    pub timeout_secs: u64,
+    #[serde(default = "default_ocr_worker_interval_secs")]
+    pub worker_interval_secs: u64,
+    #[serde(default)]
+    pub adaptive_throttle: bool,
+    #[serde(default = "default_max_cpu_pressure_avg10")]
+    pub max_cpu_pressure_avg10: f32,
+    #[serde(default = "default_nice_level")]
+    pub nice_level: i32,
+    #[serde(default)]
+    pub io_class_idle: bool,
+}
+
+impl Default for OcrConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            languages: Vec::new(),
+            max_pages_per_pdf: default_max_pages_per_pdf(),
+            min_image_side_px: default_min_image_side_px(),
+            timeout_secs: default_ocr_timeout_secs(),
+            worker_interval_secs: default_ocr_worker_interval_secs(),
+            adaptive_throttle: false,
+            max_cpu_pressure_avg10: default_max_cpu_pressure_avg10(),
+            nice_level: default_nice_level(),
+            io_class_idle: false,
+        }
+    }
+}
+
+fn default_max_pages_per_pdf() -> Option<usize> {
+    None
+}
+fn default_min_image_side_px() -> u32 {
+    200
+}
+fn default_ocr_timeout_secs() -> u64 {
+    30
+}
+fn default_ocr_worker_interval_secs() -> u64 {
+    60
+}
+fn default_max_cpu_pressure_avg10() -> f32 {
+    10.0
+}
+fn default_nice_level() -> i32 {
+    19
 }
 
 #[derive(Debug, Deserialize)]
@@ -179,6 +278,8 @@ pub struct Config {
     pub keybindings: Keybindings,
     pub preview: PreviewConfig,
     pub gui: GuiConfig,
+    pub extract: ExtractConfig,
+    pub ocr: OcrConfig,
     pub state_dir: PathBuf,
     pub plugin_sections: BTreeMap<String, toml::Value>,
 }
@@ -248,6 +349,8 @@ impl Default for Config {
             keybindings: Keybindings::default(),
             preview: PreviewConfig::default(),
             gui: GuiConfig::default(),
+            extract: ExtractConfig::default(),
+            ocr: OcrConfig::default(),
             state_dir: state_dir(),
             plugin_sections: BTreeMap::new(),
         }
@@ -441,6 +544,13 @@ impl Config {
                 cfg.gui.preview_max_height_px = v.max(400);
             }
         }
+        if let Some(extract) = parsed.extract {
+            cfg.extract = extract;
+        }
+        if let Some(ocr) = parsed.ocr {
+            cfg.ocr = ocr;
+        }
+        cfg.validate_and_normalize();
 
         let known: HashSet<&'static str> = KNOWN_TOP_LEVEL_KEYS.iter().copied().collect();
         let known_preview: HashSet<&'static str> = KNOWN_PREVIEW_KEYS.iter().copied().collect();
@@ -491,6 +601,26 @@ impl Config {
             top_hit_min_confidence: self.ranking_top_hit_min_confidence,
             top_hit_min_margin: self.ranking_top_hit_min_margin,
             strong_latch_threshold: self.ranking_strong_latch_threshold,
+        }
+    }
+
+    fn validate_and_normalize(&mut self) {
+        if self.ocr.max_pages_per_pdf == Some(0) {
+            tracing::warn!("[ocr].max_pages_per_pdf = 0 interpreted as unlimited");
+            self.ocr.max_pages_per_pdf = None;
+        }
+        if self.ocr.worker_interval_secs == 0 {
+            tracing::warn!("[ocr].worker_interval_secs = 0 clamped to 1");
+            self.ocr.worker_interval_secs = 1;
+        }
+        if !(0..=19).contains(&self.ocr.nice_level) {
+            let clamped = self.ocr.nice_level.clamp(0, 19);
+            tracing::warn!(
+                "[ocr].nice_level = {} out of 0..=19, clamped to {}",
+                self.ocr.nice_level,
+                clamped
+            );
+            self.ocr.nice_level = clamped;
         }
     }
 }
@@ -558,5 +688,114 @@ mod tests {
         assert_eq!(cfg.ranking_total_multiplier_cap, 6.0);
         let ranking = cfg.ranking_config();
         assert!((ranking.total_multiplier_cap - 6.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn extract_config_round_trip() {
+        let ec = ExtractConfig {
+            cache_max_mb: 1024,
+            cache_sweep_interval_secs: 30,
+        };
+        let s = toml::to_string(&ec).unwrap();
+        let parsed: ExtractConfig = toml::from_str(&s).unwrap();
+        assert_eq!(ec, parsed);
+    }
+
+    #[test]
+    fn ocr_config_round_trip() {
+        let oc = OcrConfig {
+            enabled: true,
+            languages: vec!["eng".into(), "rus".into()],
+            max_pages_per_pdf: Some(20),
+            min_image_side_px: 300,
+            timeout_secs: 45,
+            worker_interval_secs: 90,
+            adaptive_throttle: true,
+            max_cpu_pressure_avg10: 25.0,
+            nice_level: 10,
+            io_class_idle: true,
+        };
+        let s = toml::to_string(&oc).unwrap();
+        let parsed: OcrConfig = toml::from_str(&s).unwrap();
+        assert_eq!(oc, parsed);
+    }
+
+    #[test]
+    fn extract_config_defaults_match_plan() {
+        let ec = ExtractConfig::default();
+        assert_eq!(ec.cache_max_mb, 500);
+        assert_eq!(ec.cache_sweep_interval_secs, 600);
+    }
+
+    #[test]
+    fn ocr_config_defaults_apply_when_only_enabled_set() {
+        let cfg =
+            Config::from_toml_str("[ocr]\nenabled = true\n").expect("parse");
+        assert!(cfg.ocr.enabled);
+        assert!(cfg.ocr.languages.is_empty());
+        assert_eq!(cfg.ocr.max_pages_per_pdf, None);
+        assert_eq!(cfg.ocr.min_image_side_px, 200);
+        assert_eq!(cfg.ocr.timeout_secs, 30);
+        assert_eq!(cfg.ocr.worker_interval_secs, 60);
+        assert!(!cfg.ocr.adaptive_throttle);
+        assert!((cfg.ocr.max_cpu_pressure_avg10 - 10.0).abs() < f32::EPSILON);
+        assert_eq!(cfg.ocr.nice_level, 19);
+        assert!(!cfg.ocr.io_class_idle);
+    }
+
+    #[test]
+    fn ocr_config_max_pages_none_when_omitted() {
+        let cfg = Config::from_toml_str("[ocr]\nenabled = true\n").unwrap();
+        assert_eq!(cfg.ocr.max_pages_per_pdf, None);
+        let cfg2 =
+            Config::from_toml_str("[ocr]\nmax_pages_per_pdf = 5\n").unwrap();
+        assert_eq!(cfg2.ocr.max_pages_per_pdf, Some(5));
+    }
+
+    #[test]
+    fn ocr_config_max_pages_zero_normalized_to_none() {
+        let cfg =
+            Config::from_toml_str("[ocr]\nmax_pages_per_pdf = 0\n").unwrap();
+        assert_eq!(cfg.ocr.max_pages_per_pdf, None);
+    }
+
+    #[test]
+    fn ocr_config_worker_interval_zero_clamped_to_one() {
+        let cfg =
+            Config::from_toml_str("[ocr]\nworker_interval_secs = 0\n").unwrap();
+        assert_eq!(cfg.ocr.worker_interval_secs, 1);
+    }
+
+    #[test]
+    fn ocr_config_nice_out_of_range_clamped() {
+        let cfg_low =
+            Config::from_toml_str("[ocr]\nnice_level = -5\n").unwrap();
+        assert_eq!(cfg_low.ocr.nice_level, 0);
+        let cfg_high =
+            Config::from_toml_str("[ocr]\nnice_level = 25\n").unwrap();
+        assert_eq!(cfg_high.ocr.nice_level, 19);
+        let cfg_ok =
+            Config::from_toml_str("[ocr]\nnice_level = 10\n").unwrap();
+        assert_eq!(cfg_ok.ocr.nice_level, 10);
+    }
+
+    #[test]
+    fn extract_config_parsed_from_toml() {
+        let cfg = Config::from_toml_str(
+            "[extract]\ncache_max_mb = 1024\ncache_sweep_interval_secs = 120\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.extract.cache_max_mb, 1024);
+        assert_eq!(cfg.extract.cache_sweep_interval_secs, 120);
+    }
+
+    #[test]
+    fn extract_and_ocr_sections_not_treated_as_plugin_sections() {
+        let cfg = Config::from_toml_str(
+            "[extract]\ncache_max_mb = 100\n[ocr]\nenabled = true\n",
+        )
+        .unwrap();
+        assert!(!cfg.plugin_sections.contains_key("extract"));
+        assert!(!cfg.plugin_sections.contains_key("ocr"));
     }
 }

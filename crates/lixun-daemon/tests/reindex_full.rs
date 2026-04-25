@@ -1,4 +1,6 @@
-use lixun_daemon::config::{Config, GuiConfig, Keybindings, PreviewConfig};
+use lixun_daemon::config::{
+    Config, ExtractConfig, GuiConfig, Keybindings, OcrConfig, PreviewConfig,
+};
 use lixun_daemon::index_service::spawn_writer_service;
 use lixun_daemon::indexer;
 use lixun_sources::manifest::Manifest;
@@ -29,6 +31,8 @@ fn test_config(root: std::path::PathBuf, state_dir: std::path::PathBuf) -> Confi
         keybindings: Keybindings::default(),
         preview: PreviewConfig::default(),
         gui: GuiConfig::default(),
+        extract: ExtractConfig::default(),
+        ocr: OcrConfig::default(),
         state_dir,
         plugin_sections: BTreeMap::new(),
     }
