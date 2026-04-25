@@ -309,7 +309,10 @@ impl LixunIndex {
         let now_secs = Utc::now().timestamp();
 
         let query_obj = build_search_query(&query.text, &self.index, s, &self.plugins);
-        let top_docs = searcher.search(&query_obj, &TopDocs::with_limit(query.limit as usize))?;
+        let top_docs = searcher.search(
+            &query_obj,
+            &TopDocs::with_limit(query.limit as usize).order_by_score(),
+        )?;
 
         let mut results = Vec::new();
         for (score, doc_address) in top_docs {
@@ -456,7 +459,7 @@ impl LixunIndex {
         let searcher = reader.searcher();
         let term = Term::from_field_text(self.schema.id, id);
         let query = TermQuery::new(term, IndexRecordOption::Basic);
-        let top_docs = searcher.search(&query, &TopDocs::with_limit(1))?;
+        let top_docs = searcher.search(&query, &TopDocs::with_limit(1).order_by_score())?;
         let Some((_, addr)) = top_docs.first() else {
             return Ok(None);
         };
@@ -477,7 +480,7 @@ impl LixunIndex {
         let searcher = reader.searcher();
         let term = Term::from_field_text(self.schema.id, id);
         let query = TermQuery::new(term, IndexRecordOption::Basic);
-        let top_docs = searcher.search(&query, &TopDocs::with_limit(1))?;
+        let top_docs = searcher.search(&query, &TopDocs::with_limit(1).order_by_score())?;
         let Some((_, addr)) = top_docs.first() else {
             return Ok(None);
         };
@@ -1358,6 +1361,102 @@ mod tests {
             "apps=99 vs files=1 must amplify top score by >90×: got {} vs {}",
             hits[0].score,
             hits[1].score,
+        );
+    }
+
+    /// Guard: every full-text field indexed with the spotlight tokenizer
+    /// MUST record term positions (`WithFreqsAndPositions`). Wave B's
+    /// proximity / PhraseQuery work relies on this, and a tantivy upgrade
+    /// that silently demotes the index option would break scoring without
+    /// any obvious failure. This test pins the invariant at the schema
+    /// level AND behaviourally via a PhraseQuery (which is unsatisfiable
+    /// unless positions are live in the segment).
+    #[test]
+    fn test_fulltext_fields_record_positions() {
+        use tantivy::query::PhraseQuery;
+        use tantivy::schema::FieldType;
+
+        // --- Schema-level introspection ---
+        let (schema, _plugins) = LixunSchema::build_with_plugins(&BTreeMap::new()).unwrap();
+        let raw: &Schema = &schema.schema;
+
+        // Fields we register with the spotlight tokenizer + full-text
+        // indexing. Must stay in lockstep with `LixunSchema::build_with_plugins`.
+        let spotlight_fields = [
+            ("title", schema.title),
+            ("title_terms", schema.title_terms),
+            ("title_initials", schema.title_initials),
+            ("title_prefixes", schema.title_prefixes),
+            ("body", schema.body),
+            ("path", schema.path),
+            ("sender", schema.sender),
+            ("recipients", schema.recipients),
+        ];
+
+        for (name, field) in spotlight_fields {
+            let entry = raw.get_field_entry(field);
+            match entry.field_type() {
+                FieldType::Str(text_opts) => {
+                    let indexing = text_opts.get_indexing_options().unwrap_or_else(|| {
+                        panic!("field `{name}` missing TextFieldIndexing options")
+                    });
+                    assert_eq!(
+                        indexing.index_option(),
+                        IndexRecordOption::WithFreqsAndPositions,
+                        "field `{name}` must record positions (got {:?})",
+                        indexing.index_option(),
+                    );
+                    assert_eq!(
+                        indexing.tokenizer(),
+                        "spotlight",
+                        "field `{name}` must use the spotlight tokenizer (got {})",
+                        indexing.tokenizer(),
+                    );
+                }
+                other => panic!("field `{name}` must be Str, got {other:?}"),
+            }
+        }
+
+        // --- Behavioural proof: PhraseQuery only returns hits when
+        //     positions are stored in the segment. ---
+        let doc = sample_document(
+            "fs:/tmp/phrase.txt",
+            "quick brown fox",
+            "the quick brown fox jumps over the lazy dog",
+        );
+        let (_tmp, index) = create_index_with_docs(&[doc]);
+
+        let title_field = index.schema.title;
+        let reader = index.index.reader().unwrap();
+        let searcher = reader.searcher();
+
+        // Adjacent phrase: must hit.
+        let phrase_hit = PhraseQuery::new(vec![
+            Term::from_field_text(title_field, "quick"),
+            Term::from_field_text(title_field, "brown"),
+        ]);
+        let hits_match = searcher
+            .search(&phrase_hit, &TopDocs::with_limit(5).order_by_score())
+            .unwrap();
+        assert_eq!(
+            hits_match.len(),
+            1,
+            "PhraseQuery on adjacent title terms must find the doc when positions are live",
+        );
+
+        // Non-adjacent order: must miss (proves positions are actually
+        // being consulted, not ignored).
+        let phrase_miss = PhraseQuery::new(vec![
+            Term::from_field_text(title_field, "fox"),
+            Term::from_field_text(title_field, "quick"),
+        ]);
+        let hits_miss = searcher
+            .search(&phrase_miss, &TopDocs::with_limit(5).order_by_score())
+            .unwrap();
+        assert_eq!(
+            hits_miss.len(),
+            0,
+            "PhraseQuery with reversed terms must not match; if it does, positions are wrong",
         );
     }
 }

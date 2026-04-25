@@ -27,7 +27,7 @@ pub fn stats() -> (u64, u64, u64) {
 
 const COMMIT_MIN_INTERVAL: Duration = Duration::from_secs(3);
 const COMMIT_CHECK_INTERVAL: Duration = Duration::from_millis(500);
-pub const WRITER_HEAP_BYTES: usize = 32_000_000;
+pub const WRITER_HEAP_BYTES: usize = 100_000_000;
 
 #[allow(dead_code)]
 pub enum Mutation {
