@@ -195,6 +195,31 @@ impl OcrQueue {
         .context("ocr queue: mark_failure failed")
     }
 
+    /// Delete rows whose attempts counter has exhausted the worker's
+    /// retry budget (`attempts >= max_attempts`) and whose
+    /// `enqueued_at` is older than `older_than_secs` (Unix seconds).
+    /// Returns the number of rows deleted.
+    ///
+    /// Called from the cache-sweep tick (T9) to bound queue growth
+    /// under permanent-failure conditions while preserving a grace
+    /// window during which operators can still inspect `last_error`
+    /// via `sqlite3`. The worker treats a row with `attempts >=
+    /// max_attempts` as invisible (see [`peek_next`]), so reaping
+    /// does not race with in-flight OCR.
+    pub fn reap_zombies(&self, max_attempts: u32, older_than_secs: i64) -> Result<u64> {
+        self.with_conn(|conn| {
+            with_busy_retry(|| {
+                let affected = conn.execute(
+                    "DELETE FROM ocr_queue
+                     WHERE attempts >= ?1 AND enqueued_at < ?2",
+                    params![max_attempts as i64, older_than_secs],
+                )?;
+                Ok(affected as u64)
+            })
+        })
+        .context("ocr queue: reap_zombies failed")
+    }
+
     /// `true` iff the queue is empty.
     pub fn is_empty(&self) -> Result<bool> {
         Ok(self.len()? == 0)
@@ -535,5 +560,35 @@ mod tests {
         let q = mem_queue();
         q.mark_failure("nope", "ignored").unwrap();
         assert_eq!(q.len().unwrap(), 0);
+    }
+
+    #[test]
+    fn reap_zombies_deletes_old_high_attempt_rows() {
+        let q = mem_queue();
+        let now = now_secs();
+        let thirty_days = 30 * 86_400;
+
+        let mut fresh_no_fail = sample_row("fresh-no-fail");
+        fresh_no_fail.attempts = 0;
+        fresh_no_fail.enqueued_at = now - 40 * 86_400;
+        q.enqueue(fresh_no_fail).unwrap();
+
+        let mut old_exhausted = sample_row("old-exhausted");
+        old_exhausted.attempts = 3;
+        old_exhausted.enqueued_at = now - 40 * 86_400;
+        q.enqueue(old_exhausted).unwrap();
+
+        let mut recent_exhausted = sample_row("recent-exhausted");
+        recent_exhausted.attempts = 3;
+        recent_exhausted.enqueued_at = now - 25 * 86_400;
+        q.enqueue(recent_exhausted).unwrap();
+
+        let cutoff = now - thirty_days;
+        let deleted = q.reap_zombies(3, cutoff).unwrap();
+        assert_eq!(deleted, 1, "only old-exhausted should be reaped");
+        assert_eq!(q.len().unwrap(), 2);
+
+        let row = q.peek_next(10).unwrap().expect("at least one row remains");
+        assert_ne!(row.doc_id, "old-exhausted");
     }
 }

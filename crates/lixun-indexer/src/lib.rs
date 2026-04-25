@@ -1,3 +1,4 @@
+pub mod cache_sweep;
 pub mod index_service;
 pub mod indexer;
 pub mod ocr_tick;
