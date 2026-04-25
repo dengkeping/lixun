@@ -4,7 +4,7 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use bytes::{BufMut, BytesMut};
 use chrono::Utc;
 use futures::StreamExt;
@@ -129,6 +129,15 @@ async fn main() -> Result<()> {
     );
     extract_caps.ocr_enabled = config.ocr.enabled;
     lixun_extract::init_capabilities(extract_caps.clone());
+
+    // Ensure the state directory exists on disk before any subsystem
+    // opens a sqlite file or loads a store under it. The ocr queue
+    // below is the first consumer; `FrecencyStore`, `QueryLatchStore`,
+    // `QueryLog`, the index dir, and the per-source state subdir all
+    // expect this path to exist already. On a fresh install or in an
+    // isolated sandbox, `$XDG_STATE_HOME/lixun` may be absent.
+    std::fs::create_dir_all(&config.state_dir)
+        .with_context(|| format!("creating state_dir {}", config.state_dir.display()))?;
 
     // Open the deferred-OCR queue eagerly (before the indexer or the
     // watcher boot up) so every FsSource extraction path — full
