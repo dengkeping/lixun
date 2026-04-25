@@ -855,15 +855,31 @@ fn spawn_ocr_worker(
         return;
     };
     let langs = resolve_ocr_langs(&config.ocr.languages, &caps.tesseract_langs);
+    let throttle = if config.ocr.adaptive_throttle {
+        Some((config.ocr.nice_level, config.ocr.io_class_idle))
+    } else {
+        None
+    };
     let cfg = lixun_indexer::ocr_tick::OcrWorkerCfg {
         interval: std::time::Duration::from_secs(config.ocr.worker_interval_secs),
         langs,
         min_image_side_px: config.ocr.min_image_side_px,
         max_pages_per_pdf: config.ocr.max_pages_per_pdf,
         max_attempts: 3,
+        throttle,
     };
-    let idle: Arc<dyn lixun_indexer::ocr_tick::IdleGate> =
-        Arc::new(StatsIdleGate { stats });
+    let idle: Arc<dyn lixun_indexer::ocr_tick::IdleGate> = if config.ocr.adaptive_throttle {
+        let stats_gate: Arc<dyn lixun_indexer::ocr_tick::IdleGate> =
+            Arc::new(StatsIdleGate { stats });
+        let psi_gate: Arc<dyn lixun_indexer::ocr_tick::IdleGate> = Arc::new(
+            lixun_indexer::psi_gate::CpuPsiGate::new(config.ocr.max_cpu_pressure_avg10),
+        );
+        Arc::new(lixun_indexer::psi_gate::CompositeIdleGate {
+            gates: vec![stats_gate, psi_gate],
+        })
+    } else {
+        Arc::new(StatsIdleGate { stats })
+    };
     let handle = lixun_indexer::ocr_tick::spawn(queue, idle, sink, Arc::new(caps), cfg);
     std::mem::forget(handle);
 }

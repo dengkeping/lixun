@@ -14,13 +14,24 @@ pub trait CommandRunner {
 
 pub struct SystemRunner {
     pub timeout: Duration,
+    low_priority: Option<(i32, bool)>,
 }
 
 impl SystemRunner {
     pub fn new(timeout_secs: u64) -> Self {
         Self {
             timeout: Duration::from_secs(timeout_secs),
+            low_priority: None,
         }
+    }
+
+    /// Arrange for every spawned child to lower itself (nice +
+    /// optional ioprio-idle class) between `fork` and `execve`.
+    /// Enabled by `[ocr].adaptive_throttle = true` in the daemon
+    /// config (DB-15).
+    pub fn with_low_priority(mut self, nice: i32, ioprio_idle: bool) -> Self {
+        self.low_priority = Some((nice, ioprio_idle));
+        self
     }
 }
 
@@ -32,9 +43,12 @@ impl Default for SystemRunner {
 
 impl CommandRunner for SystemRunner {
     fn run(&self, cmd: &str, args: &[&str], _input: Option<&[u8]>) -> Result<String> {
-        let mut child = Command::new(cmd)
-            .args(args)
-            .env("OMP_THREAD_LIMIT", "1")
+        let mut command = Command::new(cmd);
+        command.args(args).env("OMP_THREAD_LIMIT", "1");
+        if let Some((nice, ioprio_idle)) = self.low_priority {
+            apply_low_priority(&mut command, nice, ioprio_idle);
+        }
+        let mut child = command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .process_group(0)
@@ -150,6 +164,32 @@ pub fn write_temp_named(prefix: &str, ext: &str, bytes: &[u8]) -> Result<(PathBu
     Ok((handle.path().to_path_buf(), handle))
 }
 
+#[cfg(target_os = "linux")]
+fn apply_low_priority(cmd: &mut std::process::Command, nice: i32, ioprio_idle: bool) {
+    use std::os::unix::process::CommandExt;
+    // pre_exec runs post-fork, pre-exec, in the child. Must be
+    // async-signal-safe: no alloc, no logging, raw syscalls only.
+    unsafe {
+        cmd.pre_exec(move || {
+            libc::setpriority(libc::PRIO_PROCESS, 0, nice);
+            if ioprio_idle {
+                const IOPRIO_CLASS_IDLE: libc::c_long = 3;
+                const IOPRIO_WHO_PROCESS: libc::c_long = 1;
+                let _ = libc::syscall(
+                    libc::SYS_ioprio_set,
+                    IOPRIO_WHO_PROCESS,
+                    0,
+                    IOPRIO_CLASS_IDLE << 13,
+                );
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn apply_low_priority(_cmd: &mut std::process::Command, _nice: i32, _ioprio_idle: bool) {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,6 +244,14 @@ mod tests {
             out.contains("OMP_THREAD_LIMIT=1"),
             "SystemRunner must export OMP_THREAD_LIMIT=1 to children, got: {out:?}"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nice_child_pre_exec_compiles_and_runs() {
+        let runner = SystemRunner::new(5).with_low_priority(19, true);
+        let res = runner.run("true", &[], None);
+        assert!(res.is_ok(), "spawn with pre_exec failed: {res:?}");
     }
 
     #[test]
