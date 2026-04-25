@@ -274,11 +274,13 @@ mod tests {
             2 => Response::HitsWithExtras {
                 hits,
                 calculation: None,
+                explanations: vec![],
             },
             _ => Response::HitsWithExtrasV3 {
                 hits,
                 calculation: None,
                 top_hit,
+                explanations: vec![],
             },
         }
     }

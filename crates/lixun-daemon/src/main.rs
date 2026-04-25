@@ -54,6 +54,25 @@ fn clamp_stage2_mult(stage2: f32, cap: f32) -> f32 {
     stage2.min(cap)
 }
 
+/// Format a single hit's score breakdown as a one-line string for
+/// `Response::HitsWithExtras{,V3}.explanations`. Emitted only when
+/// the CLI invokes `lixun search --explain` (T6). The format is
+/// `score=<final> = tantivy(<t>) × cat(<c>) × prefix(<p>) × acronym(<a>) × recency(<r>) × coord(<co>) × stage2(<s>)`
+/// so each multiplier is visible alongside the final ranking score.
+fn format_breakdown(b: &lixun_core::ScoreBreakdown, _h: &lixun_core::Hit) -> String {
+    format!(
+        "score={:.4} = tantivy({:.4}) × cat({:.3}) × prefix({:.3}) × acronym({:.3}) × recency({:.3}) × coord({:.3}) × stage2({:.3})",
+        b.final_score,
+        b.tantivy,
+        b.category_mult,
+        b.prefix_mult,
+        b.acronym_mult,
+        b.recency_mult,
+        b.coord_mult,
+        b.stage2_clamped,
+    )
+}
+
 /// Total-order comparator for the final hit sort: descending by
 /// score, with a deterministic tiebreaker on `doc_id.0` ascending.
 /// Without the tiebreaker, near-ties (or NaN scores) produce
@@ -606,72 +625,142 @@ async fn handle_client(
         Request::Toggle => gui_result_to_response(gui_control.dispatch(GuiCommand::Toggle).await),
         Request::Show => gui_result_to_response(gui_control.dispatch(GuiCommand::Show).await),
         Request::Hide => gui_result_to_response(gui_control.dispatch(GuiCommand::Hide).await),
-        Request::Search { q, limit } => match search.search(&lixun_core::Query { text: q.clone(), limit }).await {
-            Ok(mut hits) => {
-                let now = chrono::Utc::now().timestamp();
-                {
-                    let frecency = frecency.read().await;
-                    let latch = query_latch.read().await;
-                    let alpha = config.ranking_frecency_alpha;
-                    let w = config.ranking_latch_weight;
-                    let cap = config.ranking_latch_cap;
-                    let total_cap = config.ranking_total_multiplier_cap;
-                    for hit in &mut hits {
-                        let stage2 = frecency.mult(&hit.id.0, now, alpha)
-                            * latch.mult(&q, &hit.id.0, now, w, cap);
-                        hit.score *= clamp_stage2_mult(stage2, total_cap);
+        Request::Search { q, limit, explain } => {
+            let query_obj = lixun_core::Query { text: q.clone(), limit };
+            // Dual-path to avoid breakdown cost when the caller doesn't ask
+            // for explanations. Both paths produce the same `hits` vec and
+            // differ only in whether `breakdowns` is populated (T6).
+            let search_result: Result<(Vec<lixun_core::Hit>, Vec<lixun_core::ScoreBreakdown>), anyhow::Error> = if explain {
+                search.search_with_breakdown(&query_obj).await.map(|pairs| {
+                    let mut hits_v = Vec::with_capacity(pairs.len());
+                    let mut brk_v = Vec::with_capacity(pairs.len());
+                    for (h, b) in pairs {
+                        hits_v.push(h);
+                        brk_v.push(b);
+                    }
+                    (hits_v, brk_v)
+                })
+            } else {
+                search.search(&query_obj).await.map(|h| (h, Vec::new()))
+            };
+            match search_result {
+                Ok((mut hits, mut breakdowns)) => {
+                    let now = chrono::Utc::now().timestamp();
+                    {
+                        let frecency = frecency.read().await;
+                        let latch = query_latch.read().await;
+                        let alpha = config.ranking_frecency_alpha;
+                        let w = config.ranking_latch_weight;
+                        let cap = config.ranking_latch_cap;
+                        let total_cap = config.ranking_total_multiplier_cap;
+                        for (i, hit) in hits.iter_mut().enumerate() {
+                            let frec = frecency.mult(&hit.id.0, now, alpha);
+                            let lat = latch.mult(&q, &hit.id.0, now, w, cap);
+                            let stage2 = frec * lat;
+                            let clamped = clamp_stage2_mult(stage2, total_cap);
+                            hit.score *= clamped;
+                            if explain
+                                && let Some(b) = breakdowns.get_mut(i)
+                            {
+                                b.frecency_mult = frec;
+                                b.latch_mult = lat;
+                                b.stage2_clamped = clamped;
+                                b.final_score = hit.score;
+                            }
+                        }
+                    }
+                    // Fan-out `on_query` to every registered source plugin.
+                    // Plugins set their own scores; frecency and latch do not
+                    // apply. Host names no plugin (AGENTS.md hard-modularity).
+                    for inst in registry.instances.iter() {
+                        let qctx = QueryContext {
+                            instance_id: inst.instance_id.as_str(),
+                            state_dir: &inst.state_dir,
+                        };
+                        let plugin_hits = inst.source.on_query(&q, &qctx);
+                        if explain {
+                            // Plugins never populate ScoreBreakdown because
+                            // they bypass the Tantivy scoring path entirely.
+                            // Synthesize a minimal breakdown so the parallel
+                            // `breakdowns` vec stays the same length as `hits`
+                            // and downstream indexing by position stays safe.
+                            for h in &plugin_hits {
+                                breakdowns.push(lixun_core::ScoreBreakdown {
+                                    tantivy: h.score,
+                                    category_mult: 1.0,
+                                    prefix_mult: 1.0,
+                                    acronym_mult: 1.0,
+                                    recency_mult: 1.0,
+                                    coord_mult: 1.0,
+                                    frecency_mult: 1.0,
+                                    latch_mult: 1.0,
+                                    stage2_clamped: 1.0,
+                                    final_score: h.score,
+                                });
+                            }
+                        }
+                        hits.extend(plugin_hits);
+                    }
+                    // Sort hits + breakdowns together by building a paired
+                    // index and permuting both vectors. Ensures breakdowns
+                    // stay 1:1 with hits after ranking reorders them.
+                    let explanations: Vec<String> = if explain {
+                        let mut idx: Vec<usize> = (0..hits.len()).collect();
+                        idx.sort_by(|&a, &b| compare_hits_for_ranking(&hits[a], &hits[b]));
+                        let hits_sorted: Vec<_> = idx.iter().map(|&i| hits[i].clone()).collect();
+                        let brk_sorted: Vec<_> = idx.iter().map(|&i| breakdowns[i].clone()).collect();
+                        hits = hits_sorted;
+                        breakdowns = brk_sorted;
+                        breakdowns.iter().zip(hits.iter()).map(|(b, h)| format_breakdown(b, h)).collect()
+                    } else {
+                        hits.sort_by(compare_hits_for_ranking);
+                        Vec::new()
+                    };
+                    let decision = {
+                        let frecency = frecency.read().await;
+                        let latch = query_latch.read().await;
+                        top_hit::select_top_hit(
+                            &q,
+                            &hits,
+                            &frecency,
+                            &latch,
+                            now,
+                            config.ranking_top_hit_min_confidence,
+                            config.ranking_top_hit_min_margin,
+                            config.ranking_strong_latch_threshold,
+                        )
+                    };
+                    tracing::debug!(
+                        query = %q,
+                        top_hit = ?decision.id,
+                        confidence = decision.confidence,
+                        margin = decision.margin,
+                        prefix_match = decision.prefix_match,
+                        acronym_match = decision.acronym_match,
+                        has_strong_latch = decision.has_strong_latch,
+                        dominance = decision.dominance,
+                        "top_hit selection"
+                    );
+                    let top_hit_id = decision.id;
+                    let calculation: Option<lixun_core::Calculation> = None;
+                    match negotiated_version {
+                        1 => Response::Hits(hits),
+                        2 => Response::HitsWithExtras {
+                            hits,
+                            calculation,
+                            explanations,
+                        },
+                        _ => Response::HitsWithExtrasV3 {
+                            hits,
+                            calculation,
+                            top_hit: top_hit_id,
+                            explanations,
+                        },
                     }
                 }
-                // Fan-out `on_query` to every registered source plugin.
-                // Plugins set their own scores; frecency and latch do not
-                // apply. Host names no plugin (AGENTS.md hard-modularity).
-                for inst in registry.instances.iter() {
-                    let qctx = QueryContext {
-                        instance_id: inst.instance_id.as_str(),
-                        state_dir: &inst.state_dir,
-                    };
-                    hits.extend(inst.source.on_query(&q, &qctx));
-                }
-                hits.sort_by(compare_hits_for_ranking);
-                let decision = {
-                    let frecency = frecency.read().await;
-                    let latch = query_latch.read().await;
-                    top_hit::select_top_hit(
-                        &q,
-                        &hits,
-                        &frecency,
-                        &latch,
-                        now,
-                        config.ranking_top_hit_min_confidence,
-                        config.ranking_top_hit_min_margin,
-                        config.ranking_strong_latch_threshold,
-                    )
-                };
-                tracing::debug!(
-                    query = %q,
-                    top_hit = ?decision.id,
-                    confidence = decision.confidence,
-                    margin = decision.margin,
-                    prefix_match = decision.prefix_match,
-                    acronym_match = decision.acronym_match,
-                    has_strong_latch = decision.has_strong_latch,
-                    dominance = decision.dominance,
-                    "top_hit selection"
-                );
-                let top_hit_id = decision.id;
-                let calculation: Option<lixun_core::Calculation> = None;
-                match negotiated_version {
-                    1 => Response::Hits(hits),
-                    2 => Response::HitsWithExtras { hits, calculation },
-                    _ => Response::HitsWithExtrasV3 {
-                        hits,
-                        calculation,
-                        top_hit: top_hit_id,
-                    },
-                }
+                Err(e) => Response::Error(e.to_string()),
             }
-            Err(e) => Response::Error(e.to_string()),
-        },
+        }
         Request::Reindex { paths } => {
             let already_running = {
                 let mut s = stats.write().await;

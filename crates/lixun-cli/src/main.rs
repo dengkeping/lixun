@@ -28,6 +28,11 @@ enum Commands {
         query: String,
         #[arg(short, long, default_value_t = 20)]
         limit: u32,
+        /// Print a per-hit score breakdown (tantivy, category, prefix,
+        /// acronym, recency, coord, stage-2) under each result. Useful
+        /// when tuning RankingConfig knobs or debugging ordering.
+        #[arg(long)]
+        explain: bool,
     },
     /// Trigger a reindex.
     Reindex {
@@ -90,8 +95,17 @@ async fn main() -> Result<()> {
             let resp = send_request(Request::Hide).await?;
             handle_response(resp, false);
         }
-        Commands::Search { query, limit } => {
-            let resp = send_request(Request::Search { q: query, limit }).await?;
+        Commands::Search {
+            query,
+            limit,
+            explain,
+        } => {
+            let resp = send_request(Request::Search {
+                q: query,
+                limit,
+                explain,
+            })
+            .await?;
             handle_response(resp, false);
         }
         Commands::Reindex { paths } => {
@@ -122,30 +136,45 @@ fn handle_response(resp: Response, ocr_only: bool) {
                 );
             }
         }
-        Response::HitsWithExtras { hits, calculation } => {
+        Response::HitsWithExtras {
+            hits,
+            calculation,
+            explanations,
+        } => {
             if let Some(c) = calculation {
                 println!("= {} = {}", c.expr, c.result);
             }
-            for hit in hits {
+            for (i, hit) in hits.iter().enumerate() {
                 println!(
                     "{:.2} | {:?} | {} | {}",
                     hit.score, hit.category, hit.title, hit.subtitle
                 );
+                if let Some(expl) = explanations.get(i)
+                    && !expl.is_empty()
+                {
+                    println!("    {}", expl);
+                }
             }
         }
         Response::HitsWithExtrasV3 {
             hits,
             calculation,
             top_hit: _,
+            explanations,
         } => {
             if let Some(c) = calculation {
                 println!("= {} = {}", c.expr, c.result);
             }
-            for hit in hits {
+            for (i, hit) in hits.iter().enumerate() {
                 println!(
                     "{:.2} | {:?} | {} | {}",
                     hit.score, hit.category, hit.title, hit.subtitle
                 );
+                if let Some(expl) = explanations.get(i)
+                    && !expl.is_empty()
+                {
+                    println!("    {}", expl);
+                }
             }
         }
         Response::Status {

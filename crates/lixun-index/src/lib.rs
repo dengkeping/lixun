@@ -26,7 +26,7 @@ pub use tantivy::{IndexWriter as TantivyIndexWriter, TantivyDocument as TantivyD
 
 use lixun_core::{
     Category, DocId, Document, ExtraFieldValue, Hit, PluginFieldSpec, PluginFieldType, PluginValue,
-    Query, RankingConfig,
+    Query, RankingConfig, ScoreBreakdown,
 };
 use normalize::normalize_for_match;
 
@@ -303,6 +303,23 @@ impl LixunIndex {
 
     /// Search the index with fuzzy matching.
     pub fn search(&self, query: &Query) -> Result<Vec<Hit>> {
+        Ok(self
+            .search_with_breakdown(query)?
+            .into_iter()
+            .map(|(hit, _)| hit)
+            .collect())
+    }
+
+    /// Wave B T6: score-breakdown-preserving variant of `search`.
+    /// Returns each hit paired with the raw multipliers that produced
+    /// `Hit.score`. Stage-2 fields (frecency, latch) are left at their
+    /// defaults (1.0 multipliers, 0.0 final) because they are applied
+    /// by the daemon after this call; daemon fills them in before
+    /// formatting the human-readable explanation string.
+    pub fn search_with_breakdown(
+        &self,
+        query: &Query,
+    ) -> Result<Vec<(Hit, ScoreBreakdown)>> {
         let reader = self.index.reader()?;
         let searcher = reader.searcher();
         let s = &self.schema;
@@ -325,7 +342,7 @@ impl LixunIndex {
             .map(|t| t.len())
             .unwrap_or(0);
 
-        let mut results = Vec::new();
+        let mut results: Vec<(Hit, ScoreBreakdown)> = Vec::new();
         for (score, doc_address) in top_docs {
             let doc: TantivyDocument = searcher.doc(doc_address)?;
 
@@ -405,33 +422,48 @@ impl LixunIndex {
                 1.0
             };
 
-            let doc_mult = self.ranking.multiplier_for(category)
-                * scoring::prefix_mult(&title_norm, &q_norm, self.ranking.prefix_boost)
-                * scoring::acronym_mult(&title, &q_norm, self.ranking.acronym_boost)
-                * scoring::recency_mult(
-                    category,
-                    mtime,
-                    now_secs,
-                    self.ranking.recency_weight,
-                    self.ranking.recency_tau_days,
-                )
-                * coord_mult;
+            let category_mult = self.ranking.multiplier_for(category);
+            let prefix_mult = scoring::prefix_mult(&title_norm, &q_norm, self.ranking.prefix_boost);
+            let acronym_mult = scoring::acronym_mult(&title, &q_norm, self.ranking.acronym_boost);
+            let recency_mult = scoring::recency_mult(
+                category,
+                mtime,
+                now_secs,
+                self.ranking.recency_weight,
+                self.ranking.recency_tau_days,
+            );
+            let doc_mult =
+                category_mult * prefix_mult * acronym_mult * recency_mult * coord_mult;
+            let final_score = score * doc_mult;
 
-            results.push(Hit {
+            let hit = Hit {
                 id: lixun_core::DocId(id),
                 category,
                 title,
                 subtitle,
                 icon_name,
                 kind_label,
-                score: score * doc_mult,
+                score: final_score,
                 action,
                 extract_fail,
                 sender,
                 recipients,
                 body,
                 secondary_action,
-            });
+            };
+            let breakdown = ScoreBreakdown {
+                tantivy: score,
+                category_mult,
+                prefix_mult,
+                acronym_mult,
+                recency_mult,
+                coord_mult,
+                frecency_mult: 1.0,
+                latch_mult: 1.0,
+                stage2_clamped: 1.0,
+                final_score,
+            };
+            results.push((hit, breakdown));
         }
 
         Ok(results)
@@ -1795,5 +1827,61 @@ mod tests {
         let hits = search(&index, "filler");
         assert!(!hits.is_empty(), "non-English title must not break stemming");
         assert_eq!(hits[0].id.0, "fs:/tmp/f.txt");
+    }
+
+    // ------- T6 search_with_breakdown tests (Wave B) -------
+
+    // Product invariant: `final_score == tantivy * category_mult * prefix_mult
+    // * acronym_mult * recency_mult * coord_mult` within f32 epsilon. Stage-2
+    // fields stay at 1.0 inside the index layer (daemon fills them). Use a
+    // q=2 coord-match doc so `coord_mult != 1.0` and the test exercises the
+    // full product, not a degenerate all-ones path.
+    #[test]
+    fn test_search_with_breakdown_product_invariant() {
+        let doc = sample_document("fs:/tmp/f.txt", "alpha beta", "");
+        let (_tmp, index) = create_index_with_docs(&[doc]);
+        let query = Query { text: "alpha beta".into(), limit: 10 };
+        let pairs = index.search_with_breakdown(&query).expect("search ok");
+        assert!(!pairs.is_empty(), "query must hit the indexed doc");
+        let (hit, b) = &pairs[0];
+        let product = b.tantivy
+            * b.category_mult
+            * b.prefix_mult
+            * b.acronym_mult
+            * b.recency_mult
+            * b.coord_mult
+            * b.stage2_clamped;
+        let drift = (product - b.final_score).abs();
+        assert!(
+            drift < 1e-4,
+            "breakdown product ({}) must match final_score ({}) within 1e-4, got drift {}",
+            product,
+            b.final_score,
+            drift
+        );
+        assert!((b.final_score - hit.score).abs() < 1e-4, "final_score must equal Hit.score");
+        // q=2 coord-match must produce non-unit coord_mult per the T2 formula.
+        assert!(b.coord_mult > 1.0, "q=2 all-match expected coord_mult > 1.0, got {}", b.coord_mult);
+    }
+
+    // Delegation invariant: `search(q)` must produce the same hits (same ids
+    // and same `Hit.score`) as `search_with_breakdown(q).map(|(h,_)| h)`.
+    // Breakdown path must not silently change ranking.
+    #[test]
+    fn test_search_and_search_with_breakdown_agree() {
+        let docs = vec![
+            sample_document("a", "alpha beta gamma", ""),
+            sample_document("b", "alpha x y z beta", ""),
+            sample_document("c", "alpha", "gamma beta"),
+        ];
+        let (_tmp, index) = create_index_with_docs(&docs);
+        let query = Query { text: "alpha beta".into(), limit: 10 };
+        let plain = index.search(&query).unwrap();
+        let paired = index.search_with_breakdown(&query).unwrap();
+        assert_eq!(plain.len(), paired.len(), "both paths must return same hit count");
+        for (h1, (h2, _)) in plain.iter().zip(paired.iter()) {
+            assert_eq!(h1.id.0, h2.id.0, "hit order must match between search() and search_with_breakdown()");
+            assert!((h1.score - h2.score).abs() < 1e-4, "scores must match: {} vs {}", h1.score, h2.score);
+        }
     }
 }

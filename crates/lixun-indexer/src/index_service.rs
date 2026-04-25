@@ -104,6 +104,14 @@ impl SearchHandle {
         idx.search(query)
     }
 
+    pub async fn search_with_breakdown(
+        &self,
+        query: &lixun_core::Query,
+    ) -> Result<Vec<(lixun_core::Hit, lixun_core::ScoreBreakdown)>> {
+        let idx = self.index.lock().await;
+        idx.search_with_breakdown(query)
+    }
+
     pub async fn all_doc_ids(&self) -> Result<std::collections::HashSet<String>> {
         let idx = self.index.lock().await;
         idx.all_doc_ids()

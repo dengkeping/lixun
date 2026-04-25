@@ -54,7 +54,11 @@ pub(crate) fn start_ipc_thread(session_epoch: Arc<AtomicU64>) -> IpcClient {
     std::thread::spawn(move || {
         while let Ok((query, limit, epoch_at_send)) = rx.recv() {
             let sock = socket_path();
-            let req = Request::Search { q: query, limit };
+            let req = Request::Search {
+        q: query,
+        limit,
+        explain: false,
+    };
             let json = match serde_json::to_vec(&req) {
                 Ok(j) => j,
                 Err(e) => {
@@ -123,7 +127,11 @@ pub(crate) fn start_ipc_thread(session_epoch: Arc<AtomicU64>) -> IpcClient {
                     }
                     epoch_clone.fetch_add(1, Ordering::SeqCst);
                 }
-                Ok(Response::HitsWithExtras { hits, calculation }) => {
+                Ok(Response::HitsWithExtras {
+                    hits,
+                    calculation,
+                    explanations: _,
+                }) => {
                     if let Ok(mut r) = resp_clone.lock() {
                         *r = hits;
                     }
@@ -139,6 +147,7 @@ pub(crate) fn start_ipc_thread(session_epoch: Arc<AtomicU64>) -> IpcClient {
                     hits,
                     calculation,
                     top_hit,
+                    explanations: _,
                 }) => {
                     if let Ok(mut r) = resp_clone.lock() {
                         *r = hits;
@@ -347,6 +356,7 @@ mod tests {
             hits: Vec::new(),
             calculation: None,
             top_hit: Some(lixun_core::DocId("app:firefox".into())),
+            explanations: vec![],
         };
         let bytes = serde_json::to_vec(&resp).unwrap();
         let roundtrip: Response = serde_json::from_slice(&bytes).unwrap();

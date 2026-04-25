@@ -620,6 +620,12 @@ impl Config {
             top_hit_min_confidence: self.ranking_top_hit_min_confidence,
             top_hit_min_margin: self.ranking_top_hit_min_margin,
             strong_latch_threshold: self.ranking_strong_latch_threshold,
+            // Wave B knobs (proximity T1, coordination T2) use their
+            // `RankingConfig::default()` values until the daemon config
+            // schema gains dedicated fields. Plumbing the toml keys is
+            // deferred to a follow-up so T6 stays focused on the
+            // explain-surface; defaults match the plan spec.
+            ..lixun_core::RankingConfig::default()
         }
     }
 

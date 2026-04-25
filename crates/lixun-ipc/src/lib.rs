@@ -67,7 +67,17 @@ pub enum Request {
     Toggle,
     Show,
     Hide,
-    Search { q: String, limit: u32 },
+    Search {
+        q: String,
+        limit: u32,
+        /// When `true`, daemon populates `Response::HitsWithExtras{,V3}.explanations`
+        /// with one human-readable score-breakdown string per hit. Default
+        /// `false` via `#[serde(default)]` so older clients that omit the
+        /// field keep decoding as non-explain requests \u2014 no `PROTOCOL_VERSION`
+        /// bump needed (plan DB-11).
+        #[serde(default)]
+        explain: bool,
+    },
     Reindex { paths: Vec<PathBuf> },
     Status,
     RecordClick { doc_id: String },
@@ -102,11 +112,20 @@ pub enum Response {
     HitsWithExtras {
         hits: Vec<Hit>,
         calculation: Option<lixun_core::Calculation>,
+        /// Per-hit human-readable score breakdown, one entry per `hits`
+        /// item. Empty (via `#[serde(default)]`) unless the caller sent
+        /// `Request::Search { explain: true, .. }`. Old clients that
+        /// omit the field on deserialize see an empty vec and stay on
+        /// the non-explain code path \u2014 no `PROTOCOL_VERSION` bump.
+        #[serde(default)]
+        explanations: Vec<String>,
     },
     HitsWithExtrasV3 {
         hits: Vec<Hit>,
         calculation: Option<lixun_core::Calculation>,
         top_hit: Option<lixun_core::DocId>,
+        #[serde(default)]
+        explanations: Vec<String>,
     },
     Status {
         indexed_docs: u64,
@@ -269,16 +288,61 @@ mod tests {
         let req = Request::Search {
             q: "hello world".to_string(),
             limit: 10,
+            explain: false,
         };
         codec.encode(req.clone(), &mut buf).unwrap();
 
         let decoded = codec.decode(&mut buf).unwrap().unwrap();
         match decoded {
-            Request::Search { q, limit } => {
+            Request::Search { q, limit, explain } => {
                 assert_eq!(q, "hello world");
                 assert_eq!(limit, 10);
+                assert!(!explain);
             }
             _ => panic!("Expected Search variant"),
+        }
+    }
+
+    #[test]
+    fn test_search_explain_defaults_false_on_missing_field() {
+        // Back-compat guard for `Request::Search.explain` (plan DB-11):
+        // payloads from pre-T6 clients omit the field entirely; serde
+        // must synthesize `explain: false` rather than rejecting the
+        // frame. Exercises the `#[serde(default)]` path directly.
+        let legacy_json = br#"{"Search":{"q":"hi","limit":5}}"#;
+        let req: Request = serde_json::from_slice(legacy_json).unwrap();
+        match req {
+            Request::Search { q, limit, explain } => {
+                assert_eq!(q, "hi");
+                assert_eq!(limit, 5);
+                assert!(!explain, "legacy payload must default to explain=false");
+            }
+            _ => panic!("Expected Search variant"),
+        }
+    }
+
+    #[test]
+    fn test_hits_with_extras_v3_explanations_defaults_empty_on_missing_field() {
+        // Back-compat guard for `Response::HitsWithExtrasV3.explanations`
+        // (plan DB-11). A v3 payload shipped by a pre-T6 daemon omits
+        // `explanations`; serde must synthesize an empty vec so the
+        // CLI/GUI keep treating the response as non-explain. Mirrors
+        // the Request-side guard above.
+        let legacy_json = br#"{"HitsWithExtrasV3":{"hits":[],"calculation":null,"top_hit":null}}"#;
+        let resp: Response = serde_json::from_slice(legacy_json).unwrap();
+        match resp {
+            Response::HitsWithExtrasV3 {
+                hits,
+                calculation,
+                top_hit,
+                explanations,
+            } => {
+                assert!(hits.is_empty());
+                assert!(calculation.is_none());
+                assert!(top_hit.is_none());
+                assert!(explanations.is_empty());
+            }
+            _ => panic!("Expected HitsWithExtrasV3 variant"),
         }
     }
 
@@ -409,13 +473,19 @@ mod tests {
         let resp = Response::HitsWithExtras {
             hits: vec![],
             calculation: None,
+            explanations: vec![],
         };
         let json = serde_json::to_vec(&resp).unwrap();
         let decoded: Response = serde_json::from_slice(&json).unwrap();
         match decoded {
-            Response::HitsWithExtras { hits, calculation } => {
+            Response::HitsWithExtras {
+                hits,
+                calculation,
+                explanations,
+            } => {
                 assert!(hits.is_empty());
                 assert!(calculation.is_none());
+                assert!(explanations.is_empty());
             }
             _ => panic!("expected HitsWithExtras"),
         }
@@ -429,6 +499,7 @@ mod tests {
                 expr: "2+2".into(),
                 result: "4".into(),
             }),
+            explanations: vec![],
         };
         let json = serde_json::to_vec(&resp).unwrap();
         let decoded: Response = serde_json::from_slice(&json).unwrap();

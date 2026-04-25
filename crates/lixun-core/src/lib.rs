@@ -212,6 +212,33 @@ pub struct Hit {
     pub secondary_action: Option<Box<Action>>,
 }
 
+/// Per-hit score breakdown (Wave B T6) — carries the raw multipliers
+/// that compose `Hit.score`. Populated only when a caller asks for an
+/// explanation via `search_with_breakdown`; never serialized on the
+/// wire because the daemon derives a human-readable string from it
+/// before shipping (see `Response::HitsWithExtrasV3.explanations`).
+///
+/// Invariant: when all fields are populated,
+///   `final_score == tantivy * category_mult * prefix_mult
+///                 * acronym_mult * recency_mult * coord_mult
+///                 * stage2_clamped`
+/// up to f32 rounding. Plugin-owned hits (no tantivy scoring) leave
+/// stage-1 fields at 1.0 and set `tantivy = final_score` so the
+/// invariant still holds trivially.
+#[derive(Debug, Clone, Default)]
+pub struct ScoreBreakdown {
+    pub tantivy: f32,
+    pub category_mult: f32,
+    pub prefix_mult: f32,
+    pub acronym_mult: f32,
+    pub recency_mult: f32,
+    pub coord_mult: f32,
+    pub frecency_mult: f32,
+    pub latch_mult: f32,
+    pub stage2_clamped: f32,
+    pub final_score: f32,
+}
+
 /// Inline calculator result (for Spotlight-style "2+2 = 4" display).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Calculation {
