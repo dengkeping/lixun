@@ -7,6 +7,7 @@ use std::time::Duration;
 
 pub mod cache;
 pub mod ocr;
+pub mod ocr_queue;
 pub mod shell;
 
 pub trait Extractor {
