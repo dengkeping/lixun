@@ -30,7 +30,7 @@ use lixun_core::{
 };
 use normalize::normalize_for_match;
 
-const INDEX_VERSION: u32 = 8;
+const INDEX_VERSION: u32 = 9;
 const INDEX_VERSION_FILE: &str = "index_version.txt";
 
 /// Tantivy schema fields.
@@ -1751,5 +1751,49 @@ mod tests {
             full_score > partial_score,
             "full-title coord boost must outrank partial-title (full={full_score}, partial={partial_score})"
         );
+    }
+
+    // ------- T3 stemmer tests (Wave B) -------
+
+    // Porter stem collision: both "running" (query) and "runs" (indexed) reduce
+    // to stem "run". Without the stemmer filter this query would miss the doc
+    // entirely since SimpleTokenizer + LowerCaser + AsciiFolding preserve
+    // distinct surface forms. Test guards against accidental removal of the
+    // stemmer from the tokenizer chain.
+    #[test]
+    fn test_stem_equivalence_running_matches_runs() {
+        let doc = sample_document("fs:/tmp/f.txt", "marathon runs today", "");
+        let (_tmp, index) = create_index_with_docs(&[doc]);
+        let hits = search(&index, "running");
+        assert!(!hits.is_empty(), "stemmer must bridge 'running' -> 'runs'");
+        assert_eq!(hits[0].id.0, "fs:/tmp/f.txt");
+    }
+
+    // Prefix path lives OUTSIDE the tantivy tokenizer (in
+    // scoring::compute_title_prefixes which uses split_identifiers +
+    // normalize_for_match — see DB-3 in the Wave B plan). A literal "proj"
+    // prefix must still match doc titled "project alpha" even after
+    // stemming entered the pipeline. This test codifies that contract.
+    #[test]
+    fn test_stem_prefix_still_works_post_stem() {
+        let doc = sample_document("fs:/tmp/f.txt", "project alpha", "");
+        let (_tmp, index) = create_index_with_docs(&[doc]);
+        let hits = search(&index, "proj");
+        assert!(!hits.is_empty(), "prefix path must survive stemmer addition");
+        assert_eq!(hits[0].id.0, "fs:/tmp/f.txt");
+    }
+
+    // Porter stemmer must not panic on non-English input. CJK characters
+    // pass through rust_stemmers as identity (no Porter rule applies), so
+    // the ASCII filler term remains searchable and the non-English part
+    // does not crash the pipeline. Guards against a future stemmer swap
+    // that might be less unicode-safe.
+    #[test]
+    fn test_stem_does_not_crash_on_non_english() {
+        let doc = sample_document("fs:/tmp/f.txt", "测试 filler", "");
+        let (_tmp, index) = create_index_with_docs(&[doc]);
+        let hits = search(&index, "filler");
+        assert!(!hits.is_empty(), "non-English title must not break stemming");
+        assert_eq!(hits[0].id.0, "fs:/tmp/f.txt");
     }
 }
