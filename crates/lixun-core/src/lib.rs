@@ -71,6 +71,15 @@ pub struct RankingConfig {
     // contribution without removing the phrase subquery from the tree.
     pub proximity_slop: u32,
     pub proximity_boost: f32,
+
+    // Coordination (Wave B T2) — rewards docs where every query token
+    // matches the title. Applied as a stage-1 multiplier alongside
+    // prefix/acronym/recency. Formula:
+    //   coord_mult = 1 + coordination_boost / q^coordination_delta
+    // active only when 2 <= q <= 3 and v == q (v = title matches).
+    // Guards (q<2, q>3, v<q, analyzer missing) collapse to 1.0 no-op.
+    pub coordination_boost: f32,
+    pub coordination_delta: f32,
 }
 
 impl Default for RankingConfig {
@@ -93,6 +102,8 @@ impl Default for RankingConfig {
             strong_latch_threshold: 3,
             proximity_slop: 2,
             proximity_boost: 1.8,
+            coordination_boost: 1.2,
+            coordination_delta: 0.5,
         }
     }
 }
