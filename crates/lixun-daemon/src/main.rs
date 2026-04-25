@@ -124,9 +124,10 @@ async fn main() -> Result<()> {
     let config = config::Config::load()?;
     tracing::info!("Config loaded: roots={:?}", config.roots);
 
-    lixun_extract::init_capabilities(lixun_extract::ExtractorCapabilities::probe(
+    let extract_caps = lixun_extract::ExtractorCapabilities::probe(
         std::time::Duration::from_secs(config.extractor_timeout_secs),
-    ));
+    );
+    lixun_extract::init_capabilities(extract_caps.clone());
 
     let index_path = config.state_dir.join("index");
     let registry = {
@@ -221,6 +222,13 @@ async fn main() -> Result<()> {
         );
         std::mem::forget(tick_handles);
     }
+
+    spawn_ocr_worker(
+        Arc::clone(&shared_config),
+        Arc::clone(&stats),
+        indexer_sink.clone(),
+        extract_caps.clone(),
+    );
 
     {
         let pfw_registry = Arc::clone(&registry);
@@ -742,6 +750,84 @@ fn register_builtin_sources(
     }
 
     Ok(())
+}
+
+/// Idle gate driven by the daemon's reindex-progress flag. Reads the
+/// tokio `RwLock` non-blocking; when contended we assume the daemon
+/// is busy and skip this tick.
+struct StatsIdleGate {
+    stats: Arc<RwLock<IndexStats>>,
+}
+
+impl lixun_indexer::ocr_tick::IdleGate for StatsIdleGate {
+    fn is_idle(&self) -> bool {
+        match self.stats.try_read() {
+            Ok(s) => !s.reindex_in_progress,
+            Err(_) => false,
+        }
+    }
+}
+
+fn spawn_ocr_worker(
+    config: Arc<config::Config>,
+    stats: Arc<RwLock<IndexStats>>,
+    sink: Arc<lixun_indexer::WriterSink>,
+    mut caps: lixun_extract::ExtractorCapabilities,
+) {
+    caps.timeout = std::time::Duration::from_secs(config.ocr.timeout_secs);
+    caps.ocr_enabled = config.ocr.enabled;
+    if !caps.has_tesseract || !config.ocr.enabled {
+        tracing::info!(
+            "ocr worker: not starting (has_tesseract={}, ocr.enabled={})",
+            caps.has_tesseract,
+            config.ocr.enabled
+        );
+        return;
+    }
+    let queue_path = config.state_dir.join("ocr-queue.db");
+    let queue = match lixun_extract::ocr_queue::OcrQueue::open(queue_path.clone()) {
+        Ok(q) => Arc::new(q),
+        Err(e) => {
+            tracing::error!(
+                "ocr worker: failed to open queue at {}: {e:#}",
+                queue_path.display()
+            );
+            return;
+        }
+    };
+    let langs = resolve_ocr_langs(&config.ocr.languages, &caps.tesseract_langs);
+    let cfg = lixun_indexer::ocr_tick::OcrWorkerCfg {
+        interval: std::time::Duration::from_secs(config.ocr.worker_interval_secs),
+        langs,
+        min_image_side_px: config.ocr.min_image_side_px,
+        max_pages_per_pdf: config.ocr.max_pages_per_pdf,
+        max_attempts: 3,
+    };
+    let idle: Arc<dyn lixun_indexer::ocr_tick::IdleGate> =
+        Arc::new(StatsIdleGate { stats });
+    let handle = lixun_indexer::ocr_tick::spawn(queue, idle, sink, Arc::new(caps), cfg);
+    std::mem::forget(handle);
+}
+
+/// Intersect user-configured languages with probed-available ones.
+/// Empty user config means "use everything probed". Empty result
+/// falls back to `eng` so tesseract gets a runnable `-l` argument.
+fn resolve_ocr_langs(configured: &[String], available: &[String]) -> Vec<String> {
+    if configured.is_empty() {
+        if available.is_empty() {
+            return vec!["eng".into()];
+        }
+        return available.to_vec();
+    }
+    let mut out: Vec<String> = configured
+        .iter()
+        .filter(|l| available.iter().any(|a| a == *l))
+        .cloned()
+        .collect();
+    if out.is_empty() {
+        out.push("eng".into());
+    }
+    out
 }
 
 #[cfg(test)]
