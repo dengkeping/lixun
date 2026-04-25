@@ -167,7 +167,9 @@ impl FsSource {
             // (nautilus/dolphin/nemo/...), so the same OpenFile
             // variant works for both files and dirs without needing
             // a separate OpenFolder action.
-            action: Action::OpenFile { path: meta.path.clone() },
+            action: Action::OpenFile {
+                path: meta.path.clone(),
+            },
             secondary_action: Some(Action::ShowInFileManager { path: meta.path }),
             sender: None,
             recipients: None,
@@ -319,9 +321,8 @@ impl FsSource {
                         let (body, extract_fail) = if meta.is_dir {
                             (None, false)
                         } else if meta.size <= max_size {
-                            let enq_ref = enqueue_loop
-                                .as_ref()
-                                .map(|a| a.as_ref() as &dyn OcrEnqueue);
+                            let enq_ref =
+                                enqueue_loop.as_ref().map(|a| a.as_ref() as &dyn OcrEnqueue);
                             match Self::extract_content(&meta.path, &caps_loop, enq_ref) {
                                 Ok(Some(text)) => (Some(text), false),
                                 Ok(None) => (None, false),
@@ -426,9 +427,7 @@ impl FsSource {
                     let (body, extract_fail) = if meta.is_dir {
                         (None, false)
                     } else if meta.size <= max_size {
-                        let enq_ref = enqueue
-                            .as_ref()
-                            .map(|a| a.as_ref() as &dyn OcrEnqueue);
+                        let enq_ref = enqueue.as_ref().map(|a| a.as_ref() as &dyn OcrEnqueue);
                         match Self::extract_content(&meta.path, &caps, enq_ref) {
                             Ok(Some(text)) => (Some(text), false),
                             Ok(None) => (None, false),
@@ -500,11 +499,7 @@ impl crate::source::IndexerSource for FsSource {
     }
 }
 
-fn maybe_enqueue_ocr(
-    path: &Path,
-    caps: &ExtractorCapabilities,
-    enqueue: Option<&dyn OcrEnqueue>,
-) {
+fn maybe_enqueue_ocr(path: &Path, caps: &ExtractorCapabilities, enqueue: Option<&dyn OcrEnqueue>) {
     let Some(enqueuer) = enqueue else { return };
     if !caps.has_tesseract || !caps.ocr_enabled {
         return;
@@ -620,12 +615,7 @@ mod tests {
             let mock: Arc<MockEnqueue> = Arc::new(MockEnqueue::default());
             let sink: Arc<dyn OcrEnqueue> = mock.clone();
 
-            let result = FsSource::extract_content(
-                &png,
-                &caps,
-                Some(sink.as_ref()),
-            )
-            .unwrap();
+            let result = FsSource::extract_content(&png, &caps, Some(sink.as_ref())).unwrap();
             assert!(result.is_none(), "png has no text-layer body");
 
             let calls = mock.calls.lock().unwrap();
@@ -652,7 +642,10 @@ mod tests {
             let sink: Arc<dyn OcrEnqueue> = mock.clone();
 
             let _ = FsSource::extract_content(&png, &caps, Some(sink.as_ref())).unwrap();
-            assert!(mock.calls.lock().unwrap().is_empty(), "no enqueue when ocr_enabled=false");
+            assert!(
+                mock.calls.lock().unwrap().is_empty(),
+                "no enqueue when ocr_enabled=false"
+            );
 
             let mut caps_no_tess = ExtractorCapabilities::all_available_no_timeout();
             caps_no_tess.has_tesseract = false;

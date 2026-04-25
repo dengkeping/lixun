@@ -170,10 +170,8 @@ mod tests {
 
     #[test]
     fn psi_gate_missing_file_auto_disables() {
-        let gate = CpuPsiGate::with_path(
-            10.0,
-            PathBuf::from("/nonexistent/path/proc-pressure-cpu"),
-        );
+        let gate =
+            CpuPsiGate::with_path(10.0, PathBuf::from("/nonexistent/path/proc-pressure-cpu"));
         gate.enabled.store(true, Ordering::Relaxed);
         // First call fails open and flips the flag off.
         assert!(gate.is_idle());

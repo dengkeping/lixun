@@ -236,7 +236,10 @@ mod tests {
         let out = runner
             .run(
                 "sh",
-                &["-c", "printf 'OMP_THREAD_LIMIT=%s\\n' \"${OMP_THREAD_LIMIT:-unset}\""],
+                &[
+                    "-c",
+                    "printf 'OMP_THREAD_LIMIT=%s\\n' \"${OMP_THREAD_LIMIT:-unset}\"",
+                ],
                 None,
             )
             .unwrap();

@@ -79,8 +79,7 @@ pub fn engine_tag_for_ext(ext: &str, caps: &ExtractorCapabilities) -> &'static s
 }
 
 pub fn key_for_path(path: &Path, engine_tag: &str) -> Result<CacheKey> {
-    let meta = fs::metadata(path)
-        .with_context(|| format!("cache key: stat {}", path.display()))?;
+    let meta = fs::metadata(path).with_context(|| format!("cache key: stat {}", path.display()))?;
     let mtime_ns: i128 = match meta.modified() {
         Ok(t) => system_time_to_ns(t),
         Err(_) => 0,
@@ -216,7 +215,11 @@ pub fn cached_extract_bytes(
 }
 
 fn text_to_option(s: String) -> Option<String> {
-    if s.is_empty() { None } else { Some(s) }
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
 }
 
 #[cfg(test)]
@@ -275,7 +278,11 @@ mod tests {
         let k = CacheKey([0xab; 32]);
         let rel = k.rel_path();
         assert_eq!(rel.parent().unwrap().to_str().unwrap(), "ab");
-        assert!(rel.file_name().unwrap().to_string_lossy().ends_with(".txt.zst"));
+        assert!(rel
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .ends_with(".txt.zst"));
     }
 
     #[test]
@@ -478,11 +485,7 @@ mod tests {
             let leaked_tmp: Vec<_> = fs::read_dir(&dir)
                 .unwrap()
                 .filter_map(|e| e.ok())
-                .filter(|e| {
-                    e.file_name()
-                        .to_string_lossy()
-                        .starts_with(".tmp-")
-                })
+                .filter(|e| e.file_name().to_string_lossy().starts_with(".tmp-"))
                 .collect();
             assert!(
                 leaked_tmp.is_empty(),
