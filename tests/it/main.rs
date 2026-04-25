@@ -136,6 +136,7 @@ fn ipc_codec_roundtrip_v1_hits() {
             Request::Search {
                 q: "hello".into(),
                 limit: 10,
+                explain: false,
             },
             &mut buf,
         )
