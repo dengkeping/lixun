@@ -124,10 +124,44 @@ async fn main() -> Result<()> {
     let config = config::Config::load()?;
     tracing::info!("Config loaded: roots={:?}", config.roots);
 
-    let extract_caps = lixun_extract::ExtractorCapabilities::probe(
+    let mut extract_caps = lixun_extract::ExtractorCapabilities::probe(
         std::time::Duration::from_secs(config.extractor_timeout_secs),
     );
+    extract_caps.ocr_enabled = config.ocr.enabled;
     lixun_extract::init_capabilities(extract_caps.clone());
+
+    // Open the deferred-OCR queue eagerly (before the indexer or the
+    // watcher boot up) so every FsSource extraction path — full
+    // reindex, incremental reindex, watcher refresh — can enqueue
+    // into it. If OCR is disabled or tesseract is missing, we leave
+    // the enqueue sink unset and the extraction path quietly skips
+    // the enqueue step.
+    let ocr_queue: Option<Arc<lixun_extract::ocr_queue::OcrQueue>> =
+        if config.ocr.enabled && extract_caps.has_tesseract {
+            let queue_path = config.state_dir.join("ocr-queue.db");
+            match lixun_extract::ocr_queue::OcrQueue::open(queue_path.clone()) {
+                Ok(q) => Some(Arc::new(q)),
+                Err(e) => {
+                    tracing::error!(
+                        "ocr queue: failed to open at {}: {e:#}; disabling deferred OCR",
+                        queue_path.display()
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+    let extract_caps_arc = Arc::new(extract_caps.clone());
+    let _ = config.extractor_caps.set(Arc::clone(&extract_caps_arc));
+    let ocr_enqueue_arc: Option<Arc<dyn lixun_sources::OcrEnqueue>> =
+        ocr_queue.as_ref().map(|q| {
+            Arc::new(OcrQueueEnqueuer(Arc::clone(q))) as Arc<dyn lixun_sources::OcrEnqueue>
+        });
+    if let Some(enq) = &ocr_enqueue_arc {
+        let _ = config.ocr_enqueue.set(Arc::clone(enq));
+    }
 
     let index_path = config.state_dir.join("index");
     let registry = {
@@ -199,12 +233,16 @@ async fn main() -> Result<()> {
     });
 
     let watcher_mutation = mutation_tx.clone();
+    let watcher_caps = Arc::clone(&extract_caps_arc);
+    let watcher_enqueue = ocr_enqueue_arc.clone();
     tokio::spawn(async move {
         if let Err(e) = watcher::start(
             watcher_roots,
             watcher_exclude,
             watcher_exclude_regex,
             watcher_max_size,
+            watcher_caps,
+            watcher_enqueue,
             watcher_mutation,
         )
         .await
@@ -228,6 +266,7 @@ async fn main() -> Result<()> {
         Arc::clone(&stats),
         indexer_sink.clone(),
         extract_caps.clone(),
+        ocr_queue.clone(),
     );
 
     {
@@ -703,11 +742,13 @@ fn register_builtin_sources(
         Arc::new(lixun_sources::apps::AppsSource::new()),
     );
 
-    let fs = lixun_sources::fs::FsSource::with_regex(
+    let fs = lixun_sources::fs::FsSource::with_regex_and_ocr(
         config.roots.clone(),
         config.exclude.clone(),
         config.exclude_regex.clone(),
         config.max_file_size_mb,
+        config.caps_arc(),
+        config.ocr_enqueue.get().cloned(),
     );
     registry.register("builtin:fs".into(), state_dir_root, Arc::new(fs));
 
@@ -752,6 +793,30 @@ fn register_builtin_sources(
     Ok(())
 }
 
+// Adapter bridging lixun-sources::OcrEnqueue to the concrete OcrQueue;
+// isolates lixun-sources from the SQLite layer per AGENTS.md modularity.
+struct OcrQueueEnqueuer(Arc<lixun_extract::ocr_queue::OcrQueue>);
+
+impl lixun_sources::OcrEnqueue for OcrQueueEnqueuer {
+    fn enqueue(
+        &self,
+        doc_id: &str,
+        path: &std::path::Path,
+        mtime: i64,
+        size: u64,
+        ext: &str,
+    ) -> anyhow::Result<()> {
+        let row = lixun_extract::ocr_queue::OcrQueueRow::new(
+            doc_id.to_string(),
+            path.to_string_lossy().into_owned(),
+            mtime,
+            size,
+            ext.to_string(),
+        );
+        self.0.enqueue(row)
+    }
+}
+
 /// Idle gate driven by the daemon's reindex-progress flag. Reads the
 /// tokio `RwLock` non-blocking; when contended we assume the daemon
 /// is busy and skip this tick.
@@ -773,6 +838,7 @@ fn spawn_ocr_worker(
     stats: Arc<RwLock<IndexStats>>,
     sink: Arc<lixun_indexer::WriterSink>,
     mut caps: lixun_extract::ExtractorCapabilities,
+    queue: Option<Arc<lixun_extract::ocr_queue::OcrQueue>>,
 ) {
     caps.timeout = std::time::Duration::from_secs(config.ocr.timeout_secs);
     caps.ocr_enabled = config.ocr.enabled;
@@ -784,16 +850,9 @@ fn spawn_ocr_worker(
         );
         return;
     }
-    let queue_path = config.state_dir.join("ocr-queue.db");
-    let queue = match lixun_extract::ocr_queue::OcrQueue::open(queue_path.clone()) {
-        Ok(q) => Arc::new(q),
-        Err(e) => {
-            tracing::error!(
-                "ocr worker: failed to open queue at {}: {e:#}",
-                queue_path.display()
-            );
-            return;
-        }
+    let Some(queue) = queue else {
+        tracing::error!("ocr worker: queue unavailable (open failed earlier); not starting");
+        return;
     };
     let langs = resolve_ocr_langs(&config.ocr.languages, &caps.tesseract_langs);
     let cfg = lixun_indexer::ocr_tick::OcrWorkerCfg {

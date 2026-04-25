@@ -86,16 +86,28 @@ pub async fn reindex_paths(
 ) -> Result<usize> {
     let mut all_docs: Vec<Document> = Vec::new();
 
+    let caps = config.caps();
+    let enqueue = config.ocr_enqueue();
     for path in paths {
         if path.is_file() {
-            if let Ok(doc) = crate::index_service::index_file(path, config.max_file_size_mb()) {
+            let enq_ref = enqueue
+                .as_ref()
+                .map(|a| a.as_ref() as &dyn lixun_sources::OcrEnqueue);
+            if let Ok(doc) = crate::index_service::index_file(
+                path,
+                config.max_file_size_mb(),
+                caps.as_ref(),
+                enq_ref,
+            ) {
                 all_docs.push(doc);
             }
         } else if path.is_dir() {
-            let source = lixun_sources::fs::FsSource::new(
+            let source = lixun_sources::fs::FsSource::new_with_ocr(
                 vec![path.clone()],
                 config.exclude().to_vec(),
                 config.max_file_size_mb(),
+                Arc::clone(&caps),
+                enqueue.clone(),
             );
             all_docs.extend(source.index_all()?);
         }

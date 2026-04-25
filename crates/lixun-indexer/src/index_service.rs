@@ -404,7 +404,12 @@ pub fn fs_doc_id(path: &std::path::Path) -> String {
     format!("fs:{}", path.to_string_lossy())
 }
 
-pub fn index_file(path: &std::path::Path, max_file_size_mb: u64) -> Result<Document> {
+pub fn index_file(
+    path: &std::path::Path,
+    max_file_size_mb: u64,
+    caps: &lixun_extract::ExtractorCapabilities,
+    enqueue: Option<&dyn lixun_sources::OcrEnqueue>,
+) -> Result<Document> {
     use lixun_core::{Action, Category, DocId};
 
     let path_str = path.to_string_lossy().to_string();
@@ -429,7 +434,7 @@ pub fn index_file(path: &std::path::Path, max_file_size_mb: u64) -> Result<Docum
     let (body, extract_fail) = if is_dir {
         (None, false)
     } else if size <= max_size {
-        match lixun_sources::fs::FsSource::extract_content(path) {
+        match lixun_sources::fs::FsSource::extract_content(path, caps, enqueue) {
             Ok(Some(text)) => (Some(text), false),
             Ok(None) => (None, false),
             Err(_) => (None, true),

@@ -91,9 +91,13 @@ impl ThunderbirdAttachmentsSource {
                                     let ext_hint = std::path::Path::new(&part.filename)
                                         .extension()
                                         .and_then(|ext| ext.to_str());
-                                    match lixun_extract::extract_bytes(&decoded, ext_hint) {
-                                        Ok(text) if !text.is_empty() => (Some(text), false),
-                                        Ok(_) => (None, false),
+                                    match lixun_extract::cache::cached_extract_bytes(
+                                        &decoded,
+                                        ext_hint,
+                                        &lixun_extract::capabilities(),
+                                    ) {
+                                        Ok(Some(text)) => (Some(text), false),
+                                        Ok(None) => (None, false),
                                         Err(_) => (None, true),
                                     }
                                 }
