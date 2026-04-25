@@ -43,7 +43,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1", features = ["full"] }
 
 # Index
-tantivy = "0.22"
+tantivy = "0.26.1"
 
 # File watching
 notify = "7.0"
