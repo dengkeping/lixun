@@ -16,6 +16,19 @@ impl WriterSink {
             runtime: Handle::current(),
         }
     }
+
+    /// Send an `UpsertBody` mutation. The writer task fetches the
+    /// doc by `doc_id`, overwrites its `body`, and writes it back.
+    /// No-ops (logged at debug) if the doc is already gone.
+    pub fn upsert_body(&self, doc_id: &str, body: &str) -> Result<()> {
+        let tx = self.tx.clone();
+        let doc_id = doc_id.to_string();
+        let body = body.to_string();
+        self.runtime.block_on(async move {
+            tx.send(IndexMutation::UpsertBody { doc_id, body }).await
+        })?;
+        Ok(())
+    }
 }
 
 impl MutationSink for WriterSink {

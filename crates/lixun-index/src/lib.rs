@@ -10,11 +10,11 @@ use chrono::Utc;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use tantivy::{
-    Index, IndexWriter, TantivyDocument,
+    Index, IndexWriter, TantivyDocument, Term,
     collector::TopDocs,
     directory::MmapDirectory,
     doc,
-    query::{BooleanQuery, QueryParser},
+    query::{BooleanQuery, QueryParser, TermQuery},
     schema::{
         IndexRecordOption, STORED, STRING, Schema, TEXT, TextFieldIndexing, TextOptions, Value,
     },
@@ -24,7 +24,8 @@ pub use plugin_schema::CompiledPluginSchema;
 pub use tantivy::{IndexWriter as TantivyIndexWriter, TantivyDocument as TantivyDoc};
 
 use lixun_core::{
-    Category, Document, Hit, PluginFieldSpec, PluginFieldType, PluginValue, Query, RankingConfig,
+    Category, DocId, Document, ExtraFieldValue, Hit, PluginFieldSpec, PluginFieldType, PluginValue,
+    Query, RankingConfig,
 };
 use normalize::normalize_for_match;
 
@@ -439,6 +440,146 @@ impl LixunIndex {
             }
         }
         Ok(out)
+    }
+
+    /// Fetch the full `Document` by its stable `id`. Returns `Ok(None)`
+    /// when no live doc matches (deleted, or never indexed). Intended
+    /// for the OCR worker's body-upsert path: read the existing doc,
+    /// replace `body`, write it back via `upsert`.
+    ///
+    /// Only reads stored fields. Plugin `extra` fields are reconstructed
+    /// from the stored subset; plugin fields declared with `stored:
+    /// false` are dropped (they would be dropped on any re-upsert
+    /// anyway, so this is consistent with `upsert`'s round-trip).
+    pub fn get_doc_by_id(&self, id: &str) -> Result<Option<Document>> {
+        let reader = self.index.reader()?;
+        let searcher = reader.searcher();
+        let term = Term::from_field_text(self.schema.id, id);
+        let query = TermQuery::new(term, IndexRecordOption::Basic);
+        let top_docs = searcher.search(&query, &TopDocs::with_limit(1))?;
+        let Some((_, addr)) = top_docs.first() else {
+            return Ok(None);
+        };
+        let tdoc: TantivyDocument = searcher.doc(*addr)?;
+        Ok(Some(self.doc_from_tantivy(&tdoc)))
+    }
+
+    fn doc_from_tantivy(&self, tdoc: &TantivyDocument) -> Document {
+        let s = &self.schema;
+        let id = tdoc
+            .get_first(s.id)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let category = match tdoc
+            .get_first(s.category)
+            .and_then(|v| v.as_str())
+            .unwrap_or("file")
+        {
+            "app" => Category::App,
+            "file" => Category::File,
+            "mail" => Category::Mail,
+            "attachment" => Category::Attachment,
+            "calculator" => Category::Calculator,
+            "shell" => Category::Shell,
+            _ => Category::File,
+        };
+        let title = tdoc
+            .get_first(s.title)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let subtitle = tdoc
+            .get_first(s.subtitle)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let icon_name = stored_optional_text(tdoc, s.icon_name);
+        let kind_label = stored_optional_text(tdoc, s.kind_label);
+        let body = stored_optional_text(tdoc, s.body);
+        let path = tdoc
+            .get_first(s.path)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let mtime = tdoc.get_first(s.mtime).and_then(|v| v.as_i64()).unwrap_or(0);
+        let size = tdoc.get_first(s.size).and_then(|v| v.as_u64()).unwrap_or(0);
+        let action_json = tdoc
+            .get_first(s.action)
+            .and_then(|v| v.as_str())
+            .unwrap_or("{}");
+        let action: lixun_core::Action = serde_json::from_str(action_json)
+            .unwrap_or(lixun_core::Action::OpenFile { path: "".into() });
+        let secondary_action_raw = tdoc
+            .get_first(s.secondary_action)
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let secondary_action = if secondary_action_raw.is_empty() {
+            None
+        } else {
+            serde_json::from_str::<lixun_core::Action>(secondary_action_raw).ok()
+        };
+        let extract_fail = tdoc
+            .get_first(s.extract_fail)
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let sender = stored_optional_text(tdoc, s.sender);
+        let recipients = stored_optional_text(tdoc, s.recipients);
+        let source_instance = tdoc
+            .get_first(s.source_instance)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        // Non-stored plugin fields are never persisted, so a round-trip
+        // through the index always drops them — same as a re-upsert.
+        let mut extra: Vec<ExtraFieldValue> = Vec::new();
+        for (name, cf) in &self.plugins.extras {
+            if !cf.spec.stored {
+                continue;
+            }
+            let value = match cf.spec.ty {
+                PluginFieldType::Text { .. } | PluginFieldType::Keyword => tdoc
+                    .get_first(cf.field)
+                    .and_then(|v| v.as_str())
+                    .map(|s| PluginValue::Text(s.to_string())),
+                PluginFieldType::I64 => tdoc
+                    .get_first(cf.field)
+                    .and_then(|v| v.as_i64())
+                    .map(PluginValue::I64),
+                PluginFieldType::U64 => tdoc
+                    .get_first(cf.field)
+                    .and_then(|v| v.as_u64())
+                    .map(PluginValue::U64),
+                PluginFieldType::Bool => tdoc
+                    .get_first(cf.field)
+                    .and_then(|v| v.as_bool())
+                    .map(PluginValue::Bool),
+            };
+            if let Some(value) = value {
+                extra.push(ExtraFieldValue { field: name, value });
+            }
+        }
+
+        Document {
+            id: DocId(id),
+            category,
+            title,
+            subtitle,
+            icon_name,
+            kind_label,
+            body,
+            path,
+            mtime,
+            size,
+            action,
+            extract_fail,
+            sender,
+            recipients,
+            source_instance,
+            extra,
+            secondary_action,
+        }
     }
 
     /// Create an index writer.
@@ -1096,6 +1237,34 @@ mod tests {
             INDEX_VERSION.to_string(),
             "rebuild must restore current INDEX_VERSION on disk"
         );
+    }
+
+    #[test]
+    fn test_get_doc_by_id_roundtrip() {
+        let doc = sample_document(
+            "fs:/tmp/fetchme.txt",
+            "fetchme.txt",
+            "the body we want back",
+        );
+        let (_tmp, index) = create_index_with_docs(&[doc]);
+
+        let got = index
+            .get_doc_by_id("fs:/tmp/fetchme.txt")
+            .unwrap()
+            .expect("document must be found after upsert+commit");
+
+        assert_eq!(got.id.0, "fs:/tmp/fetchme.txt");
+        assert_eq!(got.title, "fetchme.txt");
+        assert_eq!(got.body.as_deref(), Some("the body we want back"));
+        assert_eq!(got.category, Category::File);
+    }
+
+    #[test]
+    fn test_get_doc_by_id_missing_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().to_str().unwrap();
+        let index = LixunIndex::create_or_open(path, RankingConfig::default()).unwrap();
+        assert!(index.get_doc_by_id("fs:/nope").unwrap().is_none());
     }
 
     #[test]

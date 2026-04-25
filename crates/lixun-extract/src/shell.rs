@@ -34,6 +34,7 @@ impl CommandRunner for SystemRunner {
     fn run(&self, cmd: &str, args: &[&str], _input: Option<&[u8]>) -> Result<String> {
         let mut child = Command::new(cmd)
             .args(args)
+            .env("OMP_THREAD_LIMIT", "1")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .process_group(0)
@@ -187,6 +188,22 @@ mod tests {
         let name1 = p1.file_name().unwrap().to_string_lossy();
         assert!(name1.starts_with("test-prefix-"));
         assert!(name1.ends_with(".txt"));
+    }
+
+    #[test]
+    fn system_runner_sets_omp_thread_limit_for_children() {
+        let runner = SystemRunner::new(5);
+        let out = runner
+            .run(
+                "sh",
+                &["-c", "printf 'OMP_THREAD_LIMIT=%s\\n' \"${OMP_THREAD_LIMIT:-unset}\""],
+                None,
+            )
+            .unwrap();
+        assert!(
+            out.contains("OMP_THREAD_LIMIT=1"),
+            "SystemRunner must export OMP_THREAD_LIMIT=1 to children, got: {out:?}"
+        );
     }
 
     #[test]

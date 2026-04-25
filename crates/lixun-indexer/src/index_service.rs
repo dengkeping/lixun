@@ -38,6 +38,14 @@ pub enum Mutation {
     DeleteSourceInstance {
         instance_id: String,
     },
+    /// Fetch the existing document by `doc_id`, overwrite its `body`,
+    /// and write it back. Silently skipped if no document matches
+    /// (the doc was deleted between enqueue and OCR). Used by the
+    /// deferred OCR worker to inject OCR'd text into the live index.
+    UpsertBody {
+        doc_id: String,
+        body: String,
+    },
     /// Reply woken with the commit generation once every prior mutation has
     /// been applied and a commit has completed.
     Barrier(oneshot::Sender<u64>),
@@ -221,6 +229,25 @@ async fn writer_loop(
                             dirty = true;
                         }
                     }
+
+                    Mutation::UpsertBody { doc_id, body } => {
+                        match apply_upsert_body(&shared, &mut writer, &doc_id, body).await {
+                            Ok(true) => dirty = true,
+                            Ok(false) => {
+                                tracing::debug!(
+                                    "IndexService: upsert_body skipped, doc gone: {}",
+                                    doc_id
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "IndexService: upsert_body {} failed: {}",
+                                    doc_id,
+                                    e
+                                );
+                            }
+                        }
+                    }
                 }
             }
 
@@ -267,6 +294,11 @@ async fn writer_loop(
                 let _ = apply_delete_source_instance(&shared, &mut writer, &instance_id).await;
                 dirty = true;
             }
+            Mutation::UpsertBody { doc_id, body } => {
+                if let Ok(true) = apply_upsert_body(&shared, &mut writer, &doc_id, body).await {
+                    dirty = true;
+                }
+            }
             Mutation::Barrier(reply) => pending_barriers.push(reply),
             Mutation::CommitNow(reply) => pending_barriers.push(reply),
             Mutation::Shutdown => {}
@@ -310,6 +342,21 @@ async fn apply_delete(
     let mut idx = shared.lock().await;
     idx.delete_by_id(id, writer)?;
     Ok(())
+}
+
+async fn apply_upsert_body(
+    shared: &Arc<Mutex<LixunIndex>>,
+    writer: &mut TantivyIndexWriter<TantivyDoc>,
+    doc_id: &str,
+    body: String,
+) -> Result<bool> {
+    let mut idx = shared.lock().await;
+    let Some(mut doc) = idx.get_doc_by_id(doc_id)? else {
+        return Ok(false);
+    };
+    doc.body = Some(body);
+    idx.upsert(&doc, writer)?;
+    Ok(true)
 }
 
 async fn apply_delete_source_instance(
