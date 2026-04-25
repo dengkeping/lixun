@@ -13,6 +13,7 @@
 //! input to those binaries.
 
 use anyhow::{anyhow, Context, Result};
+use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
@@ -164,6 +165,53 @@ pub fn ocr_pdf_pages_with(
         return Ok(None);
     }
     Ok(Some(pages_out.join("\n\n")))
+}
+
+/// Dispatch an OCR job. Reads the file at `path`, picks image-vs-pdf
+/// based on `ext`, and returns the extracted text (or `Ok(None)` if
+/// nothing could be extracted, e.g. below `min_image_side_px`).
+///
+/// This is the entry point the OCR worker tick (T6) spawns on each
+/// drained queue row; T6 passes queued-row metadata into the
+/// arguments here. PdfExtractor at `lib.rs` is intentionally left
+/// untouched — scan-only PDFs return empty from pdftotext, get
+/// enqueued (DB-13), and are OCR'd here, off the indexing hot path.
+pub fn run_ocr_job(
+    path: &Path,
+    ext: &str,
+    langs: &[String],
+    caps: &ExtractorCapabilities,
+    min_image_side_px: u32,
+    max_pages_per_pdf: Option<usize>,
+) -> Result<Option<String>> {
+    let runner = SystemRunner::new(caps.timeout.as_secs());
+    run_ocr_job_with(
+        path,
+        ext,
+        langs,
+        min_image_side_px,
+        max_pages_per_pdf,
+        &runner,
+    )
+}
+
+/// Testable core. See [`run_ocr_job`].
+pub fn run_ocr_job_with(
+    path: &Path,
+    ext: &str,
+    langs: &[String],
+    min_image_side_px: u32,
+    max_pages_per_pdf: Option<usize>,
+    runner: &dyn CommandRunner,
+) -> Result<Option<String>> {
+    let bytes = fs::read(path)
+        .with_context(|| format!("failed to read OCR input at {}", path.display()))?;
+    let ext_lower = ext.to_ascii_lowercase();
+    if ext_lower == "pdf" {
+        ocr_pdf_pages_with(&bytes, langs, max_pages_per_pdf, runner)
+    } else {
+        ocr_image_with(&bytes, langs, min_image_side_px, runner)
+    }
 }
 
 fn run_tesseract(runner: &dyn CommandRunner, image_path: &Path, langs: &[String]) -> Result<String> {
@@ -550,6 +598,85 @@ mod tests {
     #[test]
     fn infer_image_ext_unknown_falls_back_to_png() {
         assert_eq!(infer_image_ext(b"not an image"), "png");
+    }
+
+    #[test]
+    fn run_ocr_job_pdf_branch_calls_ocr_pdf_pages() {
+        let mock = MockRunner::new(vec![
+            Ok("Pages: 2\n".into()),
+            Ok(String::new()),
+            Ok("alpha".into()),
+            Ok(String::new()),
+            Ok("bravo".into()),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let pdf_path = dir.path().join("scan.pdf");
+        std::fs::write(&pdf_path, b"%PDF-1.4 fake").unwrap();
+
+        let text = run_ocr_job_with(
+            &pdf_path,
+            "pdf",
+            &["eng".into()],
+            200,
+            None,
+            &mock,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(text.contains("alpha"), "got {text:?}");
+        assert!(text.contains("bravo"), "got {text:?}");
+        assert!(text.contains("--- page 1 ---"));
+        assert!(text.contains("--- page 2 ---"));
+
+        let calls = mock.calls();
+        let cmds: Vec<&str> = calls.iter().map(|(c, _)| c.as_str()).collect();
+        assert!(
+            cmds.contains(&"pdfinfo"),
+            "expected pdfinfo invocation, got {cmds:?}"
+        );
+        assert!(
+            cmds.contains(&"pdftoppm"),
+            "expected pdftoppm invocation, got {cmds:?}"
+        );
+        let tesseract_count = cmds.iter().filter(|c| **c == "tesseract").count();
+        assert_eq!(
+            tesseract_count, 2,
+            "expected one tesseract call per page, got {tesseract_count} (cmds: {cmds:?})"
+        );
+    }
+
+    #[test]
+    fn run_ocr_job_image_branch_calls_ocr_image() {
+        let mock = MockRunner::new(vec![Ok("IMG-OCR".into())]);
+        let dir = tempfile::tempdir().unwrap();
+        let png_path = dir.path().join("scan.png");
+        std::fs::write(&png_path, large_png_300x300()).unwrap();
+
+        let text = run_ocr_job_with(
+            &png_path,
+            "png",
+            &["eng".into()],
+            200,
+            None,
+            &mock,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(text, "IMG-OCR");
+
+        let calls = mock.calls();
+        let cmds: Vec<&str> = calls.iter().map(|(c, _)| c.as_str()).collect();
+        assert_eq!(cmds, vec!["tesseract"], "only tesseract should be invoked");
+        assert!(
+            !cmds.contains(&"pdftoppm"),
+            "pdftoppm must not run for image branch"
+        );
+        assert!(
+            !cmds.contains(&"pdfinfo"),
+            "pdfinfo must not run for image branch"
+        );
     }
 
     #[test]
