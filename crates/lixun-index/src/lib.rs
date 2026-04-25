@@ -14,10 +14,11 @@ use tantivy::{
     collector::TopDocs,
     directory::MmapDirectory,
     doc,
-    query::{BooleanQuery, QueryParser, TermQuery},
+    query::{BooleanQuery, BoostQuery, Occur, PhraseQuery, QueryParser, TermQuery},
     schema::{
         IndexRecordOption, STORED, STRING, Schema, TEXT, TextFieldIndexing, TextOptions, Value,
     },
+    tokenizer::TokenStream,
 };
 
 pub use plugin_schema::CompiledPluginSchema;
@@ -308,7 +309,8 @@ impl LixunIndex {
         let q_norm = normalize_for_match(&query.text);
         let now_secs = Utc::now().timestamp();
 
-        let query_obj = build_search_query(&query.text, &self.index, s, &self.plugins);
+        let query_obj =
+            build_search_query(&query.text, &self.index, s, &self.plugins, &self.ranking);
         let top_docs = searcher.search(
             &query_obj,
             &TopDocs::with_limit(query.limit as usize).order_by_score(),
@@ -661,6 +663,7 @@ fn build_search_query(
     index: &tantivy::Index,
     s: &LixunSchema,
     plugins: &CompiledPluginSchema,
+    ranking: &RankingConfig,
 ) -> Box<dyn tantivy::query::Query> {
     let text = text.trim();
     if text.is_empty() {
@@ -704,7 +707,44 @@ fn build_search_query(
         parser.set_field_boost(*field, *boost);
     }
 
-    parser.parse_query_lenient(&normalized_text).0
+    let parsed_query = parser.parse_query_lenient(&normalized_text).0;
+
+    // Drain `normalized_text` through the registered "spotlight" analyzer so
+    // phrase terms match the indexed positions byte-for-byte (same lowercasing,
+    // same ASCII folding, same long-token filter). Using raw whitespace split
+    // would produce case-sensitive terms that never hit the index.
+    let tokens: Vec<String> = {
+        let Some(mut analyzer) = index.tokenizers().get("spotlight") else {
+            return parsed_query;
+        };
+        let mut out = Vec::new();
+        let mut stream = analyzer.token_stream(&normalized_text);
+        stream.process(&mut |tok| out.push(tok.text.clone()));
+        out
+    };
+
+    if tokens.len() < 2 {
+        return parsed_query;
+    }
+
+    let make_phrase = |field: tantivy::schema::Field| -> Box<dyn tantivy::query::Query> {
+        let terms: Vec<Term> = tokens
+            .iter()
+            .map(|t| Term::from_field_text(field, t))
+            .collect();
+        let mut pq = PhraseQuery::new(terms);
+        pq.set_slop(ranking.proximity_slop);
+        Box::new(BoostQuery::new(Box::new(pq), ranking.proximity_boost))
+    };
+
+    let title_phrase = make_phrase(s.title);
+    let title_terms_phrase = make_phrase(s.title_terms);
+
+    Box::new(BooleanQuery::new(vec![
+        (Occur::Must, parsed_query),
+        (Occur::Should, title_phrase),
+        (Occur::Should, title_terms_phrase),
+    ]))
 }
 
 #[cfg(test)]
@@ -1457,6 +1497,89 @@ mod tests {
             hits_miss.len(),
             0,
             "PhraseQuery with reversed terms must not match; if it does, positions are wrong",
+        );
+    }
+
+    #[test]
+    fn test_proximity_boosts_adjacent_over_split_title() {
+        let doc_a = sample_document("fs:/tmp/a.txt", "alpha beta gamma", "body a");
+        let doc_b = sample_document("fs:/tmp/b.txt", "alpha x y z beta gamma", "body b");
+        let (_tmp, index) = create_index_with_docs(&[doc_a, doc_b]);
+
+        let hits = search(&index, "alpha beta");
+        let score_a = hits
+            .iter()
+            .find(|h| h.id.0 == "fs:/tmp/a.txt")
+            .expect("A must be in results")
+            .score;
+        let score_b = hits
+            .iter()
+            .find(|h| h.id.0 == "fs:/tmp/b.txt")
+            .expect("B must be in results")
+            .score;
+        assert!(
+            score_a > score_b * 1.1,
+            "adjacent title A (score={score_a}) must outrank split title B (score={score_b}) by >10%",
+        );
+    }
+
+    #[test]
+    fn test_proximity_single_token_no_op() {
+        let doc = sample_document("fs:/tmp/s.txt", "alpha beta", "body");
+        let (_tmp, index) = create_index_with_docs(&[doc]);
+
+        let hits = search(&index, "alpha");
+        assert_eq!(hits.len(), 1, "single-token query must still return the doc");
+        assert!(hits[0].score > 0.0, "score must be positive (baseline scoring preserved)");
+    }
+
+    #[test]
+    fn test_proximity_slop_respects_config() {
+        let doc = sample_document("fs:/tmp/slop.txt", "alpha x y beta", "body");
+
+        // Default slop=2 tolerates the 2-token gap between alpha and beta.
+        let (_tmp, idx_default) = create_index_with_docs(std::slice::from_ref(&doc));
+        let hits_default = search(&idx_default, "alpha beta");
+        assert_eq!(hits_default.len(), 1);
+        let score_with_phrase = hits_default[0].score;
+
+        // Slop=0 is stricter than the gap; phrase subquery fails to match
+        // but the MUST parsed_query still returns the doc at baseline.
+        let tighter = RankingConfig {
+            proximity_slop: 0,
+            ..RankingConfig::default()
+        };
+        let (_tmp2, idx_tight) = create_index_with_docs_and_ranking(&[doc], tighter);
+        let hits_tight = search(&idx_tight, "alpha beta");
+        assert_eq!(hits_tight.len(), 1, "doc must still match via MUST branch");
+        let score_without_phrase = hits_tight[0].score;
+
+        assert!(
+            score_with_phrase > score_without_phrase,
+            "phrase-matched score ({score_with_phrase}) must exceed slop=0 score ({score_without_phrase})",
+        );
+    }
+
+    #[test]
+    fn test_proximity_zero_boost_is_noop() {
+        let doc = sample_document("fs:/tmp/z.txt", "alpha beta gamma", "body");
+
+        let (_tmp, idx_default) = create_index_with_docs(std::slice::from_ref(&doc));
+        let baseline_phrase_on = search(&idx_default, "alpha beta")[0].score;
+
+        let zero_boost = RankingConfig {
+            proximity_boost: 0.0,
+            ..RankingConfig::default()
+        };
+        let (_tmp2, idx_zero) = create_index_with_docs_and_ranking(&[doc], zero_boost);
+        let score_zero = search(&idx_zero, "alpha beta")[0].score;
+
+        // With boost=0 the BoostQuery contributes exactly 0 to the sum,
+        // so the score collapses to the parsed_query baseline (strictly
+        // less than the phrase-boosted default).
+        assert!(
+            score_zero < baseline_phrase_on,
+            "zero-boost score ({score_zero}) must be less than boosted baseline ({baseline_phrase_on})",
         );
     }
 }

@@ -63,6 +63,14 @@ pub struct RankingConfig {
     pub top_hit_min_confidence: f32,
     pub top_hit_min_margin: f32,
     pub strong_latch_threshold: u32,
+
+    // Proximity (Wave B T1) — PhraseQuery over title + title_terms.
+    // `proximity_slop` is the max positional gap tolerated inside the
+    // phrase; `proximity_boost` is the multiplicative weight applied to
+    // each phrase sub-query via `BoostQuery`. Boost of `0.0` disables the
+    // contribution without removing the phrase subquery from the tree.
+    pub proximity_slop: u32,
+    pub proximity_boost: f32,
 }
 
 impl Default for RankingConfig {
@@ -83,6 +91,8 @@ impl Default for RankingConfig {
             top_hit_min_confidence: 0.6,
             top_hit_min_margin: 1.3,
             strong_latch_threshold: 3,
+            proximity_slop: 2,
+            proximity_boost: 1.8,
         }
     }
 }
