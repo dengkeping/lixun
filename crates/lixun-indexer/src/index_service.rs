@@ -419,6 +419,7 @@ pub fn index_file(
     caps: &lixun_extract::ExtractorCapabilities,
     enqueue: Option<&dyn lixun_sources::OcrEnqueue>,
     body_checker: Option<&dyn lixun_sources::HasBody>,
+    min_image_side_px: u32,
 ) -> Result<Document> {
     use lixun_core::{Action, Category, DocId};
 
@@ -444,7 +445,13 @@ pub fn index_file(
     let (body, extract_fail) = if is_dir {
         (None, false)
     } else if size <= max_size {
-        match lixun_sources::fs::FsSource::extract_content(path, caps, enqueue, body_checker) {
+        match lixun_sources::fs::FsSource::extract_content(
+            path,
+            caps,
+            enqueue,
+            body_checker,
+            min_image_side_px,
+        ) {
             Ok(Some(text)) => (Some(text), false),
             Ok(None) => (None, false),
             Err(_) => (None, true),

@@ -277,12 +277,35 @@ fn pdftoppm_output_path(stem: &Path, page: usize, total_pages: usize) -> PathBuf
     stem.with_file_name(name)
 }
 
-fn probe_image_dimensions(bytes: &[u8]) -> Result<(u32, u32)> {
+/// Decode just the header of an image to recover `(width, height)` in
+/// pixels without materialising the full bitmap. Used both by the OCR
+/// worker (to skip icons that slipped past the enqueue-side filter) and
+/// by the enqueue side (to avoid queueing tiny images in the first
+/// place). Propagates any header-decode error so callers can decide
+/// whether to treat it as "skip" or "fail open".
+pub fn probe_image_dimensions(bytes: &[u8]) -> Result<(u32, u32)> {
     let reader = image::ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .context("failed to guess image format")?;
     let (w, h) = reader.into_dimensions()?;
     Ok((w, h))
+}
+
+/// Fail-open dimension check for the enqueue path.
+///
+/// Returns `true` only if the image header decoded cleanly AND both
+/// axes are strictly below `min_side_px`. Any decode error, or
+/// `min_side_px == 0`, returns `false` so the caller keeps the
+/// image in the pipeline and lets the OCR worker make the final
+/// decision (defence-in-depth: worker-side dim check stays in place).
+pub fn image_too_small(bytes: &[u8], min_side_px: u32) -> bool {
+    if min_side_px == 0 {
+        return false;
+    }
+    match probe_image_dimensions(bytes) {
+        Ok((w, h)) => w < min_side_px && h < min_side_px,
+        Err(_) => false,
+    }
 }
 
 /// Pick an extension for the tempfile so pdftoppm/tesseract can

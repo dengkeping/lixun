@@ -21,3 +21,4 @@ mime_guess = "2"
 
 [dev-dependencies]
 tempfile.workspace = true
+image = { workspace = true }
