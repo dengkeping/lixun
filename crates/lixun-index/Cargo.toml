@@ -14,3 +14,10 @@ unicode-normalization = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+
+# Wave B T5: ranking benchmark. `harness = false` so we own `main()`
+# and can emit `target/ranking-bench.md` while still gating on the
+# plan's post∩pre top-20 ≥ 15/20 sanity criterion via a panic.
+[[bench]]
+name = "ranking_bench"
+harness = false
