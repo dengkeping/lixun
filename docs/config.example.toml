@@ -490,3 +490,45 @@ max_file_size_mb = 200
 # working_dir = "~"            # `~` expands to $HOME; absolute path also OK
 # strict_mode = false          # set true to block risky commands entirely
 # trigger_prefix = ">"         # reserved, not yet configurable — v1 hard-codes `>`
+
+# -----------------------------------------------------------------------------
+# [extract] — text-extraction cache. Shared by every extractor
+# (pdftotext, OOXML, OCR). Cache lives at ~/.cache/lixun/extract/v1/.
+# Keyed by (path + mtime + size + engine version tag) or by content
+# hash for attachments. Invalidated automatically on mtime change.
+#
+# All keys are optional; defaults shown below.
+[extract]
+# cache_max_mb = 500           # 0 disables the LRU sweep tick (cache grows unbounded)
+# cache_sweep_interval_secs = 600
+
+# -----------------------------------------------------------------------------
+# [ocr] — optical character recognition for images and scan PDFs.
+# Disabled by default. Enabling requires `tesseract` plus language
+# data (e.g. `tesseract-data-eng`, `tesseract-data-rus`,
+# `tesseract-data-chi_sim` on Arch) installed on the host.
+#
+# OCR runs deferred: extraction completes without it, and an
+# idle-gated tick task drains a persistent queue at
+# ~/.local/state/lixun/ocr-queue.db. Survives daemon restarts.
+#
+# All keys are optional; defaults shown below.
+[ocr]
+# enabled = false
+# languages: empty = auto-derive from $LANG / $LC_ALL, fallback ["eng"].
+# languages = ["eng", "rus"]
+# max_pages_per_pdf: omit key = unlimited. Per-page timeout still applies.
+# max_pages_per_pdf = 20
+# min_image_side_px = 200
+# timeout_secs = 30
+# worker_interval_secs = 60
+
+# Adaptive CPU throttle (Linux only, OFF by default). When
+# adaptive_throttle = true: (a) skip the OCR tick while
+# /proc/pressure/cpu `some avg10` > max_cpu_pressure_avg10, and
+# (b) spawn tesseract with `nice = nice_level`. Set io_class_idle = true
+# to also run tesseract with the IDLE ioprio class.
+# adaptive_throttle = false
+# max_cpu_pressure_avg10 = 10.0
+# nice_level = 19
+# io_class_idle = false
