@@ -88,16 +88,21 @@ pub async fn reindex_paths(
 
     let caps = config.caps();
     let enqueue = config.ocr_enqueue();
+    let body_checker = config.body_checker();
     for path in paths {
         if path.is_file() {
             let enq_ref = enqueue
                 .as_ref()
                 .map(|a| a.as_ref() as &dyn lixun_sources::OcrEnqueue);
+            let body_ref = body_checker
+                .as_ref()
+                .map(|a| a.as_ref() as &dyn lixun_sources::HasBody);
             if let Ok(doc) = crate::index_service::index_file(
                 path,
                 config.max_file_size_mb(),
                 caps.as_ref(),
                 enq_ref,
+                body_ref,
             ) {
                 all_docs.push(doc);
             }
@@ -108,7 +113,8 @@ pub async fn reindex_paths(
                 config.max_file_size_mb(),
                 Arc::clone(&caps),
                 enqueue.clone(),
-            );
+            )
+            .with_body_checker(body_checker.clone());
             all_docs.extend(source.index_all()?);
         }
     }

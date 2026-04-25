@@ -12,6 +12,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::has_body::HasBody;
 use crate::manifest::Manifest;
 use crate::mime_icons;
 use crate::ocr_enqueue::OcrEnqueue;
@@ -24,6 +25,7 @@ pub struct FsSource {
     pub max_file_size_mb: u64,
     pub caps: Arc<ExtractorCapabilities>,
     pub ocr_enqueue: Option<Arc<dyn OcrEnqueue>>,
+    pub body_checker: Option<Arc<dyn HasBody>>,
 }
 
 /// Intermediate metadata collected during the first pass.
@@ -45,6 +47,7 @@ impl FsSource {
             max_file_size_mb,
             caps: Arc::new(ExtractorCapabilities::all_available_no_timeout()),
             ocr_enqueue: None,
+            body_checker: None,
         }
     }
 
@@ -61,6 +64,7 @@ impl FsSource {
             max_file_size_mb,
             caps: Arc::new(ExtractorCapabilities::all_available_no_timeout()),
             ocr_enqueue: None,
+            body_checker: None,
         }
     }
 
@@ -78,6 +82,7 @@ impl FsSource {
             max_file_size_mb,
             caps,
             ocr_enqueue,
+            body_checker: None,
         }
     }
 
@@ -96,7 +101,17 @@ impl FsSource {
             max_file_size_mb,
             caps,
             ocr_enqueue,
+            body_checker: None,
         }
+    }
+
+    /// Attach a `HasBody` checker so the OCR enqueue path can
+    /// short-circuit re-enqueue of docs whose body was already
+    /// recovered in a prior pass (DB-16). Chainable off any
+    /// constructor; `None` preserves T7 behaviour (always enqueue).
+    pub fn with_body_checker(mut self, checker: Option<Arc<dyn HasBody>>) -> Self {
+        self.body_checker = checker;
+        self
     }
 
     fn is_excluded(&self, path: &Path) -> bool {
@@ -106,13 +121,16 @@ impl FsSource {
     /// Extract content from a file, going through the T1 bytes cache so
     /// unchanged files skip the extractor subprocess on the second and
     /// later runs. On an empty result for an OCR-candidate extension,
-    /// emits an enqueue request on `enqueue` (if supplied) per DB-13.
+    /// emits an enqueue request on `enqueue` (if supplied) per DB-13,
+    /// but skips the enqueue entirely when `body_checker` reports the
+    /// doc already has an indexed body (DB-16 short-circuit).
     /// Enqueue failures log-and-swallow: a queue write error must never
     /// fail the extraction path.
     pub fn extract_content(
         path: &Path,
         caps: &ExtractorCapabilities,
         enqueue: Option<&dyn OcrEnqueue>,
+        body_checker: Option<&dyn HasBody>,
     ) -> Result<Option<String>> {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             lixun_extract::cache::cached_extract_path(path, caps)
@@ -120,7 +138,7 @@ impl FsSource {
         .map_err(|_| anyhow::anyhow!("extractor panicked"))??;
 
         if result.is_none() {
-            maybe_enqueue_ocr(path, caps, enqueue);
+            maybe_enqueue_ocr(path, caps, enqueue, body_checker);
         }
         Ok(result)
     }
@@ -307,11 +325,13 @@ impl FsSource {
         let mut processed: usize = 0;
         let caps = Arc::clone(&self.caps);
         let enqueue = self.ocr_enqueue.clone();
+        let body_checker = self.body_checker.clone();
         while !changed_metas.is_empty() {
             let take_n = Self::BATCH_SIZE.min(changed_metas.len());
             let chunk: Vec<FileMeta> = changed_metas.drain(..take_n).collect();
             let caps_loop = Arc::clone(&caps);
             let enqueue_loop = enqueue.clone();
+            let body_checker_loop = body_checker.clone();
             let docs: Vec<Document> = pool.install(|| {
                 chunk
                     .into_par_iter()
@@ -323,7 +343,15 @@ impl FsSource {
                         } else if meta.size <= max_size {
                             let enq_ref =
                                 enqueue_loop.as_ref().map(|a| a.as_ref() as &dyn OcrEnqueue);
-                            match Self::extract_content(&meta.path, &caps_loop, enq_ref) {
+                            let body_ref = body_checker_loop
+                                .as_ref()
+                                .map(|a| a.as_ref() as &dyn HasBody);
+                            match Self::extract_content(
+                                &meta.path,
+                                &caps_loop,
+                                enq_ref,
+                                body_ref,
+                            ) {
                                 Ok(Some(text)) => (Some(text), false),
                                 Ok(None) => (None, false),
                                 Err(_) => (None, true),
@@ -420,6 +448,7 @@ impl FsSource {
         let pool = Self::build_pool();
         let caps = Arc::clone(&self.caps);
         let enqueue = self.ocr_enqueue.clone();
+        let body_checker = self.body_checker.clone();
         let docs: Vec<Document> = pool.install(|| {
             metas
                 .into_par_iter()
@@ -428,7 +457,9 @@ impl FsSource {
                         (None, false)
                     } else if meta.size <= max_size {
                         let enq_ref = enqueue.as_ref().map(|a| a.as_ref() as &dyn OcrEnqueue);
-                        match Self::extract_content(&meta.path, &caps, enq_ref) {
+                        let body_ref =
+                            body_checker.as_ref().map(|a| a.as_ref() as &dyn HasBody);
+                        match Self::extract_content(&meta.path, &caps, enq_ref, body_ref) {
                             Ok(Some(text)) => (Some(text), false),
                             Ok(None) => (None, false),
                             Err(_) => (None, true),
@@ -499,7 +530,12 @@ impl crate::source::IndexerSource for FsSource {
     }
 }
 
-fn maybe_enqueue_ocr(path: &Path, caps: &ExtractorCapabilities, enqueue: Option<&dyn OcrEnqueue>) {
+fn maybe_enqueue_ocr(
+    path: &Path,
+    caps: &ExtractorCapabilities,
+    enqueue: Option<&dyn OcrEnqueue>,
+    body_checker: Option<&dyn HasBody>,
+) {
     let Some(enqueuer) = enqueue else { return };
     if !caps.has_tesseract || !caps.ocr_enabled {
         return;
@@ -511,13 +547,17 @@ fn maybe_enqueue_ocr(path: &Path, caps: &ExtractorCapabilities, enqueue: Option<
     if !lixun_extract::ocr::is_ocr_candidate(&ext) {
         return;
     }
-    // TODO(OCR-v1.1): DB-16 short-circuit via SearchHandle::has_body(doc_id)
-    // to avoid re-enqueueing files whose body was already recovered in a
-    // prior OCR pass. For v1 we rely on OcrQueue's INSERT OR IGNORE (T5)
-    // to dedup at the DB layer; the worst case is a cheap attempts-preserved
-    // re-enqueue, not a redundant OCR run (because OcrQueue.peek_next still
-    // returns Some but then the upsert_body via T6 may overwrite with the
-    // same body — acceptable cost for v1).
+    let doc_id = format!("fs:{}", path.to_string_lossy());
+    // DB-16: skip enqueue when a prior OCR pass already populated the
+    // body in Tantivy. Probe errors fall through to enqueue — the
+    // OcrQueue's INSERT OR IGNORE still dedups at the DB layer, so
+    // "re-enqueue on probe failure" is the safe default.
+    if let Some(checker) = body_checker
+        && checker.has_body(&doc_id).unwrap_or(false)
+    {
+        tracing::debug!("ocr enqueue: skipping {doc_id}, body already indexed");
+        return;
+    }
     let meta = match std::fs::metadata(path) {
         Ok(m) => m,
         Err(e) => {
@@ -531,7 +571,6 @@ fn maybe_enqueue_ocr(path: &Path, caps: &ExtractorCapabilities, enqueue: Option<
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    let doc_id = format!("fs:{}", path.to_string_lossy());
     if let Err(e) = enqueuer.enqueue(&doc_id, path, mtime, meta.len(), &ext) {
         tracing::warn!("ocr enqueue for {} failed: {e}", path.display());
     }
@@ -615,7 +654,8 @@ mod tests {
             let mock: Arc<MockEnqueue> = Arc::new(MockEnqueue::default());
             let sink: Arc<dyn OcrEnqueue> = mock.clone();
 
-            let result = FsSource::extract_content(&png, &caps, Some(sink.as_ref())).unwrap();
+            let result =
+                FsSource::extract_content(&png, &caps, Some(sink.as_ref()), None).unwrap();
             assert!(result.is_none(), "png has no text-layer body");
 
             let calls = mock.calls.lock().unwrap();
@@ -641,7 +681,8 @@ mod tests {
             let mock: Arc<MockEnqueue> = Arc::new(MockEnqueue::default());
             let sink: Arc<dyn OcrEnqueue> = mock.clone();
 
-            let _ = FsSource::extract_content(&png, &caps, Some(sink.as_ref())).unwrap();
+            let _ =
+                FsSource::extract_content(&png, &caps, Some(sink.as_ref()), None).unwrap();
             assert!(
                 mock.calls.lock().unwrap().is_empty(),
                 "no enqueue when ocr_enabled=false"
@@ -650,7 +691,8 @@ mod tests {
             let mut caps_no_tess = ExtractorCapabilities::all_available_no_timeout();
             caps_no_tess.has_tesseract = false;
             let caps = Arc::new(caps_no_tess);
-            let _ = FsSource::extract_content(&png, &caps, Some(sink.as_ref())).unwrap();
+            let _ =
+                FsSource::extract_content(&png, &caps, Some(sink.as_ref()), None).unwrap();
             assert!(
                 mock.calls.lock().unwrap().is_empty(),
                 "no enqueue when has_tesseract=false"
@@ -671,10 +713,65 @@ mod tests {
             let mock: Arc<MockEnqueue> = Arc::new(MockEnqueue::default());
             let sink: Arc<dyn OcrEnqueue> = mock.clone();
 
-            let _ = FsSource::extract_content(&bin, &caps, Some(sink.as_ref()));
+            let _ = FsSource::extract_content(&bin, &caps, Some(sink.as_ref()), None);
             assert!(
                 mock.calls.lock().unwrap().is_empty(),
                 "non-candidate ext must not enqueue even on empty extraction"
+            );
+        });
+    }
+
+    #[derive(Default)]
+    struct MockHasBody {
+        has_body_for: std::collections::HashSet<String>,
+    }
+
+    impl HasBody for MockHasBody {
+        fn has_body(&self, doc_id: &str) -> Result<bool> {
+            Ok(self.has_body_for.contains(doc_id))
+        }
+    }
+
+    #[test]
+    fn extract_content_skips_enqueue_when_body_already_indexed() {
+        with_isolated_cache(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let png = tmp.path().join("scan.png");
+            std::fs::write(&png, b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR").unwrap();
+
+            let caps = Arc::new(ExtractorCapabilities::all_available_no_timeout());
+            let mock_enq: Arc<MockEnqueue> = Arc::new(MockEnqueue::default());
+            let sink: Arc<dyn OcrEnqueue> = mock_enq.clone();
+
+            let mut body = MockHasBody::default();
+            body.has_body_for
+                .insert(format!("fs:{}", png.to_string_lossy()));
+            let body: Arc<dyn HasBody> = Arc::new(body);
+
+            let _ = FsSource::extract_content(
+                &png,
+                &caps,
+                Some(sink.as_ref()),
+                Some(body.as_ref()),
+            )
+            .unwrap();
+            assert!(
+                mock_enq.calls.lock().unwrap().is_empty(),
+                "body already indexed must short-circuit the enqueue",
+            );
+
+            let other_body: Arc<dyn HasBody> = Arc::new(MockHasBody::default());
+            let _ = FsSource::extract_content(
+                &png,
+                &caps,
+                Some(sink.as_ref()),
+                Some(other_body.as_ref()),
+            )
+            .unwrap();
+            assert_eq!(
+                mock_enq.calls.lock().unwrap().len(),
+                1,
+                "checker returning false must let the enqueue proceed",
             );
         });
     }

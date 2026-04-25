@@ -163,13 +163,21 @@ async fn main() -> Result<()> {
         let _ = config.ocr_enqueue.set(Arc::clone(enq));
     }
 
+    // Registry build is split across the writer-service boot so the
+    // daemon can install `config.body_checker` (which wraps the live
+    // SearchHandle) BEFORE `FsSource` is constructed. Without this
+    // split the fs source would be wired with `body_checker: None`
+    // and the DB-16 OCR enqueue short-circuit would never fire.
+    //
+    // Step 1: register only the config-driven plugin instances so
+    // `plugin_fields_by_kind` is populated for the index schema. The
+    // builtin `apps` + `fs` sources carry no plugin fields, so
+    // deferring their registration does not change the schema.
+    let sources_state_dir = config.state_dir.join("sources");
+    let mut registry = lixun_indexer::SourceRegistry::new();
+    register_plugin_sources(&mut registry, &config, &sources_state_dir)?;
+
     let index_path = config.state_dir.join("index");
-    let registry = {
-        let mut r = lixun_indexer::SourceRegistry::new();
-        let sources_state_dir = config.state_dir.join("sources");
-        register_builtin_sources(&mut r, &config, &sources_state_dir)?;
-        Arc::new(r)
-    };
     let (index, rebuilt_from_scratch) = lixun_index::LixunIndex::create_or_open_with_plugins(
         index_path.to_str().unwrap(),
         &registry.plugin_fields_by_kind,
@@ -182,6 +190,23 @@ async fn main() -> Result<()> {
     let watcher_exclude = config.exclude.clone();
     let watcher_exclude_regex = config.exclude_regex.clone();
     let watcher_max_size = config.max_file_size_mb;
+
+    // Spawn the writer service before finishing source registration
+    // so we can wire the SearchHandle-backed HasBody adapter into
+    // `config.body_checker` — the builtin `fs` source reads that
+    // OnceLock during its own construction.
+    let (mutation_tx, search, _writer_handle) = index_service::spawn_writer_service(index)?;
+
+    let body_checker_arc: Arc<dyn lixun_sources::HasBody> =
+        Arc::new(SearchHandleBodyChecker::new(search.clone()));
+    let _ = config.body_checker.set(Arc::clone(&body_checker_arc));
+
+    // Step 2: now that `config.body_checker` is populated, register
+    // the builtin apps + fs sources. FsSource picks up the checker
+    // via `config.build_fs_source` / `with_body_checker`.
+    register_builtin_nonplugin_sources(&mut registry, &config, &sources_state_dir)?;
+    let registry = Arc::new(registry);
+
     let shared_config = Arc::new(config);
 
     let frecency = FrecencyStore::load(&state_dir)?;
@@ -208,8 +233,6 @@ async fn main() -> Result<()> {
         }
     };
 
-    let (mutation_tx, search, _writer_handle) = index_service::spawn_writer_service(index)?;
-
     let indexer_mutation = mutation_tx.clone();
     let indexer_search = search.clone();
     let indexer_stats = Arc::clone(&stats);
@@ -235,6 +258,7 @@ async fn main() -> Result<()> {
     let watcher_mutation = mutation_tx.clone();
     let watcher_caps = Arc::clone(&extract_caps_arc);
     let watcher_enqueue = ocr_enqueue_arc.clone();
+    let watcher_body_checker = Some(Arc::clone(&body_checker_arc));
     tokio::spawn(async move {
         if let Err(e) = watcher::start(
             watcher_roots,
@@ -243,6 +267,7 @@ async fn main() -> Result<()> {
             watcher_max_size,
             watcher_caps,
             watcher_enqueue,
+            watcher_body_checker,
             watcher_mutation,
         )
         .await
@@ -733,27 +758,18 @@ fn plugin_factories() -> Vec<Box<dyn lixun_sources::PluginFactory>> {
         .collect()
 }
 
-fn register_builtin_sources(
+/// Register external plugin instances only (every source built via
+/// a `PluginFactoryEntry`). Must run BEFORE the Tantivy index is
+/// created so the populated `plugin_fields_by_kind` matches the
+/// schema. Separated from the builtin apps/fs registration because
+/// the fs source wants to read `config.body_checker`, which is not
+/// populated until the writer service — and therefore the index —
+/// is already up.
+fn register_plugin_sources(
     registry: &mut lixun_indexer::SourceRegistry,
     config: &config::Config,
     state_dir_root: &std::path::Path,
 ) -> anyhow::Result<()> {
-    registry.register(
-        "builtin:apps".into(),
-        state_dir_root,
-        Arc::new(lixun_sources::apps::AppsSource::new()),
-    );
-
-    let fs = lixun_sources::fs::FsSource::with_regex_and_ocr(
-        config.roots.clone(),
-        config.exclude.clone(),
-        config.exclude_regex.clone(),
-        config.max_file_size_mb,
-        config.caps_arc(),
-        config.ocr_enqueue.get().cloned(),
-    );
-    registry.register("builtin:fs".into(), state_dir_root, Arc::new(fs));
-
     let factories = plugin_factories();
     let mut known_sections: std::collections::HashSet<&'static str> =
         std::collections::HashSet::new();
@@ -793,6 +809,76 @@ fn register_builtin_sources(
     }
 
     Ok(())
+}
+
+/// Register the builtin apps + fs sources. Must run AFTER
+/// `config.body_checker` is populated so the fs source picks up the
+/// DB-16 short-circuit adapter via `with_body_checker`.
+fn register_builtin_nonplugin_sources(
+    registry: &mut lixun_indexer::SourceRegistry,
+    config: &config::Config,
+    state_dir_root: &std::path::Path,
+) -> anyhow::Result<()> {
+    registry.register(
+        "builtin:apps".into(),
+        state_dir_root,
+        Arc::new(lixun_sources::apps::AppsSource::new()),
+    );
+
+    let fs = lixun_sources::fs::FsSource::with_regex_and_ocr(
+        config.roots.clone(),
+        config.exclude.clone(),
+        config.exclude_regex.clone(),
+        config.max_file_size_mb,
+        config.caps_arc(),
+        config.ocr_enqueue.get().cloned(),
+    )
+    .with_body_checker(config.body_checker.get().cloned());
+    registry.register("builtin:fs".into(), state_dir_root, Arc::new(fs));
+
+    Ok(())
+}
+
+// Adapter bridging lixun-sources::HasBody to the concrete async
+// SearchHandle. `maybe_enqueue_ocr` runs on rayon worker threads
+// (not tokio workers), so we can safely drive the async
+// SearchHandle::has_body via Handle::block_on. On any error we fall
+// through to enqueue — the OcrQueue's INSERT OR IGNORE dedups, so
+// "re-enqueue on probe failure" is the safe default. Isolates
+// lixun-sources from tokio + Tantivy per AGENTS.md modularity.
+struct SearchHandleBodyChecker {
+    search: SearchHandle,
+    runtime: tokio::runtime::Handle,
+}
+
+impl SearchHandleBodyChecker {
+    fn new(search: SearchHandle) -> Self {
+        Self {
+            search,
+            runtime: tokio::runtime::Handle::current(),
+        }
+    }
+}
+
+impl lixun_sources::HasBody for SearchHandleBodyChecker {
+    fn has_body(&self, doc_id: &str) -> anyhow::Result<bool> {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            // On a tokio worker we would deadlock on block_on. The
+            // rayon threads that drive maybe_enqueue_ocr are NOT tokio
+            // workers, so this branch normally never fires; it is a
+            // defensive fall-through for unforeseen callers.
+            tracing::debug!(
+                "body checker: called from tokio runtime thread, skipping short-circuit"
+            );
+            return Ok(false);
+        }
+        let search = self.search.clone();
+        let doc_id = doc_id.to_string();
+        Ok(self
+            .runtime
+            .block_on(async move { search.has_body(&doc_id).await })
+            .unwrap_or(false))
+    }
 }
 
 // Adapter bridging lixun-sources::OcrEnqueue to the concrete OcrQueue;

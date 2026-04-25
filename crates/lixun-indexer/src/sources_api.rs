@@ -7,4 +7,7 @@ pub trait IndexerSources: Send + Sync {
     fn max_file_size_mb(&self) -> u64;
     fn caps(&self) -> Arc<lixun_extract::ExtractorCapabilities>;
     fn ocr_enqueue(&self) -> Option<Arc<dyn lixun_sources::OcrEnqueue>>;
+    fn body_checker(&self) -> Option<Arc<dyn lixun_sources::HasBody>> {
+        None
+    }
 }
