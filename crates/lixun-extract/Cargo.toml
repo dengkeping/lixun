@@ -19,6 +19,7 @@ zstd = { workspace = true }
 uuid = { workspace = true }
 dirs = { workspace = true }
 image = { workspace = true }
+rusqlite = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
