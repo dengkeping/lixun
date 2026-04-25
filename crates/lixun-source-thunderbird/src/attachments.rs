@@ -133,12 +133,9 @@ impl ThunderbirdAttachmentsSource {
                         sender: None,
                         recipients: None,
                         source_instance: "builtin:tb_attachments".into(),
-                        secondary_action: part
-                            .message_id
-                            .as_ref()
-                            .map(|mid| Action::OpenUri {
-                                uri: format!("mid:{mid}"),
-                            }),
+                        secondary_action: part.message_id.as_ref().map(|mid| Action::OpenUri {
+                            uri: format!("mid:{mid}"),
+                        }),
                         extra: Vec::new(),
                     });
                 }

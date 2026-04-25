@@ -33,7 +33,7 @@
 //! are lost; the index's next pass will re-enqueue OCR candidates.
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::{params, Connection, OpenFlags};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -56,7 +56,13 @@ impl OcrQueueRow {
     /// and `enqueued_at` set to the current wall-clock second.
     /// Callers supplying historical timestamps (e.g. migration code)
     /// should set the public fields directly after construction.
-    pub fn new(doc_id: impl Into<String>, path: impl Into<String>, mtime: i64, size: u64, ext: impl Into<String>) -> Self {
+    pub fn new(
+        doc_id: impl Into<String>,
+        path: impl Into<String>,
+        mtime: i64,
+        size: u64,
+        ext: impl Into<String>,
+    ) -> Self {
         Self {
             doc_id: doc_id.into(),
             path: path.into(),
@@ -91,7 +97,10 @@ impl OcrQueue {
     pub fn open(path: PathBuf) -> Result<Self> {
         let conn = open_initialized(&path)?;
         drop(conn);
-        Ok(Self { path: Some(path), test_conn: None })
+        Ok(Self {
+            path: Some(path),
+            test_conn: None,
+        })
     }
 
     /// Test-only entry point. Takes ownership of an already-opened
@@ -102,7 +111,10 @@ impl OcrQueue {
     pub fn from_connection(conn: Connection) -> Result<Self> {
         apply_pragmas(&conn)?;
         init_schema(&conn)?;
-        Ok(Self { path: None, test_conn: Some(Mutex::new(conn)) })
+        Ok(Self {
+            path: None,
+            test_conn: Some(Mutex::new(conn)),
+        })
     }
 
     /// Idempotent enqueue. `INSERT OR IGNORE` — if the `doc_id` is
@@ -165,10 +177,7 @@ impl OcrQueue {
     pub fn remove(&self, doc_id: &str) -> Result<()> {
         self.with_conn(|conn| {
             with_busy_retry(|| {
-                conn.execute(
-                    "DELETE FROM ocr_queue WHERE doc_id = ?1",
-                    params![doc_id],
-                )?;
+                conn.execute("DELETE FROM ocr_queue WHERE doc_id = ?1", params![doc_id])?;
                 Ok(())
             })
         })
@@ -239,12 +248,18 @@ impl OcrQueue {
 
     /// Internal helper: pick between the persistent `path` (open a
     /// fresh connection) or the test-held connection.
-    fn with_conn<T>(&self, f: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> rusqlite::Result<T> {
+    fn with_conn<T>(
+        &self,
+        f: impl FnOnce(&Connection) -> rusqlite::Result<T>,
+    ) -> rusqlite::Result<T> {
         if let Some(ref m) = self.test_conn {
             let guard = m.lock().expect("ocr queue test mutex poisoned");
             f(&guard)
         } else {
-            let path = self.path.as_ref().expect("OcrQueue: no path and no test connection");
+            let path = self
+                .path
+                .as_ref()
+                .expect("OcrQueue: no path and no test connection");
             let conn = open_with_flags(path)?;
             f(&conn)
         }
@@ -287,10 +302,16 @@ fn open_initialized(path: &Path) -> Result<Connection> {
                 backup.display()
             );
             std::fs::rename(path, &backup).with_context(|| {
-                format!("ocr queue: renaming corrupt file {} aside failed", path.display())
+                format!(
+                    "ocr queue: renaming corrupt file {} aside failed",
+                    path.display()
+                )
             })?;
             try_open_and_init(path).with_context(|| {
-                format!("ocr queue: reopening {} after corruption failed", path.display())
+                format!(
+                    "ocr queue: reopening {} after corruption failed",
+                    path.display()
+                )
             })
         }
         Err(e) => Err(e).with_context(|| format!("ocr queue: opening {} failed", path.display())),
@@ -442,7 +463,13 @@ mod tests {
     }
 
     fn sample_row(doc_id: &str) -> OcrQueueRow {
-        OcrQueueRow::new(doc_id, format!("/tmp/{doc_id}.pdf"), 1_700_000_000, 4096, "pdf")
+        OcrQueueRow::new(
+            doc_id,
+            format!("/tmp/{doc_id}.pdf"),
+            1_700_000_000,
+            4096,
+            "pdf",
+        )
     }
 
     #[test]
@@ -540,7 +567,9 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
         assert!(
-            entries.iter().any(|n| n.starts_with("ocr-queue.db.corrupt-")),
+            entries
+                .iter()
+                .any(|n| n.starts_with("ocr-queue.db.corrupt-")),
             "expected a .corrupt-<ts> sibling, got entries: {entries:?}"
         );
 

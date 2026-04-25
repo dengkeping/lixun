@@ -450,13 +450,10 @@ impl Config {
             cfg.ranking_frecency_alpha = ranking.frecency_alpha.unwrap_or(0.1);
             cfg.ranking_latch_weight = ranking.latch_weight.unwrap_or(0.5);
             cfg.ranking_latch_cap = ranking.latch_cap.unwrap_or(3.0);
-            cfg.ranking_total_multiplier_cap =
-                ranking.total_multiplier_cap.unwrap_or(6.0);
-            cfg.ranking_top_hit_min_confidence =
-                ranking.top_hit_min_confidence.unwrap_or(0.6);
+            cfg.ranking_total_multiplier_cap = ranking.total_multiplier_cap.unwrap_or(6.0);
+            cfg.ranking_top_hit_min_confidence = ranking.top_hit_min_confidence.unwrap_or(0.6);
             cfg.ranking_top_hit_min_margin = ranking.top_hit_min_margin.unwrap_or(1.3);
-            cfg.ranking_strong_latch_threshold =
-                ranking.strong_latch_threshold.unwrap_or(3);
+            cfg.ranking_strong_latch_threshold = ranking.strong_latch_threshold.unwrap_or(3);
         }
         if let Some(bindings) = parsed.keybindings {
             if let Some(v) = bindings.close {
@@ -591,14 +588,9 @@ impl Config {
     }
 
     pub fn caps_arc(&self) -> std::sync::Arc<lixun_extract::ExtractorCapabilities> {
-        self.extractor_caps
-            .get()
-            .cloned()
-            .unwrap_or_else(|| {
-                std::sync::Arc::new(
-                    lixun_extract::ExtractorCapabilities::all_available_no_timeout(),
-                )
-            })
+        self.extractor_caps.get().cloned().unwrap_or_else(|| {
+            std::sync::Arc::new(lixun_extract::ExtractorCapabilities::all_available_no_timeout())
+        })
     }
 
     pub fn ranking_config(&self) -> lixun_core::RankingConfig {
@@ -752,8 +744,7 @@ mod tests {
 
     #[test]
     fn ocr_config_defaults_apply_when_only_enabled_set() {
-        let cfg =
-            Config::from_toml_str("[ocr]\nenabled = true\n").expect("parse");
+        let cfg = Config::from_toml_str("[ocr]\nenabled = true\n").expect("parse");
         assert!(cfg.ocr.enabled);
         assert!(cfg.ocr.languages.is_empty());
         assert_eq!(cfg.ocr.max_pages_per_pdf, None);
@@ -770,35 +761,29 @@ mod tests {
     fn ocr_config_max_pages_none_when_omitted() {
         let cfg = Config::from_toml_str("[ocr]\nenabled = true\n").unwrap();
         assert_eq!(cfg.ocr.max_pages_per_pdf, None);
-        let cfg2 =
-            Config::from_toml_str("[ocr]\nmax_pages_per_pdf = 5\n").unwrap();
+        let cfg2 = Config::from_toml_str("[ocr]\nmax_pages_per_pdf = 5\n").unwrap();
         assert_eq!(cfg2.ocr.max_pages_per_pdf, Some(5));
     }
 
     #[test]
     fn ocr_config_max_pages_zero_normalized_to_none() {
-        let cfg =
-            Config::from_toml_str("[ocr]\nmax_pages_per_pdf = 0\n").unwrap();
+        let cfg = Config::from_toml_str("[ocr]\nmax_pages_per_pdf = 0\n").unwrap();
         assert_eq!(cfg.ocr.max_pages_per_pdf, None);
     }
 
     #[test]
     fn ocr_config_worker_interval_zero_clamped_to_one() {
-        let cfg =
-            Config::from_toml_str("[ocr]\nworker_interval_secs = 0\n").unwrap();
+        let cfg = Config::from_toml_str("[ocr]\nworker_interval_secs = 0\n").unwrap();
         assert_eq!(cfg.ocr.worker_interval_secs, 1);
     }
 
     #[test]
     fn ocr_config_nice_out_of_range_clamped() {
-        let cfg_low =
-            Config::from_toml_str("[ocr]\nnice_level = -5\n").unwrap();
+        let cfg_low = Config::from_toml_str("[ocr]\nnice_level = -5\n").unwrap();
         assert_eq!(cfg_low.ocr.nice_level, 0);
-        let cfg_high =
-            Config::from_toml_str("[ocr]\nnice_level = 25\n").unwrap();
+        let cfg_high = Config::from_toml_str("[ocr]\nnice_level = 25\n").unwrap();
         assert_eq!(cfg_high.ocr.nice_level, 19);
-        let cfg_ok =
-            Config::from_toml_str("[ocr]\nnice_level = 10\n").unwrap();
+        let cfg_ok = Config::from_toml_str("[ocr]\nnice_level = 10\n").unwrap();
         assert_eq!(cfg_ok.ocr.nice_level, 10);
     }
 
@@ -814,10 +799,8 @@ mod tests {
 
     #[test]
     fn extract_and_ocr_sections_not_treated_as_plugin_sections() {
-        let cfg = Config::from_toml_str(
-            "[extract]\ncache_max_mb = 100\n[ocr]\nenabled = true\n",
-        )
-        .unwrap();
+        let cfg = Config::from_toml_str("[extract]\ncache_max_mb = 100\n[ocr]\nenabled = true\n")
+            .unwrap();
         assert!(!cfg.plugin_sections.contains_key("extract"));
         assert!(!cfg.plugin_sections.contains_key("ocr"));
     }

@@ -13,12 +13,5 @@ use std::path::Path;
 
 /// Sink for OCR enqueue requests emitted during file extraction.
 pub trait OcrEnqueue: Send + Sync {
-    fn enqueue(
-        &self,
-        doc_id: &str,
-        path: &Path,
-        mtime: i64,
-        size: u64,
-        ext: &str,
-    ) -> Result<()>;
+    fn enqueue(&self, doc_id: &str, path: &Path, mtime: i64, size: u64, ext: &str) -> Result<()>;
 }
