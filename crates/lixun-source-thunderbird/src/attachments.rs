@@ -213,7 +213,38 @@ impl lixun_sources::source::IndexerSource for ThunderbirdAttachmentsSource {
 mod tests {
     use super::*;
     use base64::Engine;
+    use std::sync::{Mutex, OnceLock};
     use tempfile::tempdir;
+
+    /// Serialises tests that mutate `XDG_CACHE_HOME` via `env::set_var`.
+    /// Process-global env is shared across parallel cargo threads in this
+    /// test binary; without serialisation two tests racing through
+    /// `cached_extract_bytes` would step on each other's cache roots.
+    static HOME_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn with_isolated_cache<F: FnOnce(&std::path::Path) -> R, R>(f: F) -> R {
+        let lock = HOME_LOCK.get_or_init(|| Mutex::new(()));
+        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempdir().unwrap();
+        let prev_xdg = std::env::var_os("XDG_CACHE_HOME");
+        let prev_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("XDG_CACHE_HOME", tmp.path());
+            std::env::set_var("HOME", tmp.path());
+        }
+        let result = f(tmp.path());
+        unsafe {
+            match prev_xdg {
+                Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
+                None => std::env::remove_var("XDG_CACHE_HOME"),
+            }
+            match prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        result
+    }
 
     #[test]
     fn test_thunderbird_attachments_source_integration() {
@@ -303,5 +334,66 @@ mod tests {
             "expected no secondary when Message-ID header absent, got {:?}",
             attachment.secondary_action
         );
+    }
+
+    #[test]
+    fn attachment_bytes_cache_hits_on_identical_reindex() {
+        with_isolated_cache(|cache_root| {
+            let dir = tempdir().unwrap();
+            let profile = dir.path();
+            let inbox_dir = profile.join("Mail").join("Local Folders");
+            std::fs::create_dir_all(&inbox_dir).unwrap();
+
+            let payload = base64::engine::general_purpose::STANDARD.encode("HIT_TEST_MARKER");
+            let mbox = format!(
+                "From alice@example.com Wed Jan 01 00:00:00 2025\nFrom: alice@example.com\nSubject: Cache hit test\nMessage-ID: <cache-hit@example.com>\nContent-Type: multipart/mixed; boundary=\"BB\"\nMIME-Version: 1.0\n\n--BB\nContent-Type: text/plain\n\nhello\n--BB\nContent-Type: text/plain; name=\"a.txt\"\nContent-Disposition: attachment; filename=\"a.txt\"\nContent-Transfer-Encoding: base64\n\n{payload}\n--BB--\n"
+            );
+            std::fs::write(inbox_dir.join("Inbox"), mbox).unwrap();
+
+            let source =
+                ThunderbirdAttachmentsSource::new(profile.to_path_buf(), 100 * 1024 * 1024);
+
+            let count_cache_entries = || -> usize {
+                walkdir::WalkDir::new(cache_root.join("lixun/extract/v1"))
+                    .into_iter()
+                    .filter_map(Result::ok)
+                    .filter(|e| e.file_type().is_file())
+                    .filter(|e| {
+                        e.file_name()
+                            .to_str()
+                            .is_some_and(|n| n.ends_with(".txt.zst"))
+                    })
+                    .count()
+            };
+
+            assert_eq!(count_cache_entries(), 0, "cache starts empty");
+            let docs1 = source.index_all().unwrap();
+            let entries_after_first = count_cache_entries();
+            assert!(
+                entries_after_first >= 1,
+                "first run should populate cache"
+            );
+
+            let docs2 = source.index_all().unwrap();
+            let entries_after_second = count_cache_entries();
+            assert_eq!(
+                entries_after_second, entries_after_first,
+                "second identical run must not add new cache entries (HIT expected)"
+            );
+
+            let body1 = docs1
+                .iter()
+                .find(|d| matches!(d.category, Category::Attachment))
+                .and_then(|d| d.body.clone());
+            let body2 = docs2
+                .iter()
+                .find(|d| matches!(d.category, Category::Attachment))
+                .and_then(|d| d.body.clone());
+            assert_eq!(body1, body2, "cached body must be identical across runs");
+            assert!(
+                body1.as_deref().is_some_and(|b| b.contains("HIT_TEST_MARKER")),
+                "body must contain the test marker payload, got {body1:?}"
+            );
+        });
     }
 }
