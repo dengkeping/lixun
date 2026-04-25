@@ -11,6 +11,7 @@ path = "src/main.rs"
 lixun-core = { path = "../lixun-core" }
 lixun-ipc = { path = "../lixun-ipc" }
 anyhow.workspace = true
+chrono.workspace = true
 clap.workspace = true
 tokio.workspace = true
 serde.workspace = true

@@ -185,6 +185,7 @@ async fn main() -> Result<()> {
     )?;
 
     let stats = Arc::new(RwLock::new(IndexStats::default()));
+    let ocr_worker_stats = Arc::new(lixun_indexer::ocr_tick::OcrWorkerStats::default());
     let state_dir = config.state_dir.clone();
     let watcher_roots = config.roots.clone();
     let watcher_exclude = config.exclude.clone();
@@ -294,6 +295,7 @@ async fn main() -> Result<()> {
         indexer_sink.clone(),
         extract_caps.clone(),
         ocr_queue.clone(),
+        Arc::clone(&ocr_worker_stats),
     );
 
     spawn_cache_sweep_worker(Arc::clone(&shared_config), ocr_queue.clone());
@@ -378,9 +380,11 @@ async fn main() -> Result<()> {
                 let preview_spawner = Arc::clone(&preview_spawner);
                 let shared_config = Arc::clone(&shared_config);
                 let client_registry = Arc::clone(&registry);
+                let client_ocr_queue = ocr_queue.clone();
+                let client_ocr_worker_stats = Arc::clone(&ocr_worker_stats);
 
                 tokio::spawn(async move {
-                    if let Err(e) = handle_client(stream, search, mutation_tx, frecency, query_latch, query_log, stats, gui_control, preview_spawner, shared_config, client_registry).await {
+                    if let Err(e) = handle_client(stream, search, mutation_tx, frecency, query_latch, query_log, stats, gui_control, preview_spawner, shared_config, client_registry, client_ocr_queue, client_ocr_worker_stats).await {
                         tracing::debug!("Client error: {}", e);
                     }
                 });
@@ -483,6 +487,43 @@ fn collect_writer_stats() -> lixun_ipc::WriterStats {
     }
 }
 
+/// Hardcoded retry ceiling for the OCR queue. Shared between the
+/// worker's drain loop (`peek_next(max_attempts)`) and the Status
+/// handler's stats breakdown (`stats(max_attempts)`) so pending/failed
+/// counts agree with what the worker would actually process.
+const OCR_MAX_ATTEMPTS: u32 = 3;
+
+/// Build the IPC `OcrStats` snapshot for Status responses. Returns
+/// `None` when OCR is disabled (no queue allocated) so clients can
+/// omit the OCR block entirely without ambiguity.
+fn collect_ocr_stats(
+    queue: Option<&lixun_extract::ocr_queue::OcrQueue>,
+    worker_stats: &lixun_indexer::ocr_tick::OcrWorkerStats,
+    max_attempts: u32,
+) -> Option<lixun_ipc::OcrStats> {
+    let q = queue?;
+    let qs = match q.stats(max_attempts) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::debug!("ocr stats unavailable: {:#}", e);
+            return None;
+        }
+    };
+    let (drained_total, last_drain_at_raw) = worker_stats.snapshot();
+    let last_drain_at = if last_drain_at_raw > 0 {
+        Some(last_drain_at_raw)
+    } else {
+        None
+    };
+    Some(lixun_ipc::OcrStats {
+        queue_total: qs.total,
+        queue_pending: qs.pending,
+        queue_failed: qs.failed,
+        drained_total,
+        last_drain_at,
+    })
+}
+
 fn collect_memory_stats() -> lixun_ipc::MemoryStats {
     let Ok(text) = std::fs::read_to_string("/proc/self/status") else {
         return lixun_ipc::MemoryStats::default();
@@ -523,6 +564,8 @@ async fn handle_client(
     preview_spawner: Arc<PreviewSpawner>,
     config: Arc<config::Config>,
     registry: Arc<lixun_indexer::SourceRegistry>,
+    ocr_queue: Option<Arc<lixun_extract::ocr_queue::OcrQueue>>,
+    ocr_worker_stats: Arc<lixun_indexer::ocr_tick::OcrWorkerStats>,
 ) -> anyhow::Result<()> {
     let mut header = [0u8; 4];
     stream.read_exact(&mut header).await?;
@@ -679,6 +722,7 @@ async fn handle_client(
                     memory: Some(collect_memory_stats()),
                     reindex_in_progress: s.reindex_in_progress,
                     reindex_started: s.reindex_started,
+                    ocr: collect_ocr_stats(ocr_queue.as_deref(), &ocr_worker_stats, OCR_MAX_ATTEMPTS),
                 }
             }
         }
@@ -693,6 +737,7 @@ async fn handle_client(
                 memory: Some(collect_memory_stats()),
                 reindex_in_progress: s.reindex_in_progress,
                 reindex_started: s.reindex_started,
+                ocr: collect_ocr_stats(ocr_queue.as_deref(), &ocr_worker_stats, OCR_MAX_ATTEMPTS),
             }
         }
         Request::RecordClick { doc_id } => {
@@ -945,6 +990,7 @@ fn spawn_ocr_worker(
     sink: Arc<lixun_indexer::WriterSink>,
     mut caps: lixun_extract::ExtractorCapabilities,
     queue: Option<Arc<lixun_extract::ocr_queue::OcrQueue>>,
+    worker_stats: Arc<lixun_indexer::ocr_tick::OcrWorkerStats>,
 ) {
     caps.timeout = std::time::Duration::from_secs(config.ocr.timeout_secs);
     caps.ocr_enabled = config.ocr.enabled;
@@ -971,7 +1017,7 @@ fn spawn_ocr_worker(
         langs,
         min_image_side_px: config.ocr.min_image_side_px,
         max_pages_per_pdf: config.ocr.max_pages_per_pdf,
-        max_attempts: 3,
+        max_attempts: OCR_MAX_ATTEMPTS,
         throttle,
     };
     let idle: Arc<dyn lixun_indexer::ocr_tick::IdleGate> = if config.ocr.adaptive_throttle {
@@ -986,7 +1032,8 @@ fn spawn_ocr_worker(
     } else {
         Arc::new(StatsIdleGate { stats })
     };
-    let handle = lixun_indexer::ocr_tick::spawn(queue, idle, sink, Arc::new(caps), cfg);
+    let handle =
+        lixun_indexer::ocr_tick::spawn(queue, idle, sink, Arc::new(caps), cfg, worker_stats);
     std::mem::forget(handle);
 }
 
@@ -1010,7 +1057,7 @@ fn spawn_cache_sweep_worker(
         max_bytes: config.extract.cache_max_mb * 1024 * 1024,
         interval: std::time::Duration::from_secs(config.extract.cache_sweep_interval_secs),
         tmp_max_age: std::time::Duration::from_secs(3600),
-        zombie_max_attempts: 3,
+        zombie_max_attempts: OCR_MAX_ATTEMPTS,
         zombie_max_age: std::time::Duration::from_secs(30 * 86_400),
     };
     let reaper: Option<Arc<dyn lixun_indexer::cache_sweep::ZombieReaper>> = queue.map(|q| {
