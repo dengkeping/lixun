@@ -38,6 +38,19 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+/// Aggregate queue metrics. `total == pending + failed` by
+/// construction; both sub-counts are surfaced independently because
+/// they mean different things to an operator: `pending` is "work the
+/// worker will still try", `failed` is "work the worker has given up
+/// on until the zombie reaper removes it or a manual intervention
+/// resets attempts".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OcrQueueStats {
+    pub total: u64,
+    pub pending: u64,
+    pub failed: u64,
+}
+
 /// One row in the OCR queue.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OcrQueueRow {
@@ -244,6 +257,43 @@ impl OcrQueue {
             })
         })
         .context("ocr queue: len failed")
+    }
+
+    /// Queue depth broken down into the buckets the worker reasons
+    /// about: rows still eligible to drain (`attempts < max_attempts`)
+    /// vs. rows that have exhausted the retry budget. `total` is the
+    /// sum; `pending + failed = total`. Computed in one SQL round-trip
+    /// via `SUM(CASE WHEN ...)` so the read is cheap even on a queue
+    /// with tens of thousands of rows.
+    ///
+    /// Powers the `lixun status --ocr` CLI view and the periodic
+    /// progress log; the worker's drain path keeps using
+    /// [`OcrQueue::peek_next`] directly, which has its own index.
+    pub fn stats(&self, max_attempts: u32) -> Result<OcrQueueStats> {
+        self.with_conn(|conn| {
+            with_busy_retry(|| {
+                let (total, pending, failed) = conn.query_row(
+                    "SELECT
+                        COUNT(*) AS total,
+                        COALESCE(SUM(CASE WHEN attempts <  ?1 THEN 1 ELSE 0 END), 0) AS pending,
+                        COALESCE(SUM(CASE WHEN attempts >= ?1 THEN 1 ELSE 0 END), 0) AS failed
+                     FROM ocr_queue",
+                    params![max_attempts as i64],
+                    |r| {
+                        let t: i64 = r.get(0)?;
+                        let p: i64 = r.get(1)?;
+                        let f: i64 = r.get(2)?;
+                        Ok((t, p, f))
+                    },
+                )?;
+                Ok(OcrQueueStats {
+                    total: total.max(0) as u64,
+                    pending: pending.max(0) as u64,
+                    failed: failed.max(0) as u64,
+                })
+            })
+        })
+        .context("ocr queue: stats failed")
     }
 
     /// Internal helper: pick between the persistent `path` (open a
@@ -589,6 +639,42 @@ mod tests {
         let q = mem_queue();
         q.mark_failure("nope", "ignored").unwrap();
         assert_eq!(q.len().unwrap(), 0);
+    }
+
+    #[test]
+    fn stats_returns_zero_breakdown_on_empty_queue() {
+        let q = mem_queue();
+        let s = q.stats(3).unwrap();
+        assert_eq!(s.total, 0);
+        assert_eq!(s.pending, 0);
+        assert_eq!(s.failed, 0);
+    }
+
+    #[test]
+    fn stats_buckets_by_attempts_against_max() {
+        let q = mem_queue();
+
+        let mut fresh = sample_row("fresh");
+        fresh.attempts = 0;
+        q.enqueue(fresh).unwrap();
+
+        let mut retrying = sample_row("retrying");
+        retrying.attempts = 2;
+        q.enqueue(retrying).unwrap();
+
+        let mut exhausted = sample_row("exhausted");
+        exhausted.attempts = 3;
+        q.enqueue(exhausted).unwrap();
+
+        let mut past_max = sample_row("past-max");
+        past_max.attempts = 5;
+        q.enqueue(past_max).unwrap();
+
+        let s = q.stats(3).unwrap();
+        assert_eq!(s.total, 4);
+        assert_eq!(s.pending, 2, "fresh + retrying with attempts<3");
+        assert_eq!(s.failed, 2, "exhausted + past-max with attempts>=3");
+        assert_eq!(s.pending + s.failed, s.total);
     }
 
     #[test]

@@ -12,6 +12,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -22,6 +23,43 @@ use lixun_extract::ExtractorCapabilities;
 use lixun_extract::ocr_queue::OcrQueue;
 
 use crate::writer_sink::WriterSink;
+
+/// Emit an aggregate progress log every N drained jobs. Hand-tuned:
+/// small enough that a steady drain shows signs of life within a
+/// minute at any reasonable jobs_per_tick, large enough that a
+/// single-job-per-tick default doesn't spam info! every minute.
+const PROGRESS_LOG_EVERY_N_DRAINED: u64 = 50;
+
+/// Shared, cheaply-readable observability state for the OCR worker.
+///
+/// Wire-up: the daemon allocates one [`Arc<OcrWorkerStats>`], passes
+/// it into [`spawn`], and exposes the same handle to the IPC `Status`
+/// handler. The worker bumps `drained_total` and `last_drain_at` on
+/// every successful drain; the IPC side reads both with relaxed
+/// atomics. Intentionally in-process only: restarts reset the
+/// counter (the persistent truth lives in [`OcrQueue`]).
+#[derive(Debug, Default)]
+pub struct OcrWorkerStats {
+    pub drained_total: AtomicU64,
+    /// Last successful drain as Unix seconds, or `0` if the worker
+    /// has not drained anything since startup. `i64` mirrors the
+    /// queue's on-disk timestamp type for consistent formatting.
+    pub last_drain_at: AtomicI64,
+}
+
+impl OcrWorkerStats {
+    /// Snapshot both counters atomically *enough* for status reporting.
+    /// Values are read independently (Relaxed), so a concurrent bump
+    /// between the two loads can yield `drained_total = N,
+    /// last_drain_at = T(N-1)` for one status query. This is
+    /// acceptable for operator-facing metrics and avoids a mutex on
+    /// the hot path.
+    pub fn snapshot(&self) -> (u64, i64) {
+        let d = self.drained_total.load(Ordering::Relaxed);
+        let t = self.last_drain_at.load(Ordering::Relaxed);
+        (d, t)
+    }
+}
 
 /// Composable "is the daemon idle right now?" probe.
 ///
@@ -242,12 +280,16 @@ fn filetime_secs(md: &std::fs::Metadata) -> i64 {
 
 /// Spawn the production OCR worker. Ticks every `cfg.interval` and
 /// calls [`tick_once`] with the real [`lixun_extract::ocr::run_ocr_job`].
+/// Every successful drain is reflected in [`OcrWorkerStats`] and an
+/// aggregate progress line is emitted every
+/// [`PROGRESS_LOG_EVERY_N_DRAINED`] drains.
 pub fn spawn(
     queue: Arc<OcrQueue>,
     idle: Arc<dyn IdleGate>,
     sink: Arc<WriterSink>,
     caps: Arc<ExtractorCapabilities>,
     cfg: OcrWorkerCfg,
+    stats: Arc<OcrWorkerStats>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut timer = tokio::time::interval(cfg.interval);
@@ -310,6 +352,27 @@ pub fn spawn(
                 run_ocr,
             )
             .await;
+
+            if matches!(outcome, TickOutcome::Drained { .. }) {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                stats.last_drain_at.store(now, Ordering::Relaxed);
+                let n = stats.drained_total.fetch_add(1, Ordering::Relaxed) + 1;
+                if n.is_multiple_of(PROGRESS_LOG_EVERY_N_DRAINED) {
+                    match queue.stats(cfg.max_attempts) {
+                        Ok(qs) => tracing::info!(
+                            "ocr progress: drained={n} pending={} failed={}",
+                            qs.pending,
+                            qs.failed
+                        ),
+                        Err(e) => tracing::warn!(
+                            "ocr progress: drained={n} (queue stats unavailable: {e:#})"
+                        ),
+                    }
+                }
+            }
 
             tracing::trace!(?outcome, "ocr worker: tick complete");
         }

@@ -39,6 +39,26 @@ pub struct MemoryStats {
     pub vm_swap_bytes: u64,
 }
 
+/// OCR queue + worker observability snapshot exposed to CLI/GUI.
+///
+/// The daemon populates this on `Request::Status` when OCR is enabled.
+/// All counts are best-effort point-in-time reads against the persistent
+/// queue (`queue_*`) or in-memory worker counters (`drained_total`,
+/// `last_drain_at`). `last_drain_at` uses Unix seconds with sentinel
+/// `None` for "never drained since startup".
+///
+/// Contract: `queue_total == queue_pending + queue_failed`. Sliced in
+/// the daemon via a single SQL round-trip (see
+/// `OcrQueue::stats(max_attempts)`).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OcrStats {
+    pub queue_total: u64,
+    pub queue_pending: u64,
+    pub queue_failed: u64,
+    pub drained_total: u64,
+    pub last_drain_at: Option<i64>,
+}
+
 /// The oldest protocol version this build can negotiate with.
 pub const MIN_PROTOCOL_VERSION: u16 = 1;
 
@@ -102,6 +122,8 @@ pub enum Response {
         reindex_in_progress: bool,
         #[serde(default)]
         reindex_started: Option<DateTime<Utc>>,
+        #[serde(default)]
+        ocr: Option<OcrStats>,
     },
     Visibility {
         visible: bool,
