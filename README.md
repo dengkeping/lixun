@@ -28,6 +28,70 @@ Everything local. No telemetry, no cloud, no vendor.
 
 ---
 
+## Automatic OCR
+
+Scanned PDFs and bitmap images (`.png`, `.jpg`, `.tiff`, `.webp`, …)
+can be indexed by their text content via Tesseract. Off by default;
+enable under `[ocr]` in `~/.config/lixun/config.toml`:
+
+```toml
+[ocr]
+enabled = true
+# languages: auto-derived from $LANG/$LC_ALL when omitted; fallback ["eng"]
+# languages = ["eng", "rus", "chi_sim"]
+# max_pages_per_pdf = 20         # omit = unlimited (per-page timeout still applies)
+# min_image_side_px = 200        # pre-filter: skip anything smaller
+# timeout_secs = 30
+# worker_interval_secs = 60
+# jobs_per_tick = 10             # batch drain size per worker tick
+
+# Adaptive CPU throttle (Linux PSI, off by default):
+# adaptive_throttle    = true
+# max_cpu_pressure_avg10 = 10.0  # skip tick when /proc/pressure/cpu some avg10 exceeds this
+# nice_level           = 19
+# io_class_idle        = true    # ionice IDLE class on tesseract children
+```
+
+How it behaves:
+
+- **Deferred, queued.** Extraction of a file returns immediately
+  without text content; an OCR job is enqueued into a persistent
+  SQLite queue at `~/.local/state/lixun/ocr-queue.db`. Queue survives
+  daemon restarts, retries with capped attempts, and exposes progress
+  via `lixun status --ocr`.
+- **Idle-gated.** The worker only runs while the main indexer is
+  idle, draining up to `jobs_per_tick` jobs per wake-up. User-facing
+  search never stalls behind OCR.
+- **Small-image pre-filter.** Images below `min_image_side_px` are
+  skipped before enqueue — typical icons and thumbnails don't
+  consume queue slots.
+- **Short-circuit on existing body.** If a document already has
+  body text indexed from a prior extraction, re-indexing won't
+  re-enqueue it; body is preserved across reindex.
+- **Adaptive CPU throttle (Linux).** With `adaptive_throttle =
+  true` the worker skips its tick while `/proc/pressure/cpu` shows
+  sustained load, and spawns `tesseract` with `nice = nice_level`
+  (plus `ionice --idle` if `io_class_idle = true`). Safe to leave
+  running during full builds.
+- **Shared extraction cache.** OCR results land in the same
+  `~/.cache/lixun/extract/` store as pdftotext/OOXML output, keyed
+  by `(path, mtime, size, engine version)`. Invalidates on file
+  change; an LRU sweep caps total size (see `[extract]`).
+- **Graceful degradation.** Without `tesseract` or language packs
+  installed, the daemon auto-disables OCR with a single warning and
+  keeps running.
+
+Check progress at any time:
+
+```sh
+lixun status --ocr
+```
+
+See `docs/config.example.toml` for the full `[ocr]` and `[extract]`
+reference.
+
+---
+
 ## Install
 
 ### Arch Linux (binary package)
@@ -65,12 +129,8 @@ language packs you need — `tesseract-data-eng`, `tesseract-data-rus`,
 `tesseract-data-chi_sim` (Arch); `tesseract-ocr` + `tesseract-ocr-eng`
 / `tesseract-ocr-rus` / `tesseract-ocr-chi-sim` (Debian/Ubuntu);
 `tesseract` + `tesseract-langpack-eng` / `-rus` / `-chi_sim` (Fedora).
-OCR is off by default; enable it under `[ocr]` in
-`~/.config/lixun/config.toml` (see `docs/config.example.toml`). The
-worker only runs while the main index is idle and drains one job per
-tick; state persists in `~/.local/state/lixun/ocr-queue.db` so
-progress survives daemon restarts. Without the language packs the
-daemon auto-disables OCR with a single warning.
+Off by default; see [Automatic OCR](#automatic-ocr) above for
+configuration and behaviour.
 **Optional (preview):** `gst-plugins-base`, `gst-plugins-good`,
 `gst-libav` — required for the preview pane's audio/video plugin
 and for animated GIF/WebP rendering in the image plugin. On Arch
