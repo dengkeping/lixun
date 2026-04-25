@@ -20,18 +20,25 @@ impl WriterSink {
     /// Send an `UpsertBody` mutation. The writer task fetches the
     /// doc by `doc_id`, overwrites its `body`, and writes it back.
     /// No-ops (logged at debug) if the doc is already gone.
-    pub fn upsert_body(&self, doc_id: &str, body: &str) -> Result<()> {
-        let tx = self.tx.clone();
-        let doc_id = doc_id.to_string();
-        let body = body.to_string();
-        self.runtime.block_on(async move {
-            tx.send(IndexMutation::UpsertBody { doc_id, body }).await
-        })?;
+    ///
+    /// Async because callers may already be on a tokio worker
+    /// thread (the OCR tick is): nesting `block_on` there panics
+    /// with "Cannot start a runtime from within a runtime".
+    pub async fn upsert_body(&self, doc_id: &str, body: &str) -> Result<()> {
+        self.tx
+            .send(IndexMutation::UpsertBody {
+                doc_id: doc_id.to_string(),
+                body: body.to_string(),
+            })
+            .await?;
         Ok(())
     }
 }
 
 impl MutationSink for WriterSink {
+    /// Called from blocking threads only (rayon extract batches,
+    /// `spawn_blocking` closures). Nesting `block_on` here is safe
+    /// because the caller is not itself driving async tasks.
     fn emit(&self, mutation: SrcMutation) -> Result<()> {
         let tx = self.tx.clone();
         self.runtime.block_on(async move {
