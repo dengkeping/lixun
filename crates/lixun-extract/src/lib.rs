@@ -6,6 +6,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 pub mod cache;
+pub mod ocr;
 pub mod shell;
 
 pub trait Extractor {
