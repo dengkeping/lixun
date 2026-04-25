@@ -60,6 +60,17 @@ systemctl --user enable --now lixund.service
 `zstd`, `sqlite`.
 **Optional (extraction):** `libreoffice-fresh` (docx/xlsx/pptx),
 `catdoc` or `antiword` (legacy .doc).
+**Optional (OCR for images and scan PDFs):** `tesseract` plus the
+language packs you need — `tesseract-data-eng`, `tesseract-data-rus`,
+`tesseract-data-chi_sim` (Arch); `tesseract-ocr` + `tesseract-ocr-eng`
+/ `tesseract-ocr-rus` / `tesseract-ocr-chi-sim` (Debian/Ubuntu);
+`tesseract` + `tesseract-langpack-eng` / `-rus` / `-chi_sim` (Fedora).
+OCR is off by default; enable it under `[ocr]` in
+`~/.config/lixun/config.toml` (see `docs/config.example.toml`). The
+worker only runs while the main index is idle and drains one job per
+tick; state persists in `~/.local/state/lixun/ocr-queue.db` so
+progress survives daemon restarts. Without the language packs the
+daemon auto-disables OCR with a single warning.
 **Optional (preview):** `gst-plugins-base`, `gst-plugins-good`,
 `gst-libav` — required for the preview pane's audio/video plugin
 and for animated GIF/WebP rendering in the image plugin. On Arch
