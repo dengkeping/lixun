@@ -1,7 +1,7 @@
 //! Gloda source — Thunderbird global-messages-db.sqlite.
 
 use anyhow::Result;
-use lixun_core::{Action, Category, DocId, Document};
+use lixun_core::{Action, Category, DocId, Document, RowMenuDef, RowMenuItem, RowMenuVerb};
 use rusqlite::{Connection, OpenFlags};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -321,6 +321,28 @@ impl lixun_sources::source::IndexerSource for GlodaSource {
 
     fn tick_interval(&self) -> Option<Duration> {
         Some(Duration::from_secs(30))
+    }
+
+    fn row_menu(&self) -> RowMenuDef {
+        RowMenuDef {
+            items: vec![
+                RowMenuItem {
+                    label: "Open".into(),
+                    verb: RowMenuVerb::Open,
+                    visibility: Default::default(),
+                },
+                RowMenuItem {
+                    label: "Copy subject".into(),
+                    verb: RowMenuVerb::Copy,
+                    visibility: Default::default(),
+                },
+                RowMenuItem {
+                    label: "Info".into(),
+                    verb: RowMenuVerb::Info,
+                    visibility: Default::default(),
+                },
+            ],
+        }
     }
 
     fn on_tick(

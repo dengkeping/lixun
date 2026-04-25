@@ -7,7 +7,7 @@ pub use factory::MaildirFactory;
 use anyhow::Result;
 use lixun_core::{
     Action, Category, DocId, Document, ExtraFieldValue, PluginFieldSpec, PluginFieldType,
-    PluginValue, TextTokenizer,
+    PluginValue, RowMenuDef, RowMenuItem, RowMenuVerb, TextTokenizer,
 };
 use lixun_sources::source::{
     IndexerSource, Mutation, MutationSink, SourceContext, SourceEvent, SourceEventKind, WatchSpec,
@@ -220,6 +220,28 @@ impl IndexerSource for MaildirSource {
 
     fn extra_fields(&self) -> &'static [PluginFieldSpec] {
         MAILDIR_FIELDS
+    }
+
+    fn row_menu(&self) -> RowMenuDef {
+        RowMenuDef {
+            items: vec![
+                RowMenuItem {
+                    label: "Open".into(),
+                    verb: RowMenuVerb::Open,
+                    visibility: Default::default(),
+                },
+                RowMenuItem {
+                    label: "Copy subject".into(),
+                    verb: RowMenuVerb::Copy,
+                    visibility: Default::default(),
+                },
+                RowMenuItem {
+                    label: "Info".into(),
+                    verb: RowMenuVerb::Info,
+                    visibility: Default::default(),
+                },
+            ],
+        }
     }
 
     fn watch_paths(&self, _ctx: &SourceContext) -> Result<Vec<WatchSpec>> {

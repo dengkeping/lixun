@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::LazyLock;
 
 use anyhow::Result;
-use lixun_core::{Action, Category, DocId, Hit};
+use lixun_core::{Action, Category, DocId, Hit, RowMenuDef, RowMenuItem, RowMenuVerb};
 use lixun_sources::{IndexerSource, MutationSink, QueryContext, SourceContext};
 use regex::Regex;
 
@@ -40,7 +40,7 @@ impl IndexerSource for ShellSource {
         Ok(())
     }
 
-    fn on_query(&self, query: &str, _ctx: &QueryContext) -> Vec<Hit> {
+    fn on_query(&self, query: &str, ctx: &QueryContext) -> Vec<Hit> {
         let cmd = match query.strip_prefix('>').map(str::trim_start) {
             Some(s) if !s.is_empty() => s,
             _ => return Vec::new(),
@@ -73,11 +73,23 @@ impl IndexerSource for ShellSource {
             recipients: None,
             body: None,
             secondary_action: None,
+            source_instance: ctx.instance_id.to_string(),
+            row_menu: RowMenuDef::empty(),
         }]
     }
 
     fn excludes_from_query_log(&self, query: &str) -> bool {
         query.trim_start().starts_with('>')
+    }
+
+    fn row_menu(&self) -> RowMenuDef {
+        RowMenuDef {
+            items: vec![RowMenuItem {
+                label: "Execute".into(),
+                verb: RowMenuVerb::Open,
+                visibility: Default::default(),
+            }],
+        }
     }
 }
 

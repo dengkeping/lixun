@@ -413,6 +413,12 @@ impl LixunIndex {
             let recipients = stored_optional_text(&doc, s.recipients);
             let body = stored_optional_text(&doc, s.body);
 
+            let source_instance = doc
+                .get_first(s.source_instance)
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                .to_string();
+
             let coord_mult = if (2..=3).contains(&q_tokens_count)
                 && all_match_set.contains(&doc_address)
             {
@@ -450,6 +456,8 @@ impl LixunIndex {
                 recipients,
                 body,
                 secondary_action,
+                source_instance,
+                row_menu: lixun_core::RowMenuDef::empty(),
             };
             let breakdown = ScoreBreakdown {
                 tantivy: score,

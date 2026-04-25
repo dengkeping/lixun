@@ -278,6 +278,8 @@ mod tests {
             recipients: None,
             body: None,
             secondary_action: None,
+            source_instance: String::new(),
+            row_menu: lixun_core::RowMenuDef::empty(),
         }
     }
 

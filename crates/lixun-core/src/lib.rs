@@ -175,6 +175,86 @@ pub enum Action {
     OpenUri { uri: String },
 }
 
+/// A single row context-menu item, GTK-free.
+///
+/// Sources describe what items their right-click menu exposes via
+/// [`RowMenuDef`]; the host translates this into whatever native
+/// menu model fits the platform (on Linux: `gio::Menu` +
+/// `gtk::PopoverMenu`). Keeping this type plain-data preserves the
+/// project invariant that plugin-specific UI logic never leaks
+/// into host binaries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RowMenuItem {
+    /// User-visible label. Owned so sources can localize later
+    /// without a string-interning dance.
+    pub label: String,
+    /// Verb the host dispatches when the item is activated.
+    pub verb: RowMenuVerb,
+    /// Visibility / enablement predicate evaluated per-hit on the
+    /// host side. Keeps the menu shape stable across hits so the
+    /// host can cache the translated menu by `source_instance`.
+    #[serde(default)]
+    pub visibility: RowMenuVisibility,
+}
+
+/// Verbs the host wires to SimpleActions on each row. Fixed
+/// vocabulary to keep dispatch generic: a source picks verbs, the
+/// host implements them once.
+///
+/// `Secondary` replaces the legacy `row.reveal` / "Show in
+/// folder" naming; for file hits the host still reveals in the
+/// file manager, for attachment hits it opens the parent mail,
+/// etc. — whichever `Action` the source put in
+/// [`Hit::secondary_action`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum RowMenuVerb {
+    /// Primary action (`Hit::action`).
+    Open,
+    /// Secondary action (`Hit::secondary_action`), rendered
+    /// generically — the label itself tells the user what it does.
+    Secondary,
+    /// Copy the hit's canonical textual representation to the
+    /// clipboard.
+    Copy,
+    /// QuickLook-style transient preview.
+    QuickLook,
+    /// Detailed info popover.
+    Info,
+}
+
+/// When a [`RowMenuItem`] should be enabled / visible.
+///
+/// Kept minimal on purpose: any new variant must be dispatchable
+/// on the host without naming a specific plugin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum RowMenuVisibility {
+    /// Always enabled.
+    #[default]
+    Always,
+    /// Enabled only when the hit carries a non-`None`
+    /// [`Hit::secondary_action`].
+    RequiresSecondaryAction,
+}
+
+/// Row context-menu definition. Empty means "no menu" and the host
+/// omits the gesture wiring entirely for those rows.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RowMenuDef {
+    pub items: Vec<RowMenuItem>,
+}
+
+impl RowMenuDef {
+    /// Empty menu — the default for sources that opt out of the
+    /// contextual affordance.
+    pub fn empty() -> Self {
+        Self { items: Vec::new() }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+}
+
 /// A search result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Hit {
@@ -210,6 +290,20 @@ pub struct Hit {
     /// the host hides the corresponding menu entry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secondary_action: Option<Box<Action>>,
+    /// Identifies which source produced this hit. The host uses it
+    /// as the cache key for the translated row menu (see
+    /// [`RowMenuDef`]) — every hit from the same source instance
+    /// shares one menu-model instance, bypassing the GTK4
+    /// popover-menu retention leak that per-hit rebuilding caused.
+    /// Empty string for legacy / test hits that predate plugin
+    /// menus; the host treats it as "no menu".
+    #[serde(default)]
+    pub source_instance: String,
+    /// Row context-menu supplied by the source. Attached by the
+    /// daemon (never by the plugin itself) from the source's
+    /// `row_menu()` declaration. Empty when the source opts out.
+    #[serde(default, skip_serializing_if = "RowMenuDef::is_empty")]
+    pub row_menu: RowMenuDef,
 }
 
 /// Per-hit score breakdown (Wave B T6) — carries the raw multipliers

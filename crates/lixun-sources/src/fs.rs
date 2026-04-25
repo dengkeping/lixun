@@ -6,7 +6,7 @@
 
 use anyhow::Result;
 use lixun_core::paths::{canonical_fs_doc_id, canonical_fs_path_str};
-use lixun_core::{Action, Category, DocId, Document};
+use lixun_core::{Action, Category, DocId, Document, RowMenuDef, RowMenuItem, RowMenuVerb};
 use lixun_extract::ExtractorCapabilities;
 use rayon::prelude::*;
 use std::collections::HashSet;
@@ -527,6 +527,38 @@ impl FsSource {
 impl crate::source::IndexerSource for FsSource {
     fn kind(&self) -> &'static str {
         "fs"
+    }
+
+    fn row_menu(&self) -> RowMenuDef {
+        RowMenuDef {
+            items: vec![
+                RowMenuItem {
+                    label: "Open".into(),
+                    verb: RowMenuVerb::Open,
+                    visibility: Default::default(),
+                },
+                RowMenuItem {
+                    label: "Reveal in File Manager".into(),
+                    verb: RowMenuVerb::Secondary,
+                    visibility: Default::default(),
+                },
+                RowMenuItem {
+                    label: "Copy path".into(),
+                    verb: RowMenuVerb::Copy,
+                    visibility: Default::default(),
+                },
+                RowMenuItem {
+                    label: "Quick Look".into(),
+                    verb: RowMenuVerb::QuickLook,
+                    visibility: Default::default(),
+                },
+                RowMenuItem {
+                    label: "Info".into(),
+                    verb: RowMenuVerb::Info,
+                    visibility: Default::default(),
+                },
+            ],
+        }
     }
 
     fn watch_paths(

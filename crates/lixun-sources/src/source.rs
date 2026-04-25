@@ -1,5 +1,5 @@
 use anyhow::Result;
-use lixun_core::{Document, Hit, PluginFieldSpec};
+use lixun_core::{Document, Hit, PluginFieldSpec, RowMenuDef};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -104,6 +104,21 @@ pub trait IndexerSource: Send + Sync {
     /// the frecency history. Default returns `false`.
     fn excludes_from_query_log(&self, _query: &str) -> bool {
         false
+    }
+
+    /// Declarative right-click menu for rows produced by this
+    /// source. The GUI caches the translated menu model keyed by
+    /// `Hit::source_instance`, so sources MUST return a stable,
+    /// data-independent declaration (no per-hit branching). Items
+    /// whose visibility depends on per-hit state should use
+    /// [`RowMenuVisibility::RequiresSecondaryAction`] and rely on
+    /// action enablement at bind time rather than inserting or
+    /// omitting items.
+    ///
+    /// Default returns an empty menu, which tells the GUI to hide
+    /// the context menu for rows from this source.
+    fn row_menu(&self) -> RowMenuDef {
+        RowMenuDef::empty()
     }
 }
 

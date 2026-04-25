@@ -1,29 +1,33 @@
 //! ListView factory, result model updater, and cached hit store.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use gtk::gdk;
 use gtk::gio;
 use gtk::prelude::*;
-use lixun_core::{Action, Category, Hit};
+use lixun_core::{Action, Category, Hit, RowMenuDef, RowMenuVerb, RowMenuVisibility};
 
 /// Per-row state carried by every persistent controller created
 /// in `connect_setup`. `doc_id` is the DocId of the Hit currently
 /// bound to this pool-slot row widget; `None` between `unbind`
 /// and the next `bind`. Callbacks fired on an unbound row (late
 /// gestures after scroll recycle, stale drag-prepares) must
-/// no-op by checking `doc_id.is_none()`. `category` is kept
-/// alongside so the right-click popover can swap its menu model
-/// without a second cache lookup on each click.
+/// no-op by checking `doc_id.is_none()`. `menu_key` mirrors the
+/// source_instance of the currently-bound hit so `on_item_notify`
+/// can skip `set_menu_model` when it already matches (see
+/// MENU_CACHE below — this is the leak fix for 59.77 MB of
+/// popover-menu churn heaptrack attributed to per-bind
+/// gtk_popover_menu_set_menu_model).
 #[derive(Default)]
 struct RowState {
     doc_id: Option<String>,
-    category: Option<Category>,
+    menu_key: Option<String>,
 }
 
 use crate::actions::{copy_to_clipboard, execute_action, execute_secondary_action};
-use crate::icons::resolve_icon;
+use crate::icons::{category_fallback, resolve_icon};
 use crate::ipc::dispatch_click_pair;
 use crate::ipc::send_preview_request;
 
@@ -132,65 +136,67 @@ pub(crate) fn synthetic_history_hits(queries: &[String]) -> Vec<Hit> {
             recipients: None,
             body: None,
             secondary_action: None,
+            source_instance: String::new(),
+            row_menu: lixun_core::RowMenuDef::empty(),
         })
         .collect()
 }
 
-fn placeholder_file_hit() -> Hit {
-    use lixun_core::{Action, DocId};
-    Hit {
-        id: DocId(String::new()),
-        category: Category::File,
-        title: String::new(),
-        subtitle: String::new(),
-        icon_name: None,
-        kind_label: None,
-        score: 0.0,
-        action: Action::OpenFile {
-            path: std::path::PathBuf::new(),
-        },
-        extract_fail: false,
-        sender: None,
-        recipients: None,
-        body: None,
-        secondary_action: None,
-    }
+thread_local! {
+    static MENU_CACHE: RefCell<HashMap<String, gio::Menu>> =
+        RefCell::new(HashMap::new());
 }
 
-fn build_menu_for(hit: &Hit) -> gio::Menu {
-    let menu = gio::Menu::new();
-    match hit.category {
-        Category::App => {
-            menu.append(Some("Launch"), Some("row.open"));
-            menu.append(Some("Copy name"), Some("row.copy"));
+/// Translate a plugin-authored `RowMenuDef` into a GTK `gio::Menu`,
+/// caching the result by `menu_key` (== hit.source_instance) so
+/// subsequent row binds that belong to the same source reuse the
+/// exact same menu object. This is the load-bearing half of the
+/// leak fix: `gtk_popover_menu_set_menu_model` retains its argument
+/// inside GTK's object graph; swapping it per-bind accumulates
+/// orphan menu trees (heaptrack measured 59.77 MB leaked / 1.46M
+/// g_malloc0 calls). With this cache the popover sees at most
+/// ~7 unique menu objects per session (one per source_instance),
+/// and `on_item_notify` only calls `set_menu_model` when the
+/// row's menu_key actually changes.
+///
+/// The cache is never evicted: key space equals the small, bounded
+/// set of registered source instances (current installs: 7). This
+/// also keeps the function honouring AGENTS.md invariant #1 — the
+/// host never names a plugin here; it iterates whatever verbs the
+/// plugin's `row_menu()` declared and maps them to the fixed
+/// action vocabulary below.
+fn menu_for_key(key: &str, def: &RowMenuDef) -> gio::Menu {
+    MENU_CACHE.with(|cache| {
+        if let Some(existing) = cache.borrow().get(key) {
+            return existing.clone();
         }
-        Category::File => {
-            menu.append(Some("Open"), Some("row.open"));
-            menu.append(Some("Reveal in File Manager"), Some("row.reveal"));
-            menu.append(Some("Copy path"), Some("row.copy"));
-            menu.append(Some("Quick Look"), Some("row.quicklook"));
-            menu.append(Some("Get Info"), Some("row.info"));
+        let menu = gio::Menu::new();
+        for item in &def.items {
+            let action = match item.verb {
+                RowMenuVerb::Open => "row.open",
+                RowMenuVerb::Secondary => "row.secondary",
+                RowMenuVerb::Copy => "row.copy",
+                RowMenuVerb::QuickLook => "row.quicklook",
+                RowMenuVerb::Info => "row.info",
+            };
+            menu.append(Some(&item.label), Some(action));
         }
-        Category::Mail => {
-            menu.append(Some("Open mail"), Some("row.open"));
-            menu.append(Some("Copy subject"), Some("row.copy"));
-        }
-        Category::Attachment => {
-            menu.append(Some("Open"), Some("row.open"));
-            menu.append(Some("Quick Look"), Some("row.quicklook"));
-            menu.append(Some("Copy filename"), Some("row.copy"));
-            if hit.secondary_action.is_some() {
-                menu.append(Some("Open parent mail"), Some("row.reveal"));
-            }
-        }
-        Category::Calculator => {
-            menu.append(Some("Copy result"), Some("row.copy"));
-        }
-        Category::Shell => {
-            menu.append(Some("Copy command"), Some("row.copy"));
-        }
-    }
-    menu
+        cache
+            .borrow_mut()
+            .insert(key.to_string(), menu.clone());
+        menu
+    })
+}
+
+/// Does the source's menu expose a conditionally-enabled Secondary
+/// item? Used in `on_item_notify` to decide whether `row.secondary`
+/// should follow `hit.secondary_action.is_some()` or stay permanently
+/// enabled (e.g. Fs.Reveal which is always valid).
+fn menu_has_conditional_secondary(def: &RowMenuDef) -> bool {
+    def.items.iter().any(|it| {
+        it.verb == RowMenuVerb::Secondary
+            && it.visibility == RowMenuVisibility::RequiresSecondaryAction
+    })
 }
 
 fn hit_file_path(hit: &Hit) -> Option<std::path::PathBuf> {
@@ -299,20 +305,20 @@ pub(crate) fn create_list_factory(entry: gtk::Entry) -> gtk::SignalListItemFacto
         });
         group.add_action(&open);
 
-        let reveal_state = Rc::clone(&state);
-        let reveal = gio::SimpleAction::new("reveal", None);
-        reveal.connect_activate(move |_, _| {
-            let Some(doc_id) = reveal_state.borrow().doc_id.clone() else {
-                tracing::debug!("row.reveal fired on unbound row");
+        let secondary_state = Rc::clone(&state);
+        let secondary = gio::SimpleAction::new("secondary", None);
+        secondary.connect_activate(move |_, _| {
+            let Some(doc_id) = secondary_state.borrow().doc_id.clone() else {
+                tracing::debug!("row.secondary fired on unbound row");
                 return;
             };
             if let Some(hit) = cached_hit_by_id(&doc_id)
                 && let Err(e) = execute_secondary_action(&hit)
             {
-                tracing::error!("Reveal failed: {}", e);
+                tracing::error!("Secondary action failed: {}", e);
             }
         });
-        group.add_action(&reveal);
+        group.add_action(&secondary);
 
         let copy_state = Rc::clone(&state);
         let copy = gio::SimpleAction::new("copy", None);
@@ -380,13 +386,12 @@ pub(crate) fn create_list_factory(entry: gtk::Entry) -> gtk::SignalListItemFacto
         row.insert_action_group("row", Some(&group));
 
         // ===== Right-click popover (persistent, menu model swapped on bind) =====
-        // PopoverMenu is built once with a File-shaped placeholder
-        // menu; connect_bind swaps the model via
-        // set_menu_model(Some(&build_menu_for(hit))) to match the
-        // currently-bound hit. Parented once; never rebuilt.
-        let placeholder_hit = placeholder_file_hit();
+        // PopoverMenu is built once with an empty menu; `on_item_notify`
+        // later calls `set_menu_model` only when the bound hit's
+        // `source_instance` differs from the previously-bound one
+        // (see MENU_CACHE). Parented once; never rebuilt.
         let right_click_popover =
-            gtk::PopoverMenu::from_model(Some(&build_menu_for(&placeholder_hit)));
+            gtk::PopoverMenu::from_model(Some(&gio::Menu::new()));
         right_click_popover.set_parent(&row);
         right_click_popover.set_has_arrow(false);
 
@@ -472,8 +477,14 @@ pub(crate) fn create_list_factory(entry: gtk::Entry) -> gtk::SignalListItemFacto
         // required, at the cost of one extra closure per row.
         let notify_state = Rc::clone(&state);
         let notify_right_click_popover = right_click_popover.clone();
+        let notify_secondary = secondary.clone();
         list_item.connect_notify_local(Some("item"), move |list_item, _| {
-            on_item_notify(list_item, &notify_state, &notify_right_click_popover);
+            on_item_notify(
+                list_item,
+                &notify_state,
+                &notify_right_click_popover,
+                &notify_secondary,
+            );
         });
 
         // Re-apply hero styling (large icon + card frame) whenever
@@ -530,6 +541,7 @@ fn on_item_notify(
     list_item: &gtk::ListItem,
     state: &Rc<RefCell<RowState>>,
     right_click_popover: &gtk::PopoverMenu,
+    secondary: &gio::SimpleAction,
 ) {
     let Some(row) = list_item.child().and_downcast::<gtk::Box>() else {
         return;
@@ -539,10 +551,15 @@ fn on_item_notify(
         .item()
         .and_then(|i| i.downcast::<gtk::StringObject>().ok())
     else {
-        // Item cleared — row is unbound.
+        // Item cleared — row is unbound. Reset RowState so stale
+        // callbacks no-op, and disable the secondary action so a
+        // recycled row does not show stale "Open parent mail"
+        // availability before its next bind writes the correct
+        // state.
         let mut s = state.borrow_mut();
         s.doc_id = None;
-        s.category = None;
+        s.menu_key = None;
+        secondary.set_enabled(false);
         return;
     };
 
@@ -576,11 +593,38 @@ fn on_item_notify(
                 .unwrap_or_else(|| category_kind_fallback(&hit.category).to_string());
             kind.set_text(&kind_text);
 
-            right_click_popover.set_menu_model(Some(&build_menu_for(hit)));
+            // Cache-aware menu swap: only call `set_menu_model`
+            // when this row's menu_key differs from the new hit's
+            // source_instance. Combined with the per-source
+            // `MENU_CACHE`, this bounds `set_menu_model` calls to
+            // O(unique source_instances) per process instead of
+            // O(binds), which fixes the PopoverMenu retention
+            // leak measured by heaptrack on the old code path.
+            let current_key = state.borrow().menu_key.clone();
+            let new_key = Some(hit.source_instance.clone());
+            if current_key != new_key {
+                let menu = menu_for_key(&hit.source_instance, &hit.row_menu);
+                right_click_popover.set_menu_model(Some(&menu));
+            }
+
+            // Conditional-secondary items live in a shared menu
+            // model cached per source_instance; visibility of
+            // "Open parent mail" (and any future
+            // `RequiresSecondaryAction` item) is expressed via
+            // GAction enabled state, not by rebuilding the menu.
+            if menu_has_conditional_secondary(&hit.row_menu) {
+                secondary.set_enabled(hit.secondary_action.is_some());
+            } else {
+                // Source does not use conditional secondary; keep
+                // the action enabled so sources that expose an
+                // unconditional "Secondary" verb (e.g. fs reveal)
+                // still work.
+                secondary.set_enabled(true);
+            }
 
             let mut s = state.borrow_mut();
             s.doc_id = Some(doc_id);
-            s.category = Some(hit.category);
+            s.menu_key = new_key;
         }
     });
 }
@@ -639,14 +683,7 @@ fn apply_top_hit_styling(list_item: &gtk::ListItem) {
             if let Some(paintable) = resolve_icon(hit, icon_size) {
                 icon.set_paintable(Some(&paintable));
             } else {
-                icon.set_icon_name(Some(match hit.category {
-                    Category::App => "application-x-executable",
-                    Category::File => "text-x-generic",
-                    Category::Mail => "mail-message",
-                    Category::Attachment => "mail-attachment",
-                    Category::Calculator => "accessories-calculator",
-                    Category::Shell => "utilities-terminal",
-                }));
+                icon.set_icon_name(Some(category_fallback(&hit.category)));
             }
         }
     });
@@ -656,67 +693,78 @@ fn apply_top_hit_styling(list_item: &gtk::ListItem) {
 mod tests {
     use super::*;
 
-    fn hit_with(category: Category, secondary: Option<Action>) -> Hit {
-        use lixun_core::DocId;
-        Hit {
-            id: DocId(String::new()),
-            category,
-            title: String::new(),
-            subtitle: String::new(),
-            icon_name: None,
-            kind_label: None,
-            score: 0.0,
-            action: Action::OpenFile {
-                path: std::path::PathBuf::new(),
-            },
-            extract_fail: false,
-            sender: None,
-            recipients: None,
-            body: None,
-            secondary_action: secondary.map(Box::new),
+    use lixun_core::{RowMenuItem, RowMenuVerb};
+
+    fn sample_def_single(verb: RowMenuVerb, label: &str) -> RowMenuDef {
+        RowMenuDef {
+            items: vec![RowMenuItem {
+                label: label.to_string(),
+                verb,
+                visibility: Default::default(),
+            }],
         }
-    }
-
-    #[test]
-    fn menu_for_file_has_expected_items() {
-        let menu = build_menu_for(&hit_with(Category::File, None));
-        assert_eq!(menu.n_items(), 5);
-    }
-
-    #[test]
-    fn menu_for_app_has_expected_items() {
-        let menu = build_menu_for(&hit_with(Category::App, None));
-        assert_eq!(menu.n_items(), 2);
-    }
-
-    #[test]
-    fn menu_for_mail_has_expected_items() {
-        let menu = build_menu_for(&hit_with(Category::Mail, None));
-        assert_eq!(menu.n_items(), 2);
-    }
-
-    #[test]
-    fn menu_for_attachment_without_secondary_omits_parent_mail() {
-        let menu = build_menu_for(&hit_with(Category::Attachment, None));
-        assert_eq!(menu.n_items(), 3);
-    }
-
-    #[test]
-    fn menu_for_attachment_with_secondary_has_parent_mail() {
-        let menu = build_menu_for(&hit_with(
-            Category::Attachment,
-            Some(Action::OpenUri {
-                uri: "mid:parent@example.com".into(),
-            }),
-        ));
-        assert_eq!(menu.n_items(), 4);
     }
 
     #[test]
     fn row_state_default_is_unbound() {
         let s = RowState::default();
         assert!(s.doc_id.is_none());
-        assert!(s.category.is_none());
+        assert!(s.menu_key.is_none());
+    }
+
+    #[test]
+    fn menu_for_key_caches_by_key() {
+        gtk::init().ok();
+        MENU_CACHE.with(|c| c.borrow_mut().clear());
+        let key = "test.key.cache";
+        let def = sample_def_single(RowMenuVerb::Open, "Open");
+        let a = menu_for_key(key, &def);
+        let b = menu_for_key(key, &def);
+        assert_eq!(a.n_items(), 1);
+        assert_eq!(b.n_items(), 1);
+        assert!(MENU_CACHE.with(|c| c.borrow().contains_key(key)));
+    }
+
+    #[test]
+    fn menu_for_key_separate_keys_separate_entries() {
+        gtk::init().ok();
+        MENU_CACHE.with(|c| c.borrow_mut().clear());
+        let def = sample_def_single(RowMenuVerb::Copy, "Copy");
+        let _ = menu_for_key("a.key", &def);
+        let _ = menu_for_key("b.key", &def);
+        let len = MENU_CACHE.with(|c| c.borrow().len());
+        assert!(len >= 2);
+    }
+
+    #[test]
+    fn menu_has_conditional_secondary_detects_flag() {
+        let def = RowMenuDef {
+            items: vec![
+                RowMenuItem {
+                    label: "Open".into(),
+                    verb: RowMenuVerb::Open,
+                    visibility: Default::default(),
+                },
+                RowMenuItem {
+                    label: "Open parent mail".into(),
+                    verb: RowMenuVerb::Secondary,
+                    visibility: RowMenuVisibility::RequiresSecondaryAction,
+                },
+            ],
+        };
+        assert!(menu_has_conditional_secondary(&def));
+    }
+
+    #[test]
+    fn menu_has_conditional_secondary_false_without_flag() {
+        let def = RowMenuDef {
+            items: vec![RowMenuItem {
+                label: "Reveal".into(),
+                verb: RowMenuVerb::Secondary,
+                visibility: Default::default(),
+            }],
+        };
+        assert!(!menu_has_conditional_secondary(&def));
     }
 
     #[test]

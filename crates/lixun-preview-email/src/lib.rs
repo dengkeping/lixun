@@ -427,6 +427,8 @@ mod tests {
             recipients: None,
             body: None,
             secondary_action: None,
+            source_instance: String::new(),
+            row_menu: lixun_core::RowMenuDef::empty(),
         }
     }
 
@@ -454,6 +456,8 @@ mod tests {
             recipients: None,
             body: None,
             secondary_action: None,
+            source_instance: String::new(),
+            row_menu: lixun_core::RowMenuDef::empty(),
         };
         assert_eq!(EmailPreview.match_score(&hit), 60);
     }
@@ -486,6 +490,8 @@ mod tests {
             recipients: None,
             body: None,
             secondary_action: None,
+            source_instance: String::new(),
+            row_menu: lixun_core::RowMenuDef::empty(),
         };
         assert_eq!(EmailPreview.match_score(&hit), 0);
     }
@@ -551,6 +557,8 @@ mod tests {
             recipients: Some("bob@example.com".into()),
             body: Some("gloda-stored body snippet".into()),
             secondary_action: None,
+            source_instance: String::new(),
+            row_menu: lixun_core::RowMenuDef::empty(),
         };
         assert!(
             EmailPreview.match_score(&hit) >= 60,
