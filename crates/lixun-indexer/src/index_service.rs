@@ -117,6 +117,11 @@ impl SearchHandle {
         let idx = self.index.lock().await;
         Ok(idx.get_body_by_id(doc_id)?.is_some())
     }
+
+    pub async fn get_body(&self, doc_id: &str) -> Result<Option<String>> {
+        let idx = self.index.lock().await;
+        idx.get_body_by_id(doc_id)
+    }
 }
 
 pub fn spawn_writer_service(
@@ -410,7 +415,7 @@ async fn do_commit(
 }
 
 pub fn fs_doc_id(path: &std::path::Path) -> String {
-    format!("fs:{}", path.to_string_lossy())
+    lixun_core::paths::canonical_fs_doc_id(path)
 }
 
 pub fn index_file(
@@ -453,7 +458,20 @@ pub fn index_file(
             min_image_side_px,
         ) {
             Ok(Some(text)) => (Some(text), false),
-            Ok(None) => (None, false),
+            // Extract returned Ok(None) — source has no synchronous
+            // body to offer (cache HIT with empty text, or OCR
+            // deferred). If the live index already carries a body
+            // for this doc (recovered by a prior OCR pass), preserve
+            // it instead of clobbering it with None. reindex_full
+            // wipes the manifest so every file looks changed; without
+            // this guard the OCR-recovered text would be lost and
+            // then re-enqueued on the next pass, wasting a full OCR
+            // cycle per affected document.
+            Ok(None) => {
+                let preserved = body_checker
+                    .and_then(|bc| bc.get_body(&fs_doc_id(path)).ok().flatten());
+                (preserved, false)
+            }
             Err(_) => (None, true),
         }
     } else {
@@ -488,4 +506,130 @@ pub fn index_file(
         }),
         extra: Vec::new(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    static HOME_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn with_isolated_cache<F, R>(f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        let lock = HOME_LOCK.get_or_init(|| Mutex::new(()));
+        let _g = lock.lock().unwrap();
+        let td = tempfile::TempDir::new().unwrap();
+        let old_xdg = std::env::var_os("XDG_CACHE_HOME");
+        let old_home = std::env::var_os("HOME");
+        // SAFETY: env is process-global; HOME_LOCK serializes every test
+        // in this module that touches the cache and no other code in the
+        // crate reads these vars during the test window.
+        unsafe {
+            std::env::set_var("XDG_CACHE_HOME", td.path());
+            std::env::set_var("HOME", td.path());
+        }
+        let out = f();
+        unsafe {
+            match old_xdg {
+                Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
+                None => std::env::remove_var("XDG_CACHE_HOME"),
+            }
+            match old_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        drop(td);
+        out
+    }
+
+    #[derive(Default)]
+    struct MockBodyChecker {
+        bodies: Mutex<HashMap<String, String>>,
+    }
+
+    impl MockBodyChecker {
+        fn with_body(doc_id: &str, body: &str) -> Self {
+            let mut bodies = HashMap::new();
+            bodies.insert(doc_id.to_string(), body.to_string());
+            Self {
+                bodies: Mutex::new(bodies),
+            }
+        }
+    }
+
+    impl lixun_sources::HasBody for MockBodyChecker {
+        fn has_body(&self, doc_id: &str) -> Result<bool> {
+            Ok(self.bodies.lock().unwrap().contains_key(doc_id))
+        }
+
+        fn get_body(&self, doc_id: &str) -> Result<Option<String>> {
+            Ok(self.bodies.lock().unwrap().get(doc_id).cloned())
+        }
+    }
+
+    #[test]
+    fn index_file_preserves_existing_body_when_extract_returns_none() {
+        with_isolated_cache(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let txt = tmp.path().join("empty.txt");
+            std::fs::write(&txt, b"").unwrap();
+
+            let caps = lixun_extract::ExtractorCapabilities::all_available_no_timeout();
+            let doc_id = fs_doc_id(&txt);
+            let body_checker = MockBodyChecker::with_body(&doc_id, "recovered by ocr");
+
+            let doc = index_file(&txt, 100, &caps, None, Some(&body_checker), 0).unwrap();
+            assert_eq!(
+                doc.body.as_deref(),
+                Some("recovered by ocr"),
+                "extract=Ok(None) with indexed body must preserve the existing body",
+            );
+            assert!(!doc.extract_fail);
+        });
+    }
+
+    #[test]
+    fn index_file_writes_none_when_extract_none_and_no_prior_body() {
+        with_isolated_cache(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let txt = tmp.path().join("empty.txt");
+            std::fs::write(&txt, b"").unwrap();
+
+            let caps = lixun_extract::ExtractorCapabilities::all_available_no_timeout();
+            let body_checker = MockBodyChecker::default();
+
+            let doc = index_file(&txt, 100, &caps, None, Some(&body_checker), 0).unwrap();
+            assert!(
+                doc.body.is_none(),
+                "extract=Ok(None) with no indexed body must leave body None",
+            );
+            assert!(!doc.extract_fail);
+        });
+    }
+
+    #[test]
+    fn index_file_overwrites_body_when_extract_returns_some() {
+        with_isolated_cache(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let txt = tmp.path().join("fresh.txt");
+            std::fs::write(&txt, b"fresh content").unwrap();
+
+            let caps = lixun_extract::ExtractorCapabilities::all_available_no_timeout();
+            let doc_id = fs_doc_id(&txt);
+            let body_checker = MockBodyChecker::with_body(&doc_id, "stale body");
+
+            let doc = index_file(&txt, 100, &caps, None, Some(&body_checker), 0).unwrap();
+            assert_eq!(
+                doc.body.as_deref(),
+                Some("fresh content"),
+                "extract=Ok(Some) must overwrite, never preserve stale body",
+            );
+            assert!(!doc.extract_fail);
+        });
+    }
 }

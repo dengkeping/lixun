@@ -882,6 +882,21 @@ impl lixun_sources::HasBody for SearchHandleBodyChecker {
             .block_on(async move { search.has_body(&doc_id).await })
             .unwrap_or(false))
     }
+
+    fn get_body(&self, doc_id: &str) -> anyhow::Result<Option<String>> {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            tracing::debug!(
+                "body checker: get_body called from tokio runtime thread, skipping preservation"
+            );
+            return Ok(None);
+        }
+        let search = self.search.clone();
+        let doc_id = doc_id.to_string();
+        Ok(self
+            .runtime
+            .block_on(async move { search.get_body(&doc_id).await })
+            .unwrap_or(None))
+    }
 }
 
 // Adapter bridging lixun-sources::OcrEnqueue to the concrete OcrQueue;

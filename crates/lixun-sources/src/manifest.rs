@@ -1,3 +1,4 @@
+use lixun_core::paths::canonical_fs_path_str;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -10,10 +11,38 @@ pub struct Manifest {
 impl Manifest {
     pub fn load(state_dir: &Path) -> Self {
         let path = state_dir.join("manifest.json");
-        match std::fs::read_to_string(&path) {
+        let raw: Self = match std::fs::read_to_string(&path) {
             Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
-            Err(_) => Self::default(),
+            Err(_) => return Self::default(),
+        };
+        Self::canonicalize_keys(raw)
+    }
+
+    fn canonicalize_keys(raw: Self) -> Self {
+        let mut migrated: HashMap<String, i64> = HashMap::with_capacity(raw.files.len());
+        let mut rewritten: usize = 0;
+        for (key, mtime) in raw.files {
+            let canon = canonical_fs_path_str(Path::new(&key));
+            if canon != key {
+                rewritten += 1;
+            }
+            migrated
+                .entry(canon)
+                .and_modify(|existing| {
+                    if mtime > *existing {
+                        *existing = mtime;
+                    }
+                })
+                .or_insert(mtime);
         }
+        if rewritten > 0 {
+            tracing::info!(
+                "Manifest: canonicalised {} entries ({} unique after merge)",
+                rewritten,
+                migrated.len(),
+            );
+        }
+        Self { files: migrated }
     }
 
     pub fn save(&self, state_dir: &Path) {
@@ -125,5 +154,60 @@ mod tests {
         assert!(m.is_unchanged("/tmp/test.txt", 200));
         assert!(!m.is_unchanged("/tmp/test.txt", 100));
         assert_eq!(m.len(), 1);
+    }
+
+    #[test]
+    fn load_canonicalises_symlinked_keys_and_merges_duplicates() {
+        use std::os::unix::fs as unix_fs;
+
+        let tmp = tempfile::tempdir().unwrap();
+
+        let real_dir = tmp.path().join("real");
+        fs::create_dir(&real_dir).unwrap();
+        let real_file = real_dir.join("doc.txt");
+        fs::write(&real_file, b"x").unwrap();
+
+        let link_dir = tmp.path().join("link");
+        unix_fs::symlink(&real_dir, &link_dir).unwrap();
+        let aliased = link_dir.join("doc.txt");
+
+        let canonical = canonical_fs_path_str(&real_file);
+        let aliased_str = aliased.to_string_lossy().into_owned();
+        let raw_stored = fs::canonicalize(&real_file)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_ne!(aliased_str, canonical, "symlink alias must differ from canonical");
+
+        let mut pre = Manifest::default();
+        pre.update(aliased_str.clone(), 100);
+        pre.update(raw_stored.clone(), 200);
+        pre.save(tmp.path());
+
+        let loaded = Manifest::load(tmp.path());
+        assert_eq!(loaded.len(), 1, "alias + canonical keys must collapse to one");
+        assert!(
+            loaded.is_unchanged(&canonical, 200),
+            "merged mtime must be the newest of the two aliases"
+        );
+    }
+
+    #[test]
+    fn load_is_idempotent_on_canonical_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("a.txt");
+        fs::write(&file, b"x").unwrap();
+        let canonical = canonical_fs_path_str(&file);
+
+        let mut pre = Manifest::default();
+        pre.update(canonical.clone(), 42);
+        pre.save(tmp.path());
+
+        let first = Manifest::load(tmp.path());
+        first.save(tmp.path());
+        let second = Manifest::load(tmp.path());
+
+        assert_eq!(second.len(), 1);
+        assert!(second.is_unchanged(&canonical, 42));
     }
 }
