@@ -95,6 +95,8 @@ pub struct OcrConfig {
     pub timeout_secs: u64,
     #[serde(default = "default_ocr_worker_interval_secs")]
     pub worker_interval_secs: u64,
+    #[serde(default = "default_ocr_jobs_per_tick")]
+    pub jobs_per_tick: u32,
     #[serde(default)]
     pub adaptive_throttle: bool,
     #[serde(default = "default_max_cpu_pressure_avg10")]
@@ -114,6 +116,7 @@ impl Default for OcrConfig {
             min_image_side_px: default_min_image_side_px(),
             timeout_secs: default_ocr_timeout_secs(),
             worker_interval_secs: default_ocr_worker_interval_secs(),
+            jobs_per_tick: default_ocr_jobs_per_tick(),
             adaptive_throttle: false,
             max_cpu_pressure_avg10: default_max_cpu_pressure_avg10(),
             nice_level: default_nice_level(),
@@ -132,7 +135,10 @@ fn default_ocr_timeout_secs() -> u64 {
     30
 }
 fn default_ocr_worker_interval_secs() -> u64 {
-    60
+    10
+}
+fn default_ocr_jobs_per_tick() -> u32 {
+    10
 }
 fn default_max_cpu_pressure_avg10() -> f32 {
     10.0
@@ -626,6 +632,10 @@ impl Config {
             tracing::warn!("[ocr].worker_interval_secs = 0 clamped to 1");
             self.ocr.worker_interval_secs = 1;
         }
+        if self.ocr.jobs_per_tick == 0 {
+            tracing::warn!("[ocr].jobs_per_tick = 0 clamped to 1");
+            self.ocr.jobs_per_tick = 1;
+        }
         if !(0..=19).contains(&self.ocr.nice_level) {
             let clamped = self.ocr.nice_level.clamp(0, 19);
             tracing::warn!(
@@ -735,6 +745,7 @@ mod tests {
             min_image_side_px: 300,
             timeout_secs: 45,
             worker_interval_secs: 90,
+            jobs_per_tick: 25,
             adaptive_throttle: true,
             max_cpu_pressure_avg10: 25.0,
             nice_level: 10,
@@ -760,7 +771,8 @@ mod tests {
         assert_eq!(cfg.ocr.max_pages_per_pdf, None);
         assert_eq!(cfg.ocr.min_image_side_px, 200);
         assert_eq!(cfg.ocr.timeout_secs, 30);
-        assert_eq!(cfg.ocr.worker_interval_secs, 60);
+        assert_eq!(cfg.ocr.worker_interval_secs, 10);
+        assert_eq!(cfg.ocr.jobs_per_tick, 10);
         assert!(!cfg.ocr.adaptive_throttle);
         assert!((cfg.ocr.max_cpu_pressure_avg10 - 10.0).abs() < f32::EPSILON);
         assert_eq!(cfg.ocr.nice_level, 19);
@@ -785,6 +797,12 @@ mod tests {
     fn ocr_config_worker_interval_zero_clamped_to_one() {
         let cfg = Config::from_toml_str("[ocr]\nworker_interval_secs = 0\n").unwrap();
         assert_eq!(cfg.ocr.worker_interval_secs, 1);
+    }
+
+    #[test]
+    fn ocr_config_jobs_per_tick_zero_clamped_to_one() {
+        let cfg = Config::from_toml_str("[ocr]\njobs_per_tick = 0\n").unwrap();
+        assert_eq!(cfg.ocr.jobs_per_tick, 1);
     }
 
     #[test]
