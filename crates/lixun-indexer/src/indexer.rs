@@ -103,6 +103,7 @@ pub async fn reindex_paths(
                 caps.as_ref(),
                 enq_ref,
                 body_ref,
+                config.min_image_side_px(),
             ) {
                 all_docs.push(doc);
             }

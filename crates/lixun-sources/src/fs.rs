@@ -26,6 +26,13 @@ pub struct FsSource {
     pub caps: Arc<ExtractorCapabilities>,
     pub ocr_enqueue: Option<Arc<dyn OcrEnqueue>>,
     pub body_checker: Option<Arc<dyn HasBody>>,
+    /// Enqueue-side OCR dimension filter threshold (pixels). `0` keeps
+    /// the v1.1 behaviour where every OCR-candidate image reaches the
+    /// queue; any positive value skips images whose header decodes and
+    /// whose both axes fall below the threshold. See
+    /// `maybe_enqueue_ocr` for full semantics (PDFs are always
+    /// enqueued; decode errors fail open).
+    pub min_image_side_px: u32,
 }
 
 /// Intermediate metadata collected during the first pass.
@@ -48,6 +55,7 @@ impl FsSource {
             caps: Arc::new(ExtractorCapabilities::all_available_no_timeout()),
             ocr_enqueue: None,
             body_checker: None,
+            min_image_side_px: 0,
         }
     }
 
@@ -65,6 +73,7 @@ impl FsSource {
             caps: Arc::new(ExtractorCapabilities::all_available_no_timeout()),
             ocr_enqueue: None,
             body_checker: None,
+            min_image_side_px: 0,
         }
     }
 
@@ -83,6 +92,7 @@ impl FsSource {
             caps,
             ocr_enqueue,
             body_checker: None,
+            min_image_side_px: 0,
         }
     }
 
@@ -102,6 +112,7 @@ impl FsSource {
             caps,
             ocr_enqueue,
             body_checker: None,
+            min_image_side_px: 0,
         }
     }
 
@@ -111,6 +122,15 @@ impl FsSource {
     /// constructor; `None` preserves T7 behaviour (always enqueue).
     pub fn with_body_checker(mut self, checker: Option<Arc<dyn HasBody>>) -> Self {
         self.body_checker = checker;
+        self
+    }
+
+    /// Set the enqueue-side OCR dimension filter threshold. Chainable
+    /// off any constructor; `0` keeps the v1.1 behaviour (no filter).
+    /// The worker-side dim check in `ocr_image_with` stays as
+    /// defence-in-depth regardless of this setting.
+    pub fn with_min_image_side_px(mut self, min_side_px: u32) -> Self {
+        self.min_image_side_px = min_side_px;
         self
     }
 
@@ -124,6 +144,12 @@ impl FsSource {
     /// emits an enqueue request on `enqueue` (if supplied) per DB-13,
     /// but skips the enqueue entirely when `body_checker` reports the
     /// doc already has an indexed body (DB-16 short-circuit).
+    ///
+    /// `min_image_side_px` applies the enqueue-side dimension filter:
+    /// images whose header decodes and whose both axes fall below this
+    /// threshold are skipped without hitting the OCR queue. `0` disables
+    /// the filter (v1.1 behaviour). See `maybe_enqueue_ocr` for details.
+    ///
     /// Enqueue failures log-and-swallow: a queue write error must never
     /// fail the extraction path.
     pub fn extract_content(
@@ -131,6 +157,7 @@ impl FsSource {
         caps: &ExtractorCapabilities,
         enqueue: Option<&dyn OcrEnqueue>,
         body_checker: Option<&dyn HasBody>,
+        min_image_side_px: u32,
     ) -> Result<Option<String>> {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             lixun_extract::cache::cached_extract_path(path, caps)
@@ -138,7 +165,7 @@ impl FsSource {
         .map_err(|_| anyhow::anyhow!("extractor panicked"))??;
 
         if result.is_none() {
-            maybe_enqueue_ocr(path, caps, enqueue, body_checker);
+            maybe_enqueue_ocr(path, caps, enqueue, body_checker, min_image_side_px);
         }
         Ok(result)
     }
@@ -326,6 +353,7 @@ impl FsSource {
         let caps = Arc::clone(&self.caps);
         let enqueue = self.ocr_enqueue.clone();
         let body_checker = self.body_checker.clone();
+        let min_image_side_px = self.min_image_side_px;
         while !changed_metas.is_empty() {
             let take_n = Self::BATCH_SIZE.min(changed_metas.len());
             let chunk: Vec<FileMeta> = changed_metas.drain(..take_n).collect();
@@ -351,6 +379,7 @@ impl FsSource {
                                 &caps_loop,
                                 enq_ref,
                                 body_ref,
+                                min_image_side_px,
                             ) {
                                 Ok(Some(text)) => (Some(text), false),
                                 Ok(None) => (None, false),
@@ -449,6 +478,7 @@ impl FsSource {
         let caps = Arc::clone(&self.caps);
         let enqueue = self.ocr_enqueue.clone();
         let body_checker = self.body_checker.clone();
+        let min_image_side_px = self.min_image_side_px;
         let docs: Vec<Document> = pool.install(|| {
             metas
                 .into_par_iter()
@@ -459,7 +489,13 @@ impl FsSource {
                         let enq_ref = enqueue.as_ref().map(|a| a.as_ref() as &dyn OcrEnqueue);
                         let body_ref =
                             body_checker.as_ref().map(|a| a.as_ref() as &dyn HasBody);
-                        match Self::extract_content(&meta.path, &caps, enq_ref, body_ref) {
+                        match Self::extract_content(
+                            &meta.path,
+                            &caps,
+                            enq_ref,
+                            body_ref,
+                            min_image_side_px,
+                        ) {
                             Ok(Some(text)) => (Some(text), false),
                             Ok(None) => (None, false),
                             Err(_) => (None, true),
@@ -530,11 +566,18 @@ impl crate::source::IndexerSource for FsSource {
     }
 }
 
+/// Files strictly smaller than this are skipped by the enqueue-side
+/// dimension filter without opening them — a valid PNG/JPEG/etc. header
+/// is at least ~30 bytes and any real image larger than `min_side_px`
+/// on either axis is orders of magnitude above this threshold.
+const MIN_IMAGE_BYTES_FOR_PROBE: u64 = 64;
+
 fn maybe_enqueue_ocr(
     path: &Path,
     caps: &ExtractorCapabilities,
     enqueue: Option<&dyn OcrEnqueue>,
     body_checker: Option<&dyn HasBody>,
+    min_image_side_px: u32,
 ) {
     let Some(enqueuer) = enqueue else { return };
     if !caps.has_tesseract || !caps.ocr_enabled {
@@ -565,6 +608,28 @@ fn maybe_enqueue_ocr(
             return;
         }
     };
+    // v1.2 Finding 3: drop icon-sized rasters before they reach the
+    // OCR queue. PDFs never dimension-filter here — pdftoppm rasterises
+    // pages at its own DPI so the file size on disk tells nothing about
+    // the usable page bitmap. All failure modes fail open: the OCR
+    // worker keeps its own dim check as defence-in-depth.
+    if min_image_side_px > 0 && ext != "pdf" {
+        if meta.len() < MIN_IMAGE_BYTES_FOR_PROBE {
+            tracing::debug!(
+                "ocr enqueue: skipping {doc_id}, file {} bytes below probe threshold",
+                meta.len()
+            );
+            return;
+        }
+        if let Ok(bytes) = std::fs::read(path)
+            && lixun_extract::ocr::image_too_small(&bytes, min_image_side_px)
+        {
+            tracing::debug!(
+                "ocr enqueue: skipping {doc_id}, both axes below {min_image_side_px}px"
+            );
+            return;
+        }
+    }
     let mtime = meta
         .modified()
         .ok()
@@ -655,7 +720,7 @@ mod tests {
             let sink: Arc<dyn OcrEnqueue> = mock.clone();
 
             let result =
-                FsSource::extract_content(&png, &caps, Some(sink.as_ref()), None).unwrap();
+                FsSource::extract_content(&png, &caps, Some(sink.as_ref()), None, 0).unwrap();
             assert!(result.is_none(), "png has no text-layer body");
 
             let calls = mock.calls.lock().unwrap();
@@ -682,7 +747,7 @@ mod tests {
             let sink: Arc<dyn OcrEnqueue> = mock.clone();
 
             let _ =
-                FsSource::extract_content(&png, &caps, Some(sink.as_ref()), None).unwrap();
+                FsSource::extract_content(&png, &caps, Some(sink.as_ref()), None, 0).unwrap();
             assert!(
                 mock.calls.lock().unwrap().is_empty(),
                 "no enqueue when ocr_enabled=false"
@@ -692,7 +757,7 @@ mod tests {
             caps_no_tess.has_tesseract = false;
             let caps = Arc::new(caps_no_tess);
             let _ =
-                FsSource::extract_content(&png, &caps, Some(sink.as_ref()), None).unwrap();
+                FsSource::extract_content(&png, &caps, Some(sink.as_ref()), None, 0).unwrap();
             assert!(
                 mock.calls.lock().unwrap().is_empty(),
                 "no enqueue when has_tesseract=false"
@@ -713,7 +778,7 @@ mod tests {
             let mock: Arc<MockEnqueue> = Arc::new(MockEnqueue::default());
             let sink: Arc<dyn OcrEnqueue> = mock.clone();
 
-            let _ = FsSource::extract_content(&bin, &caps, Some(sink.as_ref()), None);
+            let _ = FsSource::extract_content(&bin, &caps, Some(sink.as_ref()), None, 0);
             assert!(
                 mock.calls.lock().unwrap().is_empty(),
                 "non-candidate ext must not enqueue even on empty extraction"
@@ -753,6 +818,7 @@ mod tests {
                 &caps,
                 Some(sink.as_ref()),
                 Some(body.as_ref()),
+                0,
             )
             .unwrap();
             assert!(
@@ -766,6 +832,7 @@ mod tests {
                 &caps,
                 Some(sink.as_ref()),
                 Some(other_body.as_ref()),
+                0,
             )
             .unwrap();
             assert_eq!(
@@ -805,6 +872,100 @@ mod tests {
 
         assert_eq!(doc.icon_name.as_deref(), Some("text-x-generic"));
         assert_eq!(doc.kind_label.as_deref(), Some("Octet Stream"));
+    }
+
+    fn write_png(path: &Path, w: u32, h: u32) {
+        let img = image::RgbImage::new(w, h);
+        img.save_with_format(path, image::ImageFormat::Png).unwrap();
+    }
+
+    #[test]
+    fn maybe_enqueue_ocr_skips_tiny_png() {
+        let tmp = tempfile::tempdir().unwrap();
+        let png = tmp.path().join("icon.png");
+        write_png(&png, 32, 32);
+
+        let caps = ExtractorCapabilities::all_available_no_timeout();
+        let mock: Arc<MockEnqueue> = Arc::new(MockEnqueue::default());
+        let sink: Arc<dyn OcrEnqueue> = mock.clone();
+
+        super::maybe_enqueue_ocr(&png, &caps, Some(sink.as_ref()), None, 256);
+        assert!(
+            mock.calls.lock().unwrap().is_empty(),
+            "32x32 PNG must be filtered out at min=256"
+        );
+    }
+
+    #[test]
+    fn maybe_enqueue_ocr_enqueues_large_png() {
+        let tmp = tempfile::tempdir().unwrap();
+        let png = tmp.path().join("scan.png");
+        write_png(&png, 512, 512);
+
+        let caps = ExtractorCapabilities::all_available_no_timeout();
+        let mock: Arc<MockEnqueue> = Arc::new(MockEnqueue::default());
+        let sink: Arc<dyn OcrEnqueue> = mock.clone();
+
+        super::maybe_enqueue_ocr(&png, &caps, Some(sink.as_ref()), None, 256);
+        assert_eq!(
+            mock.calls.lock().unwrap().len(),
+            1,
+            "512x512 PNG must enqueue at min=256"
+        );
+    }
+
+    #[test]
+    fn maybe_enqueue_ocr_enqueues_pdf_regardless() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pdf = tmp.path().join("tiny.pdf");
+        std::fs::write(&pdf, vec![b'%'; 512]).unwrap();
+
+        let caps = ExtractorCapabilities::all_available_no_timeout();
+        let mock: Arc<MockEnqueue> = Arc::new(MockEnqueue::default());
+        let sink: Arc<dyn OcrEnqueue> = mock.clone();
+
+        super::maybe_enqueue_ocr(&pdf, &caps, Some(sink.as_ref()), None, 2048);
+        assert_eq!(
+            mock.calls.lock().unwrap().len(),
+            1,
+            "PDFs must bypass the enqueue-side dimension pre-filter"
+        );
+    }
+
+    #[test]
+    fn maybe_enqueue_ocr_enqueues_on_unreadable_header() {
+        let tmp = tempfile::tempdir().unwrap();
+        let png = tmp.path().join("junk.png");
+        std::fs::write(&png, vec![0xFFu8; 4096]).unwrap();
+
+        let caps = ExtractorCapabilities::all_available_no_timeout();
+        let mock: Arc<MockEnqueue> = Arc::new(MockEnqueue::default());
+        let sink: Arc<dyn OcrEnqueue> = mock.clone();
+
+        super::maybe_enqueue_ocr(&png, &caps, Some(sink.as_ref()), None, 256);
+        assert_eq!(
+            mock.calls.lock().unwrap().len(),
+            1,
+            "decode error must fail-open (worker will dim-check)",
+        );
+    }
+
+    #[test]
+    fn maybe_enqueue_ocr_with_min_zero_preserves_v11_behaviour() {
+        let tmp = tempfile::tempdir().unwrap();
+        let png = tmp.path().join("icon.png");
+        write_png(&png, 32, 32);
+
+        let caps = ExtractorCapabilities::all_available_no_timeout();
+        let mock: Arc<MockEnqueue> = Arc::new(MockEnqueue::default());
+        let sink: Arc<dyn OcrEnqueue> = mock.clone();
+
+        super::maybe_enqueue_ocr(&png, &caps, Some(sink.as_ref()), None, 0);
+        assert_eq!(
+            mock.calls.lock().unwrap().len(),
+            1,
+            "min=0 must preserve v1.1 unconditional-enqueue behaviour",
+        );
     }
 
     #[test]

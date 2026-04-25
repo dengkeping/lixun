@@ -587,7 +587,8 @@ impl Config {
             self.caps_arc(),
             self.ocr_enqueue.get().cloned(),
         )
-        .with_body_checker(self.body_checker.get().cloned()))
+        .with_body_checker(self.body_checker.get().cloned())
+        .with_min_image_side_px(self.ocr.min_image_side_px))
     }
 
     pub fn caps_arc(&self) -> std::sync::Arc<lixun_extract::ExtractorCapabilities> {
@@ -655,6 +656,9 @@ impl lixun_indexer::IndexerSources for Config {
     }
     fn body_checker(&self) -> Option<std::sync::Arc<dyn lixun_sources::HasBody>> {
         self.body_checker.get().cloned()
+    }
+    fn min_image_side_px(&self) -> u32 {
+        self.ocr.min_image_side_px
     }
 }
 

@@ -259,6 +259,7 @@ async fn main() -> Result<()> {
     let watcher_caps = Arc::clone(&extract_caps_arc);
     let watcher_enqueue = ocr_enqueue_arc.clone();
     let watcher_body_checker = Some(Arc::clone(&body_checker_arc));
+    let watcher_min_image_side_px = shared_config.ocr.min_image_side_px;
     tokio::spawn(async move {
         if let Err(e) = watcher::start(
             watcher_roots,
@@ -268,6 +269,7 @@ async fn main() -> Result<()> {
             watcher_caps,
             watcher_enqueue,
             watcher_body_checker,
+            watcher_min_image_side_px,
             watcher_mutation,
         )
         .await
@@ -833,7 +835,8 @@ fn register_builtin_nonplugin_sources(
         config.caps_arc(),
         config.ocr_enqueue.get().cloned(),
     )
-    .with_body_checker(config.body_checker.get().cloned());
+    .with_body_checker(config.body_checker.get().cloned())
+    .with_min_image_side_px(config.ocr.min_image_side_px);
     registry.register("builtin:fs".into(), state_dir_root, Arc::new(fs));
 
     Ok(())

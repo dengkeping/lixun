@@ -80,6 +80,7 @@ pub async fn start(
     caps: Arc<ExtractorCapabilities>,
     ocr_enqueue: Option<Arc<dyn OcrEnqueue>>,
     body_checker: Option<Arc<dyn HasBody>>,
+    min_image_side_px: u32,
     mutation_tx: IndexMutationTx,
 ) -> Result<()> {
     let (raw_tx, raw_rx) = mpsc::channel::<RawEvent>(RAW_EVENT_QUEUE_CAP);
@@ -115,6 +116,7 @@ pub async fn start(
             caps: Arc::clone(&caps),
             ocr_enqueue: ocr_enqueue.clone(),
             body_checker: body_checker.clone(),
+            min_image_side_px,
         };
         tokio::spawn(resolver_task(worker_id, rx, mutation_tx, ctrl_tx, refresh_tx, env));
     }
@@ -327,6 +329,7 @@ struct ResolverEnv {
     caps: Arc<ExtractorCapabilities>,
     ocr_enqueue: Option<Arc<dyn OcrEnqueue>>,
     body_checker: Option<Arc<dyn HasBody>>,
+    min_image_side_px: u32,
 }
 
 async fn resolver_task(
@@ -351,6 +354,7 @@ async fn resolver_task(
                 let enq_b = env.ocr_enqueue.clone();
                 let body_b = env.body_checker.clone();
                 let max_size = env.max_file_size_mb;
+                let min_side = env.min_image_side_px;
                 let result = tokio::task::spawn_blocking(move || {
                     resolve_refresh(
                         &path_blocking,
@@ -359,6 +363,7 @@ async fn resolver_task(
                         &caps_b,
                         enq_b.as_ref().map(|a| a.as_ref() as &dyn OcrEnqueue),
                         body_b.as_ref().map(|a| a.as_ref() as &dyn HasBody),
+                        min_side,
                     )
                 })
                 .await;
@@ -417,6 +422,7 @@ enum Resolved {
     Skip,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_refresh(
     path: &Path,
     exclude: &ExcludeSet,
@@ -424,6 +430,7 @@ fn resolve_refresh(
     caps: &ExtractorCapabilities,
     ocr_enqueue: Option<&dyn OcrEnqueue>,
     body_checker: Option<&dyn HasBody>,
+    min_image_side_px: u32,
 ) -> Resolved {
     let Ok(meta) = std::fs::metadata(path) else {
         return Resolved::Gone;
@@ -432,7 +439,14 @@ fn resolve_refresh(
         return Resolved::Skip;
     }
     if meta.is_file() {
-        match index_file(path, max_file_size_mb, caps, ocr_enqueue, body_checker) {
+        match index_file(
+            path,
+            max_file_size_mb,
+            caps,
+            ocr_enqueue,
+            body_checker,
+            min_image_side_px,
+        ) {
             Ok(doc) => Resolved::File(Box::new(doc)),
             Err(_) => Resolved::Skip,
         }
