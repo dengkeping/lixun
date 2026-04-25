@@ -288,7 +288,7 @@ Zero changes to `lixund`. Config-driven, auto-registered.
 
 ## Performance notes
 
-- **Writer heap:** 32 MiB (bounded by Tantivy).
+- **Writer heap:** 100 MB (bounded by Tantivy).
 - **Memory after full reindex of ~500k documents:** ~260 MiB RSS (jemalloc).
   `systemd MemoryPeak` will show much higher — that's page cache attributed
   to the cgroup, not daemon heap. Check `/proc/$(pgrep lixund)/status` for
@@ -298,6 +298,25 @@ Zero changes to `lixund`. Config-driven, auto-registered.
 - **gloda batch size:** tune `[thunderbird].gloda_batch_size` to trade off
   catch-up latency vs peak memory. Default 2500 is balanced for a 255k-message
   gloda database.
+
+---
+
+## Upgrade notes
+
+The on-disk search index is versioned by `INDEX_VERSION` in
+`crates/lixun-index/src/lib.rs`. When this version bumps, the daemon
+detects the mismatch on startup and re-indexes from scratch; the old
+index stays queryable until the rebuild finishes, so there is no
+user-visible search downtime. Expect transient CPU and I/O for the
+duration of the reindex (minutes on typical home corpora).
+
+Recent version bumps:
+
+- **8 → 9** (Wave B, ranking overhaul). Tantivy upgraded to 0.26.1,
+  the spotlight tokenizer gained a Porter English stemmer as its final
+  stage (so e.g. `running` and `runs` both reach the index as `run`),
+  and query-time proximity + coordination boosts were added. First
+  daemon start after pulling this release will re-index once.
 
 ---
 

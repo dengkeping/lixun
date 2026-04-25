@@ -1,13 +1,23 @@
 use tantivy::{
-    tokenizer::{AsciiFoldingFilter, LowerCaser, RemoveLongFilter, SimpleTokenizer, TextAnalyzer},
+    tokenizer::{
+        AsciiFoldingFilter, LowerCaser, RemoveLongFilter, SimpleTokenizer, Stemmer, TextAnalyzer,
+    },
     Index,
 };
 
+// Spotlight tokenizer chain (Wave B T3): stemming is the TAIL step.
+// Order is load-bearing — tantivy's Stemmer documents that it expects
+// lowercased input, so LowerCaser must precede it. AsciiFoldingFilter
+// also runs before the stemmer so accented forms share a stem with
+// their ASCII siblings (e.g. "naïve" → "naive" → "naiv"). Adding or
+// reordering filters past this point MUST bump INDEX_VERSION — the
+// on-disk posting lists depend on the exact output of this chain.
 pub fn register_spotlight_tokenizer(index: &Index) {
     let analyzer = TextAnalyzer::builder(SimpleTokenizer::default())
         .filter(RemoveLongFilter::limit(40))
         .filter(LowerCaser)
         .filter(AsciiFoldingFilter)
+        .filter(Stemmer::default())
         .build();
 
     index.tokenizers().register("spotlight", analyzer);
