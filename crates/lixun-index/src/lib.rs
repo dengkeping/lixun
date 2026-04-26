@@ -507,6 +507,115 @@ impl LixunIndex {
         Ok(out)
     }
 
+    /// Reconstruct a `Hit` + `ScoreBreakdown` for a single doc identified
+    /// by `id`, without running a query. Returns `Ok(None)` when no live
+    /// doc matches. Used by Wave D fusion: when the ANN side surfaces a
+    /// doc that BM25 missed, we still need a `Hit` to render. Multipliers
+    /// are degenerate (1.0) and `tantivy` is 0.0 because there is no
+    /// query to score against — the fusion layer assigns the final
+    /// score from RRF before publishing.
+    pub fn hydrate_doc_by_id(&self, id: &str) -> Result<Option<(Hit, ScoreBreakdown)>> {
+        let reader = self.index.reader()?;
+        let searcher = reader.searcher();
+        let s = &self.schema;
+        let term = Term::from_field_text(s.id, id);
+        let query = TermQuery::new(term, IndexRecordOption::Basic);
+        let top_docs = searcher.search(&query, &TopDocs::with_limit(1).order_by_score())?;
+        let Some((_, addr)) = top_docs.first() else {
+            return Ok(None);
+        };
+        let doc: TantivyDocument = searcher.doc(*addr)?;
+
+        let id_str = doc
+            .get_first(s.id)
+            .and_then(|v| v.as_str())
+            .unwrap_or("?")
+            .to_string();
+        let category = match doc
+            .get_first(s.category)
+            .and_then(|v| v.as_str())
+            .unwrap_or("file")
+        {
+            "app" => Category::App,
+            "file" => Category::File,
+            "mail" => Category::Mail,
+            "attachment" => Category::Attachment,
+            _ => Category::File,
+        };
+        let title = doc
+            .get_first(s.title)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let subtitle = doc
+            .get_first(s.subtitle)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let icon_name = stored_optional_text(&doc, s.icon_name);
+        let kind_label = stored_optional_text(&doc, s.kind_label);
+        let action_json = doc
+            .get_first(s.action)
+            .and_then(|v| v.as_str())
+            .unwrap_or("{}");
+        let action: lixun_core::Action = serde_json::from_str(action_json)
+            .unwrap_or(lixun_core::Action::OpenFile { path: "".into() });
+        let secondary_action_raw = doc
+            .get_first(s.secondary_action)
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let secondary_action = if secondary_action_raw.is_empty() {
+            None
+        } else {
+            serde_json::from_str::<lixun_core::Action>(secondary_action_raw)
+                .ok()
+                .map(Box::new)
+        };
+        let extract_fail = doc
+            .get_first(s.extract_fail)
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let sender = stored_optional_text(&doc, s.sender);
+        let recipients = stored_optional_text(&doc, s.recipients);
+        let body = stored_optional_text(&doc, s.body);
+        let source_instance = doc
+            .get_first(s.source_instance)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let hit = Hit {
+            id: lixun_core::DocId(id_str),
+            category,
+            title,
+            subtitle,
+            icon_name,
+            kind_label,
+            score: 0.0,
+            action,
+            extract_fail,
+            sender,
+            recipients,
+            body,
+            secondary_action,
+            source_instance,
+            row_menu: lixun_core::RowMenuDef::empty(),
+        };
+        let breakdown = ScoreBreakdown {
+            tantivy: 0.0,
+            category_mult: 1.0,
+            prefix_mult: 1.0,
+            acronym_mult: 1.0,
+            recency_mult: 1.0,
+            coord_mult: 1.0,
+            frecency_mult: 1.0,
+            latch_mult: 1.0,
+            stage2_clamped: 1.0,
+            final_score: 0.0,
+        };
+        Ok(Some((hit, breakdown)))
+    }
+
     /// Fetch the full `Document` by its stable `id`. Returns `Ok(None)`
     /// when no live doc matches (deleted, or never indexed). Intended
     /// for the OCR worker's body-upsert path: read the existing doc,
