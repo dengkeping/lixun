@@ -81,11 +81,15 @@ impl MutationBroadcaster for MultiBroadcaster {
     }
 }
 
-/// Marker trait for approximate-nearest-neighbour search backends.
-/// The full surface lands in WD-T7; defining the trait here keeps
-/// `lixun-fusion` and the future ANN-providing plugin from depending
-/// on each other.
-pub trait AnnHandle: Send + Sync {}
+/// Async query interface implemented by ANN-providing plugins.
+/// Lives in this leaf crate so `lixun-fusion` (the RRF consumer)
+/// and `lixun-source-semantic` (the producer) can share the type
+/// without either depending on the other (DB-3, AGENTS.md §1).
+#[async_trait::async_trait]
+pub trait AnnHandle: Send + Sync {
+    async fn search_text(&self, query: &str, k: usize) -> anyhow::Result<Vec<AnnHit>>;
+    async fn search_image(&self, query: &str, k: usize) -> anyhow::Result<Vec<AnnHit>>;
+}
 
 /// One result from an approximate-nearest-neighbour query. Lives in
 /// the plugin-agnostic leaf crate so `lixun-fusion` (RRF consumer)
