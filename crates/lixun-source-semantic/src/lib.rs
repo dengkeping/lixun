@@ -1,8 +1,23 @@
 //! Semantic search source plugin (Wave D).
 //!
-//! WD-T0 scaffold: the crate exists in the workspace graph so every
-//! later task compiles without further Cargo churn. Concrete modules
-//! (`factory`, `source`, `config`, `worker`, `embed`, `store`,
-//! `backfill`) land in WD-T4 onward.
+//! WD-T4 skeleton: registers a [`PluginFactory`] gated on the
+//! `[semantic]` config section and exposes capability hooks
+//! (`broadcaster()` / `ann_handle()`) that future tasks (WD-T5 / WD-T6
+//! / WD-T7) flesh out with the real LanceDB store, fastembed worker,
+//! and backfill journal.
+//!
+//! [`PluginFactory`]: lixun_sources::PluginFactory
 
 #![allow(dead_code)]
+
+mod ann;
+mod broadcaster;
+mod config;
+mod factory;
+mod source;
+
+pub use ann::LanceDbAnnHandle;
+pub use broadcaster::SemanticBroadcasterAdapter;
+pub use config::SemanticConfig;
+pub use factory::SemanticFactory;
+pub use source::SemanticSource;

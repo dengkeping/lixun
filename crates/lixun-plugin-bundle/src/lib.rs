@@ -24,3 +24,7 @@ use lixun_source_calculator as _;
 #[cfg(feature = "shell")]
 #[allow(unused_imports)]
 use lixun_source_shell as _;
+
+#[cfg(feature = "semantic")]
+#[allow(unused_imports)]
+use lixun_source_semantic as _;
