@@ -15,13 +15,17 @@ mod broadcaster;
 mod config;
 mod embedder;
 mod factory;
+mod journal;
 mod source;
 mod store;
+mod worker;
 
 pub use ann::LanceDbAnnHandle;
 pub use broadcaster::SemanticBroadcasterAdapter;
 pub use config::SemanticConfig;
 pub use embedder::{ImageEmbedder, TextEmbedder, load_image_embedder, load_text_embedder};
 pub use factory::SemanticFactory;
+pub use journal::{BackfillJournal, default_journal_path};
 pub use source::SemanticSource;
 pub use store::VectorStore;
+pub use worker::{CHANNEL_IMAGE, CHANNEL_TEXT, EmbedJob, WorkerHandle, spawn_worker, start_backfill};
