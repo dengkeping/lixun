@@ -100,3 +100,50 @@ pub struct AnnHit {
     pub doc_id: String,
     pub distance: f32,
 }
+
+/// Plugin-contributed CLI verb tree. The host (`lixun-cli`) queries
+/// the daemon for a flattened `CliManifest` at startup and synthesizes
+/// clap subcommands from it, so plugin verb names never appear as
+/// literals in any host crate (AGENTS.md §1).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CliManifest {
+    pub verbs: Vec<CliVerb>,
+}
+
+/// One verb in a [`CliManifest`]. `subverbs` may nest arbitrarily
+/// (e.g. `lixun-cli foo bar baz`); leaf verbs use an empty
+/// `subverbs` and declare their positional/named arguments via
+/// `args`. Empty `args` means the verb takes none.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CliVerb {
+    pub name: String,
+    pub about: String,
+    #[serde(default)]
+    pub subverbs: Vec<CliVerb>,
+    #[serde(default)]
+    pub args: Vec<CliArg>,
+}
+
+/// One named argument of a [`CliVerb`]. Forwarded to the plugin via
+/// `Request::PluginCommand.args` as a JSON object keyed by `name`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CliArg {
+    pub name: String,
+    pub required: bool,
+    pub help: String,
+}
+
+/// Read-only view onto the lexical document store, exposed to plugins
+/// that need to walk every indexed doc (e.g. semantic backfill) without
+/// pulling in a hard dependency on `lixun-indexer`. The daemon installs
+/// an implementation backed by `SearchHandle` after the writer service
+/// boots; plugins that don't need it never observe the install.
+#[async_trait::async_trait]
+pub trait DocStore: Send + Sync {
+    async fn all_doc_ids(&self) -> anyhow::Result<std::collections::HashSet<String>>;
+    async fn hydrate_doc(
+        &self,
+        doc_id: &str,
+    ) -> anyhow::Result<Option<(lixun_core::Hit, lixun_core::ScoreBreakdown)>>;
+    async fn get_body(&self, doc_id: &str) -> anyhow::Result<Option<String>>;
+}

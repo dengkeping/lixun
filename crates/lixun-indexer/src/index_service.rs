@@ -145,6 +145,24 @@ impl SearchHandle {
     }
 }
 
+#[async_trait::async_trait]
+impl lixun_mutation::DocStore for SearchHandle {
+    async fn all_doc_ids(&self) -> Result<std::collections::HashSet<String>> {
+        SearchHandle::all_doc_ids(self).await
+    }
+
+    async fn hydrate_doc(
+        &self,
+        doc_id: &str,
+    ) -> Result<Option<(lixun_core::Hit, lixun_core::ScoreBreakdown)>> {
+        SearchHandle::hydrate_doc(self, doc_id).await
+    }
+
+    async fn get_body(&self, doc_id: &str) -> Result<Option<String>> {
+        SearchHandle::get_body(self, doc_id).await
+    }
+}
+
 pub fn spawn_writer_service(
     index: LixunIndex,
 ) -> Result<(IndexMutationTx, SearchHandle, tokio::task::JoinHandle<()>)> {

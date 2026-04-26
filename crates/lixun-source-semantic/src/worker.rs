@@ -271,11 +271,8 @@ fn unix_seconds() -> i64 {
 /// journal, hydrates each remaining doc, and forwards an
 /// [`EmbedJob::Upsert`] into the worker's channel using awaited
 /// `send` so backpressure flows naturally.
-///
-/// Not yet wired by the daemon — WD-T8 attaches it to the
-/// `lixun semantic backfill` CLI verb.
 pub async fn start_backfill(
-    search: lixun_indexer::index_service::SearchHandle,
+    search: Arc<dyn lixun_mutation::DocStore>,
     journal: Arc<Mutex<BackfillJournal>>,
     embedder_tx: mpsc::Sender<EmbedJob>,
 ) -> Result<()> {

@@ -80,7 +80,7 @@ impl PluginFactory for SemanticFactory {
         let _ = ann.install_store(store.clone());
         let _ = ann.install_text_embedder(text_embedder);
 
-        let source = SemanticSource::new(worker, ann);
+        let source = SemanticSource::new(worker, ann, journal);
 
         Ok(vec![PluginInstance {
             instance_id: "semantic".into(),

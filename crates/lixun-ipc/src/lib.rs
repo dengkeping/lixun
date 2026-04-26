@@ -103,6 +103,19 @@ pub enum Request {
         hit: Box<Hit>,
         monitor: Option<String>,
     },
+    /// Ask the daemon for the flattened CLI manifest contributed by
+    /// every registered plugin. The host CLI uses this once at startup
+    /// to synthesize subcommands without learning any plugin name at
+    /// compile time.
+    EnumeratePlugins,
+    /// Invoke a plugin-registered CLI verb. `verb_path` is the
+    /// position-ordered slice of names selected by the user
+    /// (`[top, sub, sub, ...]`); `args` is the JSON-encoded argument
+    /// map keyed by [`lixun_mutation::CliArg::name`].
+    PluginCommand {
+        verb_path: Vec<String>,
+        args: serde_json::Value,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -148,6 +161,9 @@ pub enum Response {
         visible: bool,
     },
     Queries(Vec<String>),
+    PluginManifest(lixun_mutation::CliManifest),
+    PluginResult(serde_json::Value),
+    PluginError(String),
     Error(String),
 }
 
