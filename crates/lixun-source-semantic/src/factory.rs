@@ -1,6 +1,7 @@
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use lixun_sources::{
     PluginBuildContext, PluginFactory, PluginFactoryEntry, PluginInstance, inventory,
 };
@@ -57,9 +58,8 @@ impl PluginFactory for SemanticFactory {
         let text_embedder = Arc::new(Mutex::new(text_embedder));
         let image_embedder = Arc::new(Mutex::new(image_embedder));
 
-        let store = runtime
-            .block_on(VectorStore::open(&vectors_dir, text_dim, image_dim))
-            .with_context(|| {
+        let store =
+            open_store_blocking(vectors_dir.clone(), text_dim, image_dim).with_context(|| {
                 format!("opening LanceDB vector store at {}", vectors_dir.display())
             })?;
         let store = Arc::new(store);
@@ -94,6 +94,32 @@ impl PluginFactory for SemanticFactory {
 fn vector_store_dir() -> Result<std::path::PathBuf> {
     let base = dirs::data_local_dir().context("XDG data-local directory unavailable")?;
     Ok(base.join("lixun").join("vectors"))
+}
+
+/// Open the LanceDB vector store on a fresh OS thread with its own
+/// current-thread tokio runtime.
+///
+/// The daemon's `#[tokio::main]` is already driving the calling
+/// thread when `PluginFactory::build` runs, so calling
+/// `Handle::block_on` on that runtime panics ("Cannot start a
+/// runtime from within a runtime"). A throwaway `std::thread` with
+/// its own runtime sidesteps the constraint without making the
+/// `PluginFactory` trait async or deferring the open past
+/// registration (the worker, ANN handle, and source all need
+/// `Arc<VectorStore>` at build time).
+fn open_store_blocking(root: PathBuf, text_dim: usize, image_dim: usize) -> Result<VectorStore> {
+    let join = std::thread::Builder::new()
+        .name("lixun-semantic-store-open".into())
+        .spawn(move || -> Result<VectorStore> {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("building semantic init runtime")?;
+            rt.block_on(VectorStore::open(&root, text_dim, image_dim))
+        })
+        .context("spawning semantic init thread")?;
+    join.join()
+        .map_err(|_| anyhow!("semantic init thread panicked"))?
 }
 
 fn embedder_cache_dir(cfg: &SemanticConfig) -> Result<std::path::PathBuf> {
