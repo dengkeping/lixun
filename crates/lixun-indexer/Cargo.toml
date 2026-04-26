@@ -11,6 +11,7 @@ path = "src/lib.rs"
 lixun-core = { path = "../lixun-core" }
 lixun-extract = { path = "../lixun-extract" }
 lixun-index = { path = "../lixun-index" }
+lixun-mutation = { path = "../lixun-mutation" }
 lixun-sources = { path = "../lixun-sources" }
 anyhow.workspace = true
 tracing.workspace = true

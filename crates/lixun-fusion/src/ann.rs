@@ -1,3 +1,1 @@
-use lixun_mutation as _;
-
-pub trait AnnHandle: Send + Sync {}
+pub use lixun_mutation::AnnHandle;
