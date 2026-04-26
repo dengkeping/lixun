@@ -124,7 +124,8 @@ impl PreviewPlugin for OfficePreview {
 
         stack.set_visible_child_name("loading");
 
-        let (tx, rx): (Sender<ConvertOutcome>, Receiver<ConvertOutcome>) = async_channel::bounded(1);
+        let (tx, rx): (Sender<ConvertOutcome>, Receiver<ConvertOutcome>) =
+            async_channel::bounded(1);
         let soffice_bin = soffice_bin.unwrap();
         let target_path = cache_file.clone();
         let source_path = path.clone();
@@ -289,10 +290,7 @@ fn run_soffice_convert(bin: &Path, src: &Path, dest: &Path) -> ConvertOutcome {
             std::fs::remove_file(&produced).ok();
         })
     }) {
-        return ConvertOutcome::Err(format!(
-            "moving {:?} -> {:?}: {}",
-            produced, dest, e
-        ));
+        return ConvertOutcome::Err(format!("moving {:?} -> {:?}: {}", produced, dest, e));
     }
 
     let _ = std::fs::remove_dir_all(&outdir);
@@ -467,7 +465,8 @@ mod tests {
 
     #[test]
     fn cache_key_depends_on_path_and_mtime() {
-        let tmp = std::env::temp_dir().join(format!("lixun-office-cachekey-{}", std::process::id()));
+        let tmp =
+            std::env::temp_dir().join(format!("lixun-office-cachekey-{}", std::process::id()));
         std::fs::write(&tmp, b"hello").unwrap();
         let first = compute_cache_key(&tmp);
         // Touch to bump mtime.

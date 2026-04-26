@@ -298,7 +298,9 @@ mod tests {
     #[tokio::test]
     async fn async_roundtrip_cmd() {
         let mut buf = Vec::<u8>::new();
-        write_frame_async(&mut buf, &GuiCommand::Toggle).await.unwrap();
+        write_frame_async(&mut buf, &GuiCommand::Toggle)
+            .await
+            .unwrap();
         let mut cur = Cursor::new(buf);
         let c: GuiCommand = read_frame_async(&mut cur).await.unwrap();
         assert_eq!(c, GuiCommand::Toggle);
@@ -339,7 +341,9 @@ mod tests {
     #[tokio::test]
     async fn async_written_frame_decodes_sync() {
         let mut buf = Vec::<u8>::new();
-        write_frame_async(&mut buf, &GuiCommand::Ping).await.unwrap();
+        write_frame_async(&mut buf, &GuiCommand::Ping)
+            .await
+            .unwrap();
         let mut cur = Cursor::new(buf);
         let c: GuiCommand = read_frame_sync(&mut cur).unwrap();
         assert_eq!(c, GuiCommand::Ping);

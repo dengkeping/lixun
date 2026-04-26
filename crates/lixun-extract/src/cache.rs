@@ -281,11 +281,12 @@ mod tests {
         let k = CacheKey([0xab; 32]);
         let rel = k.rel_path();
         assert_eq!(rel.parent().unwrap().to_str().unwrap(), "ab");
-        assert!(rel
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .ends_with(".txt.zst"));
+        assert!(
+            rel.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with(".txt.zst")
+        );
     }
 
     #[test]

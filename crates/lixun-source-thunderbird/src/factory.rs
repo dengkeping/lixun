@@ -1,5 +1,5 @@
 use crate::{GlodaSource, ThunderbirdAttachmentsSource};
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use lixun_sources::{PluginBuildContext, PluginFactory, PluginFactoryEntry, PluginInstance};
 use serde::Deserialize;
 use std::path::PathBuf;

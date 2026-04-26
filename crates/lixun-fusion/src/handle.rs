@@ -43,10 +43,7 @@ impl HybridSearchHandle {
         }
     }
 
-    pub async fn search(
-        &self,
-        query: &lixun_core::Query,
-    ) -> Result<Vec<lixun_core::Hit>> {
+    pub async fn search(&self, query: &lixun_core::Query) -> Result<Vec<lixun_core::Hit>> {
         #[cfg(feature = "semantic")]
         if self.ann.is_some() {
             let pairs = self.search_with_breakdown(query).await?;
@@ -95,7 +92,9 @@ impl HybridSearchHandle {
         use std::collections::HashMap;
 
         let target_limit = query.limit.max(1) as usize;
-        let ann_k = target_limit.saturating_mul(self.overfetch).max(target_limit);
+        let ann_k = target_limit
+            .saturating_mul(self.overfetch)
+            .max(target_limit);
 
         let lex_fut = self.inner.search_with_breakdown(query);
         let ann_fut = ann.search_text(&query.text, ann_k);

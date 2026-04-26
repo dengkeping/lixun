@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use arrow_array::{
-    FixedSizeListArray, Float32Array, Int64Array, RecordBatch, RecordBatchIterator, RecordBatchReader,
-    StringArray,
+    FixedSizeListArray, Float32Array, Int64Array, RecordBatch, RecordBatchIterator,
+    RecordBatchReader, StringArray,
 };
 use arrow_schema::{DataType, Field, Schema};
 use futures::TryStreamExt;
@@ -62,7 +62,15 @@ impl VectorStore {
         mtime: i64,
         vector: &[f32],
     ) -> Result<()> {
-        upsert_one(&self.text, doc_id, source_instance, mtime, vector, self.text_dim).await
+        upsert_one(
+            &self.text,
+            doc_id,
+            source_instance,
+            mtime,
+            vector,
+            self.text_dim,
+        )
+        .await
     }
 
     pub async fn upsert_image(
@@ -143,8 +151,10 @@ async fn ensure_table(conn: &Connection, name: &str, dim: usize) -> Result<Table
     }
     let schema = Arc::new(table_schema(dim));
     let empty = RecordBatch::new_empty(schema.clone());
-    let reader: Box<dyn RecordBatchReader + Send> =
-        Box::new(RecordBatchIterator::new(vec![Ok(empty)].into_iter(), schema));
+    let reader: Box<dyn RecordBatchReader + Send> = Box::new(RecordBatchIterator::new(
+        vec![Ok(empty)].into_iter(),
+        schema,
+    ));
     conn.create_table(name, reader)
         .execute()
         .await
@@ -200,13 +210,11 @@ async fn upsert_one(
         ],
     )
     .context("arrow: build RecordBatch")?;
-    let iter: Box<dyn RecordBatchReader + Send> =
-        Box::new(RecordBatchIterator::new(vec![Ok(batch)].into_iter(), schema));
-    table
-        .add(iter)
-        .execute()
-        .await
-        .context("lancedb: add")?;
+    let iter: Box<dyn RecordBatchReader + Send> = Box::new(RecordBatchIterator::new(
+        vec![Ok(batch)].into_iter(),
+        schema,
+    ));
+    table.add(iter).execute().await.context("lancedb: add")?;
     Ok(())
 }
 

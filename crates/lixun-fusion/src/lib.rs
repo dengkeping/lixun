@@ -4,14 +4,14 @@
 
 #![allow(dead_code)]
 
-mod handle;
 #[cfg(feature = "semantic")]
 mod ann;
 #[cfg(feature = "semantic")]
 mod debug;
+mod handle;
 #[cfg(feature = "semantic")]
 mod rrf;
 
-pub use handle::HybridSearchHandle;
 #[cfg(feature = "semantic")]
 pub use debug::FusionDebug;
+pub use handle::HybridSearchHandle;

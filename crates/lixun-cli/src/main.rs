@@ -9,9 +9,7 @@ use std::path::PathBuf;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
-const BUILTIN_VERBS: &[&str] = &[
-    "toggle", "show", "hide", "search", "reindex", "status",
-];
+const BUILTIN_VERBS: &[&str] = &["toggle", "show", "hide", "search", "reindex", "status"];
 
 async fn send_request(req: Request) -> Result<Response> {
     let socket_path = lixun_ipc::socket_path();
@@ -98,15 +96,15 @@ fn root_command(plugin_verbs: &[CliVerb]) -> Command {
                     Arg::new("explain")
                         .long("explain")
                         .action(clap::ArgAction::SetTrue)
-                        .help(
-                            "Print a per-hit score breakdown under each result.",
-                        ),
+                        .help("Print a per-hit score breakdown under each result."),
                 ),
         )
         .subcommand(
-            Command::new("reindex")
-                .about("Trigger a reindex.")
-                .arg(Arg::new("paths").num_args(0..).value_parser(clap::value_parser!(PathBuf))),
+            Command::new("reindex").about("Trigger a reindex.").arg(
+                Arg::new("paths")
+                    .num_args(0..)
+                    .value_parser(clap::value_parser!(PathBuf)),
+            ),
         )
         .subcommand(
             Command::new("status").about("Show daemon status.").arg(
@@ -134,10 +132,7 @@ fn root_command(plugin_verbs: &[CliVerb]) -> Command {
 /// `verb_path` slice the daemon expects and a JSON object of every
 /// leaf-level argument keyed by name. Booleans and integers are
 /// preserved as JSON booleans / numbers; everything else stringifies.
-fn collect_plugin_invocation(
-    head: &str,
-    matches: &ArgMatches,
-) -> (Vec<String>, serde_json::Value) {
+fn collect_plugin_invocation(head: &str, matches: &ArgMatches) -> (Vec<String>, serde_json::Value) {
     let mut path = vec![head.to_string()];
     let mut current = matches;
     while let Some((sub, sub_m)) = current.subcommand() {
@@ -202,9 +197,7 @@ async fn main() -> Result<()> {
                 .unwrap_or_default();
             let resp = send_request(Request::Reindex { paths }).await?;
             if matches!(resp, Response::Status { .. }) {
-                println!(
-                    "Reindex started in background. Check progress with: lixun-cli status"
-                );
+                println!("Reindex started in background. Check progress with: lixun-cli status");
             } else {
                 handle_response(resp, false);
             }

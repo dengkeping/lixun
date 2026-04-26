@@ -74,8 +74,7 @@ pub async fn start(registry: Arc<SourceRegistry>, sink: Arc<WriterSink>) -> Resu
         Config::default(),
     )?;
 
-    let mut instances_watched: std::collections::HashSet<usize> =
-        std::collections::HashSet::new();
+    let mut instances_watched: std::collections::HashSet<usize> = std::collections::HashSet::new();
     for (path, (idx, recursive)) in &route {
         let mode = if *recursive {
             RecursiveMode::Recursive
@@ -87,11 +86,7 @@ pub async fn start(registry: Arc<SourceRegistry>, sink: Arc<WriterSink>) -> Resu
                 instances_watched.insert(*idx);
             }
             Err(e) => {
-                tracing::warn!(
-                    "plugin fs watcher: watch({:?}) failed: {}",
-                    path,
-                    e
-                );
+                tracing::warn!("plugin fs watcher: watch({:?}) failed: {}", path, e);
             }
         }
     }
@@ -175,19 +170,18 @@ fn map_notify_kind(event: &Event) -> SourceEventKind {
     match event.kind {
         EventKind::Create(_) => SourceEventKind::Created,
         EventKind::Remove(_) => SourceEventKind::Removed,
-        EventKind::Modify(notify::event::ModifyKind::Name(
-            notify::event::RenameMode::Both,
-        )) if event.paths.len() == 2 => SourceEventKind::Renamed {
-            from: event.paths[0].clone(),
-        },
+        EventKind::Modify(notify::event::ModifyKind::Name(notify::event::RenameMode::Both))
+            if event.paths.len() == 2 =>
+        {
+            SourceEventKind::Renamed {
+                from: event.paths[0].clone(),
+            }
+        }
         _ => SourceEventKind::Modified,
     }
 }
 
-fn longest_prefix_instance(
-    route: &HashMap<PathBuf, (usize, bool)>,
-    path: &Path,
-) -> Option<usize> {
+fn longest_prefix_instance(route: &HashMap<PathBuf, (usize, bool)>, path: &Path) -> Option<usize> {
     route
         .iter()
         .filter(|(root, _)| path.starts_with(root))
@@ -231,20 +225,14 @@ mod tests {
             paths: vec![PathBuf::from("/a")],
             attrs: notify::event::EventAttributes::default(),
         };
-        assert!(matches!(
-            map_notify_kind(&create),
-            SourceEventKind::Created
-        ));
+        assert!(matches!(map_notify_kind(&create), SourceEventKind::Created));
 
         let remove = Event {
             kind: EventKind::Remove(notify::event::RemoveKind::File),
             paths: vec![PathBuf::from("/a")],
             attrs: notify::event::EventAttributes::default(),
         };
-        assert!(matches!(
-            map_notify_kind(&remove),
-            SourceEventKind::Removed
-        ));
+        assert!(matches!(map_notify_kind(&remove), SourceEventKind::Removed));
 
         let modify = Event {
             kind: EventKind::Modify(notify::event::ModifyKind::Data(

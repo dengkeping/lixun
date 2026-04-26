@@ -220,11 +220,7 @@ pub fn select_plugin(hit: &Hit) -> Option<Box<dyn PreviewPlugin>> {
         .map(|entry| (entry.factory)())
         .filter_map(|p| {
             let score = p.match_score(hit);
-            if score == 0 {
-                None
-            } else {
-                Some((score, p))
-            }
+            if score == 0 { None } else { Some((score, p)) }
         })
         .max_by(|(s1, p1), (s2, p2)| s1.cmp(s2).then_with(|| p1.id().cmp(p2.id())))
         .map(|(_, p)| p)
@@ -305,11 +301,7 @@ mod tests {
             .into_iter()
             .filter_map(|p| {
                 let score = p.match_score(hit);
-                if score == 0 {
-                    None
-                } else {
-                    Some((score, p))
-                }
+                if score == 0 { None } else { Some((score, p)) }
             })
             .max_by(|(s1, p1), (s2, p2)| s1.cmp(s2).then_with(|| p1.id().cmp(p2.id())))
             .map(|(_, p)| {

@@ -59,7 +59,9 @@ impl PluginFactory for SemanticFactory {
 
         let store = runtime
             .block_on(VectorStore::open(&vectors_dir, text_dim, image_dim))
-            .with_context(|| format!("opening LanceDB vector store at {}", vectors_dir.display()))?;
+            .with_context(|| {
+                format!("opening LanceDB vector store at {}", vectors_dir.display())
+            })?;
         let store = Arc::new(store);
 
         let journal = BackfillJournal::open(&journal_path)?;

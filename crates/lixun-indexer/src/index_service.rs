@@ -78,8 +78,7 @@ impl IndexMutationTx {
     pub async fn commit_now(&self) -> Result<u64> {
         let (tx, rx) = oneshot::channel();
         self.send(Mutation::CommitNow(tx)).await?;
-        rx.await
-            .map_err(|_| anyhow::anyhow!("commit_now dropped"))
+        rx.await.map_err(|_| anyhow::anyhow!("commit_now dropped"))
     }
 }
 
@@ -97,10 +96,7 @@ impl SearchHandle {
         Self { index }
     }
 
-    pub async fn search(
-        &self,
-        query: &lixun_core::Query,
-    ) -> Result<Vec<lixun_core::Hit>> {
+    pub async fn search(&self, query: &lixun_core::Query) -> Result<Vec<lixun_core::Hit>> {
         let idx = self.index.lock().await;
         idx.search(query)
     }
@@ -363,7 +359,10 @@ async fn writer_loop(
     while let Ok(mutation) = rx.try_recv() {
         match mutation {
             Mutation::Upsert(doc) => {
-                if apply_upsert(&shared, &mut writer, doc.as_ref()).await.is_ok() {
+                if apply_upsert(&shared, &mut writer, doc.as_ref())
+                    .await
+                    .is_ok()
+                {
                     pending_batch.upserts.push(upserted_doc_from(doc.as_ref()));
                 }
                 dirty = true;
@@ -584,8 +583,8 @@ pub fn index_file(
             // then re-enqueued on the next pass, wasting a full OCR
             // cycle per affected document.
             Ok(None) => {
-                let preserved = body_checker
-                    .and_then(|bc| bc.get_body(&fs_doc_id(path)).ok().flatten());
+                let preserved =
+                    body_checker.and_then(|bc| bc.get_body(&fs_doc_id(path)).ok().flatten());
                 (preserved, false)
             }
             Err(_) => (None, true),

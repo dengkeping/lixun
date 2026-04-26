@@ -187,9 +187,7 @@ pub fn acronym_initials_indexed(title: &str) -> String {
     let concatenated = acronym_initials(title);
 
     let mut out = per_word.join(" ");
-    if !concatenated.is_empty()
-        && !out.split_whitespace().any(|t| t == concatenated)
-    {
+    if !concatenated.is_empty() && !out.split_whitespace().any(|t| t == concatenated) {
         if !out.is_empty() {
             out.push(' ');
         }
@@ -234,10 +232,7 @@ mod tests {
     fn title_prefixes_fixtures() {
         let cases: &[(&str, &str)] = &[
             ("Firefox", "fi fir fire firef firefo firefox"),
-            (
-                "JSONParser",
-                "js jso json pa par pars parse parser",
-            ),
+            ("JSONParser", "js jso json pa par pars parse parser"),
             (
                 "Visual Studio Code",
                 "vi vis visu visua visual st stu stud studi studio co cod code",
@@ -248,11 +243,7 @@ mod tests {
         ];
 
         for (title, expected) in cases {
-            assert_eq!(
-                compute_title_prefixes(title),
-                *expected,
-                "title: {title:?}"
-            );
+            assert_eq!(compute_title_prefixes(title), *expected, "title: {title:?}");
         }
     }
 

@@ -352,8 +352,7 @@ mod tests {
         path
     }
 
-    const BASIC_EML: &str =
-        "From: alice@example.com\r\nTo: bob@example.com, carol@example.com\r\nSubject: Weekly sync\r\nMessage-ID: <week-1@example.com>\r\n\r\nSee you tomorrow.\r\n";
+    const BASIC_EML: &str = "From: alice@example.com\r\nTo: bob@example.com, carol@example.com\r\nSubject: Weekly sync\r\nMessage-ID: <week-1@example.com>\r\n\r\nSee you tomorrow.\r\n";
 
     #[test]
     fn reindex_full_emits_delete_then_upsert() {

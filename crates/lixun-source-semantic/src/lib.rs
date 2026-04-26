@@ -28,4 +28,6 @@ pub use factory::SemanticFactory;
 pub use journal::{BackfillJournal, default_journal_path};
 pub use source::SemanticSource;
 pub use store::VectorStore;
-pub use worker::{CHANNEL_IMAGE, CHANNEL_TEXT, EmbedJob, WorkerHandle, spawn_worker, start_backfill};
+pub use worker::{
+    CHANNEL_IMAGE, CHANNEL_TEXT, EmbedJob, WorkerHandle, spawn_worker, start_backfill,
+};

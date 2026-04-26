@@ -134,12 +134,7 @@ pub fn select_top_hit(
 /// terms (sufficient absolute usage AND clear lead over #2), else
 /// `0.0`. The single-hit case (`hits.len() < 2`) relies solely on
 /// the absolute threshold — there is no one to out-rank.
-fn frecency_dominance(
-    candidate: &Hit,
-    hits: &[Hit],
-    frecency: &FrecencyStore,
-    now: i64,
-) -> f32 {
+fn frecency_dominance(candidate: &Hit, hits: &[Hit], frecency: &FrecencyStore, now: i64) -> f32 {
     let cand_raw = frecency.raw(&candidate.id.0, now);
     if hits.len() < 2 {
         return if cand_raw >= FRECENCY_DOMINANCE_MIN_RAW {
@@ -219,10 +214,7 @@ mod tests {
     /// so no Top Hit is emitted — but the probes are still filled.
     #[test]
     fn ambiguous_returns_none() {
-        let hits = vec![
-            make_hit("fs:a", "Doc", 10.0),
-            make_hit("fs:b", "Doc", 9.5),
-        ];
+        let hits = vec![make_hit("fs:a", "Doc", 10.0), make_hit("fs:b", "Doc", 9.5)];
         let decision = select_top_hit(
             "doc",
             &hits,
@@ -234,7 +226,10 @@ mod tests {
             3,
         );
         assert!(decision.id.is_none());
-        assert!(decision.prefix_match, "probe still fires even when gate rejects");
+        assert!(
+            decision.prefix_match,
+            "probe still fires even when gate rejects"
+        );
         assert!(
             (decision.margin - (10.0_f32 / 9.5)).abs() < 0.001,
             "margin value populated regardless of gate outcome"

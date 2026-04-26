@@ -155,10 +155,9 @@ pub fn sweep_once(cfg: &CacheSweepCfg, reaper: Option<&dyn ZombieReaper>) -> Res
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                         remaining = remaining.saturating_sub(f.size);
                     }
-                    Err(e) => tracing::warn!(
-                        "cache sweep: failed to evict {}: {e}",
-                        f.path.display()
-                    ),
+                    Err(e) => {
+                        tracing::warn!("cache sweep: failed to evict {}: {e}", f.path.display())
+                    }
                 }
             }
 
@@ -215,7 +214,10 @@ pub fn spawn(cfg: CacheSweepCfg, reaper: Option<Arc<dyn ZombieReaper>>) -> JoinH
             let cfg_clone = cfg.clone();
             let reaper_clone = reaper.clone();
             let result = tokio::task::spawn_blocking(move || {
-                sweep_once(&cfg_clone, reaper_clone.as_deref().map(|r| r as &dyn ZombieReaper))
+                sweep_once(
+                    &cfg_clone,
+                    reaper_clone.as_deref().map(|r| r as &dyn ZombieReaper),
+                )
             })
             .await;
             match result {

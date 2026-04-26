@@ -171,12 +171,17 @@ fn parse_profiles_ini_selected(tb_path: &std::path::Path, content: &str) -> Opti
         match key.trim() {
             "Path" => current_path = Some(value.trim().to_string()),
             "IsRelative" => current_is_relative = value.trim() != "0",
-            "Default" if current_section
-                .as_deref()
-                .is_some_and(|s| s.starts_with("Profile")) => current_default = value.trim() == "1",
-            "Default" if current_section
-                .as_deref()
-                .is_some_and(|s| s.starts_with("Install")) =>
+            "Default"
+                if current_section
+                    .as_deref()
+                    .is_some_and(|s| s.starts_with("Profile")) =>
+            {
+                current_default = value.trim() == "1"
+            }
+            "Default"
+                if current_section
+                    .as_deref()
+                    .is_some_and(|s| s.starts_with("Install")) =>
             {
                 install_default_name = Some(value.trim().to_string())
             }
@@ -194,7 +199,9 @@ fn parse_profiles_ini_selected(tb_path: &std::path::Path, content: &str) -> Opti
     );
 
     if let Some(default_name) = install_default_name.as_deref()
-        && let Some(profile) = profiles.iter().find(|p| p.path.as_deref() == Some(default_name))
+        && let Some(profile) = profiles
+            .iter()
+            .find(|p| p.path.as_deref() == Some(default_name))
         && let Some(path) = profile.path.as_deref()
     {
         return Some(if profile.is_relative {
@@ -220,7 +227,11 @@ fn parse_profiles_ini_selected(tb_path: &std::path::Path, content: &str) -> Opti
 
 /// Query messages from a Gloda connection. Extracted for testability against
 /// an in-memory rusqlite `Connection` seeded with the real Gloda schema.
-pub fn query_messages(conn: &Connection, last_key: u64, limit: u32) -> rusqlite::Result<Vec<Document>> {
+pub fn query_messages(
+    conn: &Connection,
+    last_key: u64,
+    limit: u32,
+) -> rusqlite::Result<Vec<Document>> {
     let mut stmt = conn.prepare(
         "SELECT m.id, m.messageKey, m.headerMessageID, \
                 mt.c1subject, mt.c3author, mt.c4recipients, mt.c0body \
@@ -456,8 +467,8 @@ impl lixun_sources::source::IndexerSource for GlodaSource {
 mod tests {
     use super::*;
     use rusqlite::Connection;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn setup_schema(conn: &Connection) {
         conn.execute_batch(
@@ -605,11 +616,7 @@ mod tests {
             |e: &i32| *e == 5,
             move || {
                 let n = c.fetch_add(1, Ordering::SeqCst);
-                if n < 2 {
-                    Err(5)
-                } else {
-                    Ok(42)
-                }
+                if n < 2 { Err(5) } else { Ok(42) }
             },
         );
         assert_eq!(result.unwrap(), 42);
