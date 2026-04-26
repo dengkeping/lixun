@@ -8,6 +8,7 @@
 use anyhow::Result;
 use lixun_core::Document;
 use lixun_index::{LixunIndex, TantivyDoc, TantivyIndexWriter};
+use lixun_mutation::{MutationBatch, MutationBroadcaster, NoopBroadcaster, UpsertedDoc};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -147,6 +148,17 @@ impl SearchHandle {
 pub fn spawn_writer_service(
     index: LixunIndex,
 ) -> Result<(IndexMutationTx, SearchHandle, tokio::task::JoinHandle<()>)> {
+    spawn_writer_service_with_broadcaster(index, Arc::new(NoopBroadcaster))
+}
+
+/// Variant of [`spawn_writer_service`] that fires
+/// `broadcaster.broadcast` from `tokio::task::spawn_blocking` after
+/// every successful commit. The writer task never awaits on the
+/// broadcaster, so a slow consumer cannot stall index commits.
+pub fn spawn_writer_service_with_broadcaster(
+    index: LixunIndex,
+    broadcaster: Arc<dyn MutationBroadcaster>,
+) -> Result<(IndexMutationTx, SearchHandle, tokio::task::JoinHandle<()>)> {
     let writer = index.writer(WRITER_HEAP_BYTES)?;
 
     let shared = Arc::new(Mutex::new(index));
@@ -154,7 +166,7 @@ pub fn spawn_writer_service(
 
     let (tx, rx) = mpsc::channel::<Mutation>(4096);
 
-    let handle = tokio::spawn(writer_loop(shared, writer, rx));
+    let handle = tokio::spawn(writer_loop(shared, writer, rx, broadcaster));
 
     Ok((IndexMutationTx { tx }, search, handle))
 }
@@ -163,11 +175,13 @@ async fn writer_loop(
     shared: Arc<Mutex<LixunIndex>>,
     mut writer: TantivyIndexWriter<TantivyDoc>,
     mut rx: mpsc::Receiver<Mutation>,
+    broadcaster: Arc<dyn MutationBroadcaster>,
 ) {
     let mut dirty = false;
     let mut last_commit = Instant::now();
     let mut generation: u64 = 0;
     let mut pending_barriers: Vec<oneshot::Sender<u64>> = Vec::new();
+    let mut pending_batch = MutationBatch::default();
     let mut commit_tick = tokio::time::interval(COMMIT_CHECK_INTERVAL);
     commit_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -198,7 +212,7 @@ async fn writer_loop(
 
                     Mutation::CommitNow(reply) => {
                         pending_barriers.push(reply);
-                        if let Err(e) = do_commit(
+                        match do_commit(
                             &shared,
                             &mut writer,
                             &mut generation,
@@ -206,7 +220,14 @@ async fn writer_loop(
                             &mut dirty,
                             &mut last_commit,
                         ).await {
-                            tracing::error!("IndexService: commit_now failed: {}", e);
+                            Ok(()) => flush_post_commit(
+                                &mut pending_batch,
+                                generation,
+                                &broadcaster,
+                            ),
+                            Err(e) => {
+                                tracing::error!("IndexService: commit_now failed: {}", e);
+                            }
                         }
                     }
 
@@ -214,6 +235,7 @@ async fn writer_loop(
                         if let Err(e) = apply_upsert(&shared, &mut writer, doc.as_ref()).await {
                             tracing::warn!("IndexService: upsert {} failed: {}", doc.id.0, e);
                         } else {
+                            pending_batch.upserts.push(upserted_doc_from(doc.as_ref()));
                             dirty = true;
                         }
                     }
@@ -223,6 +245,7 @@ async fn writer_loop(
                             if let Err(e) = apply_upsert(&shared, &mut writer, doc).await {
                                 tracing::warn!("IndexService: upsert {} failed: {}", doc.id.0, e);
                             } else {
+                                pending_batch.upserts.push(upserted_doc_from(doc));
                                 dirty = true;
                             }
                         }
@@ -232,15 +255,17 @@ async fn writer_loop(
                         if let Err(e) = apply_delete(&shared, &mut writer, &id).await {
                             tracing::warn!("IndexService: delete {} failed: {}", id, e);
                         } else {
+                            pending_batch.deletes.push(id);
                             dirty = true;
                         }
                     }
 
                     Mutation::DeleteMany(ids) => {
-                        for id in &ids {
-                            if let Err(e) = apply_delete(&shared, &mut writer, id).await {
+                        for id in ids {
+                            if let Err(e) = apply_delete(&shared, &mut writer, &id).await {
                                 tracing::warn!("IndexService: delete {} failed: {}", id, e);
                             } else {
+                                pending_batch.deletes.push(id);
                                 dirty = true;
                             }
                         }
@@ -260,14 +285,21 @@ async fn writer_loop(
                                 "IndexService: purged all docs for source instance {}",
                                 instance_id
                             );
+                            // No broadcast: apply_delete_source_instance does
+                            // not return the affected doc_ids, and instance_id
+                            // is not a doc_id. Broadcasting it would corrupt
+                            // any consumer that keys off doc_id.
                             dirty = true;
                         }
                     }
 
                     Mutation::UpsertBody { doc_id, body } => {
                         match apply_upsert_body(&shared, &mut writer, &doc_id, body).await {
-                            Ok(true) => dirty = true,
-                            Ok(false) => {
+                            Ok(Some(updated)) => {
+                                pending_batch.upserts.push(upserted_doc_from(&updated));
+                                dirty = true;
+                            }
+                            Ok(None) => {
                                 tracing::debug!(
                                     "IndexService: upsert_body skipped, doc gone: {}",
                                     doc_id
@@ -286,8 +318,8 @@ async fn writer_loop(
             }
 
             _ = commit_tick.tick() => {
-                if dirty && last_commit.elapsed() >= COMMIT_MIN_INTERVAL
-                    && let Err(e) = do_commit(
+                if dirty && last_commit.elapsed() >= COMMIT_MIN_INTERVAL {
+                    match do_commit(
                         &shared,
                         &mut writer,
                         &mut generation,
@@ -295,8 +327,16 @@ async fn writer_loop(
                         &mut dirty,
                         &mut last_commit,
                     ).await {
-                        tracing::error!("IndexService: periodic commit failed: {}", e);
+                        Ok(()) => flush_post_commit(
+                            &mut pending_batch,
+                            generation,
+                            &broadcaster,
+                        ),
+                        Err(e) => {
+                            tracing::error!("IndexService: periodic commit failed: {}", e);
+                        }
                     }
+                }
             }
         }
     }
@@ -305,22 +345,30 @@ async fn writer_loop(
     while let Ok(mutation) = rx.try_recv() {
         match mutation {
             Mutation::Upsert(doc) => {
-                let _ = apply_upsert(&shared, &mut writer, doc.as_ref()).await;
+                if apply_upsert(&shared, &mut writer, doc.as_ref()).await.is_ok() {
+                    pending_batch.upserts.push(upserted_doc_from(doc.as_ref()));
+                }
                 dirty = true;
             }
             Mutation::UpsertMany(docs) => {
                 for doc in &docs {
-                    let _ = apply_upsert(&shared, &mut writer, doc).await;
+                    if apply_upsert(&shared, &mut writer, doc).await.is_ok() {
+                        pending_batch.upserts.push(upserted_doc_from(doc));
+                    }
                     dirty = true;
                 }
             }
             Mutation::Delete(id) => {
-                let _ = apply_delete(&shared, &mut writer, &id).await;
+                if apply_delete(&shared, &mut writer, &id).await.is_ok() {
+                    pending_batch.deletes.push(id);
+                }
                 dirty = true;
             }
             Mutation::DeleteMany(ids) => {
-                for id in &ids {
-                    let _ = apply_delete(&shared, &mut writer, id).await;
+                for id in ids {
+                    if apply_delete(&shared, &mut writer, &id).await.is_ok() {
+                        pending_batch.deletes.push(id);
+                    }
                     dirty = true;
                 }
             }
@@ -329,7 +377,10 @@ async fn writer_loop(
                 dirty = true;
             }
             Mutation::UpsertBody { doc_id, body } => {
-                if let Ok(true) = apply_upsert_body(&shared, &mut writer, &doc_id, body).await {
+                if let Ok(Some(updated)) =
+                    apply_upsert_body(&shared, &mut writer, &doc_id, body).await
+                {
+                    pending_batch.upserts.push(upserted_doc_from(&updated));
                     dirty = true;
                 }
             }
@@ -348,6 +399,7 @@ async fn writer_loop(
             &mut last_commit,
         )
         .await;
+        flush_post_commit(&mut pending_batch, generation, &broadcaster);
     }
     for reply in pending_barriers.drain(..) {
         let _ = reply.send(generation);
@@ -383,14 +435,14 @@ async fn apply_upsert_body(
     writer: &mut TantivyIndexWriter<TantivyDoc>,
     doc_id: &str,
     body: String,
-) -> Result<bool> {
+) -> Result<Option<Document>> {
     let mut idx = shared.lock().await;
     let Some(mut doc) = idx.get_doc_by_id(doc_id)? else {
-        return Ok(false);
+        return Ok(None);
     };
     doc.body = Some(body);
     idx.upsert(&doc, writer)?;
-    Ok(true)
+    Ok(Some(doc))
 }
 
 async fn apply_delete_source_instance(
@@ -432,6 +484,32 @@ async fn do_commit(
         let _ = reply.send(*generation);
     }
     Ok(())
+}
+
+fn upserted_doc_from(doc: &Document) -> UpsertedDoc {
+    UpsertedDoc {
+        doc_id: doc.id.0.clone(),
+        source_instance: doc.source_instance.clone(),
+        mtime: doc.mtime,
+        // `Document` carries no MIME today; reserved so the broadcast
+        // surface stays stable when extractors start preserving it.
+        mime: None,
+        body: doc.body.clone(),
+    }
+}
+
+fn flush_post_commit(
+    pending_batch: &mut MutationBatch,
+    generation: u64,
+    broadcaster: &Arc<dyn MutationBroadcaster>,
+) {
+    if pending_batch.is_empty() {
+        return;
+    }
+    pending_batch.generation = generation;
+    let batch = std::mem::take(pending_batch);
+    let bcaster = Arc::clone(broadcaster);
+    tokio::task::spawn_blocking(move || bcaster.broadcast(&batch));
 }
 
 pub fn fs_doc_id(path: &std::path::Path) -> String {

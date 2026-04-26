@@ -1,1 +1,88 @@
 #![allow(dead_code)]
+
+use std::sync::Arc;
+
+use serde::{Deserialize, Serialize};
+
+/// One document upserted in a single committed batch. The fields are
+/// the minimum a downstream consumer (e.g. a vector-store backfill
+/// worker) needs to decide whether to re-embed the doc and to attach
+/// the resulting vector to the right primary key.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UpsertedDoc {
+    pub doc_id: String,
+    pub source_instance: String,
+    pub mtime: i64,
+    pub mime: Option<String>,
+    pub body: Option<String>,
+}
+
+/// All mutations that landed in a single committed generation.
+/// `generation` is the writer-service generation counter value
+/// AFTER the commit succeeded; consumers can use it as a watermark
+/// for resumable backfill journals.
+#[derive(Clone, Debug, Default)]
+pub struct MutationBatch {
+    pub upserts: Vec<UpsertedDoc>,
+    pub deletes: Vec<String>,
+    pub generation: u64,
+}
+
+impl MutationBatch {
+    pub fn is_empty(&self) -> bool {
+        self.upserts.is_empty() && self.deletes.is_empty()
+    }
+}
+
+/// Implemented by sinks that want to react to committed index
+/// mutations. The writer service invokes `broadcast` from a
+/// `tokio::task::spawn_blocking` after every successful commit, so
+/// implementations may do synchronous IO (sqlite writes, embedding
+/// queue pushes) without stalling the writer task.
+pub trait MutationBroadcaster: Send + Sync {
+    fn broadcast(&self, batch: &MutationBatch);
+}
+
+/// Default broadcaster used when no consumer is wired in.
+pub struct NoopBroadcaster;
+
+impl MutationBroadcaster for NoopBroadcaster {
+    fn broadcast(&self, _batch: &MutationBatch) {}
+}
+
+/// Fan-out broadcaster. A panic in one inner broadcaster does not
+/// prevent the others from running.
+pub struct MultiBroadcaster {
+    inner: Vec<Arc<dyn MutationBroadcaster>>,
+}
+
+impl MultiBroadcaster {
+    pub fn new(inner: Vec<Arc<dyn MutationBroadcaster>>) -> Self {
+        Self { inner }
+    }
+
+    pub fn push(&mut self, b: Arc<dyn MutationBroadcaster>) {
+        self.inner.push(b);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+}
+
+impl MutationBroadcaster for MultiBroadcaster {
+    fn broadcast(&self, batch: &MutationBatch) {
+        for b in &self.inner {
+            let b = Arc::clone(b);
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                b.broadcast(batch);
+            }));
+        }
+    }
+}
+
+/// Marker trait for approximate-nearest-neighbour search backends.
+/// The full surface lands in WD-T7; defining the trait here keeps
+/// `lixun-fusion` and the future ANN-providing plugin from depending
+/// on each other.
+pub trait AnnHandle: Send + Sync {}
