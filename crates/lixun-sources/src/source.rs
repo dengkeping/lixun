@@ -120,6 +120,23 @@ pub trait IndexerSource: Send + Sync {
     fn row_menu(&self) -> RowMenuDef {
         RowMenuDef::empty()
     }
+
+    /// Optional post-commit mutation broadcaster contributed by this
+    /// source. The daemon collects every `Some` returned across all
+    /// registered sources and routes committed mutations to each of
+    /// them via [`lixun_mutation::MultiBroadcaster`]. Default returns
+    /// `None`, so existing sources need no changes.
+    fn broadcaster(&self) -> Option<Arc<dyn lixun_mutation::MutationBroadcaster>> {
+        None
+    }
+
+    /// Optional ANN handle contributed by this source. The daemon
+    /// uses the first `Some` it finds (single ANN provider per
+    /// process); the hybrid search layer consults it alongside the
+    /// lexical index. Default returns `None`.
+    fn ann_handle(&self) -> Option<Arc<dyn lixun_mutation::AnnHandle>> {
+        None
+    }
 }
 
 pub struct PluginBuildContext {
