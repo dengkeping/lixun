@@ -78,11 +78,7 @@ impl FrecencyStore {
                     }
                 },
                 Err(e) => {
-                    tracing::warn!(
-                        "frecency: failed to read {:?}: {}; starting empty",
-                        path,
-                        e
-                    );
+                    tracing::warn!("frecency: failed to read {:?}: {}; starting empty", path, e);
                     return Ok(Self::default());
                 }
             }

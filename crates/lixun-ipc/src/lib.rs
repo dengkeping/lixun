@@ -78,12 +78,23 @@ pub enum Request {
         #[serde(default)]
         explain: bool,
     },
-    Reindex { paths: Vec<PathBuf> },
+    Reindex {
+        paths: Vec<PathBuf>,
+    },
     Status,
-    RecordClick { doc_id: String },
-    RecordQuery { q: String },
-    RecordQueryClick { doc_id: String, query: String },
-    SearchHistory { limit: u32 },
+    RecordClick {
+        doc_id: String,
+    },
+    RecordQuery {
+        q: String,
+    },
+    RecordQueryClick {
+        doc_id: String,
+        query: String,
+    },
+    SearchHistory {
+        limit: u32,
+    },
     /// Open a preview window for the given hit. The GUI embeds the
     /// full Hit rather than a DocId because app / calculator /
     /// recent-query hits never reach Tantivy and so cannot be
@@ -270,11 +281,7 @@ pub(crate) fn get_uid_fallback() -> u32 {
     if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
         for line in status.lines() {
             if let Some(rest) = line.strip_prefix("Uid:")
-                && let Ok(uid) = rest
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or("0")
-                    .parse::<u32>()
+                && let Ok(uid) = rest.split_whitespace().next().unwrap_or("0").parse::<u32>()
             {
                 return uid;
             }

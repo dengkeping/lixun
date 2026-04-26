@@ -16,7 +16,6 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::RwLock;
 
-
 mod frecency;
 mod query_latch;
 mod query_log;
@@ -94,10 +93,7 @@ fn format_breakdown(b: &lixun_core::ScoreBreakdown, _h: &lixun_core::Hit) -> Str
 /// Without the tiebreaker, near-ties (or NaN scores) produce
 /// non-deterministic order, which propagates into Top Hit selection
 /// because `select_top_hit` reads `hits[0]` and `hits[1]` directly.
-fn compare_hits_for_ranking(
-    a: &lixun_core::Hit,
-    b: &lixun_core::Hit,
-) -> std::cmp::Ordering {
+fn compare_hits_for_ranking(a: &lixun_core::Hit, b: &lixun_core::Hit) -> std::cmp::Ordering {
     b.score
         .partial_cmp(&a.score)
         .unwrap_or(std::cmp::Ordering::Equal)
@@ -199,10 +195,9 @@ async fn main() -> Result<()> {
 
     let extract_caps_arc = Arc::new(extract_caps.clone());
     let _ = config.extractor_caps.set(Arc::clone(&extract_caps_arc));
-    let ocr_enqueue_arc: Option<Arc<dyn lixun_sources::OcrEnqueue>> =
-        ocr_queue.as_ref().map(|q| {
-            Arc::new(OcrQueueEnqueuer(Arc::clone(q))) as Arc<dyn lixun_sources::OcrEnqueue>
-        });
+    let ocr_enqueue_arc: Option<Arc<dyn lixun_sources::OcrEnqueue>> = ocr_queue
+        .as_ref()
+        .map(|q| Arc::new(OcrQueueEnqueuer(Arc::clone(q))) as Arc<dyn lixun_sources::OcrEnqueue>);
     if let Some(enq) = &ocr_enqueue_arc {
         let _ = config.ocr_enqueue.set(Arc::clone(enq));
     }
@@ -300,7 +295,8 @@ async fn main() -> Result<()> {
     let global_toggle_rx = hotkeys::spawn_global_toggle_listener(
         shared_config.keybindings.global_toggle.clone(),
         state_dir.clone(),
-    ).await;
+    )
+    .await;
     let mut global_toggle_rx = match global_toggle_rx {
         Ok(rx) => Some(rx),
         Err(e) => {
@@ -356,7 +352,8 @@ async fn main() -> Result<()> {
 
     let indexer_sink = Arc::new(lixun_indexer::WriterSink::new(mutation_tx.clone()));
     {
-        let tick_handles = lixun_indexer::tick_scheduler::spawn_all(&registry, indexer_sink.clone());
+        let tick_handles =
+            lixun_indexer::tick_scheduler::spawn_all(&registry, indexer_sink.clone());
         tracing::info!(
             "tick scheduler: {} source instance(s) with tick_interval",
             tick_handles.len()
@@ -673,11 +670,17 @@ async fn handle_client(
         Request::Show => gui_result_to_response(gui_control.dispatch(GuiCommand::Show).await),
         Request::Hide => gui_result_to_response(gui_control.dispatch(GuiCommand::Hide).await),
         Request::Search { q, limit, explain } => {
-            let query_obj = lixun_core::Query { text: q.clone(), limit };
+            let query_obj = lixun_core::Query {
+                text: q.clone(),
+                limit,
+            };
             // Dual-path to avoid breakdown cost when the caller doesn't ask
             // for explanations. Both paths produce the same `hits` vec and
             // differ only in whether `breakdowns` is populated (T6).
-            let search_result: Result<(Vec<lixun_core::Hit>, Vec<lixun_core::ScoreBreakdown>), anyhow::Error> = if explain {
+            let search_result: Result<
+                (Vec<lixun_core::Hit>, Vec<lixun_core::ScoreBreakdown>),
+                anyhow::Error,
+            > = if explain {
                 search.search_with_breakdown(&query_obj).await.map(|pairs| {
                     let mut hits_v = Vec::with_capacity(pairs.len());
                     let mut brk_v = Vec::with_capacity(pairs.len());
@@ -706,9 +709,7 @@ async fn handle_client(
                             let stage2 = frec * lat;
                             let clamped = clamp_stage2_mult(stage2, total_cap);
                             hit.score *= clamped;
-                            if explain
-                                && let Some(b) = breakdowns.get_mut(i)
-                            {
+                            if explain && let Some(b) = breakdowns.get_mut(i) {
                                 b.frecency_mult = frec;
                                 b.latch_mult = lat;
                                 b.stage2_clamped = clamped;
@@ -769,10 +770,15 @@ async fn handle_client(
                         let mut idx: Vec<usize> = (0..hits.len()).collect();
                         idx.sort_by(|&a, &b| compare_hits_for_ranking(&hits[a], &hits[b]));
                         let hits_sorted: Vec<_> = idx.iter().map(|&i| hits[i].clone()).collect();
-                        let brk_sorted: Vec<_> = idx.iter().map(|&i| breakdowns[i].clone()).collect();
+                        let brk_sorted: Vec<_> =
+                            idx.iter().map(|&i| breakdowns[i].clone()).collect();
                         hits = hits_sorted;
                         breakdowns = brk_sorted;
-                        breakdowns.iter().zip(hits.iter()).map(|(b, h)| format_breakdown(b, h)).collect()
+                        breakdowns
+                            .iter()
+                            .zip(hits.iter())
+                            .map(|(b, h)| format_breakdown(b, h))
+                            .collect()
                     } else {
                         hits.sort_by(compare_hits_for_ranking);
                         Vec::new()
@@ -839,10 +845,7 @@ async fn handle_client(
                     .reindex_started
                     .map(|t| t.to_rfc3339())
                     .unwrap_or_else(|| "unknown".into());
-                Response::Error(format!(
-                    "Reindex already in progress (started {})",
-                    started
-                ))
+                Response::Error(format!("Reindex already in progress (started {})", started))
             } else {
                 let stats_for_task = Arc::clone(&stats);
                 let mutation_tx_for_task = mutation_tx.clone();
@@ -881,7 +884,11 @@ async fn handle_client(
                     memory: Some(collect_memory_stats()),
                     reindex_in_progress: s.reindex_in_progress,
                     reindex_started: s.reindex_started,
-                    ocr: collect_ocr_stats(ocr_queue.as_deref(), &ocr_worker_stats, OCR_MAX_ATTEMPTS),
+                    ocr: collect_ocr_stats(
+                        ocr_queue.as_deref(),
+                        &ocr_worker_stats,
+                        OCR_MAX_ATTEMPTS,
+                    ),
                 }
             }
         }
@@ -1007,9 +1014,9 @@ fn register_plugin_sources(
         let Some(raw) = config.plugin_sections.get(section) else {
             continue;
         };
-        let instances = factory.build(raw, &ctx).map_err(|e| {
-            anyhow::anyhow!("plugin factory '{}' failed to build: {}", section, e)
-        })?;
+        let instances = factory
+            .build(raw, &ctx)
+            .map_err(|e| anyhow::anyhow!("plugin factory '{}' failed to build: {}", section, e))?;
         let count = instances.len();
         for inst in instances {
             registry.register(inst.instance_id, state_dir_root, inst.source);
@@ -1227,9 +1234,8 @@ fn spawn_cache_sweep_worker(
         zombie_max_attempts: OCR_MAX_ATTEMPTS,
         zombie_max_age: std::time::Duration::from_secs(30 * 86_400),
     };
-    let reaper: Option<Arc<dyn lixun_indexer::cache_sweep::ZombieReaper>> = queue.map(|q| {
-        Arc::new(OcrQueueReaper(q)) as Arc<dyn lixun_indexer::cache_sweep::ZombieReaper>
-    });
+    let reaper: Option<Arc<dyn lixun_indexer::cache_sweep::ZombieReaper>> = queue
+        .map(|q| Arc::new(OcrQueueReaper(q)) as Arc<dyn lixun_indexer::cache_sweep::ZombieReaper>);
     let handle = lixun_indexer::cache_sweep::spawn(cfg, reaper);
     std::mem::forget(handle);
 }

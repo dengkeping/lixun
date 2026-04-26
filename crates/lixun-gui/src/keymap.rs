@@ -67,9 +67,7 @@ fn jump_to_next_category(
             .and_then(|o| o.downcast::<gtk::StringObject>().ok())
             .and_then(|s| {
                 let id = s.string().to_string();
-                with_cached_hits(|hits| {
-                    hits.iter().find(|h| h.id.0 == id).map(|h| h.category)
-                })
+                with_cached_hits(|hits| hits.iter().find(|h| h.id.0 == id).map(|h| h.category))
             });
         if cat != current_cat {
             selection.set_selected(i);
@@ -166,14 +164,22 @@ pub(crate) fn install_keyboard_handler(
     let key_controller = gtk::EventControllerKey::new();
     key_controller.set_propagation_phase(gtk::PropagationPhase::Capture);
     key_controller.connect_key_pressed(clone!(
-        #[strong] selection,
-        #[strong] filter_model,
-        #[strong] list_view,
-        #[strong] window,
-        #[strong] entry,
-        #[strong] chips,
-        #[strong] keybindings,
-        #[strong] controller,
+        #[strong]
+        selection,
+        #[strong]
+        filter_model,
+        #[strong]
+        list_view,
+        #[strong]
+        window,
+        #[strong]
+        entry,
+        #[strong]
+        chips,
+        #[strong]
+        keybindings,
+        #[strong]
+        controller,
         move |_, key, _keycode, state| {
             // Hard rule: printable unmodified keys belong to the focused
             // Entry. Forward them before any accel dispatch can swallow
@@ -239,145 +245,150 @@ pub(crate) fn install_keyboard_handler(
             let ctrl = state.contains(gtk::gdk::ModifierType::CONTROL_MASK);
             let shift = state.contains(gtk::gdk::ModifierType::SHIFT_MASK);
             if accel_matches(&keybindings.previous_result, key, state) {
-                    // Up on empty entry = let entry_key_controller handle history
-                    if entry.text().is_empty() && entry_has_focus(&entry, &window) {
-                        return glib::signal::Propagation::Proceed;
-                    }
-                    // Defensive: no results, no list to navigate. Pin focus
-                    // in the entry so GTK's default Up/Down focus-chain
-                    // cannot warp focus to a sibling widget (the list is
-                    // hidden, chip row, etc.) leaving the user stuck in
-                    // a widget that doesn't accept printable keys.
-                    // BUG-5 regression guard.
-                    if filter_model.n_items() == 0 {
-                        entry.grab_focus();
-                        return glib::signal::Propagation::Stop;
-                    }
-                    let entry_had_focus = entry_has_focus(&entry, &window);
-                    if ctrl {
-                        jump_to_next_category(&selection, &filter_model, -1);
-                        let target = selection.selected();
-                        if target != gtk::INVALID_LIST_POSITION {
-                            scroll_with_margin(&list_view, &selection, target, -1);
-                            controller.mark_user_selected();
-                        }
-                        if entry_had_focus {
-                            list_view.grab_focus();
-                        }
-                        return glib::signal::Propagation::Stop;
-                    }
-                    let current = selection.selected();
-                    if current > 0 {
-                        let target = current - 1;
-                        selection.set_selected(target);
-                        controller.mark_user_selected();
+                // Up on empty entry = let entry_key_controller handle history
+                if entry.text().is_empty() && entry_has_focus(&entry, &window) {
+                    return glib::signal::Propagation::Proceed;
+                }
+                // Defensive: no results, no list to navigate. Pin focus
+                // in the entry so GTK's default Up/Down focus-chain
+                // cannot warp focus to a sibling widget (the list is
+                // hidden, chip row, etc.) leaving the user stuck in
+                // a widget that doesn't accept printable keys.
+                // BUG-5 regression guard.
+                if filter_model.n_items() == 0 {
+                    entry.grab_focus();
+                    return glib::signal::Propagation::Stop;
+                }
+                let entry_had_focus = entry_has_focus(&entry, &window);
+                if ctrl {
+                    jump_to_next_category(&selection, &filter_model, -1);
+                    let target = selection.selected();
+                    if target != gtk::INVALID_LIST_POSITION {
                         scroll_with_margin(&list_view, &selection, target, -1);
-                        if entry_had_focus {
-                            list_view.grab_focus();
-                        }
-                    } else {
-                        // Already at the top row; Up returns focus to the Entry.
-                        entry.grab_focus();
-                    }
-                    glib::signal::Propagation::Stop
-            } else if accel_matches(&keybindings.next_result, key, state) {
-                    // BUG-5 regression guard: same defensive pin as Up.
-                    if filter_model.n_items() == 0 {
-                        entry.grab_focus();
-                        return glib::signal::Propagation::Stop;
-                    }
-                    let entry_had_focus = entry_has_focus(&entry, &window);
-                    if ctrl {
-                        jump_to_next_category(&selection, &filter_model, 1);
-                        let target = selection.selected();
-                        if target != gtk::INVALID_LIST_POSITION {
-                            scroll_with_margin(&list_view, &selection, target, 1);
-                            controller.mark_user_selected();
-                        }
-                        if entry_had_focus {
-                            list_view.grab_focus();
-                        }
-                        return glib::signal::Propagation::Stop;
-                    }
-                    let current = selection.selected();
-                    let n = selection.n_items();
-                    if current + 1 < n {
-                        let target = current + 1;
-                        selection.set_selected(target);
                         controller.mark_user_selected();
-                        scroll_with_margin(&list_view, &selection, target, 1);
                     }
-                    if entry_had_focus && n > 0 {
+                    if entry_had_focus {
                         list_view.grab_focus();
                     }
-                    glib::signal::Propagation::Stop
+                    return glib::signal::Propagation::Stop;
+                }
+                let current = selection.selected();
+                if current > 0 {
+                    let target = current - 1;
+                    selection.set_selected(target);
+                    controller.mark_user_selected();
+                    scroll_with_margin(&list_view, &selection, target, -1);
+                    if entry_had_focus {
+                        list_view.grab_focus();
+                    }
+                } else {
+                    // Already at the top row; Up returns focus to the Entry.
+                    entry.grab_focus();
+                }
+                glib::signal::Propagation::Stop
+            } else if accel_matches(&keybindings.next_result, key, state) {
+                // BUG-5 regression guard: same defensive pin as Up.
+                if filter_model.n_items() == 0 {
+                    entry.grab_focus();
+                    return glib::signal::Propagation::Stop;
+                }
+                let entry_had_focus = entry_has_focus(&entry, &window);
+                if ctrl {
+                    jump_to_next_category(&selection, &filter_model, 1);
+                    let target = selection.selected();
+                    if target != gtk::INVALID_LIST_POSITION {
+                        scroll_with_margin(&list_view, &selection, target, 1);
+                        controller.mark_user_selected();
+                    }
+                    if entry_had_focus {
+                        list_view.grab_focus();
+                    }
+                    return glib::signal::Propagation::Stop;
+                }
+                let current = selection.selected();
+                let n = selection.n_items();
+                if current + 1 < n {
+                    let target = current + 1;
+                    selection.set_selected(target);
+                    controller.mark_user_selected();
+                    scroll_with_margin(&list_view, &selection, target, 1);
+                }
+                if entry_had_focus && n > 0 {
+                    list_view.grab_focus();
+                }
+                glib::signal::Propagation::Stop
             } else if accel_matches(&keybindings.close, key, state) {
-                    controller.hide();
-                    glib::signal::Propagation::Stop
+                controller.hide();
+                glib::signal::Propagation::Stop
             } else if accel_matches(&keybindings.primary_action, key, state)
                 || accel_matches(&keybindings.secondary_action, key, state)
             {
-                    let mut should_hide = true;
-                    let query_at_click = entry.text().to_string();
-                    selected_hit_in(&selection, &filter_model, |hit| {
-                        if let Action::ReplaceQuery { q } = &hit.action {
-                            entry.set_text(q);
-                            entry.set_position(-1);
-                            entry.grab_focus();
-                            should_hide = false;
-                            return;
-                        }
-                        dispatch_click_pair(&hit.id.0, &query_at_click);
-                        let result = if accel_matches(&keybindings.secondary_action, key, state) || shift || ctrl {
-                            execute_secondary_action(hit)
-                        } else {
-                            execute_action(hit)
-                        };
-                        if let Err(e) = result {
-                            tracing::error!("Action failed: {}", e);
-                        }
-                    });
-                    // Launch-completing action: drop the session cache
-                    // so the next show is a fresh launcher.
-                    // ReplaceQuery keeps the launcher visible and is
-                    // mid-session, so it must NOT clear.
-                    if should_hide {
-                        controller.clear_and_hide();
+                let mut should_hide = true;
+                let query_at_click = entry.text().to_string();
+                selected_hit_in(&selection, &filter_model, |hit| {
+                    if let Action::ReplaceQuery { q } = &hit.action {
+                        entry.set_text(q);
+                        entry.set_position(-1);
+                        entry.grab_focus();
+                        should_hide = false;
+                        return;
                     }
-                    glib::signal::Propagation::Stop
+                    dispatch_click_pair(&hit.id.0, &query_at_click);
+                    let result = if accel_matches(&keybindings.secondary_action, key, state)
+                        || shift
+                        || ctrl
+                    {
+                        execute_secondary_action(hit)
+                    } else {
+                        execute_action(hit)
+                    };
+                    if let Err(e) = result {
+                        tracing::error!("Action failed: {}", e);
+                    }
+                });
+                // Launch-completing action: drop the session cache
+                // so the next show is a fresh launcher.
+                // ReplaceQuery keeps the launcher visible and is
+                // mid-session, so it must NOT clear.
+                if should_hide {
+                    controller.clear_and_hide();
+                }
+                glib::signal::Propagation::Stop
             } else if accel_matches(&keybindings.copy, key, state) {
-                    // Copy is treated as a completed action (the user
-                    // got what they wanted — a clipboard value), so
-                    // clear the session on hide. But copy itself does
-                    // not close the launcher today; wait for user's
-                    // next Escape/focus-loss, which will hit hide()
-                    // and persist the session again. That's the
-                    // current UX and this commit does not change it.
-                    selected_hit_in(&selection, &filter_model, copy_to_clipboard);
-                    glib::signal::Propagation::Stop
-            } else if accel_matches(&keybindings.quick_look, key, state) && !entry_has_focus(&entry, &window) {
-                    // Only trigger when focus is NOT in entry (i.e. list is focused)
-                    // so space can still be typed into the search field.
-                    let monitor = current_monitor_connector(&window);
-                    selected_hit_in(&selection, &filter_model, |hit| {
-                        send_preview_request(hit, monitor.clone());
-                    });
-                    glib::signal::Propagation::Stop
+                // Copy is treated as a completed action (the user
+                // got what they wanted — a clipboard value), so
+                // clear the session on hide. But copy itself does
+                // not close the launcher today; wait for user's
+                // next Escape/focus-loss, which will hit hide()
+                // and persist the session again. That's the
+                // current UX and this commit does not change it.
+                selected_hit_in(&selection, &filter_model, copy_to_clipboard);
+                glib::signal::Propagation::Stop
+            } else if accel_matches(&keybindings.quick_look, key, state)
+                && !entry_has_focus(&entry, &window)
+            {
+                // Only trigger when focus is NOT in entry (i.e. list is focused)
+                // so space can still be typed into the search field.
+                let monitor = current_monitor_connector(&window);
+                selected_hit_in(&selection, &filter_model, |hit| {
+                    send_preview_request(hit, monitor.clone());
+                });
+                glib::signal::Propagation::Stop
             } else if accel_matches(&keybindings.filter_all, key, state) {
-                    chips.activate_index(0);
-                    glib::signal::Propagation::Stop
+                chips.activate_index(0);
+                glib::signal::Propagation::Stop
             } else if accel_matches(&keybindings.filter_apps, key, state) {
-                    chips.activate_index(1);
-                    glib::signal::Propagation::Stop
+                chips.activate_index(1);
+                glib::signal::Propagation::Stop
             } else if accel_matches(&keybindings.filter_files, key, state) {
-                    chips.activate_index(2);
-                    glib::signal::Propagation::Stop
+                chips.activate_index(2);
+                glib::signal::Propagation::Stop
             } else if accel_matches(&keybindings.filter_mail, key, state) {
-                    chips.activate_index(3);
-                    glib::signal::Propagation::Stop
+                chips.activate_index(3);
+                glib::signal::Propagation::Stop
             } else if accel_matches(&keybindings.filter_attachments, key, state) {
-                    chips.activate_index(4);
-                    glib::signal::Propagation::Stop
+                chips.activate_index(4);
+                glib::signal::Propagation::Stop
             } else {
                 glib::signal::Propagation::Proceed
             }
@@ -392,34 +403,42 @@ pub(crate) fn install_keyboard_handler(
     let entry_key_controller = gtk::EventControllerKey::new();
     entry_key_controller.set_propagation_phase(gtk::PropagationPhase::Capture);
     entry_key_controller.connect_key_pressed(clone!(
-        #[strong] entry,
-        #[strong] selection,
-        #[strong] model,
-        #[strong] list_view,
-        #[strong] status_bar,
-        #[strong] keybindings,
-        #[strong] scrolled,
-        #[strong] chips_container,
+        #[strong]
+        entry,
+        #[strong]
+        selection,
+        #[strong]
+        model,
+        #[strong]
+        list_view,
+        #[strong]
+        status_bar,
+        #[strong]
+        keybindings,
+        #[strong]
+        scrolled,
+        #[strong]
+        chips_container,
         move |_, key, _keycode, state| {
             if accel_matches(&keybindings.history_up, key, state) && entry.text().is_empty() {
-                    let queries = request_search_history(10);
-                    if queries.is_empty() {
-                        return glib::signal::Propagation::Stop;
-                    }
-                    let hits = synthetic_history_hits(&queries);
-                    update_results(&model, &selection, &hits, None);
-                    selection.set_selected(0);
-                    list_view.scroll_to(0, gtk::ListScrollFlags::NONE, None);
-                    status_bar.hide();
-                    // The list_view/scrolled are hidden by default on
-                    // empty-entry state (window.rs:455). Force them
-                    // visible here, otherwise the synthetic history
-                    // hits are loaded into the model silently and the
-                    // user sees nothing.
-                    chips_container.set_visible(true);
-                    scrolled.set_visible(true);
-                    scrolled.set_vexpand(true);
-                    glib::signal::Propagation::Stop
+                let queries = request_search_history(10);
+                if queries.is_empty() {
+                    return glib::signal::Propagation::Stop;
+                }
+                let hits = synthetic_history_hits(&queries);
+                update_results(&model, &selection, &hits, None);
+                selection.set_selected(0);
+                list_view.scroll_to(0, gtk::ListScrollFlags::NONE, None);
+                status_bar.hide();
+                // The list_view/scrolled are hidden by default on
+                // empty-entry state (window.rs:455). Force them
+                // visible here, otherwise the synthetic history
+                // hits are loaded into the model silently and the
+                // user sees nothing.
+                chips_container.set_visible(true);
+                scrolled.set_visible(true);
+                scrolled.set_vexpand(true);
+                glib::signal::Propagation::Stop
             } else {
                 glib::signal::Propagation::Proceed
             }

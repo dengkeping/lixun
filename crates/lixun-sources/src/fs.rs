@@ -492,8 +492,7 @@ impl FsSource {
                         (None, false)
                     } else if meta.size <= max_size {
                         let enq_ref = enqueue.as_ref().map(|a| a.as_ref() as &dyn OcrEnqueue);
-                        let body_ref =
-                            body_checker.as_ref().map(|a| a.as_ref() as &dyn HasBody);
+                        let body_ref = body_checker.as_ref().map(|a| a.as_ref() as &dyn HasBody);
                         match Self::extract_content(
                             &meta.path,
                             &caps,
@@ -783,8 +782,7 @@ mod tests {
             let mock: Arc<MockEnqueue> = Arc::new(MockEnqueue::default());
             let sink: Arc<dyn OcrEnqueue> = mock.clone();
 
-            let _ =
-                FsSource::extract_content(&png, &caps, Some(sink.as_ref()), None, 0).unwrap();
+            let _ = FsSource::extract_content(&png, &caps, Some(sink.as_ref()), None, 0).unwrap();
             assert!(
                 mock.calls.lock().unwrap().is_empty(),
                 "no enqueue when ocr_enabled=false"
@@ -793,8 +791,7 @@ mod tests {
             let mut caps_no_tess = ExtractorCapabilities::all_available_no_timeout();
             caps_no_tess.has_tesseract = false;
             let caps = Arc::new(caps_no_tess);
-            let _ =
-                FsSource::extract_content(&png, &caps, Some(sink.as_ref()), None, 0).unwrap();
+            let _ = FsSource::extract_content(&png, &caps, Some(sink.as_ref()), None, 0).unwrap();
             assert!(
                 mock.calls.lock().unwrap().is_empty(),
                 "no enqueue when has_tesseract=false"
@@ -849,14 +846,9 @@ mod tests {
             body.has_body_for.insert(canonical_fs_doc_id(&png));
             let body: Arc<dyn HasBody> = Arc::new(body);
 
-            let _ = FsSource::extract_content(
-                &png,
-                &caps,
-                Some(sink.as_ref()),
-                Some(body.as_ref()),
-                0,
-            )
-            .unwrap();
+            let _ =
+                FsSource::extract_content(&png, &caps, Some(sink.as_ref()), Some(body.as_ref()), 0)
+                    .unwrap();
             assert!(
                 mock_enq.calls.lock().unwrap().is_empty(),
                 "body already indexed must short-circuit the enqueue",

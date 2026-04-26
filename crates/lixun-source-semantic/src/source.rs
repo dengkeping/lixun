@@ -76,8 +76,7 @@ impl IndexerSource for SemanticSource {
                 about: "Semantic embedding management.".to_string(),
                 subverbs: vec![CliVerb {
                     name: VERB_BACKFILL.to_string(),
-                    about: "Re-embed every document currently in the lexical index."
-                        .to_string(),
+                    about: "Re-embed every document currently in the lexical index.".to_string(),
                     subverbs: Vec::new(),
                     args: Vec::new(),
                 }],
@@ -90,9 +89,8 @@ impl IndexerSource for SemanticSource {
         &'a self,
         verb_path: &'a [String],
         _args: &'a serde_json::Value,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<serde_json::Value>> + Send + 'a>,
-    > {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value>> + Send + 'a>>
+    {
         Box::pin(async move {
             match verb_path
                 .iter()

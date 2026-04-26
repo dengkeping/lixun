@@ -527,8 +527,9 @@ Exec=/usr/bin/app2
         let names: Vec<_> = docs.iter().map(|doc| &doc.title).collect();
         assert!(names.contains(&&"App One".to_string()));
         assert!(names.contains(&&"App Two".to_string()));
-        assert!(docs
-            .iter()
-            .all(|doc| doc.kind_label.as_deref() == Some("Application")));
+        assert!(
+            docs.iter()
+                .all(|doc| doc.kind_label.as_deref() == Some("Application"))
+        );
     }
 }

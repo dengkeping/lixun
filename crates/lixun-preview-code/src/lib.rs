@@ -46,8 +46,8 @@ const STRONG_EXTENSIONS: &[&str] = &[
     "rs", "py", "js", "ts", "jsx", "tsx", "go", "c", "cc", "cpp", "cxx", "h", "hh", "hpp", "hxx",
     "java", "kt", "rb", "sh", "bash", "zsh", "fish", "toml", "yaml", "yml", "json", "xml", "html",
     "htm", "css", "scss", "sass", "sql", "lua", "pl", "pm", "swift", "zig", "nim", "hs", "ml",
-    "mli", "scala", "clj", "cljs", "ex", "exs", "erl", "dart", "md", "markdown", "vim", "r",
-    "php", "cs", "fs", "fsx",
+    "mli", "scala", "clj", "cljs", "ex", "exs", "erl", "dart", "md", "markdown", "vim", "r", "php",
+    "cs", "fs", "fsx",
 ];
 
 pub struct CodePreview;
@@ -105,9 +105,7 @@ impl PreviewPlugin for CodePreview {
 
         let mut full_markup = markup;
         if truncated {
-            full_markup.push_str(
-                "\n\n<i>… [truncated at 50 KiB for preview]</i>\n",
-            );
+            full_markup.push_str("\n\n<i>… [truncated at 50 KiB for preview]</i>\n");
         }
 
         let label = gtk::Label::new(None);
@@ -166,11 +164,7 @@ fn read_capped(path: &std::path::Path) -> anyhow::Result<(String, bool)> {
     Ok((String::from_utf8_lossy(&buf).into_owned(), truncated))
 }
 
-fn pick_syntax<'a>(
-    set: &'a SyntaxSet,
-    path: &std::path::Path,
-    body: &str,
-) -> &'a SyntaxReference {
+fn pick_syntax<'a>(set: &'a SyntaxSet, path: &std::path::Path, body: &str) -> &'a SyntaxReference {
     if let Some(ext) = path.extension().and_then(|e| e.to_str())
         && let Some(syntax) = set.find_syntax_by_extension(&ext.to_ascii_lowercase())
     {
@@ -370,7 +364,10 @@ mod tests {
         let set = ThemeSet::load_defaults();
         let toml_value = toml::Value::Table({
             let mut t = toml::map::Map::new();
-            t.insert("theme".into(), toml::Value::String("Solarized (light)".into()));
+            t.insert(
+                "theme".into(),
+                toml::Value::String("Solarized (light)".into()),
+            );
             t
         });
         let cfg = PreviewPluginCfg {

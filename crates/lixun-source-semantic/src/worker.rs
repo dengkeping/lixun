@@ -192,9 +192,7 @@ impl WorkerThread {
                 }
             },
             Err(e) => {
-                tracing::error!(
-                    "semantic embed worker: text embedder mutex poisoned: {e}"
-                );
+                tracing::error!("semantic embed worker: text embedder mutex poisoned: {e}");
                 return;
             }
         };
@@ -242,11 +240,7 @@ impl WorkerThread {
 }
 
 fn classify(doc: &UpsertedDoc) -> Channel {
-    if doc
-        .mime
-        .as_deref()
-        .is_some_and(|m| m.starts_with("image/"))
-    {
+    if doc.mime.as_deref().is_some_and(|m| m.starts_with("image/")) {
         return Channel::Skip;
     }
     match doc.body.as_deref() {
@@ -286,9 +280,7 @@ pub async fn start_backfill(
     for doc_id in all_ids {
         total += 1;
         let already = match journal.lock() {
-            Ok(j) => j
-                .was_embedded(&doc_id, CHANNEL_TEXT)
-                .unwrap_or(false),
+            Ok(j) => j.was_embedded(&doc_id, CHANNEL_TEXT).unwrap_or(false),
             Err(_) => false,
         };
         if already {
@@ -332,10 +324,6 @@ pub async fn start_backfill(
         let _ = j.meta_set("last_backfill_submitted", &submitted.to_string());
     }
 
-    tracing::info!(
-        total,
-        submitted,
-        "semantic backfill: enumeration complete"
-    );
+    tracing::info!(total, submitted, "semantic backfill: enumeration complete");
     Ok(())
 }

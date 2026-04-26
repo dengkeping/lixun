@@ -12,19 +12,20 @@
 //! subprocess itself plus the tempfile scratch needed to hand the
 //! input to those binaries.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
-use crate::shell::{self, CommandRunner, SystemRunner};
 use crate::ExtractorCapabilities;
+use crate::shell::{self, CommandRunner, SystemRunner};
 
 /// Extensions eligible for OCR enqueue (DB-13). Single source of
 /// truth; the indexer consults this to decide whether an empty
 /// extraction result should become a queued OCR job.
-pub const OCR_CANDIDATES: &[&str] =
-    &["pdf", "png", "jpg", "jpeg", "gif", "bmp", "webp", "tif", "tiff"];
+pub const OCR_CANDIDATES: &[&str] = &[
+    "pdf", "png", "jpg", "jpeg", "gif", "bmp", "webp", "tif", "tiff",
+];
 
 /// `true` when `ext` (lowercase, no dot) is in [`OCR_CANDIDATES`].
 pub fn is_ocr_candidate(ext: &str) -> bool {
@@ -145,15 +146,21 @@ pub fn ocr_pdf_pages_with(
         runner.run(
             "pdftoppm",
             &[
-                "-r", "200", "-png", "-f", &page_str, "-l", &page_str, pdf_path_str, stem_str,
+                "-r",
+                "200",
+                "-png",
+                "-f",
+                &page_str,
+                "-l",
+                &page_str,
+                pdf_path_str,
+                stem_str,
             ],
             None,
         )?;
 
         let page_png = pdftoppm_output_path(&stem, page, limit);
-        let page_png_str = page_png
-            .to_str()
-            .context("non-UTF8 pdftoppm output path")?;
+        let page_png_str = page_png.to_str().context("non-UTF8 pdftoppm output path")?;
         let text = run_tesseract(runner, Path::new(page_png_str), langs)?;
         let trimmed = text.trim();
         if !trimmed.is_empty() {
@@ -214,7 +221,11 @@ pub fn run_ocr_job_with(
     }
 }
 
-fn run_tesseract(runner: &dyn CommandRunner, image_path: &Path, langs: &[String]) -> Result<String> {
+fn run_tesseract(
+    runner: &dyn CommandRunner,
+    image_path: &Path,
+    langs: &[String],
+) -> Result<String> {
     let image_path_str = image_path
         .to_str()
         .context("non-UTF8 image path for tesseract")?;
@@ -232,14 +243,7 @@ fn run_tesseract(runner: &dyn CommandRunner, image_path: &Path, langs: &[String]
     // the real tesseract.
     runner.run(
         "tesseract",
-        &[
-            image_path_str,
-            "stdout",
-            "-l",
-            &langs_arg,
-            "--psm",
-            "3",
-        ],
+        &[image_path_str, "stdout", "-l", &langs_arg, "--psm", "3"],
         None,
     )
 }
@@ -268,9 +272,7 @@ fn pdftoppm_output_path(stem: &Path, page: usize, total_pages: usize) -> PathBuf
     let width = total_pages.to_string().len();
     let name = format!(
         "{}-{:0width$}.png",
-        stem.file_name()
-            .and_then(|o| o.to_str())
-            .unwrap_or("page"),
+        stem.file_name().and_then(|o| o.to_str()).unwrap_or("page"),
         page,
         width = width
     );
@@ -373,12 +375,7 @@ mod tests {
                 .push((cmd.to_string(), args_vec.clone()));
 
             if cmd == "pdftoppm" {
-                let out_path = args_vec
-                    .iter()
-                    .rev()
-                    .nth(0)
-                    .cloned()
-                    .unwrap_or_default();
+                let out_path = args_vec.iter().rev().nth(0).cloned().unwrap_or_default();
                 let f_idx = args_vec.iter().position(|a| a == "-f").unwrap();
                 let page: usize = args_vec[f_idx + 1].parse().unwrap();
                 // `pdfinfo` was mocked first in every PDF test, so the
@@ -428,14 +425,19 @@ mod tests {
         let img = image::RgbImage::new(300, 300);
         let mut bytes: Vec<u8> = Vec::new();
         image::DynamicImage::ImageRgb8(img)
-            .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
             .unwrap();
         bytes
     }
 
     #[test]
     fn ocr_candidates_contains_expected_exts() {
-        for ext in ["pdf", "png", "jpg", "jpeg", "gif", "bmp", "webp", "tif", "tiff"] {
+        for ext in [
+            "pdf", "png", "jpg", "jpeg", "gif", "bmp", "webp", "tif", "tiff",
+        ] {
             assert!(is_ocr_candidate(ext), "expected {ext} to be candidate");
         }
         assert!(!is_ocr_candidate("docx"));
@@ -609,7 +611,10 @@ mod tests {
         let padded = pdftoppm_output_path(&stem, 3, 12);
         assert_eq!(padded, std::path::PathBuf::from("/tmp/page-03.png"));
         let padded_hundred = pdftoppm_output_path(&stem, 7, 100);
-        assert_eq!(padded_hundred, std::path::PathBuf::from("/tmp/page-007.png"));
+        assert_eq!(
+            padded_hundred,
+            std::path::PathBuf::from("/tmp/page-007.png")
+        );
     }
 
     #[test]
@@ -636,16 +641,9 @@ mod tests {
         let pdf_path = dir.path().join("scan.pdf");
         std::fs::write(&pdf_path, b"%PDF-1.4 fake").unwrap();
 
-        let text = run_ocr_job_with(
-            &pdf_path,
-            "pdf",
-            &["eng".into()],
-            200,
-            None,
-            &mock,
-        )
-        .unwrap()
-        .unwrap();
+        let text = run_ocr_job_with(&pdf_path, "pdf", &["eng".into()], 200, None, &mock)
+            .unwrap()
+            .unwrap();
 
         assert!(text.contains("alpha"), "got {text:?}");
         assert!(text.contains("bravo"), "got {text:?}");
@@ -676,16 +674,9 @@ mod tests {
         let png_path = dir.path().join("scan.png");
         std::fs::write(&png_path, large_png_300x300()).unwrap();
 
-        let text = run_ocr_job_with(
-            &png_path,
-            "png",
-            &["eng".into()],
-            200,
-            None,
-            &mock,
-        )
-        .unwrap()
-        .unwrap();
+        let text = run_ocr_job_with(&png_path, "png", &["eng".into()], 200, None, &mock)
+            .unwrap()
+            .unwrap();
 
         assert_eq!(text, "IMG-OCR");
 

@@ -403,10 +403,7 @@ mod tests {
             assert_eq!(count_cache_entries(), 0, "cache starts empty");
             let docs1 = source.index_all().unwrap();
             let entries_after_first = count_cache_entries();
-            assert!(
-                entries_after_first >= 1,
-                "first run should populate cache"
-            );
+            assert!(entries_after_first >= 1, "first run should populate cache");
 
             let docs2 = source.index_all().unwrap();
             let entries_after_second = count_cache_entries();
@@ -425,7 +422,9 @@ mod tests {
                 .and_then(|d| d.body.clone());
             assert_eq!(body1, body2, "cached body must be identical across runs");
             assert!(
-                body1.as_deref().is_some_and(|b| b.contains("HIT_TEST_MARKER")),
+                body1
+                    .as_deref()
+                    .is_some_and(|b| b.contains("HIT_TEST_MARKER")),
                 "body must contain the test marker payload, got {body1:?}"
             );
         });

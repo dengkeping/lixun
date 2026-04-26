@@ -92,10 +92,7 @@ fn load_or_create_token(state_dir: &Path) -> Result<String> {
         if is_valid_token(&trimmed) {
             return Ok(trimmed);
         }
-        tracing::warn!(
-            "hotkeys: token at {:?} is invalid, regenerating",
-            path
-        );
+        tracing::warn!("hotkeys: token at {:?} is invalid, regenerating", path);
     }
 
     let token = generate_token();
@@ -108,9 +105,7 @@ fn load_or_create_token(state_dir: &Path) -> Result<String> {
 }
 
 fn is_valid_token(s: &str) -> bool {
-    !s.is_empty()
-        && s.len() <= 64
-        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    !s.is_empty() && s.len() <= 64 && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 fn generate_token() -> String {
@@ -156,7 +151,8 @@ async fn bind_shortcut(
     if normalized != preferred_trigger {
         tracing::info!(
             "hotkeys: normalized trigger {:?} -> {:?} (XDG shortcuts spec)",
-            preferred_trigger, normalized
+            preferred_trigger,
+            normalized
         );
     }
     let handle_token = random_handle();
@@ -170,13 +166,7 @@ async fn bind_shortcut(
 
     let parent_window = "";
 
-    let proxy = zbus::Proxy::new(
-        conn,
-        PORTAL_SERVICE,
-        PORTAL_PATH,
-        IFACE_GLOBAL_SHORTCUTS,
-    )
-    .await?;
+    let proxy = zbus::Proxy::new(conn, PORTAL_SERVICE, PORTAL_PATH, IFACE_GLOBAL_SHORTCUTS).await?;
     let request_path: OwnedObjectPath = proxy
         .call(
             "BindShortcuts",
@@ -195,13 +185,7 @@ async fn portal_request(
     body: &HashMap<&str, Value<'_>>,
     handle_token: &str,
 ) -> Result<HashMap<String, OwnedValue>> {
-    let proxy = zbus::Proxy::new(
-        conn,
-        PORTAL_SERVICE,
-        PORTAL_PATH,
-        IFACE_GLOBAL_SHORTCUTS,
-    )
-    .await?;
+    let proxy = zbus::Proxy::new(conn, PORTAL_SERVICE, PORTAL_PATH, IFACE_GLOBAL_SHORTCUTS).await?;
     let request_path: OwnedObjectPath = proxy.call(method, body).await?;
     await_request_response(conn, &request_path, handle_token).await
 }
@@ -211,13 +195,8 @@ async fn await_request_response(
     request_path: &OwnedObjectPath,
     _handle_token: &str,
 ) -> Result<HashMap<String, OwnedValue>> {
-    let request_proxy = zbus::Proxy::new(
-        conn,
-        PORTAL_SERVICE,
-        request_path.as_str(),
-        IFACE_REQUEST,
-    )
-    .await?;
+    let request_proxy =
+        zbus::Proxy::new(conn, PORTAL_SERVICE, request_path.as_str(), IFACE_REQUEST).await?;
     let mut stream = request_proxy.receive_signal("Response").await?;
     let Some(msg) = stream.next().await else {
         anyhow::bail!("Response stream closed without a message");
@@ -229,9 +208,7 @@ async fn await_request_response(
     Ok(results)
 }
 
-fn extract_session_handle(
-    results: &HashMap<String, OwnedValue>,
-) -> Result<OwnedObjectPath> {
+fn extract_session_handle(results: &HashMap<String, OwnedValue>) -> Result<OwnedObjectPath> {
     let value = results
         .get("session_handle")
         .context("response missing session_handle")?;
@@ -242,20 +219,11 @@ fn extract_session_handle(
     Ok(path.into())
 }
 
-async fn supervisor_loop(
-    conn: Connection,
-    session_handle: OwnedObjectPath,
-    tx: mpsc::Sender<()>,
-) {
+async fn supervisor_loop(conn: Connection, session_handle: OwnedObjectPath, tx: mpsc::Sender<()>) {
     let mut backoff = RESUBSCRIBE_MIN_BACKOFF;
     loop {
-        let proxy_res = zbus::Proxy::new(
-            &conn,
-            PORTAL_SERVICE,
-            PORTAL_PATH,
-            IFACE_GLOBAL_SHORTCUTS,
-        )
-        .await;
+        let proxy_res =
+            zbus::Proxy::new(&conn, PORTAL_SERVICE, PORTAL_PATH, IFACE_GLOBAL_SHORTCUTS).await;
         let proxy = match proxy_res {
             Ok(p) => p,
             Err(e) => {
@@ -355,9 +323,7 @@ fn normalize_modifier(m: &str) -> String {
         "ALT" | "OPT" | "OPTION" => "ALT".to_string(),
         "SHIFT" => "SHIFT".to_string(),
         "NUM" | "NUMLOCK" => "NUM".to_string(),
-        "LOGO" | "SUPER" | "META" | "WIN" | "WINDOWS" | "CMD" | "COMMAND" => {
-            "LOGO".to_string()
-        }
+        "LOGO" | "SUPER" | "META" | "WIN" | "WINDOWS" | "CMD" | "COMMAND" => "LOGO".to_string(),
         other => other.to_string(),
     }
 }
@@ -420,10 +386,7 @@ mod tests {
 
     #[test]
     fn normalize_trigger_multi_modifier() {
-        assert_eq!(
-            normalize_trigger("Super+Shift+p"),
-            "LOGO+SHIFT+p"
-        );
+        assert_eq!(normalize_trigger("Super+Shift+p"), "LOGO+SHIFT+p");
         assert_eq!(
             normalize_trigger("Ctrl+Alt+Super+Delete"),
             "CTRL+ALT+LOGO+Delete"
