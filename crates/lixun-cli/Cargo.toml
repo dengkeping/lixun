@@ -4,12 +4,13 @@ version.workspace = true
 edition.workspace = true
 
 [[bin]]
-name = "lixun"
+name = "lixun-cli"
 path = "src/main.rs"
 
 [dependencies]
 lixun-core = { path = "../lixun-core" }
 lixun-ipc = { path = "../lixun-ipc" }
+lixun-mutation = { path = "../lixun-mutation" }
 anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true

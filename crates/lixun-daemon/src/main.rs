@@ -281,6 +281,8 @@ async fn main() -> Result<()> {
     #[cfg(not(feature = "semantic"))]
     let ipc_search: SearchSurface = search.clone();
 
+    registry.install_doc_store(Arc::new(search.clone()) as Arc<dyn lixun_mutation::DocStore>);
+
     let shared_config = Arc::new(config);
 
     let frecency = FrecencyStore::load(&state_dir)?;
@@ -942,6 +944,13 @@ async fn handle_client(
                 Response::Error(format!("preview dispatch failed: {}", e))
             }
         },
+        Request::EnumeratePlugins => Response::PluginManifest(registry.cli_manifest()),
+        Request::PluginCommand { verb_path, args } => {
+            match registry.cli_invoke(&verb_path, &args).await {
+                Ok(value) => Response::PluginResult(value),
+                Err(e) => Response::PluginError(format!("{e:#}")),
+            }
+        }
     };
 
     let json = serde_json::to_vec(&resp)?;
