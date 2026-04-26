@@ -91,9 +91,12 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 # name it here so the version stays in fastembed's hands.
 fastembed = "=5.13.3"
 lancedb = "=0.27.1"
-arrow = "54"
-arrow-array = "54"
-arrow-schema = "54"
+# Aligned with the arrow major lancedb 0.27.1 pulls transitively;
+# mismatched majors would compile but fail at runtime since arrow's
+# RecordBatch / Schema types are not version-compatible across majors.
+arrow = "57"
+arrow-array = "57"
+arrow-schema = "57"
 
 # Profile for memory profiling: release optimizations + full debug info
 # so heaptrack/valgrind can resolve symbols. Used for diagnosis only;

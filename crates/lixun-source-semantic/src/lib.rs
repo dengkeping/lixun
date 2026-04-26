@@ -13,11 +13,15 @@
 mod ann;
 mod broadcaster;
 mod config;
+mod embedder;
 mod factory;
 mod source;
+mod store;
 
 pub use ann::LanceDbAnnHandle;
 pub use broadcaster::SemanticBroadcasterAdapter;
 pub use config::SemanticConfig;
+pub use embedder::{ImageEmbedder, TextEmbedder, load_image_embedder, load_text_embedder};
 pub use factory::SemanticFactory;
 pub use source::SemanticSource;
+pub use store::VectorStore;

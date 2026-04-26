@@ -86,3 +86,13 @@ impl MutationBroadcaster for MultiBroadcaster {
 /// `lixun-fusion` and the future ANN-providing plugin from depending
 /// on each other.
 pub trait AnnHandle: Send + Sync {}
+
+/// One result from an approximate-nearest-neighbour query. Lives in
+/// the plugin-agnostic leaf crate so `lixun-fusion` (RRF consumer)
+/// and `lixun-source-semantic` (ANN producer) share the type without
+/// either depending on the other (DB-3).
+#[derive(Clone, Debug)]
+pub struct AnnHit {
+    pub doc_id: String,
+    pub distance: f32,
+}
