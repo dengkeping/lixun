@@ -6,7 +6,16 @@ pkgdesc="Spotlight-like launcher for Linux (pre-built binary)"
 arch=("x86_64")
 url="https://repo.dkp.hk/denis/lixun"
 license=("MIT")
-depends=("gtk4" "gtk4-layer-shell" "poppler" "zstd" "sqlite")
+# Cargo feature set baked into the shipped lixund. This -bin package installs
+# pre-built artifacts and does NOT invoke cargo, so the var is documentation /
+# intent only here; a sibling source-build PKGBUILD would consume it via
+# `cargo build -p lixun-daemon --bin lixund --features "$_features"`.
+_features="semantic"
+# gcc-libs (libgomp) and xz (liblzma) are pulled in at runtime by ONNX Runtime
+# when lixund is built with --features semantic; the embedder loads them via
+# dlopen on first vector op, so they must be present even though the daemon
+# itself does not link them directly.
+depends=("gtk4" "gtk4-layer-shell" "poppler" "zstd" "sqlite" "gcc-libs" "xz")
 optdepends=("antiword: .doc extraction"
             "catdoc: .doc extraction"
             "libreoffice-fresh: .docx/.xlsx/.pptx extraction + preview"
@@ -28,7 +37,7 @@ md5sums=("SKIP" "SKIP" "SKIP" "SKIP")
 
 package() {
   install -Dm755 "lixund" "$pkgdir/usr/bin/lixund"
-  install -Dm755 "lixun" "$pkgdir/usr/bin/lixun"
+  install -Dm755 "lixun-cli" "$pkgdir/usr/bin/lixun-cli"
   install -Dm755 "lixun-gui" "$pkgdir/usr/bin/lixun-gui"
   install -Dm755 "lixun-preview" "$pkgdir/usr/bin/lixun-preview"
   install -Dm644 "${srcdir}/systemd-lixund.service" "$pkgdir/usr/lib/systemd/user/lixund.service"
