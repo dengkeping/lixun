@@ -35,6 +35,22 @@ use lixun_daemon::preview_spawn::PreviewSpawner;
 use lixun_indexer::plugin_fs_watcher;
 use lixun_indexer::watcher;
 
+#[cfg(feature = "semantic")]
+use lixun_fusion::HybridSearchHandle;
+
+/// IPC-facing search surface. With the `semantic` feature on, the
+/// daemon wraps the lexical [`SearchHandle`] in [`HybridSearchHandle`]
+/// so RRF fusion runs transparently on every query; without the
+/// feature the alias collapses to the lexical handle and the daemon
+/// links no fusion code at all. Both types expose byte-identical
+/// `search` / `search_with_breakdown` / `all_doc_ids` / `has_body`
+/// / `get_body` / `hydrate_doc` signatures, so call sites stay
+/// cfg-free (DB-3).
+#[cfg(feature = "semantic")]
+type SearchSurface = HybridSearchHandle;
+#[cfg(not(feature = "semantic"))]
+type SearchSurface = SearchHandle;
+
 #[derive(Debug, Clone, Default)]
 struct IndexStats {
     indexed_docs: u64,
@@ -224,6 +240,18 @@ async fn main() -> Result<()> {
     // so we can wire the SearchHandle-backed HasBody adapter into
     // `config.body_checker` — the builtin `fs` source reads that
     // OnceLock during its own construction.
+    #[cfg(feature = "semantic")]
+    let (mutation_tx, search, _writer_handle) = {
+        let broadcasters = registry.broadcasters();
+        let multi: std::sync::Arc<dyn lixun_mutation::MutationBroadcaster> =
+            if broadcasters.is_empty() {
+                std::sync::Arc::new(lixun_mutation::NoopBroadcaster)
+            } else {
+                std::sync::Arc::new(lixun_mutation::MultiBroadcaster::new(broadcasters))
+            };
+        index_service::spawn_writer_service_with_broadcaster(index, multi)?
+    };
+    #[cfg(not(feature = "semantic"))]
     let (mutation_tx, search, _writer_handle) = index_service::spawn_writer_service(index)?;
 
     let body_checker_arc: Arc<dyn lixun_sources::HasBody> =
@@ -235,6 +263,23 @@ async fn main() -> Result<()> {
     // via `config.build_fs_source` / `with_body_checker`.
     register_builtin_nonplugin_sources(&mut registry, &config, &sources_state_dir)?;
     let registry = Arc::new(registry);
+
+    // Build the IPC-facing search surface. With `--features semantic`
+    // and a plugin advertising an ANN handle this becomes a
+    // `HybridSearchHandle` running RRF fusion; without either it
+    // collapses to the lexical `SearchHandle`. The host names no
+    // plugin (AGENTS.md §1) — `registry.ann_handle()` is a generic
+    // capability probe. The indexer + body-checker paths keep using
+    // the raw lexical `search` because they need the unfused
+    // `SearchHandle` API surface (writer-side hooks, OCR enqueue
+    // body lookups), which fusion has nothing to add to.
+    #[cfg(feature = "semantic")]
+    let ipc_search: SearchSurface = match registry.ann_handle() {
+        Some(ann) => HybridSearchHandle::new(search.clone(), ann, 60.0),
+        None => HybridSearchHandle::new_lexical_only(search.clone()),
+    };
+    #[cfg(not(feature = "semantic"))]
+    let ipc_search: SearchSurface = search.clone();
 
     let shared_config = Arc::new(config);
 
@@ -398,7 +443,7 @@ async fn main() -> Result<()> {
                         continue;
                     }
                 };
-                let search = search.clone();
+                let search = ipc_search.clone();
                 let mutation_tx = mutation_tx.clone();
                 let frecency = Arc::clone(&frecency);
                 let query_latch = Arc::clone(&query_latch);
@@ -582,7 +627,7 @@ fn collect_memory_stats() -> lixun_ipc::MemoryStats {
 #[allow(clippy::too_many_arguments)]
 async fn handle_client(
     mut stream: tokio::net::UnixStream,
-    search: SearchHandle,
+    search: SearchSurface,
     mutation_tx: IndexMutationTx,
     frecency: Arc<RwLock<FrecencyStore>>,
     query_latch: Arc<RwLock<QueryLatchStore>>,

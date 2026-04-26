@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -7,7 +6,7 @@ use lixun_mutation::UpsertedDoc;
 use tokio::sync::mpsc;
 
 use crate::config::SemanticConfig;
-use crate::embedder::{ImageEmbedder, TextEmbedder, load_image_embedder, load_text_embedder};
+use crate::embedder::{ImageEmbedder, TextEmbedder};
 use crate::journal::BackfillJournal;
 use crate::store::VectorStore;
 
@@ -35,26 +34,22 @@ impl WorkerHandle {
 
 /// Spawns the synchronous embedder thread.
 ///
-/// Embedders are loaded eagerly so any model-init failure (missing
-/// ONNX runtime, unsupported model name, network failure during
-/// download) surfaces from `spawn_worker` itself rather than at the
-/// first batch flush. The thread is `std::thread`, not a tokio task,
-/// because fastembed's `TextEmbedding`/`ImageEmbedding` own ONNX
-/// `Session`s that are not safe to migrate across tokio worker
-/// threads — pinning to a single OS thread sidesteps the whole
-/// `Send`/lifetime question.
+/// Embedders are loaded by the caller and shared via `Arc<Mutex<…>>`
+/// so the query-side ANN path (`LanceDbAnnHandle::search_text`) can
+/// reach the same `TextEmbedding` session without instantiating a
+/// second one. fastembed sessions own ONNX `Session`s that must
+/// only be invoked serially per session, which the `Mutex`
+/// guarantees. The worker thread is `std::thread`, not a tokio
+/// task, because the ONNX session pins itself to a CPU thread that
+/// must not migrate across tokio's worker pool.
 pub fn spawn_worker(
     cfg: SemanticConfig,
     store: Arc<VectorStore>,
     journal: Arc<Mutex<BackfillJournal>>,
     runtime: tokio::runtime::Handle,
-    cache_dir: PathBuf,
+    text_embedder: Arc<Mutex<TextEmbedder>>,
+    image_embedder: Arc<Mutex<ImageEmbedder>>,
 ) -> Result<WorkerHandle> {
-    let text = load_text_embedder(&cfg.text_model, &cache_dir)
-        .with_context(|| format!("loading text embedder '{}'", cfg.text_model))?;
-    let image = load_image_embedder(&cfg.image_model, &cache_dir)
-        .with_context(|| format!("loading image embedder '{}'", cfg.image_model))?;
-
     let (tx, rx) = mpsc::channel::<EmbedJob>(QUEUE_CAPACITY);
 
     let worker = WorkerThread {
@@ -62,8 +57,8 @@ pub fn spawn_worker(
         store,
         journal,
         runtime: runtime.clone(),
-        text,
-        image,
+        text: text_embedder,
+        image: image_embedder,
         rx,
         pending_text: Vec::new(),
         last_flush: Instant::now(),
@@ -82,9 +77,9 @@ struct WorkerThread {
     store: Arc<VectorStore>,
     journal: Arc<Mutex<BackfillJournal>>,
     runtime: tokio::runtime::Handle,
-    text: TextEmbedder,
+    text: Arc<Mutex<TextEmbedder>>,
     #[allow(dead_code)]
-    image: ImageEmbedder,
+    image: Arc<Mutex<ImageEmbedder>>,
     rx: mpsc::Receiver<EmbedJob>,
     pending_text: Vec<UpsertedDoc>,
     last_flush: Instant,
@@ -185,12 +180,20 @@ impl WorkerThread {
             .map(|d| compose_text_input(&d.doc_id, d.body.as_deref()))
             .collect();
 
-        let vectors = match self.text.embed(texts) {
-            Ok(v) => v,
+        let vectors = match self.text.lock() {
+            Ok(mut t) => match t.embed(texts) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        "semantic embed worker: text embed batch of {} failed: {e:#}",
+                        batch.len()
+                    );
+                    return;
+                }
+            },
             Err(e) => {
-                tracing::warn!(
-                    "semantic embed worker: text embed batch of {} failed: {e:#}",
-                    batch.len()
+                tracing::error!(
+                    "semantic embed worker: text embedder mutex poisoned: {e}"
                 );
                 return;
             }

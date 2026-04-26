@@ -28,6 +28,7 @@ lixun-index = { path = "../lixun-index" }
 lixun-sources = { path = "../lixun-sources" }
 lixun-plugin-bundle = { path = "../lixun-plugin-bundle" }
 lixun-indexer = { path = "../lixun-indexer" }
+lixun-mutation = { path = "../lixun-mutation" }
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
