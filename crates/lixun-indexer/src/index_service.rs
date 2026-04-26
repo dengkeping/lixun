@@ -130,6 +130,18 @@ impl SearchHandle {
         let idx = self.index.lock().await;
         idx.get_body_by_id(doc_id)
     }
+
+    /// Reconstruct a `Hit` + `ScoreBreakdown` for a single doc without
+    /// running a query. The breakdown is degenerate (tantivy=0.0,
+    /// multipliers=1.0) because there is no query context; the caller
+    /// (Wave D fusion) assigns the final fused score before publishing.
+    pub async fn hydrate_doc(
+        &self,
+        doc_id: &str,
+    ) -> Result<Option<(lixun_core::Hit, lixun_core::ScoreBreakdown)>> {
+        let idx = self.index.lock().await;
+        idx.hydrate_doc_by_id(doc_id)
+    }
 }
 
 pub fn spawn_writer_service(
