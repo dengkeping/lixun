@@ -1,0 +1,15 @@
+[package]
+name = "lixun-mutation"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "lixun_mutation"
+path = "src/lib.rs"
+
+[dependencies]
+lixun-core = { path = "../lixun-core" }
+anyhow.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+async-trait = "0.1"

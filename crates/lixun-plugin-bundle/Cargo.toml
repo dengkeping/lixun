@@ -13,9 +13,16 @@ maildir = ["dep:lixun-source-maildir"]
 thunderbird = ["dep:lixun-source-thunderbird"]
 calculator = ["dep:lixun-source-calculator"]
 shell = ["dep:lixun-source-shell"]
+semantic = [
+    "dep:lixun-source-semantic",
+    "dep:lixun-fusion",
+    "lixun-fusion/semantic",
+]
 
 [dependencies]
 lixun-source-maildir = { path = "../lixun-source-maildir", optional = true }
 lixun-source-thunderbird = { path = "../lixun-source-thunderbird", optional = true }
 lixun-source-calculator = { path = "../lixun-source-calculator", optional = true }
 lixun-source-shell = { path = "../lixun-source-shell", optional = true }
+lixun-source-semantic = { path = "../lixun-source-semantic", optional = true }
+lixun-fusion = { path = "../lixun-fusion", optional = true, default-features = false }

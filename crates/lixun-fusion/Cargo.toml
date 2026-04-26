@@ -1,0 +1,37 @@
+[package]
+name = "lixun-fusion"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "lixun_fusion"
+path = "src/lib.rs"
+
+[features]
+default = []
+# Activates the heavy ML stack (LanceDB + fastembed + arrow). Without
+# this feature the crate compiles as a thin pass-through over
+# `SearchHandle` so downstream code can opt in without changing call
+# sites.
+semantic = [
+    "dep:lancedb",
+    "dep:fastembed",
+    "dep:arrow",
+    "dep:arrow-array",
+    "dep:arrow-schema",
+]
+
+[dependencies]
+lixun-core = { path = "../lixun-core" }
+lixun-indexer = { path = "../lixun-indexer" }
+lixun-mutation = { path = "../lixun-mutation" }
+anyhow.workspace = true
+tracing.workspace = true
+tokio = { workspace = true }
+serde.workspace = true
+async-trait = "0.1"
+lancedb = { workspace = true, optional = true }
+fastembed = { workspace = true, optional = true }
+arrow = { workspace = true, optional = true }
+arrow-array = { workspace = true, optional = true }
+arrow-schema = { workspace = true, optional = true }

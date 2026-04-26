@@ -11,7 +11,16 @@ path = "src/main.rs"
 name = "lixun_daemon"
 path = "src/lib.rs"
 
+[features]
+default = []
+semantic = [
+    "lixun-plugin-bundle/semantic",
+    "lixun-fusion/semantic",
+    "dep:lixun-fusion",
+]
+
 [dependencies]
+lixun-fusion = { path = "../lixun-fusion", optional = true, default-features = false }
 lixun-core = { path = "../lixun-core" }
 lixun-extract = { path = "../lixun-extract" }
 lixun-ipc = { path = "../lixun-ipc" }
