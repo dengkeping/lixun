@@ -11,6 +11,7 @@ path = "src/lib.rs"
 lixun-core = { path = "../lixun-core" }
 lixun-sources = { path = "../lixun-sources" }
 lixun-mutation = { path = "../lixun-mutation" }
+lixun-indexer = { path = "../lixun-indexer" }
 anyhow.workspace = true
 tracing.workspace = true
 tokio = { workspace = true }
