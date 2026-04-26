@@ -40,6 +40,6 @@ impl IndexerSource for SemanticSource {
     }
 
     fn ann_handle(&self) -> Option<Arc<dyn AnnHandle>> {
-        Some(Arc::new(LanceDbAnnHandle))
+        Some(Arc::new(LanceDbAnnHandle::new()))
     }
 }
