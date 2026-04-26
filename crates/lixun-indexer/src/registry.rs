@@ -1,4 +1,5 @@
 use lixun_core::{PluginFieldSpec, RowMenuDef};
+use lixun_mutation::{AnnHandle, MutationBroadcaster};
 use lixun_sources::IndexerSource;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -34,6 +35,30 @@ impl SourceRegistry {
             .iter()
             .find(|inst| inst.instance_id == instance_id)
             .map(|inst| inst.source.row_menu())
+    }
+
+    /// Collect every post-commit broadcaster contributed by a
+    /// registered source. The daemon wraps the result in a
+    /// [`lixun_mutation::MultiBroadcaster`] before passing it to the
+    /// writer service, so a panic in one consumer cannot break the
+    /// fan-out to the others.
+    pub fn broadcasters(&self) -> Vec<Arc<dyn MutationBroadcaster>> {
+        self.instances
+            .iter()
+            .filter_map(|inst| inst.source.broadcaster())
+            .collect()
+    }
+
+    /// Pick the first ANN handle contributed by any registered
+    /// source. The hybrid search layer is built around a single
+    /// ANN provider per process; if a future deployment ships two
+    /// sources with `ann_handle()` returning `Some`, the daemon
+    /// should refuse to start rather than silently dropping one,
+    /// but that validation lives in the daemon (WD-T7), not here.
+    pub fn ann_handle(&self) -> Option<Arc<dyn AnnHandle>> {
+        self.instances
+            .iter()
+            .find_map(|inst| inst.source.ann_handle())
     }
 
     pub fn register(
