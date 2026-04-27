@@ -2,6 +2,7 @@
 name = "lixun-daemon"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [[bin]]
 name = "lixund"
@@ -41,8 +42,11 @@ walkdir.workspace = true
 bytes.workspace = true
 rayon.workspace = true
 regex.workspace = true
+num_cpus.workspace = true
 dirs = "5"
 toml = "0.8"
+toml_edit.workspace = true
+arc-swap.workspace = true
 libc = "0.2"
 signal-hook = "0.3"
 signal-hook-tokio = { version = "0.3", features = ["futures-v0_3"] }

@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tokio_util::codec::{Decoder, Encoder};
 
-use lixun_core::Hit;
+use lixun_core::{Hit, ImpactProfile, SystemImpact};
 
 pub mod gui;
 
@@ -127,6 +127,27 @@ pub enum Request {
         verb_path: Vec<String>,
         args: serde_json::Value,
     },
+    /// Read the daemon's currently-applied [`ImpactProfile`] without
+    /// changing it. Response is [`Response::ImpactSnapshot`] with
+    /// empty `applied_hot` / `requires_restart` and `persisted=false`.
+    ImpactGet,
+    /// Switch the daemon to a new [`SystemImpact`] level. Hot knobs
+    /// (daemon nice, OCR worker tunables) re-apply immediately; the
+    /// remainder require a daemon restart and are reported back in
+    /// [`Response::ImpactSnapshot::requires_restart`]. When `persist`
+    /// is true the new level is also written to
+    /// `~/.config/lixun/config.toml` via `toml_edit` (preserves
+    /// comments and unrelated keys).
+    ImpactSet {
+        level: SystemImpact,
+        persist: bool,
+    },
+    /// Return the resolved [`ImpactProfile`] for the daemon's current
+    /// level so the CLI can render an explanation table. Same shape as
+    /// `ImpactGet` — both return [`Response::ImpactSnapshot`] — but
+    /// kept as a distinct request to leave room for future explain-only
+    /// fields without forcing every Get caller to opt in.
+    ImpactExplain,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -176,6 +197,76 @@ pub enum Response {
     PluginResult(serde_json::Value),
     PluginError(String),
     Error(String),
+    /// Reply to every `Impact*` request. `applied_hot` and
+    /// `requires_restart` are populated only on `ImpactSet`; both
+    /// empty for `ImpactGet` / `ImpactExplain`. `persisted` is true
+    /// when the new level was successfully written to
+    /// `config.toml`. The `profile` field carries every resolved
+    /// knob value so the CLI can render an explanation table without
+    /// a follow-up round-trip.
+    ImpactSnapshot {
+        level: SystemImpact,
+        profile: ImpactProfileWire,
+        #[serde(default)]
+        applied_hot: Vec<String>,
+        #[serde(default)]
+        requires_restart: Vec<String>,
+        #[serde(default)]
+        persisted: bool,
+    },
+}
+
+/// Serde-friendly mirror of [`lixun_core::ImpactProfile`]. Lives in
+/// `lixun-ipc` (not `lixun-core`) so `lixun-core` stays dep-light.
+/// `Duration` collapses to `u64` seconds — every value the profile
+/// stores is whole seconds, so no precision is lost.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImpactProfileWire {
+    pub level: SystemImpact,
+    pub tokio_worker_threads: usize,
+    pub onnx_intra_threads: usize,
+    pub onnx_inter_threads: usize,
+    pub rayon_threads: usize,
+    pub tantivy_heap_bytes: usize,
+    pub tantivy_num_threads: usize,
+    pub embed_batch_hint: usize,
+    pub embed_concurrency_hint: Option<usize>,
+    pub ocr_jobs_per_tick: usize,
+    pub ocr_adaptive_throttle: bool,
+    pub ocr_nice_level: i32,
+    pub ocr_io_class_idle: bool,
+    pub ocr_worker_interval_secs: u64,
+    pub extract_cache_max_bytes: usize,
+    pub max_file_size_bytes: u64,
+    pub gloda_batch_size: usize,
+    pub daemon_nice: i32,
+    pub daemon_sched_idle: bool,
+}
+
+impl From<&ImpactProfile> for ImpactProfileWire {
+    fn from(p: &ImpactProfile) -> Self {
+        Self {
+            level: p.level,
+            tokio_worker_threads: p.tokio_worker_threads,
+            onnx_intra_threads: p.onnx_intra_threads,
+            onnx_inter_threads: p.onnx_inter_threads,
+            rayon_threads: p.rayon_threads,
+            tantivy_heap_bytes: p.tantivy_heap_bytes,
+            tantivy_num_threads: p.tantivy_num_threads,
+            embed_batch_hint: p.embed_batch_hint,
+            embed_concurrency_hint: p.embed_concurrency_hint,
+            ocr_jobs_per_tick: p.ocr_jobs_per_tick,
+            ocr_adaptive_throttle: p.ocr_adaptive_throttle,
+            ocr_nice_level: p.ocr_nice_level,
+            ocr_io_class_idle: p.ocr_io_class_idle,
+            ocr_worker_interval_secs: p.ocr_worker_interval.as_secs(),
+            extract_cache_max_bytes: p.extract_cache_max_bytes,
+            max_file_size_bytes: p.max_file_size_bytes,
+            gloda_batch_size: p.gloda_batch_size,
+            daemon_nice: p.daemon_nice,
+            daemon_sched_idle: p.daemon_sched_idle,
+        }
+    }
 }
 
 /// Framing codec: u32 BE length + u16 version + JSON payload.
@@ -632,6 +723,78 @@ mod tests {
         assert!(matches!(
             codec.decode(&mut buf).unwrap().unwrap(),
             Request::Status
+        ));
+    }
+
+    #[test]
+    fn test_impact_snapshot_roundtrips_via_serde_json() {
+        let profile = lixun_core::ImpactProfile::from_level(lixun_core::SystemImpact::Medium, 8);
+        let wire = ImpactProfileWire::from(&profile);
+        let resp = Response::ImpactSnapshot {
+            level: lixun_core::SystemImpact::Medium,
+            profile: wire.clone(),
+            applied_hot: vec!["daemon_nice".into(), "ocr_jobs_per_tick".into()],
+            requires_restart: vec!["tokio_worker_threads".into()],
+            persisted: true,
+        };
+        let bytes = serde_json::to_vec(&resp).unwrap();
+        let back: Response = serde_json::from_slice(&bytes).unwrap();
+        match back {
+            Response::ImpactSnapshot {
+                level,
+                profile,
+                applied_hot,
+                requires_restart,
+                persisted,
+            } => {
+                assert_eq!(level, lixun_core::SystemImpact::Medium);
+                assert_eq!(profile, wire);
+                assert_eq!(profile.tokio_worker_threads, 4);
+                assert_eq!(profile.ocr_worker_interval_secs, 5);
+                assert_eq!(applied_hot.len(), 2);
+                assert_eq!(requires_restart, vec!["tokio_worker_threads".to_string()]);
+                assert!(persisted);
+            }
+            other => panic!("expected ImpactSnapshot, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_impact_set_request_roundtrips_via_codec() {
+        let mut codec = FrameCodec::default();
+        let mut buf = BytesMut::new();
+        codec
+            .encode(
+                Request::ImpactSet {
+                    level: lixun_core::SystemImpact::Low,
+                    persist: true,
+                },
+                &mut buf,
+            )
+            .unwrap();
+        let decoded = codec.decode(&mut buf).unwrap().unwrap();
+        match decoded {
+            Request::ImpactSet { level, persist } => {
+                assert_eq!(level, lixun_core::SystemImpact::Low);
+                assert!(persist);
+            }
+            other => panic!("expected ImpactSet, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_impact_get_and_explain_roundtrip_via_codec() {
+        let mut codec = FrameCodec::default();
+        let mut buf = BytesMut::new();
+        codec.encode(Request::ImpactGet, &mut buf).unwrap();
+        codec.encode(Request::ImpactExplain, &mut buf).unwrap();
+        assert!(matches!(
+            codec.decode(&mut buf).unwrap().unwrap(),
+            Request::ImpactGet
+        ));
+        assert!(matches!(
+            codec.decode(&mut buf).unwrap().unwrap(),
+            Request::ImpactExplain
         ));
     }
 }

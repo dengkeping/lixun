@@ -1,6 +1,7 @@
 //! Configuration — ~/.config/lixun/config.toml
 
 use anyhow::Result;
+use lixun_core::{ImpactProfile, SystemImpact};
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
@@ -17,6 +18,7 @@ const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "gui",
     "extract",
     "ocr",
+    "impact",
 ];
 
 #[derive(Debug, Deserialize)]
@@ -30,8 +32,71 @@ struct ConfigToml {
     keybindings: Option<KeybindingsToml>,
     preview: Option<PreviewToml>,
     gui: Option<GuiToml>,
-    extract: Option<ExtractConfig>,
-    ocr: Option<OcrConfig>,
+    extract: Option<ExtractToml>,
+    ocr: Option<OcrToml>,
+    impact: Option<ImpactToml>,
+}
+
+/// Parse-side mirror of [`OcrConfig`]. Every field is optional so the
+/// resolved [`ImpactProfile`] can seed the five profile-controlled
+/// knobs (`worker_interval_secs`, `jobs_per_tick`, `adaptive_throttle`,
+/// `nice_level`, `io_class_idle`) when the operator has not pinned an
+/// explicit value, while preserving the existing `OcrConfig` defaults
+/// for the other knobs (per plan §5.3 precedence rule).
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct OcrToml {
+    enabled: Option<bool>,
+    languages: Option<Vec<String>>,
+    max_pages_per_pdf: Option<usize>,
+    min_image_side_px: Option<u32>,
+    timeout_secs: Option<u64>,
+    worker_interval_secs: Option<u64>,
+    jobs_per_tick: Option<u32>,
+    adaptive_throttle: Option<bool>,
+    max_cpu_pressure_avg10: Option<f32>,
+    nice_level: Option<i32>,
+    io_class_idle: Option<bool>,
+}
+
+/// Wire-format mirror of [`ImpactConfig`]. Every field is optional so
+/// an absent `[impact]` table, or a partially-populated one, falls
+/// back to [`ImpactConfig::default`] piecewise.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct ImpactToml {
+    level: Option<SystemImpact>,
+    follow_battery: Option<bool>,
+    on_battery_level: Option<SystemImpact>,
+}
+
+/// Resolved `[impact]` configuration. Defaults match Wave D behaviour:
+/// `High` level, no battery-following.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImpactConfig {
+    pub level: SystemImpact,
+    pub follow_battery: bool,
+    pub on_battery_level: SystemImpact,
+}
+
+impl Default for ImpactConfig {
+    fn default() -> Self {
+        Self {
+            level: SystemImpact::High,
+            follow_battery: false,
+            on_battery_level: SystemImpact::Low,
+        }
+    }
+}
+
+/// Parse-side mirror of [`ExtractConfig`]. Both knobs are optional so
+/// the impact profile can seed the default when the operator has not
+/// pinned an explicit value (per plan §5.3 precedence rule).
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct ExtractToml {
+    cache_max_mb: Option<u64>,
+    cache_sweep_interval_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -286,6 +351,7 @@ pub struct Config {
     pub gui: GuiConfig,
     pub extract: ExtractConfig,
     pub ocr: OcrConfig,
+    pub impact: ImpactConfig,
     pub state_dir: PathBuf,
     pub plugin_sections: BTreeMap<String, toml::Value>,
     pub extractor_caps: std::sync::OnceLock<std::sync::Arc<lixun_extract::ExtractorCapabilities>>,
@@ -360,6 +426,7 @@ impl Default for Config {
             gui: GuiConfig::default(),
             extract: ExtractConfig::default(),
             ocr: OcrConfig::default(),
+            impact: ImpactConfig::default(),
             state_dir: state_dir(),
             plugin_sections: BTreeMap::new(),
             extractor_caps: std::sync::OnceLock::new(),
@@ -440,6 +507,7 @@ impl Config {
                 }
             }
         }
+        let user_set_max_file_size_mb = parsed.max_file_size_mb.is_some();
         if let Some(max) = parsed.max_file_size_mb {
             cfg.max_file_size_mb = max;
         }
@@ -553,11 +621,77 @@ impl Config {
                 cfg.gui.preview_max_height_px = v.max(400);
             }
         }
-        if let Some(extract) = parsed.extract {
-            cfg.extract = extract;
+        if let Some(impact_toml) = parsed.impact {
+            if let Some(level) = impact_toml.level {
+                cfg.impact.level = level;
+            }
+            if let Some(fb) = impact_toml.follow_battery {
+                cfg.impact.follow_battery = fb;
+            }
+            if let Some(obl) = impact_toml.on_battery_level {
+                cfg.impact.on_battery_level = obl;
+            }
         }
+        // Seed extract knobs from the resolved impact profile, then let
+        // explicit [extract] keys override (precedence rule per plan §5.3).
+        let profile_seed = cfg.resolved_profile();
+        cfg.extract.cache_max_mb = (profile_seed.extract_cache_max_bytes / (1024 * 1024)) as u64;
+        if let Some(extract_toml) = parsed.extract {
+            if let Some(v) = extract_toml.cache_max_mb {
+                cfg.extract.cache_max_mb = v;
+            }
+            if let Some(v) = extract_toml.cache_sweep_interval_secs {
+                cfg.extract.cache_sweep_interval_secs = v;
+            }
+        }
+        if !user_set_max_file_size_mb {
+            cfg.max_file_size_mb = profile_seed.max_file_size_bytes / (1024 * 1024);
+        }
+        // Five OCR knobs are seeded from the resolved impact profile;
+        // explicit `[ocr]` keys override on a per-field basis (plan
+        // §5.3). The remaining OcrConfig defaults stay untouched so
+        // existing behaviour for `enabled`, `languages`, `timeout_secs`,
+        // `min_image_side_px`, `max_pages_per_pdf`, and
+        // `max_cpu_pressure_avg10` is preserved.
+        cfg.ocr.worker_interval_secs = profile_seed.ocr_worker_interval.as_secs();
+        cfg.ocr.jobs_per_tick = profile_seed.ocr_jobs_per_tick as u32;
+        cfg.ocr.adaptive_throttle = profile_seed.ocr_adaptive_throttle;
+        cfg.ocr.nice_level = profile_seed.ocr_nice_level;
+        cfg.ocr.io_class_idle = profile_seed.ocr_io_class_idle;
         if let Some(ocr) = parsed.ocr {
-            cfg.ocr = ocr;
+            if let Some(v) = ocr.enabled {
+                cfg.ocr.enabled = v;
+            }
+            if let Some(v) = ocr.languages {
+                cfg.ocr.languages = v;
+            }
+            if let Some(v) = ocr.max_pages_per_pdf {
+                cfg.ocr.max_pages_per_pdf = Some(v);
+            }
+            if let Some(v) = ocr.min_image_side_px {
+                cfg.ocr.min_image_side_px = v;
+            }
+            if let Some(v) = ocr.timeout_secs {
+                cfg.ocr.timeout_secs = v;
+            }
+            if let Some(v) = ocr.worker_interval_secs {
+                cfg.ocr.worker_interval_secs = v;
+            }
+            if let Some(v) = ocr.jobs_per_tick {
+                cfg.ocr.jobs_per_tick = v;
+            }
+            if let Some(v) = ocr.adaptive_throttle {
+                cfg.ocr.adaptive_throttle = v;
+            }
+            if let Some(v) = ocr.max_cpu_pressure_avg10 {
+                cfg.ocr.max_cpu_pressure_avg10 = v;
+            }
+            if let Some(v) = ocr.nice_level {
+                cfg.ocr.nice_level = v;
+            }
+            if let Some(v) = ocr.io_class_idle {
+                cfg.ocr.io_class_idle = v;
+            }
         }
         cfg.validate_and_normalize();
 
@@ -627,6 +761,49 @@ impl Config {
             // explain-surface; defaults match the plan spec.
             ..lixun_core::RankingConfig::default()
         }
+    }
+
+    pub fn resolved_profile(&self) -> ImpactProfile {
+        ImpactProfile::from_level(self.impact.level, num_cpus::get())
+    }
+
+    /// Write `level = "<lowercase>"` into the `[impact]` table of
+    /// `~/.config/lixun/config.toml`, preserving every comment and
+    /// every other key verbatim by editing the file via
+    /// [`toml_edit::DocumentMut`]. If the file does not exist a
+    /// minimal `[impact] level = "..."` document is created.
+    /// Returns the on-disk path that was written.
+    pub fn persist_impact_level(level: SystemImpact) -> Result<PathBuf> {
+        Self::persist_impact_level_at(config_dir().join("lixun/config.toml"), level)
+    }
+
+    /// Same as [`persist_impact_level`] but writes to an explicit path.
+    /// Used by unit tests to avoid mutating process-wide environment
+    /// state (`XDG_CONFIG_HOME`) which races between parallel tests.
+    pub fn persist_impact_level_at(
+        path: PathBuf,
+        level: SystemImpact,
+    ) -> Result<PathBuf> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let level_str = level.to_string();
+        let new_doc = if path.exists() {
+            let raw = std::fs::read_to_string(&path)?;
+            let mut doc: toml_edit::DocumentMut = raw.parse()?;
+            let impact_item = doc
+                .entry("impact")
+                .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
+            let table = impact_item.as_table_mut().ok_or_else(|| {
+                anyhow::anyhow!("[impact] in {} is not a table", path.display())
+            })?;
+            table["level"] = toml_edit::value(level_str.clone());
+            doc.to_string()
+        } else {
+            format!("[impact]\nlevel = \"{level_str}\"\n")
+        };
+        std::fs::write(&path, new_doc)?;
+        Ok(path)
     }
 
     fn validate_and_normalize(&mut self) {
@@ -771,17 +948,21 @@ mod tests {
 
     #[test]
     fn ocr_config_defaults_apply_when_only_enabled_set() {
+        // The five profile-seeded knobs (worker_interval_secs,
+        // jobs_per_tick, adaptive_throttle, nice_level, io_class_idle)
+        // come from the resolved ImpactProfile (default level = High).
+        // The remaining six keep OcrConfig::default() values.
         let cfg = Config::from_toml_str("[ocr]\nenabled = true\n").expect("parse");
         assert!(cfg.ocr.enabled);
         assert!(cfg.ocr.languages.is_empty());
         assert_eq!(cfg.ocr.max_pages_per_pdf, None);
         assert_eq!(cfg.ocr.min_image_side_px, 200);
         assert_eq!(cfg.ocr.timeout_secs, 30);
-        assert_eq!(cfg.ocr.worker_interval_secs, 10);
-        assert_eq!(cfg.ocr.jobs_per_tick, 10);
+        assert_eq!(cfg.ocr.worker_interval_secs, 1);
+        assert_eq!(cfg.ocr.jobs_per_tick, 100);
         assert!(!cfg.ocr.adaptive_throttle);
         assert!((cfg.ocr.max_cpu_pressure_avg10 - 10.0).abs() < f32::EPSILON);
-        assert_eq!(cfg.ocr.nice_level, 19);
+        assert_eq!(cfg.ocr.nice_level, 5);
         assert!(!cfg.ocr.io_class_idle);
     }
 
@@ -837,5 +1018,95 @@ mod tests {
             .unwrap();
         assert!(!cfg.plugin_sections.contains_key("extract"));
         assert!(!cfg.plugin_sections.contains_key("ocr"));
+    }
+
+    #[test]
+    fn persist_impact_level_preserves_comments_and_unrelated_keys() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg_path = tmp.path().join("lixun/config.toml");
+        std::fs::create_dir_all(cfg_path.parent().unwrap()).unwrap();
+        let fixture = "\
+# top-of-file comment kept verbatim
+max_file_size_mb = 50
+
+[ranking]
+# preserved comment in [ranking]
+apps = 1.5
+
+[impact]
+level = \"high\"
+follow_battery = false
+";
+        std::fs::write(&cfg_path, fixture).unwrap();
+
+        let written = Config::persist_impact_level_at(cfg_path.clone(), SystemImpact::Low)
+            .expect("persist");
+        assert_eq!(written, cfg_path);
+
+        let after = std::fs::read_to_string(&cfg_path).unwrap();
+        assert!(
+            after.contains("# top-of-file comment kept verbatim"),
+            "top-of-file comment must survive: {after}"
+        );
+        assert!(
+            after.contains("# preserved comment in [ranking]"),
+            "[ranking] comment must survive: {after}"
+        );
+        assert!(after.contains("apps = 1.5"));
+        assert!(after.contains("max_file_size_mb = 50"));
+        assert!(after.contains("level = \"low\""));
+        assert!(
+            after.contains("follow_battery = false"),
+            "unrelated [impact] key must survive: {after}"
+        );
+
+        let parsed = Config::from_toml_str(&after).expect("parse after persist");
+        assert_eq!(parsed.impact.level, SystemImpact::Low);
+        assert_eq!(parsed.ranking_apps, 1.5);
+    }
+
+    #[test]
+    fn persist_impact_level_creates_minimal_file_when_absent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg_path = tmp.path().join("lixun/config.toml");
+        assert!(!cfg_path.exists());
+        let written = Config::persist_impact_level_at(cfg_path.clone(), SystemImpact::Medium)
+            .expect("persist");
+        assert_eq!(written, cfg_path);
+        let after = std::fs::read_to_string(&cfg_path).unwrap();
+        assert!(after.contains("[impact]"));
+        assert!(after.contains("level = \"medium\""));
+    }
+
+    #[test]
+    fn impact_level_fromstr_rejects_bogus_value() {
+        let err = "BOGUS".parse::<SystemImpact>().unwrap_err();
+        assert!(err.contains("invalid level"));
+        assert!(err.contains("unlimited, high, medium, low"));
+    }
+
+    #[test]
+    fn arc_swap_observes_new_profile_after_store() {
+        // Simulates the daemon-side hot reload: build an ArcSwap with the
+        // High profile, swap it for Low, ensure the next load() observes
+        // the new values without rebuilding the swap.
+        use arc_swap::ArcSwap;
+        use std::sync::Arc as StdArc;
+
+        let initial = ImpactProfile::from_level(SystemImpact::High, 8);
+        let swap: StdArc<ArcSwap<ImpactProfile>> =
+            StdArc::new(ArcSwap::from_pointee(initial.clone()));
+        assert_eq!(swap.load().level, SystemImpact::High);
+        assert_eq!(swap.load().ocr_jobs_per_tick, 100);
+
+        let new_profile = ImpactProfile::from_level(SystemImpact::Low, 8);
+        swap.store(StdArc::new(new_profile.clone()));
+
+        let observed = swap.load_full();
+        assert_eq!(observed.level, SystemImpact::Low);
+        assert_eq!(observed.ocr_jobs_per_tick, 5);
+        assert_eq!(observed.daemon_nice, 10);
+        assert!(observed.daemon_sched_idle);
+        assert_eq!(observed.ocr_worker_interval.as_secs(), 30);
     }
 }

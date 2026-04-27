@@ -783,6 +783,18 @@ impl LixunIndex {
         let writer = self.index.writer(heap_size)?;
         Ok(writer)
     }
+
+    /// Create an index writer with an explicit thread count, mirroring
+    /// Tantivy 0.26's `Index::writer_with_num_threads`. Used by the
+    /// daemon when seeding writer concurrency from `ImpactProfile`.
+    pub fn writer_with_num_threads(
+        &self,
+        num_threads: usize,
+        heap_size: usize,
+    ) -> Result<IndexWriter<TantivyDocument>> {
+        let writer = self.index.writer_with_num_threads(num_threads, heap_size)?;
+        Ok(writer)
+    }
 }
 
 fn stored_optional_text(doc: &TantivyDocument, field: tantivy::schema::Field) -> Option<String> {
