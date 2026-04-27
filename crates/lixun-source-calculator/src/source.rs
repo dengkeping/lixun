@@ -1,6 +1,8 @@
 use crate::detect;
 use anyhow::Result;
-use lixun_core::{Action, Category, DocId, Hit, PluginFieldSpec, RowMenuDef, RowMenuItem, RowMenuVerb};
+use lixun_core::{
+    Action, Category, DocId, Hit, PluginFieldSpec, RowMenuDef, RowMenuItem, RowMenuVerb,
+};
 use lixun_sources::{IndexerSource, MutationSink, QueryContext, SourceContext};
 
 pub struct CalculatorSource;

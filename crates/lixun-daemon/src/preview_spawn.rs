@@ -202,8 +202,8 @@ fn tempfile_path() -> anyhow::Result<PathBuf> {
     let runtime = match dirs::runtime_dir() {
         Some(p) => p,
         None => {
-            let tmp_base = std::env::temp_dir()
-                .join(format!("lixun-{}", unsafe { libc::getuid() }));
+            let tmp_base =
+                std::env::temp_dir().join(format!("lixun-{}", unsafe { libc::getuid() }));
             std::fs::create_dir_all(&tmp_base)?;
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&tmp_base, std::fs::Permissions::from_mode(0o700))?;

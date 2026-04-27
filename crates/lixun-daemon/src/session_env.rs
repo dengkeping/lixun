@@ -150,10 +150,7 @@ mod tests {
 
     /// Build a fake /run/user/$UID directory with the given wayland sockets
     /// and optional dbus bus socket.
-    fn fake_runtime(
-        wayland_sockets: &[&str],
-        include_bus: bool,
-    ) -> TempDir {
+    fn fake_runtime(wayland_sockets: &[&str], include_bus: bool) -> TempDir {
         let td = TempDir::new().unwrap();
         for name in wayland_sockets {
             fs::write(td.path().join(name), b"").unwrap();
@@ -219,16 +216,10 @@ mod tests {
         let rt = fake_runtime(&["wayland-0", "wayland-0.lock"], true);
         let x = fake_x11(&["X0"]);
         let mut inherited = HashMap::new();
-        inherited.insert(
-            "WAYLAND_DISPLAY".to_string(),
-            "wayland-99".to_string(),
-        );
+        inherited.insert("WAYLAND_DISPLAY".to_string(), "wayland-99".to_string());
 
         let env = discover_gui_env_at(rt.path(), x.path(), &inherited);
-        assert_eq!(
-            env.get("WAYLAND_DISPLAY"),
-            Some(&"wayland-99".to_string())
-        );
+        assert_eq!(env.get("WAYLAND_DISPLAY"), Some(&"wayland-99".to_string()));
     }
 
     /// X11 display discovery picks lowest-numbered socket.

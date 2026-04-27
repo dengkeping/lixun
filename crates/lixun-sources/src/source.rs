@@ -120,6 +120,59 @@ pub trait IndexerSource: Send + Sync {
     fn row_menu(&self) -> RowMenuDef {
         RowMenuDef::empty()
     }
+
+    /// Optional post-commit mutation broadcaster contributed by this
+    /// source. The daemon collects every `Some` returned across all
+    /// registered sources and routes committed mutations to each of
+    /// them via [`lixun_mutation::MultiBroadcaster`]. Default returns
+    /// `None`, so existing sources need no changes.
+    fn broadcaster(&self) -> Option<Arc<dyn lixun_mutation::MutationBroadcaster>> {
+        None
+    }
+
+    /// Optional ANN handle contributed by this source. The daemon
+    /// uses the first `Some` it finds (single ANN provider per
+    /// process); the hybrid search layer consults it alongside the
+    /// lexical index. Default returns `None`.
+    fn ann_handle(&self) -> Option<Arc<dyn lixun_mutation::AnnHandle>> {
+        None
+    }
+
+    /// Optional CLI verb tree contributed by this source. The daemon
+    /// flattens every `Some` returned across all instances into a
+    /// single [`lixun_mutation::CliManifest`] which `lixun-cli` reads
+    /// once at startup to synthesize clap subcommands. Default returns
+    /// `None`, so non-CLI-extending sources need no changes.
+    fn cli_manifest(&self) -> Option<lixun_mutation::CliManifest> {
+        None
+    }
+
+    /// Async dispatcher for CLI verbs declared in [`Self::cli_manifest`].
+    /// Returns a boxed future so the trait stays object-safe without an
+    /// `async_trait` macro on the whole trait — every existing
+    /// non-overriding source keeps its synchronous shape. The default
+    /// rejects every verb, which is correct for sources that publish no
+    /// manifest.
+    fn cli_invoke<'a>(
+        &'a self,
+        verb_path: &'a [String],
+        _args: &'a serde_json::Value,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            Err(anyhow::anyhow!(
+                "plugin does not handle CLI verb {:?}",
+                verb_path
+            ))
+        })
+    }
+
+    /// One-shot install hook for the daemon-owned read-only document
+    /// store. Called once after the writer service boots, before any
+    /// CLI verb dispatch. Default discards the handle, which is what
+    /// every source that does not need lexical-corpus enumeration
+    /// wants.
+    fn install_doc_store(&self, _store: Arc<dyn lixun_mutation::DocStore>) {}
 }
 
 pub struct PluginBuildContext {

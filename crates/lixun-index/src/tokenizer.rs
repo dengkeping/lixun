@@ -1,8 +1,8 @@
 use tantivy::{
+    Index,
     tokenizer::{
         AsciiFoldingFilter, LowerCaser, RemoveLongFilter, SimpleTokenizer, Stemmer, TextAnalyzer,
     },
-    Index,
 };
 
 // Spotlight tokenizer chain (Wave B T3): stemming is the TAIL step.

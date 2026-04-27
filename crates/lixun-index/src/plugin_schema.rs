@@ -1,10 +1,10 @@
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use lixun_core::{PluginFieldSpec, PluginFieldType, TextTokenizer};
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use tantivy::schema::{
-    IndexRecordOption, NumericOptions, SchemaBuilder, TextFieldIndexing, TextOptions, FAST, STORED,
-    STRING,
+    FAST, IndexRecordOption, NumericOptions, STORED, STRING, SchemaBuilder, TextFieldIndexing,
+    TextOptions,
 };
 
 pub const FINGERPRINT_FILE: &str = "layout.fingerprint";
@@ -93,7 +93,10 @@ pub fn add_plugin_fields_to_schema(
             }
             PluginFieldType::I64 => {
                 let opts = if spec.stored {
-                    NumericOptions::default().set_indexed().set_stored().set_fast()
+                    NumericOptions::default()
+                        .set_indexed()
+                        .set_stored()
+                        .set_fast()
                 } else {
                     NumericOptions::default().set_indexed().set_fast()
                 };
@@ -101,7 +104,10 @@ pub fn add_plugin_fields_to_schema(
             }
             PluginFieldType::U64 => {
                 let opts = if spec.stored {
-                    NumericOptions::default().set_indexed().set_stored().set_fast()
+                    NumericOptions::default()
+                        .set_indexed()
+                        .set_stored()
+                        .set_fast()
                 } else {
                     NumericOptions::default().set_indexed().set_fast()
                 };
@@ -109,7 +115,11 @@ pub fn add_plugin_fields_to_schema(
             }
             PluginFieldType::Bool => {
                 let _ = FAST;
-                let opts = if spec.stored { STORED.into() } else { NumericOptions::default() };
+                let opts = if spec.stored {
+                    STORED.into()
+                } else {
+                    NumericOptions::default()
+                };
                 builder.add_bool_field(spec.schema_name, opts)
             }
         };
@@ -144,12 +154,7 @@ pub fn compute_fingerprint(
         for s in specs_vec {
             canonical.push_str(&format!(
                 "  {}|alias={:?}|ty={:?}|stored={}|default={}|boost={}\n",
-                s.schema_name,
-                s.query_alias,
-                s.ty,
-                s.stored,
-                s.default_search,
-                s.boost,
+                s.schema_name, s.query_alias, s.ty, s.stored, s.default_search, s.boost,
             ));
         }
     }
@@ -180,10 +185,7 @@ pub fn write_fingerprint(index_dir: &Path, fingerprint: &str) -> Result<()> {
         .map_err(|e| anyhow!("write fingerprint: {}", e))
 }
 
-pub fn rewrite_query_aliases(
-    text: &str,
-    aliases: &HashMap<&'static str, &'static str>,
-) -> String {
+pub fn rewrite_query_aliases(text: &str, aliases: &HashMap<&'static str, &'static str>) -> String {
     if aliases.is_empty() {
         return text.to_string();
     }
@@ -196,9 +198,7 @@ pub fn rewrite_query_aliases(
         let at_boundary = i == 0 || !bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_';
         if is_id_start && at_boundary {
             let start = i;
-            while i < bytes.len()
-                && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
-            {
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                 i += 1;
             }
             if i < bytes.len() && bytes[i] == b':' {
@@ -362,10 +362,7 @@ mod tests {
     fn test_rewrite_aliases_respects_word_boundary() {
         let mut aliases: HashMap<&'static str, &'static str> = HashMap::new();
         aliases.insert("folder", "maildir_folder");
-        assert_eq!(
-            rewrite_query_aliases("myfolder:x", &aliases),
-            "myfolder:x"
-        );
+        assert_eq!(rewrite_query_aliases("myfolder:x", &aliases), "myfolder:x");
     }
 
     #[test]

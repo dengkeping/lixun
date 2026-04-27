@@ -153,8 +153,8 @@ fn build_preview_window(
     window.set_anchor(Edge::Bottom, false);
     window.set_keyboard_mode(KeyboardMode::Exclusive);
 
-    let display = gtk::gdk::Display::default()
-        .ok_or_else(|| anyhow::anyhow!("no default GDK display"))?;
+    let display =
+        gtk::gdk::Display::default().ok_or_else(|| anyhow::anyhow!("no default GDK display"))?;
 
     // Compute the effective cap (w_max, h_max) from config and the
     // active monitor. This is the configured ceiling regardless of
@@ -220,10 +220,8 @@ fn build_preview_window(
         Ok(widget) => content_scroll.set_child(Some(&widget)),
         Err(e) => {
             tracing::error!("preview: plugin `{}` build failed: {}", plugin_id, e);
-            let err_label = gtk::Label::new(Some(&format!(
-                "Preview failed ({}):\n{}",
-                plugin_id, e
-            )));
+            let err_label =
+                gtk::Label::new(Some(&format!("Preview failed ({}):\n{}", plugin_id, e)));
             err_label.set_wrap(true);
             err_label.set_margin_top(24);
             err_label.set_margin_bottom(24);

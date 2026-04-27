@@ -181,9 +181,7 @@ fn menu_for_key(key: &str, def: &RowMenuDef) -> gio::Menu {
             };
             menu.append(Some(&item.label), Some(action));
         }
-        cache
-            .borrow_mut()
-            .insert(key.to_string(), menu.clone());
+        cache.borrow_mut().insert(key.to_string(), menu.clone());
         menu
     })
 }
@@ -390,8 +388,7 @@ pub(crate) fn create_list_factory(entry: gtk::Entry) -> gtk::SignalListItemFacto
         // later calls `set_menu_model` only when the bound hit's
         // `source_instance` differs from the previously-bound one
         // (see MENU_CACHE). Parented once; never rebuilt.
-        let right_click_popover =
-            gtk::PopoverMenu::from_model(Some(&gio::Menu::new()));
+        let right_click_popover = gtk::PopoverMenu::from_model(Some(&gio::Menu::new()));
         right_click_popover.set_parent(&row);
         right_click_popover.set_has_arrow(false);
 

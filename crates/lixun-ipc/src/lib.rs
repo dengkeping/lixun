@@ -78,12 +78,23 @@ pub enum Request {
         #[serde(default)]
         explain: bool,
     },
-    Reindex { paths: Vec<PathBuf> },
+    Reindex {
+        paths: Vec<PathBuf>,
+    },
     Status,
-    RecordClick { doc_id: String },
-    RecordQuery { q: String },
-    RecordQueryClick { doc_id: String, query: String },
-    SearchHistory { limit: u32 },
+    RecordClick {
+        doc_id: String,
+    },
+    RecordQuery {
+        q: String,
+    },
+    RecordQueryClick {
+        doc_id: String,
+        query: String,
+    },
+    SearchHistory {
+        limit: u32,
+    },
     /// Open a preview window for the given hit. The GUI embeds the
     /// full Hit rather than a DocId because app / calculator /
     /// recent-query hits never reach Tantivy and so cannot be
@@ -102,6 +113,19 @@ pub enum Request {
     Preview {
         hit: Box<Hit>,
         monitor: Option<String>,
+    },
+    /// Ask the daemon for the flattened CLI manifest contributed by
+    /// every registered plugin. The host CLI uses this once at startup
+    /// to synthesize subcommands without learning any plugin name at
+    /// compile time.
+    EnumeratePlugins,
+    /// Invoke a plugin-registered CLI verb. `verb_path` is the
+    /// position-ordered slice of names selected by the user
+    /// (`[top, sub, sub, ...]`); `args` is the JSON-encoded argument
+    /// map keyed by [`lixun_mutation::CliArg::name`].
+    PluginCommand {
+        verb_path: Vec<String>,
+        args: serde_json::Value,
     },
 }
 
@@ -148,6 +172,9 @@ pub enum Response {
         visible: bool,
     },
     Queries(Vec<String>),
+    PluginManifest(lixun_mutation::CliManifest),
+    PluginResult(serde_json::Value),
+    PluginError(String),
     Error(String),
 }
 
@@ -254,11 +281,7 @@ pub(crate) fn get_uid_fallback() -> u32 {
     if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
         for line in status.lines() {
             if let Some(rest) = line.strip_prefix("Uid:")
-                && let Ok(uid) = rest
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or("0")
-                    .parse::<u32>()
+                && let Ok(uid) = rest.split_whitespace().next().unwrap_or("0").parse::<u32>()
             {
                 return uid;
             }

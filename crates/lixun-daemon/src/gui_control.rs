@@ -140,7 +140,10 @@ impl GuiControl {
         let Ok(Ok(mut stream)) = connect.await else {
             return false;
         };
-        if write_frame_async(&mut stream, &GuiCommand::Ping).await.is_err() {
+        if write_frame_async(&mut stream, &GuiCommand::Ping)
+            .await
+            .is_err()
+        {
             return false;
         }
         let read = tokio::time::timeout(
@@ -199,8 +202,12 @@ async fn wait_for_ready() -> anyhow::Result<()> {
     let deadline = tokio::time::Instant::now() + CONNECT_TIMEOUT;
     loop {
         if let Ok(mut stream) = UnixStream::connect(&path).await
-            && write_frame_async(&mut stream, &GuiCommand::Ping).await.is_ok()
-            && read_frame_async::<_, GuiResponse>(&mut stream).await.is_ok()
+            && write_frame_async(&mut stream, &GuiCommand::Ping)
+                .await
+                .is_ok()
+            && read_frame_async::<_, GuiResponse>(&mut stream)
+                .await
+                .is_ok()
         {
             return Ok(());
         }

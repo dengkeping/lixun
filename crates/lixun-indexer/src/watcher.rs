@@ -118,7 +118,14 @@ pub async fn start(
             body_checker: body_checker.clone(),
             min_image_side_px,
         };
-        tokio::spawn(resolver_task(worker_id, rx, mutation_tx, ctrl_tx, refresh_tx, env));
+        tokio::spawn(resolver_task(
+            worker_id,
+            rx,
+            mutation_tx,
+            ctrl_tx,
+            refresh_tx,
+            env,
+        ));
     }
 
     Ok(())
@@ -377,14 +384,13 @@ async fn resolver_task(
                 match resolved {
                     Resolved::File(doc) => {
                         if let Err(e) = mutation_tx.send(Mutation::Upsert(doc)).await {
-                            tracing::debug!(
-                                "resolver[{}]: send upsert failed: {}",
-                                worker_id,
-                                e
-                            );
+                            tracing::debug!("resolver[{}]: send upsert failed: {}", worker_id, e);
                         }
                     }
-                    Resolved::Directory { subtree_files, subdirs } => {
+                    Resolved::Directory {
+                        subtree_files,
+                        subdirs,
+                    } => {
                         for dir in subdirs {
                             let _ = ctrl_tx.try_send(Control::AddWatch(dir));
                         }
