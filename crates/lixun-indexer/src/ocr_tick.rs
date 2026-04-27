@@ -282,11 +282,37 @@ fn filetime_secs(md: &std::fs::Metadata) -> i64 {
         .unwrap_or(0)
 }
 
+/// Type-erased reload hook. The daemon stores its live impact
+/// profile in an `Arc<ArcSwap<ImpactProfile>>`; this trait lets the
+/// indexer crate consume the latest values per-tick without taking
+/// a direct dependency on `arc-swap` or `lixun-core` for hot-reload.
+/// Implementors return the per-tick subset of [`OcrWorkerCfg`]
+/// fields that are flagged hot in the Wave E plan §5.6:
+/// `interval`, `jobs_per_tick`, and `throttle`.
+pub trait OcrCfgRefresh: Send + Sync {
+    fn refresh(&self) -> OcrCfgUpdate;
+}
+
+/// Hot subset of [`OcrWorkerCfg`] re-read on every tick when an
+/// [`OcrCfgRefresh`] handle is supplied to [`spawn`]. Anything not
+/// listed here is fixed at spawn time (cold knob).
+#[derive(Debug, Clone)]
+pub struct OcrCfgUpdate {
+    pub interval: Duration,
+    pub jobs_per_tick: usize,
+    pub throttle: Option<(i32, bool)>,
+}
+
 /// Spawn the production OCR worker. Ticks every `cfg.interval` and
 /// calls [`tick_once`] with the real [`lixun_extract::ocr::run_ocr_job`].
 /// Every successful drain is reflected in [`OcrWorkerStats`] and an
 /// aggregate progress line is emitted every
 /// [`PROGRESS_LOG_EVERY_N_DRAINED`] drains.
+///
+/// When `refresh` is `Some`, the worker re-reads the hot
+/// [`OcrCfgUpdate`] fields at the top of every iteration so a
+/// running daemon can pick up new tunables from
+/// `lixun impact set` without restarting (Wave E §5.6).
 pub fn spawn(
     queue: Arc<OcrQueue>,
     idle: Arc<dyn IdleGate>,
@@ -294,9 +320,11 @@ pub fn spawn(
     caps: Arc<ExtractorCapabilities>,
     cfg: OcrWorkerCfg,
     stats: Arc<OcrWorkerStats>,
+    refresh: Option<Arc<dyn OcrCfgRefresh>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut timer = tokio::time::interval(cfg.interval);
+        let mut current_interval = cfg.interval;
+        let mut timer = tokio::time::interval(current_interval);
         timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
         tracing::info!(
             "ocr worker: started, interval={:?}, langs={:?}, max_attempts={}, jobs_per_tick={}",
@@ -305,10 +333,28 @@ pub fn spawn(
             cfg.max_attempts,
             cfg.jobs_per_tick
         );
-        let batch_size = cfg.jobs_per_tick.max(1);
+        let mut cfg = cfg;
         loop {
             timer.tick().await;
 
+            if let Some(r) = refresh.as_ref() {
+                let upd = r.refresh();
+                if upd.interval != current_interval {
+                    tracing::info!(
+                        "ocr worker: hot reload interval {:?} -> {:?}",
+                        current_interval,
+                        upd.interval
+                    );
+                    current_interval = upd.interval;
+                    timer = tokio::time::interval(current_interval);
+                    timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
+                }
+                cfg.interval = upd.interval;
+                cfg.jobs_per_tick = upd.jobs_per_tick;
+                cfg.throttle = upd.throttle;
+            }
+
+            let batch_size = cfg.jobs_per_tick.max(1);
             let throttle = cfg.throttle;
             let run_ocr = |path: &Path,
                            ext: &str,

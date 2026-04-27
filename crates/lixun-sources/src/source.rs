@@ -178,6 +178,7 @@ pub trait IndexerSource: Send + Sync {
 pub struct PluginBuildContext {
     pub max_file_size_mb: u64,
     pub state_dir_root: PathBuf,
+    pub impact: Arc<lixun_core::ImpactProfile>,
 }
 
 pub struct PluginInstance {

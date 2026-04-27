@@ -1,5 +1,5 @@
 use lixun_daemon::config::{
-    Config, ExtractConfig, GuiConfig, Keybindings, OcrConfig, PreviewConfig,
+    Config, ExtractConfig, GuiConfig, ImpactConfig, Keybindings, OcrConfig, PreviewConfig,
 };
 use lixun_daemon::index_service::spawn_writer_service;
 use lixun_daemon::indexer;
@@ -33,6 +33,7 @@ fn test_config(root: std::path::PathBuf, state_dir: std::path::PathBuf) -> Confi
         gui: GuiConfig::default(),
         extract: ExtractConfig::default(),
         ocr: OcrConfig::default(),
+        impact: ImpactConfig::default(),
         state_dir,
         plugin_sections: BTreeMap::new(),
         extractor_caps: std::sync::OnceLock::new(),

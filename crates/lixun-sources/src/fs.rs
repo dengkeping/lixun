@@ -34,6 +34,11 @@ pub struct FsSource {
     /// `maybe_enqueue_ocr` for full semantics (PDFs are always
     /// enqueued; decode errors fail open).
     pub min_image_side_px: u32,
+    /// Rayon pool size for the parallel content-extraction pass.
+    /// Seeded from the resolved `ImpactProfile.rayon_threads`; defaults
+    /// to `min(num_cpus, 4)` when no profile is plumbed (legacy
+    /// constructors). Always coerced to `>= 1` at pool-build time.
+    pub rayon_threads: usize,
 }
 
 /// Intermediate metadata collected during the first pass.
@@ -57,6 +62,7 @@ impl FsSource {
             ocr_enqueue: None,
             body_checker: None,
             min_image_side_px: 0,
+            rayon_threads: std::cmp::min(num_cpus::get(), 4),
         }
     }
 
@@ -75,6 +81,7 @@ impl FsSource {
             ocr_enqueue: None,
             body_checker: None,
             min_image_side_px: 0,
+            rayon_threads: std::cmp::min(num_cpus::get(), 4),
         }
     }
 
@@ -94,6 +101,7 @@ impl FsSource {
             ocr_enqueue,
             body_checker: None,
             min_image_side_px: 0,
+            rayon_threads: std::cmp::min(num_cpus::get(), 4),
         }
     }
 
@@ -114,6 +122,7 @@ impl FsSource {
             ocr_enqueue,
             body_checker: None,
             min_image_side_px: 0,
+            rayon_threads: std::cmp::min(num_cpus::get(), 4),
         }
     }
 
@@ -132,6 +141,11 @@ impl FsSource {
     /// defence-in-depth regardless of this setting.
     pub fn with_min_image_side_px(mut self, min_side_px: u32) -> Self {
         self.min_image_side_px = min_side_px;
+        self
+    }
+
+    pub fn with_rayon_threads(mut self, n: usize) -> Self {
+        self.rayon_threads = n.max(1);
         self
     }
 
@@ -171,9 +185,8 @@ impl FsSource {
         Ok(result)
     }
 
-    /// Build a rayon thread pool sized to min(num_cpus, 4).
-    fn build_pool() -> rayon::ThreadPool {
-        let num_threads = std::cmp::min(num_cpus::get(), 4);
+    fn build_pool(num_threads: usize) -> rayon::ThreadPool {
+        let num_threads = num_threads.max(1);
         rayon::ThreadPoolBuilder::new()
             .num_threads(num_threads)
             .build()
@@ -351,7 +364,7 @@ impl FsSource {
             Self::BATCH_SIZE,
         );
 
-        let pool = Self::build_pool();
+        let pool = Self::build_pool(self.rayon_threads);
         let total = changed_metas.len();
         let mut extract_fails: u64 = 0;
         let mut processed: usize = 0;
@@ -479,7 +492,7 @@ impl FsSource {
             metas.len()
         );
 
-        let pool = Self::build_pool();
+        let pool = Self::build_pool(self.rayon_threads);
         let caps = Arc::clone(&self.caps);
         let enqueue = self.ocr_enqueue.clone();
         let body_checker = self.body_checker.clone();

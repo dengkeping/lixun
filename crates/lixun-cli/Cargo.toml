@@ -2,6 +2,7 @@
 name = "lixun-cli"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [[bin]]
 name = "lixun-cli"
@@ -19,6 +20,7 @@ serde.workspace = true
 serde_json.workspace = true
 bytes.workspace = true
 tokio-util.workspace = true
+dirs.workspace = true
 
 [dev-dependencies]
 lixun-index = { path = "../lixun-index" }
