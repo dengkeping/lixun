@@ -19,6 +19,8 @@ pub struct SemanticSource {
     embedder_tx: mpsc::Sender<EmbedJob>,
     journal: Arc<std::sync::Mutex<BackfillJournal>>,
     doc_store: OnceLock<Arc<dyn DocStore>>,
+    backfill_on_start: bool,
+    runtime: tokio::runtime::Handle,
     _worker: WorkerHandle,
 }
 
@@ -27,6 +29,8 @@ impl SemanticSource {
         worker: WorkerHandle,
         ann: Arc<LanceDbAnnHandle>,
         journal: Arc<std::sync::Mutex<BackfillJournal>>,
+        backfill_on_start: bool,
+        runtime: tokio::runtime::Handle,
     ) -> Self {
         let embedder_tx = worker.sender();
         let broadcaster: Arc<dyn MutationBroadcaster> =
@@ -37,6 +41,8 @@ impl SemanticSource {
             embedder_tx,
             journal,
             doc_store: OnceLock::new(),
+            backfill_on_start,
+            runtime,
             _worker: worker,
         }
     }
@@ -66,7 +72,23 @@ impl IndexerSource for SemanticSource {
     }
 
     fn install_doc_store(&self, store: Arc<dyn DocStore>) {
-        let _ = self.doc_store.set(store);
+        // The host installs the lexical doc store exactly once,
+        // after every plugin's worker is wired up. That is the
+        // earliest moment a backfill can run, so the `backfill_on_start`
+        // config flag is honoured here rather than in `PluginFactory::build`.
+        if self.doc_store.set(store.clone()).is_err() {
+            return;
+        }
+        if !self.backfill_on_start {
+            return;
+        }
+        let journal = self.journal.clone();
+        let embedder_tx = self.embedder_tx.clone();
+        self.runtime.spawn(async move {
+            if let Err(e) = start_backfill(store, journal, embedder_tx).await {
+                tracing::warn!("semantic backfill_on_start: {e:#}");
+            }
+        });
     }
 
     fn cli_manifest(&self) -> Option<CliManifest> {
