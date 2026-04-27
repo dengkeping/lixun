@@ -81,8 +81,8 @@ fn reaper_loop(state: Arc<ReaperState>) {
         // those that exited. `try_wait` consumes the zombie; the
         // subsequent drop only closes the pidfd/handle.
         guard.retain_mut(|child| match child.try_wait() {
-            Ok(None) => true,            // still running
-            Ok(Some(_status)) => false,  // exited, reaped
+            Ok(None) => true,           // still running
+            Ok(Some(_status)) => false, // exited, reaped
             Err(e) => {
                 // ECHILD or similar: child vanished. Drop it —
                 // there's nothing to wait on anyway.

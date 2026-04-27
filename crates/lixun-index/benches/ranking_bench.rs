@@ -75,7 +75,12 @@ fn make_doc(id: &str, category: Category, title: &str, body: &str) -> Document {
 fn build_corpus() -> Vec<Document> {
     let mut docs = Vec::new();
 
-    docs.push(make_doc("app:firefox", Category::App, "Firefox", "web browser"));
+    docs.push(make_doc(
+        "app:firefox",
+        Category::App,
+        "Firefox",
+        "web browser",
+    ));
     docs.push(make_doc(
         "app:firefox-dev",
         Category::App,
@@ -321,10 +326,9 @@ fn main() {
         md.push('\n');
     }
 
-    let target = PathBuf::from(
-        std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "target".to_string()),
-    )
-    .join("ranking-bench.md");
+    let target =
+        PathBuf::from(std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "target".to_string()))
+            .join("ranking-bench.md");
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent).unwrap();
     }

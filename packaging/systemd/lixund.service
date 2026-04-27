@@ -14,6 +14,12 @@ PartOf=graphical-session.target
 ExecStart=/usr/bin/lixund
 Restart=on-failure
 RestartSec=2s
+# Pin the fastembed model cache under the user's cache home. Without this,
+# fastembed downloads ONNX text/image models into its built-in default
+# ($XDG_CACHE_HOME/.fastembed_cache/), which is opaque to operators; pinning
+# keeps the cache discoverable and matches the path documented in
+# docs/wave-d-semantic.md. %h expands to $HOME at unit start.
+Environment=FASTEMBED_CACHE_DIR=%h/.cache/lixun/fastembed
 
 [Install]
 WantedBy=default.target

@@ -11,6 +11,9 @@ members = [
     "crates/lixun-source-shell",
     "crates/lixun-plugin-bundle",
     "crates/lixun-indexer",
+    "crates/lixun-mutation",
+    "crates/lixun-fusion",
+    "crates/lixun-source-semantic",
     "crates/lixun-daemon",
     "crates/lixun-gui",
     "crates/lixun-cli",
@@ -28,8 +31,9 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
+rust-version = "1.91"
 description = "Spotlight-like launcher for Linux"
 
 [workspace.dependencies]
@@ -81,6 +85,19 @@ uuid = { version = "1", features = ["v4"] }
 dirs = "5"
 image = "0.25"
 rusqlite = { version = "0.31", features = ["bundled"] }
+
+# Wave D: dense-vector hybrid retrieval. Pinned because the ONNX
+# Runtime ABI between fastembed/ort/lancedb is fragile across patch
+# releases. `ort` itself is pulled transitively by fastembed; do not
+# name it here so the version stays in fastembed's hands.
+fastembed = "=5.13.3"
+lancedb = "=0.27.1"
+# Aligned with the arrow major lancedb 0.27.1 pulls transitively;
+# mismatched majors would compile but fail at runtime since arrow's
+# RecordBatch / Schema types are not version-compatible across majors.
+arrow = "57"
+arrow-array = "57"
+arrow-schema = "57"
 
 # Profile for memory profiling: release optimizations + full debug info
 # so heaptrack/valgrind can resolve symbols. Used for diagnosis only;

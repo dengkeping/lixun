@@ -150,7 +150,14 @@ pub async fn tick_once<S, G, F>(
 where
     S: UpsertBodySink + ?Sized,
     G: IdleGate + ?Sized,
-    F: Fn(&Path, &str, &[String], &ExtractorCapabilities, u32, Option<usize>) -> Result<Option<String>>
+    F: Fn(
+            &Path,
+            &str,
+            &[String],
+            &ExtractorCapabilities,
+            u32,
+            Option<usize>,
+        ) -> Result<Option<String>>
         + Send,
 {
     if !idle.is_idle() {
@@ -194,9 +201,7 @@ where
     match ocr_result {
         Ok(Some(text)) => {
             if !idle.is_idle() {
-                tracing::warn!(
-                    "ocr completed but idle gate flipped; keeping row {doc_id}"
-                );
+                tracing::warn!("ocr completed but idle gate flipped; keeping row {doc_id}");
                 return TickOutcome::NoIdle;
             }
             // AM-6: detect watcher-vs-worker races by re-stating the
@@ -218,11 +223,7 @@ where
                         if let Err(e) = queue.remove(&doc_id) {
                             tracing::warn!("ocr: queue.remove failed for {doc_id}: {e:#}");
                         }
-                        tracing::info!(
-                            "ocr ok: {} ({} chars)",
-                            path.display(),
-                            text.len()
-                        );
+                        tracing::info!("ocr ok: {} ({} chars)", path.display(), text.len());
                         TickOutcome::Drained { doc_id }
                     } else {
                         tracing::warn!(
@@ -236,10 +237,7 @@ where
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        "ocr: file gone mid-OCR {}: {e}",
-                        path.display()
-                    );
+                    tracing::warn!("ocr: file gone mid-OCR {}: {e}", path.display());
                     if let Err(e2) = queue.remove(&doc_id) {
                         tracing::warn!("ocr: queue.remove failed for {doc_id}: {e2:#}");
                     }
@@ -312,44 +310,42 @@ pub fn spawn(
             timer.tick().await;
 
             let throttle = cfg.throttle;
-            let run_ocr =
-                |path: &Path,
-                 ext: &str,
-                 langs: &[String],
-                 caps: &ExtractorCapabilities,
-                 min_side: u32,
-                 max_pages: Option<usize>|
-                 -> Result<Option<String>> {
-                    let caps_clone = caps.clone();
-                    let langs_vec = langs.to_vec();
-                    let path_owned = path.to_path_buf();
-                    let ext_owned = ext.to_string();
-                    tokio::task::block_in_place(|| {
-                        if let Some((nice, ioprio_idle)) = throttle {
-                            let runner = lixun_extract::shell::SystemRunner::new(
-                                caps_clone.timeout.as_secs(),
-                            )
-                            .with_low_priority(nice, ioprio_idle);
-                            lixun_extract::ocr::run_ocr_job_with(
-                                &path_owned,
-                                &ext_owned,
-                                &langs_vec,
-                                min_side,
-                                max_pages,
-                                &runner,
-                            )
-                        } else {
-                            lixun_extract::ocr::run_ocr_job(
-                                &path_owned,
-                                &ext_owned,
-                                &langs_vec,
-                                &caps_clone,
-                                min_side,
-                                max_pages,
-                            )
-                        }
-                    })
-                };
+            let run_ocr = |path: &Path,
+                           ext: &str,
+                           langs: &[String],
+                           caps: &ExtractorCapabilities,
+                           min_side: u32,
+                           max_pages: Option<usize>|
+             -> Result<Option<String>> {
+                let caps_clone = caps.clone();
+                let langs_vec = langs.to_vec();
+                let path_owned = path.to_path_buf();
+                let ext_owned = ext.to_string();
+                tokio::task::block_in_place(|| {
+                    if let Some((nice, ioprio_idle)) = throttle {
+                        let runner =
+                            lixun_extract::shell::SystemRunner::new(caps_clone.timeout.as_secs())
+                                .with_low_priority(nice, ioprio_idle);
+                        lixun_extract::ocr::run_ocr_job_with(
+                            &path_owned,
+                            &ext_owned,
+                            &langs_vec,
+                            min_side,
+                            max_pages,
+                            &runner,
+                        )
+                    } else {
+                        lixun_extract::ocr::run_ocr_job(
+                            &path_owned,
+                            &ext_owned,
+                            &langs_vec,
+                            &caps_clone,
+                            min_side,
+                            max_pages,
+                        )
+                    }
+                })
+            };
 
             let mut last_outcome: Option<TickOutcome> = None;
             for _ in 0..batch_size {
@@ -558,15 +554,14 @@ mod tests {
         let idle = FixedIdle(true);
         let caps = test_caps();
         let cfg = test_cfg();
-        let run_ocr = |_p: &Path,
-                       _e: &str,
-                       _l: &[String],
-                       _c: &ExtractorCapabilities,
-                       _m: u32,
-                       _mp: Option<usize>|
-         -> Result<Option<String>> {
-            Err(anyhow::anyhow!("tesseract exploded"))
-        };
+        let run_ocr =
+            |_p: &Path,
+             _e: &str,
+             _l: &[String],
+             _c: &ExtractorCapabilities,
+             _m: u32,
+             _mp: Option<usize>|
+             -> Result<Option<String>> { Err(anyhow::anyhow!("tesseract exploded")) };
 
         let outcome = tick_once(&queue, &idle, &sink, &caps, &cfg, run_ocr).await;
 
@@ -769,7 +764,11 @@ mod tests {
         // 5 slots offered, only 1 row: expect Drained then Empty, not 5 calls.
         let outcomes = drain_batch(&queue, &idle, &sink, &caps, &cfg, run_ocr, 5).await;
 
-        assert_eq!(outcomes.len(), 2, "batch did not break on Empty: {outcomes:?}");
+        assert_eq!(
+            outcomes.len(),
+            2,
+            "batch did not break on Empty: {outcomes:?}"
+        );
         assert!(matches!(&outcomes[0], TickOutcome::Drained { doc_id } if doc_id == "fs:/only"));
         assert_eq!(outcomes[1], TickOutcome::Empty);
         assert_eq!(queue.len().unwrap(), 0);
@@ -818,7 +817,11 @@ mod tests {
 
         let outcomes = drain_batch(&queue, &idle, &sink, &caps, &cfg, run_ocr, 5).await;
 
-        assert_eq!(outcomes.len(), 2, "batch did not break on NoIdle: {outcomes:?}");
+        assert_eq!(
+            outcomes.len(),
+            2,
+            "batch did not break on NoIdle: {outcomes:?}"
+        );
         assert!(matches!(&outcomes[0], TickOutcome::Drained { doc_id } if doc_id == "fs:/first"));
         assert_eq!(outcomes[1], TickOutcome::NoIdle);
         assert_eq!(queue.len().unwrap(), 1);

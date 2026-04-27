@@ -550,8 +550,7 @@ mod tests {
 
     #[test]
     fn test_action_exec_terminal_default_false_for_legacy_wire() {
-        let legacy_json =
-            r#"{"Exec":{"cmdline":["ls"],"working_dir":null}}"#;
+        let legacy_json = r#"{"Exec":{"cmdline":["ls"],"working_dir":null}}"#;
         let decoded: Action = serde_json::from_str(legacy_json).unwrap();
         match decoded {
             Action::Exec { terminal, .. } => assert!(!terminal),

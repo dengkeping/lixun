@@ -177,7 +177,10 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .into_owned();
-        assert_ne!(aliased_str, canonical, "symlink alias must differ from canonical");
+        assert_ne!(
+            aliased_str, canonical,
+            "symlink alias must differ from canonical"
+        );
 
         let mut pre = Manifest::default();
         pre.update(aliased_str.clone(), 100);
@@ -185,7 +188,11 @@ mod tests {
         pre.save(tmp.path());
 
         let loaded = Manifest::load(tmp.path());
-        assert_eq!(loaded.len(), 1, "alias + canonical keys must collapse to one");
+        assert_eq!(
+            loaded.len(),
+            1,
+            "alias + canonical keys must collapse to one"
+        );
         assert!(
             loaded.is_unchanged(&canonical, 200),
             "merged mtime must be the newest of the two aliases"

@@ -52,11 +52,7 @@ async fn run_one(inst: SourceInstance, interval: std::time::Duration, sink: Arc<
                 inst.instance_id,
                 e
             ),
-            Err(e) => tracing::error!(
-                "tick task for {} panicked: {}",
-                inst.source.kind(),
-                e
-            ),
+            Err(e) => tracing::error!("tick task for {} panicked: {}", inst.source.kind(), e),
         }
     }
 }

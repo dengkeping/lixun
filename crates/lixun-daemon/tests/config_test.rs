@@ -65,10 +65,11 @@ fn exclude_regex_compiled_from_toml() {
     "#;
     let cfg = Config::from_toml_str(toml).unwrap();
     assert_eq!(cfg.exclude_regex.len(), 2);
-    assert!(cfg
-        .exclude_regex
-        .iter()
-        .any(|r| r.is_match("/home/u/Docs/.~lock.Report.xlsx#")));
+    assert!(
+        cfg.exclude_regex
+            .iter()
+            .any(|r| r.is_match("/home/u/Docs/.~lock.Report.xlsx#"))
+    );
     assert!(cfg.exclude_regex.iter().any(|r| r.is_match("/a/b/foo.pyc")));
 }
 

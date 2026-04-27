@@ -203,9 +203,7 @@ fn parse_tesseract_langs(stdout: &[u8], stderr: &[u8]) -> Vec<String> {
                 continue;
             }
             let shape_ok = bytes[0].is_ascii_lowercase()
-                && bytes
-                    .iter()
-                    .all(|b| b.is_ascii_lowercase() || *b == b'_');
+                && bytes.iter().all(|b| b.is_ascii_lowercase() || *b == b'_');
             if shape_ok {
                 langs.push(line.to_string());
             }
@@ -748,8 +746,11 @@ mod tests {
 
     #[test]
     fn probe_without_tesseract_zeroes_ocr_fields() {
-        let caps =
-            ExtractorCapabilities::probe_with(Duration::from_secs(15), no_command_exists, langs_empty);
+        let caps = ExtractorCapabilities::probe_with(
+            Duration::from_secs(15),
+            no_command_exists,
+            langs_empty,
+        );
         assert!(!caps.has_tesseract);
         assert!(!caps.has_pdftoppm);
         assert!(caps.tesseract_langs.is_empty());
@@ -767,7 +768,10 @@ mod tests {
         assert!(caps.has_tesseract);
         assert!(caps.has_pdftoppm);
         assert_eq!(caps.tesseract_langs, vec!["eng", "rus"]);
-        assert!(!caps.ocr_enabled, "ocr_enabled stays false until daemon flips it");
+        assert!(
+            !caps.ocr_enabled,
+            "ocr_enabled stays false until daemon flips it"
+        );
     }
 
     #[test]
@@ -806,8 +810,7 @@ mod tests {
 
     #[test]
     fn parse_tesseract_langs_rejects_headers_and_noise() {
-        let stdout =
-            b"List of available languages (3):\neng\n  rus  \nABC\n123\n\nchi_sim\nosd\n";
+        let stdout = b"List of available languages (3):\neng\n  rus  \nABC\n123\n\nchi_sim\nosd\n";
         let langs = parse_tesseract_langs(stdout, b"");
         assert_eq!(
             langs,

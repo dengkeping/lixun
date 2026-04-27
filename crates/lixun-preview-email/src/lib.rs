@@ -404,8 +404,8 @@ inventory::submit! {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lixun_core::paths::canonical_fs_doc_id;
     use lixun_core::DocId;
+    use lixun_core::paths::canonical_fs_doc_id;
     use std::path::PathBuf;
 
     fn eml_hit(path: impl Into<PathBuf>) -> Hit {

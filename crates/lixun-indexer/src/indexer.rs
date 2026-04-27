@@ -39,16 +39,13 @@ pub async fn reindex_full(
 
         let walk_task = tokio::task::spawn_blocking(move || -> Result<()> {
             let mut manifest = Manifest::default();
-            let _deleted = fs_source.index_incremental_batched(
-                &mut manifest,
-                &empty_ids,
-                |docs| {
+            let _deleted =
+                fs_source.index_incremental_batched(&mut manifest, &empty_ids, |docs| {
                     runtime
                         .block_on(batch_tx.send(docs))
                         .map_err(|_| anyhow::anyhow!("reindex consumer closed"))?;
                     Ok(())
-                },
-            )?;
+                })?;
             manifest.save(&state_dir_for_walk);
             Ok(())
         });
@@ -216,8 +213,10 @@ async fn reindex_non_fs_from_registry(
 ) -> Result<usize> {
     let writer_sink: Arc<dyn MutationSink> = Arc::new(WriterSink::new(mutation_tx.clone()));
     let counter = Arc::new(AtomicUsize::new(0));
-    let counting_sink: Arc<dyn MutationSink> =
-        Arc::new(CountingSink::new(Arc::clone(&writer_sink), Arc::clone(&counter)));
+    let counting_sink: Arc<dyn MutationSink> = Arc::new(CountingSink::new(
+        Arc::clone(&writer_sink),
+        Arc::clone(&counter),
+    ));
 
     for inst in &registry.instances {
         if inst.source.kind() == "fs" {

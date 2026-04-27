@@ -18,8 +18,7 @@ use gtk4_layer_shell::{Edge, LayerShell};
 use lixun_core::Category;
 
 use crate::factory::{
-    add_css_class, clear_cached_hits, create_list_factory, update_results,
-    with_cached_hits,
+    add_css_class, clear_cached_hits, create_list_factory, update_results, with_cached_hits,
 };
 use crate::ipc::{IpcClient, start_ipc_thread};
 use crate::status::StatusBar;
@@ -322,8 +321,7 @@ impl LauncherController {
         for _ in 0..n {
             self.model.remove(0);
         }
-        self.selection
-            .set_selected(gtk::INVALID_LIST_POSITION);
+        self.selection.set_selected(gtk::INVALID_LIST_POSITION);
         self.selection.set_autoselect(true);
         clear_cached_hits();
 
@@ -509,7 +507,11 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
     // max_content_height (see below), so the results list has a
     // vertical cap without pinning the outer surface.
     let gui_max_content_height: i32;
-    if let Some(monitor) = display.monitors().item(0).and_downcast::<gtk::gdk::Monitor>() {
+    if let Some(monitor) = display
+        .monitors()
+        .item(0)
+        .and_downcast::<gtk::gdk::Monitor>()
+    {
         let geom = monitor.geometry();
         let w = (geom.width() * i32::from(daemon_config.gui.width_percent) / 100)
             .min(daemon_config.gui.max_width_px);

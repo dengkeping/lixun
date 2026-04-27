@@ -26,9 +26,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::mpsc::{SyncSender, sync_channel};
 use std::time::Duration;
 
-use lixun_ipc::gui::{
-    GuiCommand, GuiResponse, gui_socket_path, read_frame_sync, write_frame_sync,
-};
+use lixun_ipc::gui::{GuiCommand, GuiResponse, gui_socket_path, read_frame_sync, write_frame_sync};
 
 use crate::window::LauncherController;
 

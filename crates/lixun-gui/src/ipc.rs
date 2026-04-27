@@ -9,10 +9,10 @@
 
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 
 use lixun_core::{Calculation, DocId, Hit};
-use lixun_ipc::{socket_path, Request, Response, PROTOCOL_VERSION};
+use lixun_ipc::{PROTOCOL_VERSION, Request, Response, socket_path};
 
 pub(crate) struct IpcClient {
     pub(crate) request_tx: mpsc::Sender<(String, u32, u64)>,
@@ -55,10 +55,10 @@ pub(crate) fn start_ipc_thread(session_epoch: Arc<AtomicU64>) -> IpcClient {
         while let Ok((query, limit, epoch_at_send)) = rx.recv() {
             let sock = socket_path();
             let req = Request::Search {
-        q: query,
-        limit,
-        explain: false,
-    };
+                q: query,
+                limit,
+                explain: false,
+            };
             let json = match serde_json::to_vec(&req) {
                 Ok(j) => j,
                 Err(e) => {

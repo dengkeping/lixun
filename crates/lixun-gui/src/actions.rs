@@ -3,7 +3,7 @@
 
 use anyhow::Result;
 use gtk::gio;
-use gio::prelude::*;
+use gtk::gio::prelude::*;
 use gtk::prelude::*;
 use lixun_core::{Action, Hit};
 
@@ -78,9 +78,7 @@ fn resolve_terminal_spawn(
 
 fn terminal_spawn() -> TerminalSpawn {
     let on_path = std::env::var_os("PATH")
-        .map(|paths| {
-            std::env::split_paths(&paths).any(|p| p.join("xdg-terminal-exec").is_file())
-        })
+        .map(|paths| std::env::split_paths(&paths).any(|p| p.join("xdg-terminal-exec").is_file()))
         .unwrap_or(false);
     resolve_terminal_spawn(on_path, std::env::var("TERMINAL").ok().as_deref())
 }

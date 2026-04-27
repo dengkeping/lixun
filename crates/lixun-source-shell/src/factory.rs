@@ -2,9 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
-use lixun_sources::{
-    PluginBuildContext, PluginFactory, PluginFactoryEntry, PluginInstance,
-};
+use lixun_sources::{PluginBuildContext, PluginFactory, PluginFactoryEntry, PluginInstance};
 use serde::Deserialize;
 
 use crate::source::ShellSource;
@@ -20,11 +18,7 @@ impl PluginFactory for ShellFactory {
         "shell"
     }
 
-    fn build(
-        &self,
-        raw: &toml::Value,
-        _ctx: &PluginBuildContext,
-    ) -> Result<Vec<PluginInstance>> {
+    fn build(&self, raw: &toml::Value, _ctx: &PluginBuildContext) -> Result<Vec<PluginInstance>> {
         #[derive(Deserialize)]
         struct ShellCfg {
             working_dir: Option<String>,

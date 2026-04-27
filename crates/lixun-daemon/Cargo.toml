@@ -11,7 +11,16 @@ path = "src/main.rs"
 name = "lixun_daemon"
 path = "src/lib.rs"
 
+[features]
+default = []
+semantic = [
+    "lixun-plugin-bundle/semantic",
+    "lixun-fusion/semantic",
+    "dep:lixun-fusion",
+]
+
 [dependencies]
+lixun-fusion = { path = "../lixun-fusion", optional = true, default-features = false }
 lixun-core = { path = "../lixun-core" }
 lixun-extract = { path = "../lixun-extract" }
 lixun-ipc = { path = "../lixun-ipc" }
@@ -19,6 +28,7 @@ lixun-index = { path = "../lixun-index" }
 lixun-sources = { path = "../lixun-sources" }
 lixun-plugin-bundle = { path = "../lixun-plugin-bundle" }
 lixun-indexer = { path = "../lixun-indexer" }
+lixun-mutation = { path = "../lixun-mutation" }
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

@@ -6,9 +6,8 @@ use lixun_core::{Action, Category, DocId, Hit, RowMenuDef, RowMenuItem, RowMenuV
 use lixun_sources::{IndexerSource, MutationSink, QueryContext, SourceContext};
 use regex::Regex;
 
-static RISKY_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^(?:sudo\b|rm\s+-rf\b|mkfs\b|dd\s)").unwrap()
-});
+static RISKY_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(?:sudo\b|rm\s+-rf\b|mkfs\b|dd\s)").unwrap());
 
 /// Wrap the user's shell command in a hold-after-exit sentinel so the
 /// terminal window stays open until the user presses Enter. Without
@@ -32,11 +31,7 @@ impl IndexerSource for ShellSource {
         "shell"
     }
 
-    fn reindex_full(
-        &self,
-        _ctx: &SourceContext,
-        _sink: &dyn MutationSink,
-    ) -> Result<()> {
+    fn reindex_full(&self, _ctx: &SourceContext, _sink: &dyn MutationSink) -> Result<()> {
         Ok(())
     }
 
@@ -176,7 +171,10 @@ mod tests {
     fn on_query_emits_wrapped_cmdline() {
         let hits = src(false).on_query("> echo hello", &ctx());
         assert_eq!(hits.len(), 1);
-        let Action::Exec { cmdline, terminal, .. } = &hits[0].action else {
+        let Action::Exec {
+            cmdline, terminal, ..
+        } = &hits[0].action
+        else {
             panic!("expected Action::Exec");
         };
         assert!(*terminal);

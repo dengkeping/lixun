@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 lixun-core = { path = "../lixun-core" }
+lixun-mutation = { path = "../lixun-mutation" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

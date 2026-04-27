@@ -316,10 +316,7 @@ impl LixunIndex {
     /// defaults (1.0 multipliers, 0.0 final) because they are applied
     /// by the daemon after this call; daemon fills them in before
     /// formatting the human-readable explanation string.
-    pub fn search_with_breakdown(
-        &self,
-        query: &Query,
-    ) -> Result<Vec<(Hit, ScoreBreakdown)>> {
+    pub fn search_with_breakdown(&self, query: &Query) -> Result<Vec<(Hit, ScoreBreakdown)>> {
         let reader = self.index.reader()?;
         let searcher = reader.searcher();
         let s = &self.schema;
@@ -335,9 +332,8 @@ impl LixunIndex {
 
         // Coordination probe (Wave B T2): precompute the set of docs where
         // every query token matches the title. v==q lookup is O(1) per hit.
-        let all_match_set =
-            build_coord_all_match_set(&self.index, &searcher, s.title, &query.text)
-                .unwrap_or_default();
+        let all_match_set = build_coord_all_match_set(&self.index, &searcher, s.title, &query.text)
+            .unwrap_or_default();
         let q_tokens_count = tokenize_with_spotlight(&self.index, &query.text)
             .map(|t| t.len())
             .unwrap_or(0);
@@ -419,14 +415,13 @@ impl LixunIndex {
                 .unwrap_or("")
                 .to_string();
 
-            let coord_mult = if (2..=3).contains(&q_tokens_count)
-                && all_match_set.contains(&doc_address)
-            {
-                1.0 + self.ranking.coordination_boost
-                    / (q_tokens_count as f32).powf(self.ranking.coordination_delta)
-            } else {
-                1.0
-            };
+            let coord_mult =
+                if (2..=3).contains(&q_tokens_count) && all_match_set.contains(&doc_address) {
+                    1.0 + self.ranking.coordination_boost
+                        / (q_tokens_count as f32).powf(self.ranking.coordination_delta)
+                } else {
+                    1.0
+                };
 
             let category_mult = self.ranking.multiplier_for(category);
             let prefix_mult = scoring::prefix_mult(&title_norm, &q_norm, self.ranking.prefix_boost);
@@ -438,8 +433,7 @@ impl LixunIndex {
                 self.ranking.recency_weight,
                 self.ranking.recency_tau_days,
             );
-            let doc_mult =
-                category_mult * prefix_mult * acronym_mult * recency_mult * coord_mult;
+            let doc_mult = category_mult * prefix_mult * acronym_mult * recency_mult * coord_mult;
             let final_score = score * doc_mult;
 
             let hit = Hit {
@@ -505,6 +499,115 @@ impl LixunIndex {
             }
         }
         Ok(out)
+    }
+
+    /// Reconstruct a `Hit` + `ScoreBreakdown` for a single doc identified
+    /// by `id`, without running a query. Returns `Ok(None)` when no live
+    /// doc matches. Used by Wave D fusion: when the ANN side surfaces a
+    /// doc that BM25 missed, we still need a `Hit` to render. Multipliers
+    /// are degenerate (1.0) and `tantivy` is 0.0 because there is no
+    /// query to score against — the fusion layer assigns the final
+    /// score from RRF before publishing.
+    pub fn hydrate_doc_by_id(&self, id: &str) -> Result<Option<(Hit, ScoreBreakdown)>> {
+        let reader = self.index.reader()?;
+        let searcher = reader.searcher();
+        let s = &self.schema;
+        let term = Term::from_field_text(s.id, id);
+        let query = TermQuery::new(term, IndexRecordOption::Basic);
+        let top_docs = searcher.search(&query, &TopDocs::with_limit(1).order_by_score())?;
+        let Some((_, addr)) = top_docs.first() else {
+            return Ok(None);
+        };
+        let doc: TantivyDocument = searcher.doc(*addr)?;
+
+        let id_str = doc
+            .get_first(s.id)
+            .and_then(|v| v.as_str())
+            .unwrap_or("?")
+            .to_string();
+        let category = match doc
+            .get_first(s.category)
+            .and_then(|v| v.as_str())
+            .unwrap_or("file")
+        {
+            "app" => Category::App,
+            "file" => Category::File,
+            "mail" => Category::Mail,
+            "attachment" => Category::Attachment,
+            _ => Category::File,
+        };
+        let title = doc
+            .get_first(s.title)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let subtitle = doc
+            .get_first(s.subtitle)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let icon_name = stored_optional_text(&doc, s.icon_name);
+        let kind_label = stored_optional_text(&doc, s.kind_label);
+        let action_json = doc
+            .get_first(s.action)
+            .and_then(|v| v.as_str())
+            .unwrap_or("{}");
+        let action: lixun_core::Action = serde_json::from_str(action_json)
+            .unwrap_or(lixun_core::Action::OpenFile { path: "".into() });
+        let secondary_action_raw = doc
+            .get_first(s.secondary_action)
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let secondary_action = if secondary_action_raw.is_empty() {
+            None
+        } else {
+            serde_json::from_str::<lixun_core::Action>(secondary_action_raw)
+                .ok()
+                .map(Box::new)
+        };
+        let extract_fail = doc
+            .get_first(s.extract_fail)
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let sender = stored_optional_text(&doc, s.sender);
+        let recipients = stored_optional_text(&doc, s.recipients);
+        let body = stored_optional_text(&doc, s.body);
+        let source_instance = doc
+            .get_first(s.source_instance)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let hit = Hit {
+            id: lixun_core::DocId(id_str),
+            category,
+            title,
+            subtitle,
+            icon_name,
+            kind_label,
+            score: 0.0,
+            action,
+            extract_fail,
+            sender,
+            recipients,
+            body,
+            secondary_action,
+            source_instance,
+            row_menu: lixun_core::RowMenuDef::empty(),
+        };
+        let breakdown = ScoreBreakdown {
+            tantivy: 0.0,
+            category_mult: 1.0,
+            prefix_mult: 1.0,
+            acronym_mult: 1.0,
+            recency_mult: 1.0,
+            coord_mult: 1.0,
+            frecency_mult: 1.0,
+            latch_mult: 1.0,
+            stage2_clamped: 1.0,
+            final_score: 0.0,
+        };
+        Ok(Some((hit, breakdown)))
     }
 
     /// Fetch the full `Document` by its stable `id`. Returns `Ok(None)`
@@ -592,7 +695,10 @@ impl LixunIndex {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let mtime = tdoc.get_first(s.mtime).and_then(|v| v.as_i64()).unwrap_or(0);
+        let mtime = tdoc
+            .get_first(s.mtime)
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
         let size = tdoc.get_first(s.size).and_then(|v| v.as_u64()).unwrap_or(0);
         let action_json = tdoc
             .get_first(s.action)
@@ -1243,11 +1349,8 @@ mod tests {
 
     #[test]
     fn test_prefix_retrieval_firefox() {
-        let mut firefox = sample_document(
-            "app:firefox.desktop",
-            "Firefox",
-            "Web browser by Mozilla",
-        );
+        let mut firefox =
+            sample_document("app:firefox.desktop", "Firefox", "Web browser by Mozilla");
         firefox.category = Category::App;
         let docs = vec![firefox];
         let (_tmp, index) = create_index_with_docs(&docs);
@@ -1263,17 +1366,9 @@ mod tests {
 
     #[test]
     fn test_prefix_ranks_above_body_match() {
-        let mut firefox = sample_document(
-            "app:firefox.desktop",
-            "Firefox",
-            "browser application",
-        );
+        let mut firefox = sample_document("app:firefox.desktop", "Firefox", "browser application");
         firefox.category = Category::App;
-        let notes = sample_document(
-            "fs:/tmp/notes.txt",
-            "Notes",
-            "thoughts about fire safety",
-        );
+        let notes = sample_document("fs:/tmp/notes.txt", "Notes", "thoughts about fire safety");
         let (_tmp, index) = create_index_with_docs(&[firefox, notes]);
 
         let results = search(&index, "fire");
@@ -1627,8 +1722,15 @@ mod tests {
         let (_tmp, index) = create_index_with_docs(&[doc]);
 
         let hits = search(&index, "alpha");
-        assert_eq!(hits.len(), 1, "single-token query must still return the doc");
-        assert!(hits[0].score > 0.0, "score must be positive (baseline scoring preserved)");
+        assert_eq!(
+            hits.len(),
+            1,
+            "single-token query must still return the doc"
+        );
+        assert!(
+            hits[0].score > 0.0,
+            "score must be positive (baseline scoring preserved)"
+        );
     }
 
     #[test]
@@ -1742,7 +1844,10 @@ mod tests {
         let (_tmp, index) = create_index_with_docs(&[doc]);
         let results = search(&index, "alpha");
         assert_eq!(results.len(), 1);
-        assert!(results[0].score > 0.0, "single-token query must still score");
+        assert!(
+            results[0].score > 0.0,
+            "single-token query must still score"
+        );
     }
 
     #[test]
@@ -1751,11 +1856,7 @@ mod tests {
         // collapses to 1.0 no-op. Doc with all 4 tokens still matches
         // via QueryParser's conjunction; we just assert it returns
         // without error — no boost contract applies here.
-        let doc = sample_document(
-            "fs:/tmp/d.txt",
-            "alpha beta gamma delta",
-            "body text",
-        );
+        let doc = sample_document("fs:/tmp/d.txt", "alpha beta gamma delta", "body text");
         let (_tmp, index) = create_index_with_docs(&[doc]);
         let results = search(&index, "alpha beta gamma delta");
         assert_eq!(results.len(), 1);
@@ -1819,7 +1920,10 @@ mod tests {
         let doc = sample_document("fs:/tmp/f.txt", "project alpha", "");
         let (_tmp, index) = create_index_with_docs(&[doc]);
         let hits = search(&index, "proj");
-        assert!(!hits.is_empty(), "prefix path must survive stemmer addition");
+        assert!(
+            !hits.is_empty(),
+            "prefix path must survive stemmer addition"
+        );
         assert_eq!(hits[0].id.0, "fs:/tmp/f.txt");
     }
 
@@ -1833,7 +1937,10 @@ mod tests {
         let doc = sample_document("fs:/tmp/f.txt", "测试 filler", "");
         let (_tmp, index) = create_index_with_docs(&[doc]);
         let hits = search(&index, "filler");
-        assert!(!hits.is_empty(), "non-English title must not break stemming");
+        assert!(
+            !hits.is_empty(),
+            "non-English title must not break stemming"
+        );
         assert_eq!(hits[0].id.0, "fs:/tmp/f.txt");
     }
 
@@ -1848,7 +1955,10 @@ mod tests {
     fn test_search_with_breakdown_product_invariant() {
         let doc = sample_document("fs:/tmp/f.txt", "alpha beta", "");
         let (_tmp, index) = create_index_with_docs(&[doc]);
-        let query = Query { text: "alpha beta".into(), limit: 10 };
+        let query = Query {
+            text: "alpha beta".into(),
+            limit: 10,
+        };
         let pairs = index.search_with_breakdown(&query).expect("search ok");
         assert!(!pairs.is_empty(), "query must hit the indexed doc");
         let (hit, b) = &pairs[0];
@@ -1867,9 +1977,16 @@ mod tests {
             b.final_score,
             drift
         );
-        assert!((b.final_score - hit.score).abs() < 1e-4, "final_score must equal Hit.score");
+        assert!(
+            (b.final_score - hit.score).abs() < 1e-4,
+            "final_score must equal Hit.score"
+        );
         // q=2 coord-match must produce non-unit coord_mult per the T2 formula.
-        assert!(b.coord_mult > 1.0, "q=2 all-match expected coord_mult > 1.0, got {}", b.coord_mult);
+        assert!(
+            b.coord_mult > 1.0,
+            "q=2 all-match expected coord_mult > 1.0, got {}",
+            b.coord_mult
+        );
     }
 
     // Delegation invariant: `search(q)` must produce the same hits (same ids
@@ -1883,13 +2000,28 @@ mod tests {
             sample_document("c", "alpha", "gamma beta"),
         ];
         let (_tmp, index) = create_index_with_docs(&docs);
-        let query = Query { text: "alpha beta".into(), limit: 10 };
+        let query = Query {
+            text: "alpha beta".into(),
+            limit: 10,
+        };
         let plain = index.search(&query).unwrap();
         let paired = index.search_with_breakdown(&query).unwrap();
-        assert_eq!(plain.len(), paired.len(), "both paths must return same hit count");
+        assert_eq!(
+            plain.len(),
+            paired.len(),
+            "both paths must return same hit count"
+        );
         for (h1, (h2, _)) in plain.iter().zip(paired.iter()) {
-            assert_eq!(h1.id.0, h2.id.0, "hit order must match between search() and search_with_breakdown()");
-            assert!((h1.score - h2.score).abs() < 1e-4, "scores must match: {} vs {}", h1.score, h2.score);
+            assert_eq!(
+                h1.id.0, h2.id.0,
+                "hit order must match between search() and search_with_breakdown()"
+            );
+            assert!(
+                (h1.score - h2.score).abs() < 1e-4,
+                "scores must match: {} vs {}",
+                h1.score,
+                h2.score
+            );
         }
     }
 }
