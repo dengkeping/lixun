@@ -207,33 +207,39 @@ impl WorkerThread {
         }
 
         let now = unix_seconds();
-        for (doc, vector) in batch.into_iter().zip(vectors.into_iter()) {
-            let store = self.store.clone();
-            let doc_id = doc.doc_id.clone();
-            let source_instance = doc.source_instance.clone();
-            let mtime = doc.mtime;
-            let upsert_res = self.runtime.block_on(async move {
-                store
-                    .upsert_text(&doc_id, &source_instance, mtime, &vector)
-                    .await
-            });
-            match upsert_res {
-                Ok(()) => {
-                    if let Ok(mut j) = self.journal.lock()
-                        && let Err(e) = j.record(&doc.doc_id, CHANNEL_TEXT, now)
-                    {
-                        tracing::warn!(
-                            doc_id = %doc.doc_id,
-                            "semantic embed worker: journal record failed: {e:#}"
-                        );
+        let rows: Vec<crate::store::VectorRow> = batch
+            .iter()
+            .zip(vectors.iter())
+            .map(|(doc, vector)| crate::store::VectorRow {
+                doc_id: doc.doc_id.clone(),
+                source_instance: doc.source_instance.clone(),
+                mtime: doc.mtime,
+                vector: vector.clone(),
+            })
+            .collect();
+
+        let store = self.store.clone();
+        let upsert_res = self
+            .runtime
+            .block_on(async move { store.upsert_text_batch(&rows).await });
+        match upsert_res {
+            Ok(()) => {
+                if let Ok(mut j) = self.journal.lock() {
+                    for doc in &batch {
+                        if let Err(e) = j.record(&doc.doc_id, CHANNEL_TEXT, now) {
+                            tracing::warn!(
+                                doc_id = %doc.doc_id,
+                                "semantic embed worker: journal record failed: {e:#}"
+                            );
+                        }
                     }
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        doc_id = %doc.doc_id,
-                        "semantic embed worker: lancedb upsert_text failed: {e:#}"
-                    );
-                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    batch_len = batch.len(),
+                    "semantic embed worker: lancedb upsert_text_batch failed: {e:#}"
+                );
             }
         }
     }
