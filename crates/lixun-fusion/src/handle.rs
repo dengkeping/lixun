@@ -111,14 +111,24 @@ impl HybridSearchHandle {
 
         let fused = rrf_fuse(&bm25_ranked, &ann_ranked, self.rrf_k);
 
-        let debug_enabled = tracing::enabled!(target: "lixun_fusion", tracing::Level::DEBUG);
-        if debug_enabled {
-            tracing::debug!(
+        tracing::debug!(
+            target: "lixun_fusion",
+            bm25 = lex_pairs.len(),
+            ann = ann_hits.len(),
+            fused = fused.len(),
+            "fusion: ranked input sizes"
+        );
+        // ANN=0 while BM25>0 on a non-empty query is the signature of
+        // an unpopulated `LanceDbAnnHandle` (store or text-embedder
+        // OnceLock empty); `ann::search_text` returns Ok(empty) in that
+        // case and would otherwise hide a misconfigured semantic plugin
+        // behind a green hybrid path.
+        if ann_hits.is_empty() && !lex_pairs.is_empty() && !query.text.trim().is_empty() {
+            tracing::warn!(
                 target: "lixun_fusion",
+                query_len = query.text.len(),
                 bm25 = lex_pairs.len(),
-                ann = ann_hits.len(),
-                fused = fused.len(),
-                "fusion: ranked input sizes"
+                "fusion: ANN returned 0 hits while BM25 found matches; check ANN handle wiring"
             );
         }
 
