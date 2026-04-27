@@ -25,7 +25,7 @@ impl PluginFactory for SemanticFactory {
         "semantic"
     }
 
-    fn build(&self, raw: &toml::Value, _ctx: &PluginBuildContext) -> Result<Vec<PluginInstance>> {
+    fn build(&self, raw: &toml::Value, ctx: &PluginBuildContext) -> Result<Vec<PluginInstance>> {
         let config: SemanticConfig = raw
             .clone()
             .try_into()
@@ -49,10 +49,25 @@ impl PluginFactory for SemanticFactory {
         let cache_dir = embedder_cache_dir(&config)?;
         let journal_path = default_journal_path()?;
 
-        let text_embedder = load_text_embedder(&config.text_model, &cache_dir)
-            .with_context(|| format!("loading text embedder '{}'", config.text_model))?;
-        let image_embedder = load_image_embedder(&config.image_model, &cache_dir)
-            .with_context(|| format!("loading image embedder '{}'", config.image_model))?;
+        let onnx_intra = ctx.impact.onnx_intra_threads;
+        let onnx_inter = ctx.impact.onnx_inter_threads;
+        let effective_batch_size = config.effective_batch_size(ctx.impact.embed_batch_hint);
+        let _effective_concurrency =
+            config.effective_max_concurrent_embed_tasks(ctx.impact.embed_concurrency_hint);
+
+        tracing::info!(
+            "semantic embedder onnx_intra={} onnx_inter={} batch_size={}",
+            onnx_intra,
+            onnx_inter,
+            effective_batch_size
+        );
+
+        let text_embedder =
+            load_text_embedder(&config.text_model, &cache_dir, onnx_intra, onnx_inter)
+                .with_context(|| format!("loading text embedder '{}'", config.text_model))?;
+        let image_embedder =
+            load_image_embedder(&config.image_model, &cache_dir, onnx_intra, onnx_inter)
+                .with_context(|| format!("loading image embedder '{}'", config.image_model))?;
         let text_dim = text_embedder.dim();
         let image_dim = image_embedder.dim();
         let text_embedder = Arc::new(Mutex::new(text_embedder));
@@ -69,6 +84,7 @@ impl PluginFactory for SemanticFactory {
 
         let worker = spawn_worker(
             config.clone(),
+            effective_batch_size,
             store.clone(),
             journal.clone(),
             runtime.clone(),

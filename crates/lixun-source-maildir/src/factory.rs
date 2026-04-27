@@ -100,6 +100,10 @@ mod tests {
         PluginBuildContext {
             max_file_size_mb: 50,
             state_dir_root: std::env::temp_dir(),
+            impact: std::sync::Arc::new(lixun_core::ImpactProfile::from_level(
+                lixun_core::SystemImpact::High,
+                4,
+            )),
         }
     }
 

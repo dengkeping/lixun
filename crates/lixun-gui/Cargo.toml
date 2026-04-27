@@ -2,6 +2,7 @@
 name = "lixun-gui"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 lixun-core = { path = "../lixun-core" }

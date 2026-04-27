@@ -31,10 +31,12 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.91"
 description = "Spotlight-like launcher for Linux"
+license = "MIT OR Apache-2.0"
+authors = ["Denis Kopin <deng@lixun.app>"]
 
 [workspace.dependencies]
 # Core
@@ -68,6 +70,13 @@ bytes = "1.0"
 # Concurrency
 rayon = "1.10"
 num_cpus = "1.16"
+arc-swap = "1.7"
+
+# Format-preserving TOML editor (used by Wave E for `lixun impact set
+# --persist`: writes a single field while keeping comments and key
+# order intact). Plain `toml` would round-trip the file as a serde
+# value tree, dropping comments and reordering tables.
+toml_edit = "0.22"
 
 # Text
 regex = "1"

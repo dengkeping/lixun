@@ -44,6 +44,7 @@ impl WorkerHandle {
 /// must not migrate across tokio's worker pool.
 pub fn spawn_worker(
     cfg: SemanticConfig,
+    batch_size: usize,
     store: Arc<VectorStore>,
     journal: Arc<Mutex<BackfillJournal>>,
     runtime: tokio::runtime::Handle,
@@ -54,6 +55,7 @@ pub fn spawn_worker(
 
     let worker = WorkerThread {
         cfg,
+        batch_size: batch_size.max(1),
         store,
         journal,
         runtime: runtime.clone(),
@@ -74,6 +76,7 @@ pub fn spawn_worker(
 
 struct WorkerThread {
     cfg: SemanticConfig,
+    batch_size: usize,
     store: Arc<VectorStore>,
     journal: Arc<Mutex<BackfillJournal>>,
     runtime: tokio::runtime::Handle,
@@ -93,7 +96,7 @@ enum Channel {
 impl WorkerThread {
     fn run(mut self) {
         let flush_period = Duration::from_millis(self.cfg.flush_ms);
-        let batch_size = self.cfg.batch_size.max(1);
+        let batch_size = self.batch_size;
 
         loop {
             let elapsed = self.last_flush.elapsed();

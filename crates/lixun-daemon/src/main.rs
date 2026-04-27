@@ -5,20 +5,25 @@
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use anyhow::{Context, Result};
+use arc_swap::ArcSwap;
 use bytes::{BufMut, BytesMut};
 use chrono::Utc;
 use futures::StreamExt;
 use lixun_ipc::gui::{GuiCommand, GuiResponse};
-use lixun_ipc::{MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, Request, Response, socket_path};
+use lixun_ipc::{
+    ImpactProfileWire, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, Request, Response, socket_path,
+};
 use lixun_sources::QueryContext;
 use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::RwLock;
 
+mod battery;
 mod frecency;
 mod query_latch;
 mod query_log;
+mod sched;
 mod top_hit;
 use frecency::FrecencyStore;
 use query_latch::QueryLatchStore;
@@ -100,6 +105,75 @@ fn compare_hits_for_ranking(a: &lixun_core::Hit, b: &lixun_core::Hit) -> std::cm
         .then_with(|| a.id.0.cmp(&b.id.0))
 }
 
+/// Compare two [`ImpactProfile`]s and split changed knob names into
+/// the hot subset (re-applied immediately) and the cold subset
+/// (require daemon restart). The split mirrors plan §5.6: every
+/// `daemon_nice` and every `ocr_*` knob is hot; everything else is
+/// cold. Returns `(applied_hot, requires_restart)`. Both vectors
+/// are empty when the new profile equals the old one.
+fn impact_diff_hot_cold(
+    old: &lixun_core::ImpactProfile,
+    new: &lixun_core::ImpactProfile,
+) -> (Vec<String>, Vec<String>) {
+    let mut hot = Vec::new();
+    let mut cold = Vec::new();
+    if old.daemon_nice != new.daemon_nice {
+        hot.push("daemon_nice".into());
+    }
+    if old.ocr_jobs_per_tick != new.ocr_jobs_per_tick {
+        hot.push("ocr_jobs_per_tick".into());
+    }
+    if old.ocr_adaptive_throttle != new.ocr_adaptive_throttle {
+        hot.push("ocr_adaptive_throttle".into());
+    }
+    if old.ocr_nice_level != new.ocr_nice_level {
+        hot.push("ocr_nice_level".into());
+    }
+    if old.ocr_io_class_idle != new.ocr_io_class_idle {
+        hot.push("ocr_io_class_idle".into());
+    }
+    if old.ocr_worker_interval != new.ocr_worker_interval {
+        hot.push("ocr_worker_interval".into());
+    }
+    if old.tokio_worker_threads != new.tokio_worker_threads {
+        cold.push("tokio_worker_threads".into());
+    }
+    if old.onnx_intra_threads != new.onnx_intra_threads {
+        cold.push("onnx_intra_threads".into());
+    }
+    if old.onnx_inter_threads != new.onnx_inter_threads {
+        cold.push("onnx_inter_threads".into());
+    }
+    if old.rayon_threads != new.rayon_threads {
+        cold.push("rayon_threads".into());
+    }
+    if old.tantivy_heap_bytes != new.tantivy_heap_bytes {
+        cold.push("tantivy_heap_bytes".into());
+    }
+    if old.tantivy_num_threads != new.tantivy_num_threads {
+        cold.push("tantivy_num_threads".into());
+    }
+    if old.embed_batch_hint != new.embed_batch_hint {
+        cold.push("embed_batch_hint".into());
+    }
+    if old.embed_concurrency_hint != new.embed_concurrency_hint {
+        cold.push("embed_concurrency_hint".into());
+    }
+    if old.extract_cache_max_bytes != new.extract_cache_max_bytes {
+        cold.push("extract_cache_max_bytes".into());
+    }
+    if old.max_file_size_bytes != new.max_file_size_bytes {
+        cold.push("max_file_size_bytes".into());
+    }
+    if old.gloda_batch_size != new.gloda_batch_size {
+        cold.push("gloda_batch_size".into());
+    }
+    if old.daemon_sched_idle != new.daemon_sched_idle {
+        cold.push("daemon_sched_idle".into());
+    }
+    (hot, cold)
+}
+
 fn gui_result_to_response(r: anyhow::Result<GuiResponse>) -> Response {
     match r {
         Ok(GuiResponse::Ok { visible }) => Response::Visibility { visible },
@@ -140,8 +214,7 @@ fn try_single_instance() -> Result<std::fs::File> {
     Ok(file)
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let env_filter = match std::env::var("RUST_LOG") {
         Ok(raw) if !raw.trim().is_empty() => tracing_subscriber::EnvFilter::new(raw),
         _ => tracing_subscriber::EnvFilter::new("lixun=info"),
@@ -153,6 +226,35 @@ async fn main() -> Result<()> {
     let _lock = try_single_instance()?;
 
     let config = config::Config::load()?;
+    let initial_profile = config.resolved_profile();
+    let profile_swap: Arc<ArcSwap<lixun_core::ImpactProfile>> =
+        Arc::new(ArcSwap::from_pointee(initial_profile.clone()));
+    let profile = Arc::new(initial_profile);
+
+    sched::apply_profile(&profile);
+
+    tracing::info!(
+        "applied impact profile level={:?} tokio_workers={} tantivy_heap_mb={} rayon_threads={}",
+        profile.level,
+        profile.tokio_worker_threads,
+        profile.tantivy_heap_bytes / (1024 * 1024),
+        profile.rayon_threads,
+    );
+    tracing::debug!("impact profile resolved: {:?}", profile);
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(profile.tokio_worker_threads.max(1))
+        .enable_all()
+        .build()?;
+
+    rt.block_on(async_main(config, profile, profile_swap))
+}
+
+async fn async_main(
+    config: config::Config,
+    profile: Arc<lixun_core::ImpactProfile>,
+    profile_swap: Arc<ArcSwap<lixun_core::ImpactProfile>>,
+) -> Result<()> {
     tracing::info!("Config loaded: roots={:?}", config.roots);
 
     let mut extract_caps = lixun_extract::ExtractorCapabilities::probe(
@@ -214,7 +316,7 @@ async fn main() -> Result<()> {
     // deferring their registration does not change the schema.
     let sources_state_dir = config.state_dir.join("sources");
     let mut registry = lixun_indexer::SourceRegistry::new();
-    register_plugin_sources(&mut registry, &config, &sources_state_dir)?;
+    register_plugin_sources(&mut registry, &config, &sources_state_dir, Arc::clone(&profile))?;
 
     let index_path = config.state_dir.join("index");
     let (index, rebuilt_from_scratch) = lixun_index::LixunIndex::create_or_open_with_plugins(
@@ -244,10 +346,21 @@ async fn main() -> Result<()> {
             } else {
                 std::sync::Arc::new(lixun_mutation::MultiBroadcaster::new(broadcasters))
             };
-        index_service::spawn_writer_service_with_broadcaster(index, multi)?
+        index_service::spawn_writer_service_with_broadcaster(
+            index,
+            multi,
+            profile.tantivy_heap_bytes,
+            profile.tantivy_num_threads,
+        )?
     };
     #[cfg(not(feature = "semantic"))]
-    let (mutation_tx, search, _writer_handle) = index_service::spawn_writer_service(index)?;
+    let (mutation_tx, search, _writer_handle) =
+        index_service::spawn_writer_service_with_broadcaster(
+            index,
+            std::sync::Arc::new(lixun_mutation::NoopBroadcaster),
+            profile.tantivy_heap_bytes,
+            profile.tantivy_num_threads,
+        )?;
 
     let body_checker_arc: Arc<dyn lixun_sources::HasBody> =
         Arc::new(SearchHandleBodyChecker::new(search.clone()));
@@ -256,7 +369,7 @@ async fn main() -> Result<()> {
     // Step 2: now that `config.body_checker` is populated, register
     // the builtin apps + fs sources. FsSource picks up the checker
     // via `config.build_fs_source` / `with_body_checker`.
-    register_builtin_nonplugin_sources(&mut registry, &config, &sources_state_dir)?;
+    register_builtin_nonplugin_sources(&mut registry, &config, &sources_state_dir, &profile)?;
     let registry = Arc::new(registry);
 
     // Build the IPC-facing search surface. With `--features semantic`
@@ -368,6 +481,7 @@ async fn main() -> Result<()> {
         extract_caps.clone(),
         ocr_queue.clone(),
         Arc::clone(&ocr_worker_stats),
+        Arc::clone(&profile_swap),
     );
 
     spawn_cache_sweep_worker(Arc::clone(&shared_config), ocr_queue.clone());
@@ -378,6 +492,39 @@ async fn main() -> Result<()> {
         tokio::spawn(async move {
             if let Err(e) = plugin_fs_watcher::start(pfw_registry, pfw_sink).await {
                 tracing::error!("plugin fs watcher error: {}", e);
+            }
+        });
+    }
+
+    if shared_config.impact.follow_battery {
+        let bw_swap = Arc::clone(&profile_swap);
+        let on_ac = shared_config.impact.level;
+        let on_battery = shared_config.impact.on_battery_level;
+        let cpus = num_cpus::get();
+        let apply_swap = Arc::clone(&profile_swap);
+        let hot_apply: battery::HotApplyFn = Arc::new(move |level: lixun_core::SystemImpact| {
+            let old = apply_swap.load_full();
+            if old.level == level {
+                return;
+            }
+            let new_profile = lixun_core::ImpactProfile::from_level(level, cpus);
+            let (applied_hot, requires_restart) =
+                impact_diff_hot_cold(old.as_ref(), &new_profile);
+            sched::apply_nice_only(new_profile.daemon_nice);
+            apply_swap.store(Arc::new(new_profile.clone()));
+            tracing::info!(
+                "impact level changed (battery): {:?} -> {:?} (hot={} cold={})",
+                old.level,
+                new_profile.level,
+                applied_hot.len(),
+                requires_restart.len(),
+            );
+        });
+        tokio::spawn(async move {
+            if let Err(e) =
+                battery::watch_battery(bw_swap, on_ac, on_battery, cpus, hot_apply).await
+            {
+                tracing::warn!("battery watcher exited: {e}");
             }
         });
     }
@@ -454,9 +601,10 @@ async fn main() -> Result<()> {
                 let client_registry = Arc::clone(&registry);
                 let client_ocr_queue = ocr_queue.clone();
                 let client_ocr_worker_stats = Arc::clone(&ocr_worker_stats);
+                let client_profile_swap = Arc::clone(&profile_swap);
 
                 tokio::spawn(async move {
-                    if let Err(e) = handle_client(stream, search, mutation_tx, frecency, query_latch, query_log, stats, gui_control, preview_spawner, shared_config, client_registry, client_ocr_queue, client_ocr_worker_stats).await {
+                    if let Err(e) = handle_client(stream, search, mutation_tx, frecency, query_latch, query_log, stats, gui_control, preview_spawner, shared_config, client_registry, client_ocr_queue, client_ocr_worker_stats, client_profile_swap).await {
                         tracing::debug!("Client error: {}", e);
                     }
                 });
@@ -638,6 +786,7 @@ async fn handle_client(
     registry: Arc<lixun_indexer::SourceRegistry>,
     ocr_queue: Option<Arc<lixun_extract::ocr_queue::OcrQueue>>,
     ocr_worker_stats: Arc<lixun_indexer::ocr_tick::OcrWorkerStats>,
+    profile_swap: Arc<ArcSwap<lixun_core::ImpactProfile>>,
 ) -> anyhow::Result<()> {
     let mut header = [0u8; 4];
     stream.read_exact(&mut header).await?;
@@ -958,6 +1107,65 @@ async fn handle_client(
                 Err(e) => Response::PluginError(format!("{e:#}")),
             }
         }
+        Request::ImpactGet => {
+            let p = profile_swap.load_full();
+            Response::ImpactSnapshot {
+                level: p.level,
+                profile: ImpactProfileWire::from(p.as_ref()),
+                applied_hot: Vec::new(),
+                requires_restart: Vec::new(),
+                persisted: false,
+            }
+        }
+        Request::ImpactExplain => {
+            let p = profile_swap.load_full();
+            Response::ImpactSnapshot {
+                level: p.level,
+                profile: ImpactProfileWire::from(p.as_ref()),
+                applied_hot: Vec::new(),
+                requires_restart: Vec::new(),
+                persisted: false,
+            }
+        }
+        Request::ImpactSet { level, persist } => {
+            let old = profile_swap.load_full();
+            let new_profile = lixun_core::ImpactProfile::from_level(level, num_cpus::get());
+            let (applied_hot, requires_restart) =
+                impact_diff_hot_cold(old.as_ref(), &new_profile);
+            sched::apply_nice_only(new_profile.daemon_nice);
+            profile_swap.store(Arc::new(new_profile.clone()));
+            let persist_outcome: Result<bool, String> = if persist {
+                match config::Config::persist_impact_level(level) {
+                    Ok(path) => {
+                        tracing::info!("impact: persisted level={} to {}", level, path.display());
+                        Ok(true)
+                    }
+                    Err(e) => {
+                        tracing::error!("impact: persist failed: {e:#}");
+                        Err(format!("persist failed: {e}"))
+                    }
+                }
+            } else {
+                Ok(false)
+            };
+            tracing::info!(
+                "impact level changed: {:?} -> {:?} (hot={} cold={})",
+                old.level,
+                new_profile.level,
+                applied_hot.len(),
+                requires_restart.len(),
+            );
+            match persist_outcome {
+                Ok(persisted) => Response::ImpactSnapshot {
+                    level: new_profile.level,
+                    profile: ImpactProfileWire::from(&new_profile),
+                    applied_hot,
+                    requires_restart,
+                    persisted,
+                },
+                Err(msg) => Response::Error(msg),
+            }
+        }
     };
 
     let json = serde_json::to_vec(&resp)?;
@@ -989,6 +1197,7 @@ fn register_plugin_sources(
     registry: &mut lixun_indexer::SourceRegistry,
     config: &config::Config,
     state_dir_root: &std::path::Path,
+    impact: Arc<lixun_core::ImpactProfile>,
 ) -> anyhow::Result<()> {
     let factories = plugin_factories();
     let mut known_sections: std::collections::HashSet<&'static str> =
@@ -1008,6 +1217,7 @@ fn register_plugin_sources(
     let ctx = lixun_sources::PluginBuildContext {
         max_file_size_mb: config.max_file_size_mb,
         state_dir_root: state_dir_root.to_path_buf(),
+        impact,
     };
     for factory in factories {
         let section = factory.section();
@@ -1038,6 +1248,7 @@ fn register_builtin_nonplugin_sources(
     registry: &mut lixun_indexer::SourceRegistry,
     config: &config::Config,
     state_dir_root: &std::path::Path,
+    profile: &lixun_core::ImpactProfile,
 ) -> anyhow::Result<()> {
     registry.register(
         "builtin:apps".into(),
@@ -1054,7 +1265,8 @@ fn register_builtin_nonplugin_sources(
         config.ocr_enqueue.get().cloned(),
     )
     .with_body_checker(config.body_checker.get().cloned())
-    .with_min_image_side_px(config.ocr.min_image_side_px);
+    .with_min_image_side_px(config.ocr.min_image_side_px)
+    .with_rayon_threads(profile.rayon_threads);
     registry.register("builtin:fs".into(), state_dir_root, Arc::new(fs));
 
     Ok(())
@@ -1157,6 +1369,30 @@ impl lixun_indexer::ocr_tick::IdleGate for StatsIdleGate {
     }
 }
 
+/// Bridge between the daemon's live [`ArcSwap<ImpactProfile>`] and
+/// the indexer's per-tick [`OcrCfgRefresh`] hook. Every OCR tick
+/// re-derives the hot subset of [`OcrWorkerCfg`] from the current
+/// profile so `lixun impact set` propagates without a restart.
+struct ArcSwapOcrRefresh {
+    profile_swap: Arc<ArcSwap<lixun_core::ImpactProfile>>,
+}
+
+impl lixun_indexer::ocr_tick::OcrCfgRefresh for ArcSwapOcrRefresh {
+    fn refresh(&self) -> lixun_indexer::ocr_tick::OcrCfgUpdate {
+        let p = self.profile_swap.load();
+        let throttle = if p.ocr_adaptive_throttle {
+            Some((p.ocr_nice_level, p.ocr_io_class_idle))
+        } else {
+            None
+        };
+        lixun_indexer::ocr_tick::OcrCfgUpdate {
+            interval: p.ocr_worker_interval,
+            jobs_per_tick: p.ocr_jobs_per_tick,
+            throttle,
+        }
+    }
+}
+
 fn spawn_ocr_worker(
     config: Arc<config::Config>,
     stats: Arc<RwLock<IndexStats>>,
@@ -1164,6 +1400,7 @@ fn spawn_ocr_worker(
     mut caps: lixun_extract::ExtractorCapabilities,
     queue: Option<Arc<lixun_extract::ocr_queue::OcrQueue>>,
     worker_stats: Arc<lixun_indexer::ocr_tick::OcrWorkerStats>,
+    profile_swap: Arc<ArcSwap<lixun_core::ImpactProfile>>,
 ) {
     caps.timeout = std::time::Duration::from_secs(config.ocr.timeout_secs);
     caps.ocr_enabled = config.ocr.enabled;
@@ -1207,7 +1444,7 @@ fn spawn_ocr_worker(
         Arc::new(StatsIdleGate { stats })
     };
     let handle =
-        lixun_indexer::ocr_tick::spawn(queue, idle, sink, Arc::new(caps), cfg, worker_stats);
+        lixun_indexer::ocr_tick::spawn(queue, idle, sink, Arc::new(caps), cfg, worker_stats, Some(Arc::new(ArcSwapOcrRefresh { profile_swap }) as Arc<dyn lixun_indexer::ocr_tick::OcrCfgRefresh>));
     std::mem::forget(handle);
 }
 
