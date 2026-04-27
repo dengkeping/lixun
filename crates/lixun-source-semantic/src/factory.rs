@@ -121,7 +121,19 @@ fn open_store_blocking(root: PathBuf, text_dim: usize, image_dim: usize) -> Resu
                 .enable_all()
                 .build()
                 .context("building semantic init runtime")?;
-            rt.block_on(VectorStore::open(&root, text_dim, image_dim))
+            rt.block_on(async move {
+                let store = VectorStore::open(&root, text_dim, image_dim).await?;
+                // Lance creates a manifest version per write. Pre-batch
+                // builds of this plugin upserted one row per call and
+                // could leave behind tens of thousands of versions on
+                // disk. Compaction reclaims that space but allocates a
+                // ~1 GB working set in mimalloc that the runtime
+                // retains; gate it so a healthy table pays nothing.
+                if let Err(e) = store.compact_if_stale(100).await {
+                    tracing::warn!("semantic: compact_if_stale on open failed: {e:#}");
+                }
+                Ok::<_, anyhow::Error>(store)
+            })
         })
         .context("spawning semantic init thread")?;
     join.join()

@@ -9,11 +9,20 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema};
 use futures::TryStreamExt;
 use lancedb::query::{ExecutableQuery, QueryBase};
+use lancedb::table::{Duration as LanceDuration, OptimizeAction};
 use lancedb::{Connection, Table, connect};
 use lixun_mutation::AnnHit;
 
 const TEXT_TABLE: &str = "text_vectors";
 const IMAGE_TABLE: &str = "image_vectors";
+
+#[derive(Clone, Debug)]
+pub struct VectorRow {
+    pub doc_id: String,
+    pub source_instance: String,
+    pub mtime: i64,
+    pub vector: Vec<f32>,
+}
 
 pub struct VectorStore {
     #[allow(dead_code)]
@@ -62,14 +71,12 @@ impl VectorStore {
         mtime: i64,
         vector: &[f32],
     ) -> Result<()> {
-        upsert_one(
-            &self.text,
-            doc_id,
-            source_instance,
+        self.upsert_text_batch(std::slice::from_ref(&VectorRow {
+            doc_id: doc_id.to_string(),
+            source_instance: source_instance.to_string(),
             mtime,
-            vector,
-            self.text_dim,
-        )
+            vector: vector.to_vec(),
+        }))
         .await
     }
 
@@ -80,15 +87,93 @@ impl VectorStore {
         mtime: i64,
         vector: &[f32],
     ) -> Result<()> {
-        upsert_one(
-            &self.image,
-            doc_id,
-            source_instance,
+        self.upsert_image_batch(std::slice::from_ref(&VectorRow {
+            doc_id: doc_id.to_string(),
+            source_instance: source_instance.to_string(),
             mtime,
-            vector,
-            self.image_dim,
-        )
+            vector: vector.to_vec(),
+        }))
         .await
+    }
+
+    pub async fn upsert_text_batch(&self, rows: &[VectorRow]) -> Result<()> {
+        upsert_many(&self.text, rows, self.text_dim).await
+    }
+
+    pub async fn upsert_image_batch(&self, rows: &[VectorRow]) -> Result<()> {
+        upsert_many(&self.image, rows, self.image_dim).await
+    }
+
+    /// Run LanceDB's full optimisation pass on both tables: compact
+    /// fragments, prune old versions, and refresh indices. Idempotent
+    /// and cheap when nothing needs work, so it is safe to call from
+    /// the open path to recover from a previously-uncompacted table
+    /// (each upsert before the batch API created its own version).
+    pub async fn compact_all(&self) -> Result<()> {
+        for (name, table) in [("text", &self.text), ("image", &self.image)] {
+            table
+                .optimize(OptimizeAction::Compact {
+                    options: Default::default(),
+                    remap_options: None,
+                })
+                .await
+                .with_context(|| format!("lancedb: compact {name}"))?;
+            table
+                .optimize(OptimizeAction::Prune {
+                    older_than: Some(LanceDuration::seconds(0)),
+                    delete_unverified: Some(true),
+                    error_if_tagged_old_versions: Some(false),
+                })
+                .await
+                .with_context(|| format!("lancedb: prune {name}"))?;
+        }
+        Ok(())
+    }
+
+    /// Compact + prune only when a table has accumulated more than
+    /// `fragment_threshold` fragments. Reading the fragment count is
+    /// O(1) so the guard itself is free. Fragments climb with each
+    /// upsert and drop after compaction, so this metric rebases
+    /// after each compaction (unlike `version()`, which is a
+    /// monotonic commit counter and never resets). The threshold
+    /// avoids paying the compaction working-set cost (a transient
+    /// RSS spike of ~1 GB while Lance rewrites fragments) on
+    /// healthy tables.
+    pub async fn compact_if_stale(&self, fragment_threshold: usize) -> Result<bool> {
+        let mut did_work = false;
+        for (name, table) in [("text", &self.text), ("image", &self.image)] {
+            let frags = table
+                .stats()
+                .await
+                .with_context(|| format!("lancedb: stats({name})"))?
+                .fragment_stats
+                .num_fragments;
+            if frags > fragment_threshold {
+                tracing::info!(
+                    table = name,
+                    fragments = frags,
+                    threshold = fragment_threshold,
+                    "semantic: compacting stale lance table"
+                );
+                table
+                    .optimize(OptimizeAction::Compact {
+                        options: Default::default(),
+                        remap_options: None,
+                    })
+                    .await
+                    .with_context(|| format!("lancedb: compact {name}"))?;
+                table
+                    .optimize(OptimizeAction::Prune {
+                        older_than: Some(LanceDuration::seconds(0)),
+                        delete_unverified: Some(true),
+                        error_if_tagged_old_versions: Some(false),
+                    })
+                    .await
+                    .with_context(|| format!("lancedb: prune {name}"))?;
+                did_work = true;
+            }
+        }
+        Ok(did_work)
     }
 
     pub async fn delete(&self, doc_ids: &[String]) -> Result<()> {
@@ -170,29 +255,34 @@ fn doc_id_in_predicate(ids: &[String]) -> String {
     format!("doc_id IN ({list})")
 }
 
-async fn upsert_one(
-    table: &Table,
-    doc_id: &str,
-    source_instance: &str,
-    mtime: i64,
-    vector: &[f32],
-    dim: usize,
-) -> Result<()> {
-    if vector.len() != dim {
-        anyhow::bail!(
-            "vector dim mismatch: got {}, expected {dim} (doc_id={doc_id})",
-            vector.len()
-        );
+async fn upsert_many(table: &Table, rows: &[VectorRow], dim: usize) -> Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    for r in rows {
+        if r.vector.len() != dim {
+            anyhow::bail!(
+                "vector dim mismatch: got {}, expected {dim} (doc_id={})",
+                r.vector.len(),
+                r.doc_id
+            );
+        }
     }
 
-    let predicate = doc_id_in_predicate(std::slice::from_ref(&doc_id.to_string()));
-    table
-        .delete(&predicate)
-        .await
-        .context("lancedb: pre-upsert delete")?;
-
     let schema = Arc::new(table_schema(dim));
-    let values = Arc::new(Float32Array::from(vector.to_vec()));
+    let n = rows.len();
+    let mut doc_ids = Vec::with_capacity(n);
+    let mut source_instances = Vec::with_capacity(n);
+    let mut mtimes = Vec::with_capacity(n);
+    let mut flat_vectors = Vec::with_capacity(n * dim);
+    for r in rows {
+        doc_ids.push(r.doc_id.clone());
+        source_instances.push(r.source_instance.clone());
+        mtimes.push(r.mtime);
+        flat_vectors.extend_from_slice(&r.vector);
+    }
+
+    let values = Arc::new(Float32Array::from(flat_vectors));
     let vectors = FixedSizeListArray::try_new(
         Arc::new(Field::new("item", DataType::Float32, true)),
         dim as i32,
@@ -203,18 +293,26 @@ async fn upsert_one(
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![
-            Arc::new(StringArray::from(vec![doc_id.to_string()])),
-            Arc::new(StringArray::from(vec![source_instance.to_string()])),
-            Arc::new(Int64Array::from(vec![mtime])),
+            Arc::new(StringArray::from(doc_ids)),
+            Arc::new(StringArray::from(source_instances)),
+            Arc::new(Int64Array::from(mtimes)),
             Arc::new(vectors),
         ],
     )
     .context("arrow: build RecordBatch")?;
-    let iter: Box<dyn RecordBatchReader + Send> = Box::new(RecordBatchIterator::new(
+    let reader: Box<dyn RecordBatchReader + Send> = Box::new(RecordBatchIterator::new(
         vec![Ok(batch)].into_iter(),
         schema,
     ));
-    table.add(iter).execute().await.context("lancedb: add")?;
+
+    let mut merge = table.merge_insert(&["doc_id"]);
+    merge
+        .when_matched_update_all(None)
+        .when_not_matched_insert_all();
+    merge
+        .execute(reader)
+        .await
+        .context("lancedb: merge_insert")?;
     Ok(())
 }
 
