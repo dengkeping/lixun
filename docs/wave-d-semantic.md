@@ -138,3 +138,15 @@ re-embed everything from scratch.)
   retain rows for tombstoned docs until compaction; this is
   cosmetic, not a correctness issue. Size pressure on the index
   is bounded by your live corpus plus a small delta.
+- **Some mail messages skipped during backfill (`body_present=false`
+  in trace logs).** Expected. The Thunderbird source reads body
+  text from `messagesText_content.c0body` in
+  `global-messages-db.sqlite` (gloda). For messages where gloda
+  did not produce a full-text row (HTML-only newsletters,
+  attachment-only messages, content-type filtering, gloda
+  queueing), the LEFT JOIN returns NULL and the message has no
+  embeddable text. The semantic worker correctly skips such
+  documents — there is nothing to embed. Compare
+  `last_backfill_total` vs `last_backfill_submitted` in
+  `~/.local/state/lixun/semantic-backfill.sqlite` to see how many
+  documents fell into this bucket.
