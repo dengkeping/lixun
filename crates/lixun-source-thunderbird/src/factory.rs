@@ -42,7 +42,7 @@ impl PluginFactory for ThunderbirdFactory {
                 bail!("config: [thunderbird] gloda_batch_size must be > 0 (got 0)")
             }
             Some(n) => n,
-            None => 250,
+            None => ctx.impact.gloda_batch_size as u32,
         };
 
         let profile = match section.profile {
@@ -111,6 +111,10 @@ mod tests {
         PluginBuildContext {
             max_file_size_mb: 50,
             state_dir_root: std::env::temp_dir(),
+            impact: Arc::new(lixun_core::ImpactProfile::from_level(
+                lixun_core::SystemImpact::High,
+                4,
+            )),
         }
     }
 

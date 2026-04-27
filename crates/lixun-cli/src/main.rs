@@ -3,13 +3,17 @@
 use anyhow::{Context, Result};
 use bytes::{BufMut, BytesMut};
 use clap::{Arg, ArgMatches, Command};
-use lixun_ipc::{PROTOCOL_VERSION, Request, Response};
+use lixun_core::SystemImpact;
+use lixun_ipc::{ImpactProfileWire, PROTOCOL_VERSION, Request, Response};
 use lixun_mutation::CliVerb;
 use std::path::PathBuf;
+use std::str::FromStr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
-const BUILTIN_VERBS: &[&str] = &["toggle", "show", "hide", "search", "reindex", "status"];
+const BUILTIN_VERBS: &[&str] = &[
+    "toggle", "show", "hide", "search", "reindex", "status", "impact",
+];
 
 async fn send_request(req: Request) -> Result<Response> {
     let socket_path = lixun_ipc::socket_path();
@@ -113,6 +117,38 @@ fn root_command(plugin_verbs: &[CliVerb]) -> Command {
                     .action(clap::ArgAction::SetTrue)
                     .help("Print only the OCR queue + worker observability block."),
             ),
+        )
+        .subcommand(
+            Command::new("impact")
+                .about("Get/set the global system-impact preset.")
+                .subcommand_required(true)
+                .arg_required_else_help(true)
+                .subcommand(Command::new("get").about("Print the current impact level."))
+                .subcommand(
+                    Command::new("set")
+                        .about("Switch to a new impact level.")
+                        .arg(
+                            Arg::new("level")
+                                .required(true)
+                                .value_parser(clap::builder::PossibleValuesParser::new([
+                                    "unlimited",
+                                    "high",
+                                    "medium",
+                                    "low",
+                                ]))
+                                .help("One of: unlimited, high, medium, low."),
+                        )
+                        .arg(
+                            Arg::new("persist")
+                                .long("persist")
+                                .action(clap::ArgAction::SetTrue)
+                                .help("Also write the level into ~/.config/lixun/config.toml."),
+                        ),
+                )
+                .subcommand(
+                    Command::new("explain")
+                        .about("Print the resolved profile knob table for the current level."),
+                ),
         );
 
     for verb in plugin_verbs {
@@ -207,6 +243,34 @@ async fn main() -> Result<()> {
             let resp = send_request(Request::Status).await?;
             handle_response(resp, ocr_only);
         }
+        "impact" => {
+            let (impact_sub, impact_m) = sub_matches
+                .subcommand()
+                .expect("clap subcommand_required is set");
+            match impact_sub {
+                "get" => {
+                    let resp = send_request(Request::ImpactGet).await?;
+                    handle_impact_response(resp, ImpactRender::Get);
+                }
+                "explain" => {
+                    let resp = send_request(Request::ImpactExplain).await?;
+                    handle_impact_response(resp, ImpactRender::Explain);
+                }
+                "set" => {
+                    let level_str = impact_m
+                        .get_one::<String>("level")
+                        .expect("clap required arg")
+                        .clone();
+                    let level = SystemImpact::from_str(&level_str).map_err(|e| {
+                        anyhow::anyhow!("error: invalid level \"{}\"; {}", level_str, e)
+                    })?;
+                    let persist = impact_m.get_flag("persist");
+                    let resp = send_request(Request::ImpactSet { level, persist }).await?;
+                    handle_impact_response(resp, ImpactRender::Set);
+                }
+                other => anyhow::bail!("unknown impact subcommand: {}", other),
+            }
+        }
         other => {
             let (verb_path, args) = collect_plugin_invocation(other, sub_matches);
             let resp = send_request(Request::PluginCommand { verb_path, args }).await?;
@@ -215,6 +279,114 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+enum ImpactRender {
+    Get,
+    Set,
+    Explain,
+}
+
+fn handle_impact_response(resp: Response, render: ImpactRender) {
+    match resp {
+        Response::ImpactSnapshot {
+            level,
+            profile,
+            applied_hot,
+            requires_restart,
+            persisted,
+        } => match render {
+            ImpactRender::Get => {
+                println!("level: {}", level);
+            }
+            ImpactRender::Set => {
+                println!("level: {}", level);
+                if applied_hot.is_empty() {
+                    println!("applied_hot: (none)");
+                } else {
+                    println!("applied_hot:");
+                    for k in &applied_hot {
+                        println!("  {}", k);
+                    }
+                }
+                if requires_restart.is_empty() {
+                    println!("requires_restart: (none)");
+                } else {
+                    println!("requires_restart:");
+                    for k in &requires_restart {
+                        println!("  {}", k);
+                    }
+                }
+                if persisted {
+                    let path = dirs::config_dir()
+                        .map(|p| p.join("lixun/config.toml"))
+                        .unwrap_or_else(|| PathBuf::from("~/.config/lixun/config.toml"));
+                    println!("persisted to: {}", path.display());
+                }
+            }
+            ImpactRender::Explain => {
+                print!("{}", format_impact_table(&profile));
+            }
+        },
+        Response::Error(msg) => {
+            eprintln!("Error: {}", msg);
+            std::process::exit(1);
+        }
+        other => {
+            eprintln!("Error: unexpected response shape: {:?}", other);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn format_impact_table(p: &ImpactProfileWire) -> String {
+    let rows: [(&str, String); 19] = [
+        ("level", p.level.to_string()),
+        ("tokio_worker_threads", p.tokio_worker_threads.to_string()),
+        ("onnx_intra_threads", p.onnx_intra_threads.to_string()),
+        ("onnx_inter_threads", p.onnx_inter_threads.to_string()),
+        ("rayon_threads", p.rayon_threads.to_string()),
+        ("tantivy_heap_bytes", p.tantivy_heap_bytes.to_string()),
+        ("tantivy_num_threads", p.tantivy_num_threads.to_string()),
+        ("embed_batch_hint", p.embed_batch_hint.to_string()),
+        (
+            "embed_concurrency_hint",
+            match p.embed_concurrency_hint {
+                Some(n) => n.to_string(),
+                None => "none".to_string(),
+            },
+        ),
+        ("ocr_jobs_per_tick", p.ocr_jobs_per_tick.to_string()),
+        ("ocr_adaptive_throttle", p.ocr_adaptive_throttle.to_string()),
+        ("ocr_nice_level", p.ocr_nice_level.to_string()),
+        ("ocr_io_class_idle", p.ocr_io_class_idle.to_string()),
+        (
+            "ocr_worker_interval_secs",
+            p.ocr_worker_interval_secs.to_string(),
+        ),
+        (
+            "extract_cache_max_bytes",
+            p.extract_cache_max_bytes.to_string(),
+        ),
+        ("max_file_size_bytes", p.max_file_size_bytes.to_string()),
+        ("gloda_batch_size", p.gloda_batch_size.to_string()),
+        ("daemon_nice", p.daemon_nice.to_string()),
+        ("daemon_sched_idle", p.daemon_sched_idle.to_string()),
+    ];
+    let key_width = rows.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
+    let mut out = String::new();
+    out.push_str(&format!("level: {}\n", p.level));
+    out.push_str(&format!("{:width$}  {}\n", "knob", "value", width = key_width));
+    out.push_str(&format!(
+        "{:-<width$}  {:-<10}\n",
+        "",
+        "",
+        width = key_width
+    ));
+    for (k, v) in &rows {
+        out.push_str(&format!("{:width$}  {}\n", k, v, width = key_width));
+    }
+    out
 }
 
 fn handle_plugin_response(resp: Response) {
@@ -350,6 +522,9 @@ fn handle_response(resp: Response, ocr_only: bool) {
         }
         Response::PluginManifest(_) | Response::PluginResult(_) | Response::PluginError(_) => {
             eprintln!("Error: plugin response routed to built-in handler");
+        }
+        Response::ImpactSnapshot { .. } => {
+            eprintln!("Error: impact response routed to built-in handler");
         }
         Response::Error(msg) => {
             eprintln!("Error: {}", msg);

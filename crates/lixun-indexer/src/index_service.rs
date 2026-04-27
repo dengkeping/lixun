@@ -28,7 +28,11 @@ pub fn stats() -> (u64, u64, u64) {
 
 const COMMIT_MIN_INTERVAL: Duration = Duration::from_secs(3);
 const COMMIT_CHECK_INTERVAL: Duration = Duration::from_millis(500);
-pub const WRITER_HEAP_BYTES: usize = 100_000_000;
+
+/// Default Tantivy writer heap when callers do not pass an explicit
+/// budget. Retained for `spawn_writer_service` legacy entry points and
+/// existing tests that pre-date the impact-profile wiring.
+pub const DEFAULT_WRITER_HEAP_BYTES: usize = 100_000_000;
 
 #[allow(dead_code)]
 pub enum Mutation {
@@ -162,25 +166,42 @@ impl lixun_mutation::DocStore for SearchHandle {
 pub fn spawn_writer_service(
     index: LixunIndex,
 ) -> Result<(IndexMutationTx, SearchHandle, tokio::task::JoinHandle<()>)> {
-    spawn_writer_service_with_broadcaster(index, Arc::new(NoopBroadcaster))
+    spawn_writer_service_with_broadcaster(
+        index,
+        Arc::new(NoopBroadcaster),
+        DEFAULT_WRITER_HEAP_BYTES,
+        4,
+    )
 }
 
 /// Variant of [`spawn_writer_service`] that fires
 /// `broadcaster.broadcast` from `tokio::task::spawn_blocking` after
 /// every successful commit. The writer task never awaits on the
 /// broadcaster, so a slow consumer cannot stall index commits.
+///
+/// `tantivy_heap_bytes` and `tantivy_num_threads` are seeded from the
+/// active [`lixun_core::ImpactProfile`] by the daemon caller.
 pub fn spawn_writer_service_with_broadcaster(
     index: LixunIndex,
     broadcaster: Arc<dyn MutationBroadcaster>,
+    tantivy_heap_bytes: usize,
+    tantivy_num_threads: usize,
 ) -> Result<(IndexMutationTx, SearchHandle, tokio::task::JoinHandle<()>)> {
-    let writer = index.writer(WRITER_HEAP_BYTES)?;
+    let num_threads = tantivy_num_threads.max(1);
+    let writer = index.writer_with_num_threads(num_threads, tantivy_heap_bytes)?;
 
     let shared = Arc::new(Mutex::new(index));
     let search = SearchHandle::new(Arc::clone(&shared));
 
     let (tx, rx) = mpsc::channel::<Mutation>(4096);
 
-    let handle = tokio::spawn(writer_loop(shared, writer, rx, broadcaster));
+    let handle = tokio::spawn(writer_loop(
+        shared,
+        writer,
+        rx,
+        broadcaster,
+        tantivy_heap_bytes,
+    ));
 
     Ok((IndexMutationTx { tx }, search, handle))
 }
@@ -190,6 +211,7 @@ async fn writer_loop(
     mut writer: TantivyIndexWriter<TantivyDoc>,
     mut rx: mpsc::Receiver<Mutation>,
     broadcaster: Arc<dyn MutationBroadcaster>,
+    heap_bytes: usize,
 ) {
     let mut dirty = false;
     let mut last_commit = Instant::now();
@@ -201,7 +223,7 @@ async fn writer_loop(
 
     tracing::info!(
         "IndexService: writer started, heap={} MiB, min commit interval {:?}",
-        WRITER_HEAP_BYTES / (1024 * 1024),
+        heap_bytes / (1024 * 1024),
         COMMIT_MIN_INTERVAL
     );
 

@@ -12,10 +12,6 @@ fn default_image_model() -> String {
     "clip-vit-b-32".into()
 }
 
-fn default_batch_size() -> usize {
-    32
-}
-
 fn default_flush_ms() -> u64 {
     2000
 }
@@ -45,8 +41,8 @@ pub struct SemanticConfig {
     pub text_model: String,
     #[serde(default = "default_image_model")]
     pub image_model: String,
-    #[serde(default = "default_batch_size")]
-    pub batch_size: usize,
+    #[serde(default)]
+    pub batch_size: Option<usize>,
     #[serde(default = "default_flush_ms")]
     pub flush_ms: u64,
     #[serde(default = "default_min_image_side_px")]
@@ -61,13 +57,33 @@ pub struct SemanticConfig {
     pub cache_subdir: String,
 }
 
+impl SemanticConfig {
+    /// Resolve the effective embed batch size: explicit
+    /// `[semantic].batch_size` from operator config wins, otherwise
+    /// fall back to the impact-profile hint plumbed in by the host.
+    /// Always at least 1 — a zero batch would deadlock the worker.
+    pub fn effective_batch_size(&self, hint: usize) -> usize {
+        self.batch_size.unwrap_or(hint).max(1)
+    }
+
+    /// Resolve effective concurrency for parallel embed tasks. Same
+    /// rule as [`Self::effective_batch_size`]: explicit wins, hint is
+    /// the fallback. `None` from both means "no cap".
+    pub fn effective_max_concurrent_embed_tasks(
+        &self,
+        hint: Option<usize>,
+    ) -> Option<usize> {
+        self.max_concurrent_embed_tasks.or(hint)
+    }
+}
+
 impl Default for SemanticConfig {
     fn default() -> Self {
         Self {
             enabled: default_enabled(),
             text_model: default_text_model(),
             image_model: default_image_model(),
-            batch_size: default_batch_size(),
+            batch_size: None,
             flush_ms: default_flush_ms(),
             min_image_side_px: default_min_image_side_px(),
             backfill_on_start: default_backfill_on_start(),
