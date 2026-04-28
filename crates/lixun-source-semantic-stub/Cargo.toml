@@ -1,0 +1,29 @@
+[package]
+name = "lixun-source-semantic-stub"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Daemon-side stub plugin that proxies semantic operations over IPC to lixun-semantic-worker."
+
+[lib]
+name = "lixun_source_semantic_stub"
+path = "src/lib.rs"
+
+[dependencies]
+lixun-core = { path = "../lixun-core" }
+lixun-sources = { path = "../lixun-sources" }
+lixun-mutation = { path = "../lixun-mutation" }
+lixun-semantic-proto = { path = "../lixun-semantic-proto" }
+
+tokio = { workspace = true }
+tokio-util = { workspace = true, features = ["io", "codec"] }
+futures = "0.3"
+async-trait = "0.1"
+
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+bytes.workspace = true
+inventory.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+toml = "0.8"

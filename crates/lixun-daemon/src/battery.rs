@@ -81,14 +81,13 @@ pub async fn watch_battery(
         }
     };
 
-    let proxy =
-        match zbus::Proxy::new(&conn, UPOWER_SERVICE, UPOWER_PATH, PROPERTIES_IFACE).await {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!("upower unavailable: {e}; battery follow disabled");
-                return Ok(());
-            }
-        };
+    let proxy = match zbus::Proxy::new(&conn, UPOWER_SERVICE, UPOWER_PATH, PROPERTIES_IFACE).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("upower unavailable: {e}; battery follow disabled");
+            return Ok(());
+        }
+    };
 
     // Initial state: pick the right profile up-front.
     let on_battery_now = match read_on_battery(&proxy).await {
@@ -114,7 +113,9 @@ pub async fn watch_battery(
     let mut signal_stream = match proxy.receive_signal("PropertiesChanged").await {
         Ok(s) => s,
         Err(e) => {
-            tracing::warn!("upower PropertiesChanged subscribe failed: {e}; battery follow disabled");
+            tracing::warn!(
+                "upower PropertiesChanged subscribe failed: {e}; battery follow disabled"
+            );
             return Ok(());
         }
     };
@@ -122,13 +123,11 @@ pub async fn watch_battery(
     let mut last_on_battery = on_battery_now;
     while let Some(msg) = signal_stream.next().await {
         let body = msg.body();
-        let Ok((iface, changed, _invalidated)) = body
-            .deserialize::<(
-                String,
-                std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
-                Vec<String>,
-            )>()
-        else {
+        let Ok((iface, changed, _invalidated)) = body.deserialize::<(
+            String,
+            std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
+            Vec<String>,
+        )>() else {
             continue;
         };
         if iface != UPOWER_IFACE {
@@ -164,9 +163,7 @@ pub async fn watch_battery(
 }
 
 async fn read_on_battery(proxy: &zbus::Proxy<'_>) -> Result<bool> {
-    let value: OwnedValue = proxy
-        .call("Get", &(UPOWER_IFACE, "OnBattery"))
-        .await?;
+    let value: OwnedValue = proxy.call("Get", &(UPOWER_IFACE, "OnBattery")).await?;
     let b = <bool as TryFrom<&OwnedValue>>::try_from(&value)?;
     Ok(b)
 }

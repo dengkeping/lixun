@@ -780,10 +780,7 @@ impl Config {
     /// Same as [`persist_impact_level`] but writes to an explicit path.
     /// Used by unit tests to avoid mutating process-wide environment
     /// state (`XDG_CONFIG_HOME`) which races between parallel tests.
-    pub fn persist_impact_level_at(
-        path: PathBuf,
-        level: SystemImpact,
-    ) -> Result<PathBuf> {
+    pub fn persist_impact_level_at(path: PathBuf, level: SystemImpact) -> Result<PathBuf> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -794,9 +791,9 @@ impl Config {
             let impact_item = doc
                 .entry("impact")
                 .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
-            let table = impact_item.as_table_mut().ok_or_else(|| {
-                anyhow::anyhow!("[impact] in {} is not a table", path.display())
-            })?;
+            let table = impact_item
+                .as_table_mut()
+                .ok_or_else(|| anyhow::anyhow!("[impact] in {} is not a table", path.display()))?;
             table["level"] = toml_edit::value(level_str.clone());
             doc.to_string()
         } else {
@@ -1039,8 +1036,8 @@ follow_battery = false
 ";
         std::fs::write(&cfg_path, fixture).unwrap();
 
-        let written = Config::persist_impact_level_at(cfg_path.clone(), SystemImpact::Low)
-            .expect("persist");
+        let written =
+            Config::persist_impact_level_at(cfg_path.clone(), SystemImpact::Low).expect("persist");
         assert_eq!(written, cfg_path);
 
         let after = std::fs::read_to_string(&cfg_path).unwrap();

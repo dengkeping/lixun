@@ -69,10 +69,7 @@ impl SemanticConfig {
     /// Resolve effective concurrency for parallel embed tasks. Same
     /// rule as [`Self::effective_batch_size`]: explicit wins, hint is
     /// the fallback. `None` from both means "no cap".
-    pub fn effective_max_concurrent_embed_tasks(
-        &self,
-        hint: Option<usize>,
-    ) -> Option<usize> {
+    pub fn effective_max_concurrent_embed_tasks(&self, hint: Option<usize>) -> Option<usize> {
         self.max_concurrent_embed_tasks.or(hint)
     }
 }

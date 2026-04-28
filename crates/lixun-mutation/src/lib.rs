@@ -83,7 +83,7 @@ impl MutationBroadcaster for MultiBroadcaster {
 
 /// Async query interface implemented by ANN-providing plugins.
 /// Lives in this leaf crate so `lixun-fusion` (the RRF consumer)
-/// and `lixun-source-semantic` (the producer) can share the type
+/// and `lixun-source-semantic-stub` (the producer) can share the type
 /// without either depending on the other (DB-3, AGENTS.md §1).
 #[async_trait::async_trait]
 pub trait AnnHandle: Send + Sync {
@@ -93,9 +93,14 @@ pub trait AnnHandle: Send + Sync {
 
 /// One result from an approximate-nearest-neighbour query. Lives in
 /// the plugin-agnostic leaf crate so `lixun-fusion` (RRF consumer)
-/// and `lixun-source-semantic` (ANN producer) share the type without
+/// and `lixun-source-semantic-stub` (ANN producer) share the type without
 /// either depending on the other (DB-3).
-#[derive(Clone, Debug)]
+///
+/// `Serialize` + `Deserialize` are required for the worker→daemon
+/// IPC payload `Msg::SearchResult` in `lixun-semantic-proto`. Adding
+/// them on the leaf type is preferred over wrapping for the wire,
+/// since no internal invariants need protecting.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AnnHit {
     pub doc_id: String,
     pub distance: f32,
