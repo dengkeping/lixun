@@ -12,7 +12,7 @@ license=('MIT OR Apache-2.0')
 # wire between lixund and the worker, so mismatched versions break the
 # handshake. Bump in lockstep.
 depends=("lixun=$pkgver" 'gcc-libs' 'xz')
-makedepends=('rust' 'cargo')
+makedepends=('rust' 'cargo' 'protobuf')
 source=("lixun-$pkgver.tar.gz::https://github.com/dengkeping/lixun/archive/refs/tags/v$pkgver.tar.gz")
 sha256sums=('SKIP')
 

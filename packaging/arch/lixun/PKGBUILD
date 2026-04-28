@@ -9,7 +9,7 @@ license=('MIT OR Apache-2.0')
 depends=(
   'gtk4'
   'gtk4-layer-shell'
-  'poppler'
+  'poppler-glib'
   'zstd'
   'sqlite'
   'gcc-libs'
