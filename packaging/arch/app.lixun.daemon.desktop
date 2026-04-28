@@ -1,8 +1,0 @@
-[Desktop Entry]
-Type=Application
-Name=Lixun
-Comment=Spotlight-like launcher for Linux
-Icon=app.lixun.daemon
-Exec=/usr/bin/lixund
-NoDisplay=true
-X-GNOME-Autostart-enabled=true
