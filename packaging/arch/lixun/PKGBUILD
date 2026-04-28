@@ -34,13 +34,13 @@ source=("$pkgname-$pkgver.tar.gz::https://github.com/dengkeping/lixun/archive/re
 sha256sums=('SKIP')
 
 prepare() {
-  cd "$srcdir/lixun"
+  cd "$srcdir/lixun-$pkgver"
   export CARGO_TARGET_DIR="$srcdir/target"
   cargo fetch --locked
 }
 
 build() {
-  cd "$srcdir/lixun"
+  cd "$srcdir/lixun-$pkgver"
   export CARGO_TARGET_DIR="$srcdir/target"
   export RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-Wl,-O1,--as-needed"
   cargo build --release --frozen \
@@ -48,7 +48,7 @@ build() {
 }
 
 package() {
-  cd "$srcdir/lixun"
+  cd "$srcdir/lixun-$pkgver"
   install -Dm755 "$srcdir/target/release/lixund"        "$pkgdir/usr/bin/lixund"
   install -Dm755 "$srcdir/target/release/lixun-cli"     "$pkgdir/usr/bin/lixun-cli"
   install -Dm755 "$srcdir/target/release/lixun-gui"     "$pkgdir/usr/bin/lixun-gui"
