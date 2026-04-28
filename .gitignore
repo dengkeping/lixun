@@ -1,7 +1,6 @@
 /target
 # Per-crate target dirs created by bench targets or workspace sub-builds.
 **/target/
-Cargo.lock
 
 # Arch packaging build output (do not commit — artifacts are rebuilt)
 /packaging/arch/pkg/
