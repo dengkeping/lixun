@@ -6,6 +6,14 @@ pkgdesc="Spotlight-like launcher for Linux (core: daemon, gui, cli, preview)"
 arch=('x86_64')
 url="https://lixun.app"
 license=('MIT OR Apache-2.0')
+# Disable makepkg's default LTO. Phase 1.8 round 6 confirmed the failure
+# pattern (sqlite3_*, _rjem_*, ZSTD_* undefined symbols at the final link)
+# survives every linker-driver and RUSTFLAGS tweak; the next-cheapest
+# hypothesis is that LTO drops the static archives bundled by build.rs
+# scripts (libsqlite3-sys, tikv-jemalloc-sys, zstd-sys) before their
+# rustc-link-lib metadata reaches the final link line. Round 7 disables
+# LTO globally to test that hypothesis end-to-end.
+options=(!lto)
 depends=(
   'gtk4'
   'gtk4-layer-shell'
@@ -31,7 +39,7 @@ makedepends=('rust' 'cargo')
 provides=('lixun-bin')
 conflicts=('lixun-bin' 'lupa' 'lupa-bin')
 source=("$pkgname-$pkgver.tar.gz::https://github.com/dengkeping/lixun/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('058811d020495ac4fcc649c8e2f8a408afec9f4aa6f8da3fffb7f3a8a235e709')
 
 prepare() {
   cd "$srcdir/lixun-$pkgver"
@@ -42,7 +50,18 @@ prepare() {
 build() {
   cd "$srcdir/lixun-$pkgver"
   export CARGO_TARGET_DIR="$srcdir/target"
-  export RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-Wl,-O1,--as-needed"
+  # Force the rustc linker driver to /usr/bin/gcc so the
+  # cargo:rustc-link-lib=static=sqlite3 / =jemalloc_pic directives emitted
+  # by libsqlite3-sys and tikv-jemalloc-sys propagate into the final link
+  # line. Without this override rustc on Arch silently drops those -l
+  # flags for some toolchain configurations, leaving the bundled .a
+  # archives unreferenced and the binary undefined-symbol-broken.
+  export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=/usr/bin/gcc
+  unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS
+  # Wipe any stale build cache from previous failed rounds. Phase 1.8
+  # round 5 confirmed rustc was reusing cached link metadata even after
+  # PKGBUILD changes; a clean slate eliminates that variable.
+  cargo clean
   cargo build --release --frozen \
     -p lixun-daemon -p lixun-cli -p lixun-gui -p lixun-preview-bin
 }
