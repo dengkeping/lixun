@@ -1,0 +1,22 @@
+# Maintainer: Denis Kopin <deng@lixun.app>
+pkgname=lixun-ocr
+pkgver=0.5.1
+pkgrel=1
+pkgdesc="Lixun OCR metapackage: pulls in tesseract + English language data"
+arch=('any')
+url="https://lixun.app"
+license=('MIT OR Apache-2.0')
+# Pure metapackage. lixund detects tesseract on $PATH at startup and
+# enables OCR opportunistically (no compile-time coupling). Installing
+# this package is the supported way to opt in. Additional language packs
+# (tesseract-data-rus, tesseract-data-chi-sim, ...) can be installed
+# separately once OCR is enabled.
+depends=("lixun=$pkgver" 'tesseract' 'tesseract-data-eng')
+
+package() {
+  install -d "$pkgdir/usr/share/licenses/$pkgname"
+  cat > "$pkgdir/usr/share/licenses/$pkgname/README" <<'EOF'
+This metapackage carries no files. See /usr/share/licenses/lixun/ for
+license texts that apply to the parent project.
+EOF
+}
