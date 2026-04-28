@@ -37,8 +37,10 @@ Now with semantic search (Wave D), preview pane, and system-impact presets
   overlay showing text, images, PDFs, code, email, office documents, or
   audio/video content.
 - **Semantic search** — hybrid lexical + dense-vector retrieval via
-  Reciprocal Rank Fusion. Requires `--features semantic` build and
-  `[semantic] enabled = true` config.
+  Reciprocal Rank Fusion. Runs as a sidecar process: install the
+  `lixun-semantic-worker` binary on `$PATH` (or set
+  `LIXUN_SEMANTIC_WORKER` to its path) and add `[semantic] enabled = true`
+  to the config to activate it at runtime (default is off).
 - **Calculator** — type `= sqrt(16) + pi` and get `7.1415…` at the top.
 - **Shell** — type `> ls -la` to spawn a terminal via `xdg-terminal-exec`.
 - **Automatic OCR** — index scanned PDFs and images via Tesseract.
@@ -68,16 +70,18 @@ systemctl --user enable --now lixund.service
 ### From source (any Linux)
 
 ```sh
-# Basic build (lexical search only)
+# Daemon, GUI, CLI, preview (lexical search only)
 cargo build --workspace --release
 
-# With semantic search (requires ONNX Runtime, ~400 MB model cache)
-cargo build --workspace --release --features semantic
+# Semantic search worker (separate sidecar binary; ONNX Runtime, ~400 MB model cache)
+cargo build --release -p lixun-semantic-worker
 
 install -Dm755 target/release/lixund        /usr/local/bin/lixund
 install -Dm755 target/release/lixun-cli     /usr/local/bin/lixun-cli
 install -Dm755 target/release/lixun-gui     /usr/local/bin/lixun-gui
 install -Dm755 target/release/lixun-preview /usr/local/bin/lixun-preview
+# Optional: install the semantic worker if you built it above
+install -Dm755 target/release/lixun-semantic-worker /usr/local/bin/lixun-semantic-worker
 install -Dm644 packaging/systemd/lixund.service \
   ~/.config/systemd/user/lixund.service
 systemctl --user enable --now lixund.service
@@ -249,7 +253,7 @@ enabled = false
 # io_class_idle = false
 
 [semantic]
-enabled = false                # Requires --features semantic build
+enabled = false                # Requires the lixun-semantic-worker sidecar binary
 text_model = "bge-small-en-v1.5"
 image_model = "clip-vit-b-32"
 batch_size = 32
@@ -296,7 +300,9 @@ Semantic search adds dense-vector retrieval to the lexical BM25 index.
 Results from both paths are fused with Reciprocal Rank Fusion (RRF).
 
 **Requirements:**
-- Build with `--features semantic` (enabled in Arch `lixun-bin` package)
+- Install the `lixun-semantic-worker` sidecar binary (the daemon
+  discovers it via `LIXUN_SEMANTIC_WORKER`, then `$PATH`, then
+  `/usr/lib/lixun/lixun-semantic-worker`)
 - Add `[semantic] enabled = true` to config
 - GLIBC >= 2.27 (ONNX Runtime requirement)
 
@@ -468,7 +474,7 @@ all widgets of a kind.
     │  lixun-source-maildir
     │  lixun-source-calculator  (= prefix)
     │  lixun-source-shell        (> prefix)
-    │  lixun-source-semantic     (vector index, RRF fusion)
+    │  lixun-source-semantic-stub (IPC client to lixun-semantic-worker sidecar)
     │  … (add your own: see below)
     └────────────────────────────────────┘
 
@@ -510,7 +516,7 @@ A source plugin is loaded **if and only if** its config section is present:
 - `[[maildir]]` → `lixun-source-maildir` registered (one instance per block)
 - `[calculator]` → `lixun-source-calculator` registered (singleton)
 - `[shell]` → `lixun-source-shell` registered (singleton)
-- `[semantic]` + `--features semantic` build → `lixun-source-semantic` registered
+- `[semantic]` + reachable `lixun-semantic-worker` sidecar → `lixun-source-semantic-stub` registered
 - Nothing → plugin stays dormant, zero runtime cost
 
 No code in `lixund` names any plugin. The daemon iterates
@@ -559,7 +565,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 | `lixun-source-thunderbird` | Gloda + mbox attachments |
 | `lixun-source-calculator` | Calculator plugin (`=` prefix) |
 | `lixun-source-shell` | Shell-command plugin (`>` prefix) |
-| `lixun-source-semantic` | Semantic search plugin (dense vectors, RRF) |
+| `lixun-source-semantic-stub` | Semantic search IPC client (talks to `lixun-semantic-worker` sidecar) |
 
 **Preview pane (10 crates):**
 
@@ -623,9 +629,12 @@ duration of the reindex (minutes on typical home corpora).
 
 Recent version bumps:
 
-- **v0.4.0** (Wave D, semantic search). Added optional `lixun-source-semantic`
-  plugin behind `--features semantic` flag. Requires explicit `[semantic]`
-  config section to enable. No INDEX_VERSION bump (semantic is additive).
+- **v0.4.0** (Wave D, semantic search). Added the semantic search
+  feature. As of the sidecar refactor, semantic runs in a separate
+  `lixun-semantic-worker` process discovered by the daemon at startup;
+  the heavy ML stack (ONNX Runtime, LanceDB) no longer links into
+  `lixund` itself. Requires explicit `[semantic]` config section to
+  enable. No INDEX_VERSION bump (semantic is additive).
 
 - **v0.5.0** (Wave E, system-impact preset). Added `[impact]` config block
   and `lixun-cli impact` commands. No INDEX_VERSION bump. New config knobs

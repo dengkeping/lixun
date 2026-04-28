@@ -1,0 +1,27 @@
+[package]
+name = "lixun-semantic-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Wire protocol shared between lixund and the lixun-semantic-worker sidecar."
+
+[lib]
+name = "lixun_semantic_proto"
+path = "src/lib.rs"
+
+[dependencies]
+# Hit/ScoreBreakdown live here. We only forward Hit across the wire
+# (ScoreBreakdown is dropped at the only call site), so no extra serde
+# work is required in lixun-core for this crate's payloads.
+lixun-core = { path = "../lixun-core" }
+# UpsertedDoc + AnnHit cross the wire as Cmd::Embed payload and the
+# search RPC return value respectively. Both already derive serde.
+lixun-mutation = { path = "../lixun-mutation" }
+
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+bytes.workspace = true
+# `codec` brings in tokio-util::codec::{Encoder, Decoder} traits used
+# by FrameCodec. `io` is unused at the lib level but kept so the
+# workspace pin is satisfied uniformly.
+tokio-util = { workspace = true, features = ["io", "codec"] }

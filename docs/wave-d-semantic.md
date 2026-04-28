@@ -6,12 +6,16 @@ Lixun's hybrid search combines two retrieval paths: lexical scoring
 (BM25 over Tantivy, always on) and dense-vector semantic similarity
 (opt-in). When both paths are active the daemon fuses their results
 with Reciprocal Rank Fusion (RRF, default `k = 60`) so a hit ranked
-well by either side surfaces in the merged list. The semantic plugin
-runs in-process inside `lixund` and is gated twice: once at compile
-time behind the `semantic` Cargo feature, and once at runtime behind
-`[semantic] enabled = true` in the user config. Without both gates
-the daemon behaves exactly like a pure-lexical build — no vector
-index is opened, no models are downloaded.
+well by either side surfaces in the merged list. The heavy ML stack
+(ONNX Runtime, LanceDB, fastembed) lives in a separate
+`lixun-semantic-worker` sidecar process, not in `lixund` itself; the
+daemon talks to the worker over IPC. Semantic is gated by two
+conditions: a reachable `lixun-semantic-worker` binary on disk
+(daemon probes at startup) and `[semantic] enabled = true` in the
+user config (the daemon-side stub defaults to disabled, matching
+the legacy plugin's opt-in semantics). Without both, the daemon
+behaves exactly like a pure-lexical build — no vector index is
+opened, no models are downloaded, no worker is spawned.
 
 ## Requirements
 
@@ -25,10 +29,14 @@ index is opened, no models are downloaded.
   - Vector index at `~/.local/share/lixun/vectors/`. Two LanceDB
     tables (`text_vectors`, `image_vectors`); size scales roughly
     linearly with corpus size.
-- **A `lixund` binary built with `--features semantic`.** Arch
-  users get this for free by installing the `lixun-bin` package,
-  which ships a daemon compiled with `_features="semantic"`. From
-  source: `cargo build -p lixun-daemon --bin lixund --features semantic`.
+- **The `lixun-semantic-worker` sidecar binary.** The daemon probes
+  for it at startup in this order: the `LIXUN_SEMANTIC_WORKER` env
+  var, then any `lixun-semantic-worker` on `$PATH`, then
+  `/usr/lib/lixun/lixun-semantic-worker`. Arch users get this for
+  free by installing the `lixun-bin` package. From source:
+  `cargo build --release -p lixun-semantic-worker` then drop the
+  resulting `target/release/lixun-semantic-worker` somewhere
+  reachable.
 
 ## Enabling semantic search
 

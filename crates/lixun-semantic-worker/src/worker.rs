@@ -278,14 +278,14 @@ pub async fn start_backfill(
     search: Arc<dyn lixun_mutation::DocStore>,
     journal: Arc<Mutex<BackfillJournal>>,
     embedder_tx: mpsc::Sender<EmbedJob>,
-) -> Result<()> {
+) -> Result<(u64, u64)> {
     let all_ids = search
         .all_doc_ids()
         .await
         .context("backfill: enumerating doc ids")?;
 
-    let mut total = 0usize;
-    let mut submitted = 0usize;
+    let mut total = 0u64;
+    let mut submitted = 0u64;
     for doc_id in all_ids {
         total += 1;
         let already = match journal.lock() {
@@ -334,5 +334,5 @@ pub async fn start_backfill(
     }
 
     tracing::info!(total, submitted, "semantic backfill: enumeration complete");
-    Ok(())
+    Ok((submitted, total))
 }

@@ -5,18 +5,13 @@
 
 use anyhow::Result;
 use lixun_indexer::index_service::SearchHandle;
-
-#[cfg(feature = "semantic")]
 use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct HybridSearchHandle {
     inner: SearchHandle,
-    #[cfg(feature = "semantic")]
     ann: Option<Arc<dyn crate::ann::AnnHandle>>,
-    #[cfg(feature = "semantic")]
     rrf_k: f32,
-    #[cfg(feature = "semantic")]
     overfetch: usize,
 }
 
@@ -24,16 +19,12 @@ impl HybridSearchHandle {
     pub fn new_lexical_only(inner: SearchHandle) -> Self {
         Self {
             inner,
-            #[cfg(feature = "semantic")]
             ann: None,
-            #[cfg(feature = "semantic")]
             rrf_k: 60.0,
-            #[cfg(feature = "semantic")]
             overfetch: 4,
         }
     }
 
-    #[cfg(feature = "semantic")]
     pub fn new(inner: SearchHandle, ann: Arc<dyn crate::ann::AnnHandle>, rrf_k: f32) -> Self {
         Self {
             inner,
@@ -44,7 +35,6 @@ impl HybridSearchHandle {
     }
 
     pub async fn search(&self, query: &lixun_core::Query) -> Result<Vec<lixun_core::Hit>> {
-        #[cfg(feature = "semantic")]
         if self.ann.is_some() {
             let pairs = self.search_with_breakdown(query).await?;
             return Ok(pairs.into_iter().map(|(h, _)| h).collect());
@@ -56,7 +46,6 @@ impl HybridSearchHandle {
         &self,
         query: &lixun_core::Query,
     ) -> Result<Vec<(lixun_core::Hit, lixun_core::ScoreBreakdown)>> {
-        #[cfg(feature = "semantic")]
         if let Some(ann) = self.ann.clone() {
             return self.fused_search(query, ann).await;
         }
@@ -82,7 +71,6 @@ impl HybridSearchHandle {
         self.inner.hydrate_doc(doc_id).await
     }
 
-    #[cfg(feature = "semantic")]
     async fn fused_search(
         &self,
         query: &lixun_core::Query,
@@ -119,9 +107,9 @@ impl HybridSearchHandle {
             "fusion: ranked input sizes"
         );
         // ANN=0 while BM25>0 on a non-empty query is the signature of
-        // an unpopulated `LanceDbAnnHandle` (store or text-embedder
-        // OnceLock empty); `ann::search_text` returns Ok(empty) in that
-        // case and would otherwise hide a misconfigured semantic plugin
+        // an unpopulated ANN handle (store or text-embedder OnceLock
+        // empty); `ann::search_text` returns Ok(empty) in that case
+        // and would otherwise hide a misconfigured semantic plugin
         // behind a green hybrid path.
         if ann_hits.is_empty() && !lex_pairs.is_empty() && !query.text.trim().is_empty() {
             tracing::warn!(

@@ -39,21 +39,17 @@ use lixun_daemon::preview_spawn::PreviewSpawner;
 use lixun_indexer::plugin_fs_watcher;
 use lixun_indexer::watcher;
 
-#[cfg(feature = "semantic")]
 use lixun_fusion::HybridSearchHandle;
 
-/// IPC-facing search surface. With the `semantic` feature on, the
-/// daemon wraps the lexical [`SearchHandle`] in [`HybridSearchHandle`]
-/// so RRF fusion runs transparently on every query; without the
-/// feature the alias collapses to the lexical handle and the daemon
-/// links no fusion code at all. Both types expose byte-identical
+/// IPC-facing search surface. The daemon wraps the lexical
+/// [`SearchHandle`] in [`HybridSearchHandle`] so RRF fusion runs
+/// transparently on every query when the registry exposes an ANN
+/// handle; otherwise the hybrid handle collapses to a thin
+/// pass-through. Both modes expose byte-identical
 /// `search` / `search_with_breakdown` / `all_doc_ids` / `has_body`
 /// / `get_body` / `hydrate_doc` signatures, so call sites stay
-/// cfg-free (DB-3).
-#[cfg(feature = "semantic")]
+/// uniform (DB-3).
 type SearchSurface = HybridSearchHandle;
-#[cfg(not(feature = "semantic"))]
-type SearchSurface = SearchHandle;
 
 #[derive(Debug, Clone, Default)]
 struct IndexStats {
@@ -316,7 +312,32 @@ async fn async_main(
     // deferring their registration does not change the schema.
     let sources_state_dir = config.state_dir.join("sources");
     let mut registry = lixun_indexer::SourceRegistry::new();
-    register_plugin_sources(&mut registry, &config, &sources_state_dir, Arc::clone(&profile))?;
+
+    /* The semantic worker is an out-of-process sidecar. When the
+    binary is on disk we spawn its supervisor before plugin
+    registration so the stub factory finds an installed connection
+    at build time; when it is absent we log once and continue —
+    the stub plugin will simply return empty results because its
+    AnnHandle never connects. */
+    match lixun_daemon::semantic_supervisor::probe_worker_binary() {
+        Some(path) => {
+            tracing::info!(
+                worker = %path.display(),
+                "semantic worker probed, supervisor starting"
+            );
+            tokio::spawn(lixun_daemon::semantic_supervisor::supervise(path));
+        }
+        None => {
+            tracing::info!("semantic worker binary not found, semantic plugin will be no-op");
+        }
+    }
+
+    register_plugin_sources(
+        &mut registry,
+        &config,
+        &sources_state_dir,
+        Arc::clone(&profile),
+    )?;
 
     let index_path = config.state_dir.join("index");
     let (index, rebuilt_from_scratch) = lixun_index::LixunIndex::create_or_open_with_plugins(
@@ -337,7 +358,6 @@ async fn async_main(
     // so we can wire the SearchHandle-backed HasBody adapter into
     // `config.body_checker` — the builtin `fs` source reads that
     // OnceLock during its own construction.
-    #[cfg(feature = "semantic")]
     let (mutation_tx, search, _writer_handle) = {
         let broadcasters = registry.broadcasters();
         let multi: std::sync::Arc<dyn lixun_mutation::MutationBroadcaster> =
@@ -353,14 +373,6 @@ async fn async_main(
             profile.tantivy_num_threads,
         )?
     };
-    #[cfg(not(feature = "semantic"))]
-    let (mutation_tx, search, _writer_handle) =
-        index_service::spawn_writer_service_with_broadcaster(
-            index,
-            std::sync::Arc::new(lixun_mutation::NoopBroadcaster),
-            profile.tantivy_heap_bytes,
-            profile.tantivy_num_threads,
-        )?;
 
     let body_checker_arc: Arc<dyn lixun_sources::HasBody> =
         Arc::new(SearchHandleBodyChecker::new(search.clone()));
@@ -372,22 +384,18 @@ async fn async_main(
     register_builtin_nonplugin_sources(&mut registry, &config, &sources_state_dir, &profile)?;
     let registry = Arc::new(registry);
 
-    // Build the IPC-facing search surface. With `--features semantic`
-    // and a plugin advertising an ANN handle this becomes a
-    // `HybridSearchHandle` running RRF fusion; without either it
-    // collapses to the lexical `SearchHandle`. The host names no
-    // plugin (AGENTS.md §1) — `registry.ann_handle()` is a generic
-    // capability probe. The indexer + body-checker paths keep using
-    // the raw lexical `search` because they need the unfused
-    // `SearchHandle` API surface (writer-side hooks, OCR enqueue
-    // body lookups), which fusion has nothing to add to.
-    #[cfg(feature = "semantic")]
+    // Build the IPC-facing search surface. When a plugin advertises
+    // an ANN handle this becomes a `HybridSearchHandle` running RRF
+    // fusion; otherwise it stays a lexical-only pass-through. The
+    // host names no plugin (AGENTS.md §1) — `registry.ann_handle()`
+    // is a generic capability probe. The indexer + body-checker
+    // paths keep using the raw lexical `search` because they need
+    // the unfused `SearchHandle` API surface (writer-side hooks,
+    // OCR enqueue body lookups), which fusion has nothing to add to.
     let ipc_search: SearchSurface = match registry.ann_handle() {
         Some(ann) => HybridSearchHandle::new(search.clone(), ann, 60.0),
         None => HybridSearchHandle::new_lexical_only(search.clone()),
     };
-    #[cfg(not(feature = "semantic"))]
-    let ipc_search: SearchSurface = search.clone();
 
     registry.install_doc_store(Arc::new(search.clone()) as Arc<dyn lixun_mutation::DocStore>);
 
@@ -508,8 +516,7 @@ async fn async_main(
                 return;
             }
             let new_profile = lixun_core::ImpactProfile::from_level(level, cpus);
-            let (applied_hot, requires_restart) =
-                impact_diff_hot_cold(old.as_ref(), &new_profile);
+            let (applied_hot, requires_restart) = impact_diff_hot_cold(old.as_ref(), &new_profile);
             sched::apply_nice_only(new_profile.daemon_nice);
             apply_swap.store(Arc::new(new_profile.clone()));
             tracing::info!(
@@ -1130,8 +1137,7 @@ async fn handle_client(
         Request::ImpactSet { level, persist } => {
             let old = profile_swap.load_full();
             let new_profile = lixun_core::ImpactProfile::from_level(level, num_cpus::get());
-            let (applied_hot, requires_restart) =
-                impact_diff_hot_cold(old.as_ref(), &new_profile);
+            let (applied_hot, requires_restart) = impact_diff_hot_cold(old.as_ref(), &new_profile);
             sched::apply_nice_only(new_profile.daemon_nice);
             profile_swap.store(Arc::new(new_profile.clone()));
             let persist_outcome: Result<bool, String> = if persist {
@@ -1443,8 +1449,16 @@ fn spawn_ocr_worker(
     } else {
         Arc::new(StatsIdleGate { stats })
     };
-    let handle =
-        lixun_indexer::ocr_tick::spawn(queue, idle, sink, Arc::new(caps), cfg, worker_stats, Some(Arc::new(ArcSwapOcrRefresh { profile_swap }) as Arc<dyn lixun_indexer::ocr_tick::OcrCfgRefresh>));
+    let handle = lixun_indexer::ocr_tick::spawn(
+        queue,
+        idle,
+        sink,
+        Arc::new(caps),
+        cfg,
+        worker_stats,
+        Some(Arc::new(ArcSwapOcrRefresh { profile_swap })
+            as Arc<dyn lixun_indexer::ocr_tick::OcrCfgRefresh>),
+    );
     std::mem::forget(handle);
 }
 
