@@ -6,6 +6,10 @@ pkgdesc="Lixun semantic sidecar worker: dense-vector hybrid retrieval via fastem
 arch=('x86_64')
 url="https://lixun.app"
 license=('MIT OR Apache-2.0')
+# Mirrors lixun PKGBUILD round-7 hypothesis: disable makepkg LTO so the
+# static archives bundled by tikv-jemalloc-sys / zstd-sys keep their
+# rustc-link-lib metadata at the final link line.
+options=(!lto)
 # The worker dlopens ONNX Runtime from inside fastembed; libgomp + liblzma
 # come from gcc-libs and xz respectively. Hard pin to the matching lixun
 # version: the IPC schema lives in lixun-semantic-proto and crosses the
@@ -14,7 +18,7 @@ license=('MIT OR Apache-2.0')
 depends=("lixun=$pkgver" 'gcc-libs' 'xz')
 makedepends=('rust' 'cargo' 'protobuf')
 source=("lixun-$pkgver.tar.gz::https://github.com/dengkeping/lixun/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('058811d020495ac4fcc649c8e2f8a408afec9f4aa6f8da3fffb7f3a8a235e709')
 
 prepare() {
   cd "$srcdir/lixun-$pkgver"
@@ -25,7 +29,13 @@ prepare() {
 build() {
   cd "$srcdir/lixun-$pkgver"
   export CARGO_TARGET_DIR="$srcdir/target"
-  export RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-Wl,-O1,--as-needed"
+  # See lixun/PKGBUILD round-6 notes: force the rustc linker driver to
+  # /usr/bin/gcc so cargo:rustc-link-lib=static=jemalloc_pic from the
+  # tikv-jemalloc-sys build script lands in the final link line, and wipe
+  # any stale build cache before the bundled .a archives are linked.
+  export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=/usr/bin/gcc
+  unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS
+  cargo clean
   cargo build --release --frozen -p lixun-semantic-worker
 }
 
