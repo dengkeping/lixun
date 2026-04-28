@@ -18,7 +18,7 @@ serde_json.workspace = true
 tracing.workspace = true
 walkdir.workspace = true
 toml = "0.8"
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { workspace = true }
 mailparse = "0.15"
 base64 = "0.22"
 quoted_printable = "0.5"
