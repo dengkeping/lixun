@@ -81,187 +81,96 @@ impl HybridSearchHandle {
         query: &lixun_core::Query,
         ann: Arc<dyn crate::ann::AnnHandle>,
     ) -> Result<Vec<(lixun_core::Hit, lixun_core::ScoreBreakdown)>> {
-        use std::collections::HashSet;
+        use std::collections::HashMap;
 
         let target_limit = query.limit.max(1) as usize;
         let ann_k = target_limit
             .saturating_mul(self.overfetch)
             .max(target_limit);
 
+        // Spotlight-style fan-out: run BM25 + text-ANN + image-ANN in
+        // parallel and let RRF (Cormack 2009, k=60) merge the three
+        // ranked lists. No pre-classification: the modality classifier
+        // approach (CLIP-text anchors) was abandoned because CLIP text
+        // space is asymmetric for short tokens — codes like 'AQL-HSSA'
+        // and identifiers like 'firefox' map equidistant from image
+        // and text anchors, producing Modality::Both. RRF is robust
+        // to score distribution mismatches between BM25 (unbounded)
+        // and ANN (cosine in [0,1]) because it uses ranks, not scores.
         let lex_fut = self.inner.search_with_breakdown(query);
-        
-        let modality = ann.classify_query(&query.text).await.unwrap_or(lixun_mutation::Modality::Text);
-        
-        let (lex_pairs, text_hits, image_hits) = match modality {
-            lixun_mutation::Modality::Text => {
-                let ann_hits = ann.search_text(&query.text, ann_k).await?;
-                let lex = lex_fut.await?;
-                (lex, ann_hits, Vec::new())
-            }
-            lixun_mutation::Modality::Image => {
-                let ann_hits = ann.search_image(&query.text, ann_k).await?;
-                let lex = lex_fut.await?;
-                (lex, Vec::new(), ann_hits)
-            }
-            lixun_mutation::Modality::Both => {
-                let text_fut = ann.search_text(&query.text, ann_k);
-                let image_fut = ann.search_image(&query.text, ann_k);
-                let (lex, text, image) = tokio::try_join!(lex_fut, text_fut, image_fut)?;
-                (lex, text, image)
-            }
-        };
+        let text_fut = ann.search_text(&query.text, ann_k);
+        let image_fut = ann.search_image(&query.text, ann_k);
+        let (lex_pairs, text_hits, image_hits) =
+            tokio::try_join!(lex_fut, text_fut, image_fut)?;
 
         tracing::debug!(
             target: "lixun_fusion",
             bm25 = lex_pairs.len(),
             text_ann = text_hits.len(),
             image_ann = image_hits.len(),
-            ?modality,
             "fusion: ranked input sizes"
         );
-        if text_hits.is_empty() && image_hits.is_empty() && !lex_pairs.is_empty() && !query.text.trim().is_empty() {
-            tracing::warn!(
-                target: "lixun_fusion",
-                query_len = query.text.len(),
-                bm25 = lex_pairs.len(),
-                "fusion: ANN returned 0 hits while BM25 found matches; check ANN handle wiring"
-            );
-        }
+
+        // Build doc_id-keyed lookup tables for hydration. BM25 already
+        // gives full Hit+ScoreBreakdown; ANN hits give only doc_id
+        // and distance, requiring hydrate_doc.
+        let bm25_by_id: HashMap<String, (lixun_core::Hit, lixun_core::ScoreBreakdown)> = lex_pairs
+            .iter()
+            .map(|(h, bd)| (h.id.0.clone(), (h.clone(), bd.clone())))
+            .collect();
+        let ann_distance_by_id: HashMap<String, f32> = text_hits
+            .iter()
+            .chain(image_hits.iter())
+            .map(|h| (h.doc_id.clone(), h.distance))
+            .collect();
+
+        let bm25_ranked: Vec<(String, f32)> = lex_pairs
+            .iter()
+            .map(|(h, bd)| (h.id.0.clone(), bd.final_score))
+            .collect();
+        let text_ranked: Vec<(String, f32)> = text_hits
+            .iter()
+            .map(|h| (h.doc_id.clone(), h.distance))
+            .collect();
+        let image_ranked: Vec<(String, f32)> = image_hits
+            .iter()
+            .map(|h| (h.doc_id.clone(), h.distance))
+            .collect();
+
+        let fused = crate::rrf::rrf_fuse_3way(
+            &bm25_ranked,
+            &text_ranked,
+            &image_ranked,
+            self.rrf_k,
+        );
 
         let mut out: Vec<(lixun_core::Hit, lixun_core::ScoreBreakdown)> =
             Vec::with_capacity(target_limit);
-        let mut seen: HashSet<String> = HashSet::with_capacity(lex_pairs.len() + text_hits.len() + image_hits.len());
 
-        match modality {
-            lixun_mutation::Modality::Image => {
-                for h in image_hits.into_iter() {
-                    if out.len() >= target_limit {
-                        break;
-                    }
-                    if seen.contains(&h.doc_id) {
-                        continue;
-                    }
-                    seen.insert(h.doc_id.clone());
-                    let Some((mut hit, mut bd)) = self.inner.hydrate_doc(&h.doc_id).await? else {
-                        continue;
-                    };
-                    hit.score = 0.0;
-                    bd.tantivy = h.distance;
-                    bd.category_mult = 1.0;
-                    bd.prefix_mult = 1.0;
-                    bd.acronym_mult = 1.0;
-                    bd.recency_mult = 1.0;
-                    bd.coord_mult = 1.0;
-                    bd.frecency_mult = 1.0;
-                    bd.latch_mult = 1.0;
-                    bd.stage2_clamped = 1.0;
-                    bd.final_score = 0.0;
-                    out.push((hit, bd));
+        for (doc_id, _rrf_score) in fused.into_iter().take(target_limit) {
+            let (mut hit, mut bd) = if let Some(pair) = bm25_by_id.get(&doc_id) {
+                pair.clone()
+            } else if let Some((hit, bd)) = self.inner.hydrate_doc(&doc_id).await? {
+                (hit, bd)
+            } else {
+                continue;
+            };
+            if !bm25_by_id.contains_key(&doc_id) {
+                if let Some(distance) = ann_distance_by_id.get(&doc_id) {
+                    bd.tantivy = *distance;
                 }
-                if out.len() < target_limit {
-                    for (hit, bd) in lex_pairs.iter().take(target_limit - out.len()) {
-                        if seen.contains(&hit.id.0) {
-                            continue;
-                        }
-                        seen.insert(hit.id.0.clone());
-                        out.push((hit.clone(), bd.clone()));
-                    }
-                }
+                bd.category_mult = 1.0;
+                bd.prefix_mult = 1.0;
+                bd.acronym_mult = 1.0;
+                bd.recency_mult = 1.0;
+                bd.coord_mult = 1.0;
+                bd.frecency_mult = 1.0;
+                bd.latch_mult = 1.0;
+                bd.stage2_clamped = 1.0;
+                hit.score = 0.0;
+                bd.final_score = 0.0;
             }
-            lixun_mutation::Modality::Text => {
-                for (hit, bd) in lex_pairs.iter().take(target_limit) {
-                    seen.insert(hit.id.0.clone());
-                    out.push((hit.clone(), bd.clone()));
-                }
-                if out.len() < target_limit {
-                    for h in text_hits.into_iter() {
-                        if out.len() >= target_limit {
-                            break;
-                        }
-                        if seen.contains(&h.doc_id) {
-                            continue;
-                        }
-                        seen.insert(h.doc_id.clone());
-                        let Some((mut hit, mut bd)) = self.inner.hydrate_doc(&h.doc_id).await? else {
-                            continue;
-                        };
-                        hit.score = 0.0;
-                        bd.tantivy = h.distance;
-                        bd.category_mult = 1.0;
-                        bd.prefix_mult = 1.0;
-                        bd.acronym_mult = 1.0;
-                        bd.recency_mult = 1.0;
-                        bd.coord_mult = 1.0;
-                        bd.frecency_mult = 1.0;
-                        bd.latch_mult = 1.0;
-                        bd.stage2_clamped = 1.0;
-                        bd.final_score = 0.0;
-                        out.push((hit, bd));
-                    }
-                }
-            }
-            lixun_mutation::Modality::Both => {
-                for h in image_hits.into_iter() {
-                    if out.len() >= target_limit {
-                        break;
-                    }
-                    if seen.contains(&h.doc_id) {
-                        continue;
-                    }
-                    seen.insert(h.doc_id.clone());
-                    let Some((mut hit, mut bd)) = self.inner.hydrate_doc(&h.doc_id).await? else {
-                        continue;
-                    };
-                    hit.score = 0.0;
-                    bd.tantivy = h.distance;
-                    bd.category_mult = 1.0;
-                    bd.prefix_mult = 1.0;
-                    bd.acronym_mult = 1.0;
-                    bd.recency_mult = 1.0;
-                    bd.coord_mult = 1.0;
-                    bd.frecency_mult = 1.0;
-                    bd.latch_mult = 1.0;
-                    bd.stage2_clamped = 1.0;
-                    bd.final_score = 0.0;
-                    out.push((hit, bd));
-                }
-                for (hit, bd) in lex_pairs.iter() {
-                    if out.len() >= target_limit {
-                        break;
-                    }
-                    if seen.contains(&hit.id.0) {
-                        continue;
-                    }
-                    seen.insert(hit.id.0.clone());
-                    out.push((hit.clone(), bd.clone()));
-                }
-                if out.len() < target_limit {
-                    for h in text_hits.into_iter() {
-                        if out.len() >= target_limit {
-                            break;
-                        }
-                        if seen.contains(&h.doc_id) {
-                            continue;
-                        }
-                        seen.insert(h.doc_id.clone());
-                        let Some((mut hit, mut bd)) = self.inner.hydrate_doc(&h.doc_id).await? else {
-                            continue;
-                        };
-                        hit.score = 0.0;
-                        bd.tantivy = h.distance;
-                        bd.category_mult = 1.0;
-                        bd.prefix_mult = 1.0;
-                        bd.acronym_mult = 1.0;
-                        bd.recency_mult = 1.0;
-                        bd.coord_mult = 1.0;
-                        bd.frecency_mult = 1.0;
-                        bd.latch_mult = 1.0;
-                        bd.stage2_clamped = 1.0;
-                        bd.final_score = 0.0;
-                        out.push((hit, bd));
-                    }
-                }
-            }
+            out.push((hit, bd));
         }
 
         Ok(out)
