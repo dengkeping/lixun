@@ -16,6 +16,11 @@ pub struct ImageEmbedder {
     dim: usize,
 }
 
+pub struct ClipTextEmbedder {
+    inner: TextEmbedding,
+    dim: usize,
+}
+
 /// Apply ONNX-runtime intra/inter op thread counts before constructing
 /// an embedder.
 ///
@@ -80,6 +85,23 @@ pub fn load_image_embedder(
     Ok(ImageEmbedder { inner, dim })
 }
 
+pub fn load_clip_text_embedder(
+    cache_dir: &Path,
+    onnx_intra_threads: usize,
+    onnx_inter_threads: usize,
+) -> Result<ClipTextEmbedder> {
+    let model = EmbeddingModel::ClipVitB32;
+    let dim = 512;
+    apply_onnx_thread_env(onnx_intra_threads, onnx_inter_threads);
+    let inner = TextEmbedding::try_new(
+        InitOptions::new(model)
+            .with_cache_dir(cache_dir.to_path_buf())
+            .with_show_download_progress(false),
+    )
+    .context("fastembed: CLIP text embedder init")?;
+    Ok(ClipTextEmbedder { inner, dim })
+}
+
 impl TextEmbedder {
     pub fn dim(&self) -> usize {
         self.dim
@@ -101,6 +123,18 @@ impl ImageEmbedder {
         self.inner
             .embed(paths, None)
             .context("fastembed: image embed batch")
+    }
+}
+
+impl ClipTextEmbedder {
+    pub fn dim(&self) -> usize {
+        self.dim
+    }
+
+    pub fn embed(&mut self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
+        self.inner
+            .embed(texts, None)
+            .context("fastembed: CLIP text embed batch")
     }
 }
 

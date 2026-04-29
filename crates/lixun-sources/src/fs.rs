@@ -202,20 +202,19 @@ impl FsSource {
     }
 
     fn build_document(meta: FileMeta, body: Option<String>, extract_fail: bool) -> Document {
-        // Directories: fixed folder icon + "Folder" kind, no body/extract.
-        // Files: mime-based icon + kind via mime_icons.
-        let (icon_name, kind_label) = if meta.is_dir {
-            ("folder".to_string(), "Folder".to_string())
+        let (icon_name, kind_label, mime) = if meta.is_dir {
+            ("folder".to_string(), "Folder".to_string(), None)
         } else {
-            Self::metadata_for_path(&meta.path)
+            let mime_obj = mime_guess::from_path(&meta.path).first_or_octet_stream();
+            let (icon, kind) = (
+                mime_icons::mime_to_icon_name(&mime_obj),
+                mime_icons::human_kind(&mime_obj),
+            );
+            (icon, kind, Some(mime_obj.to_string()))
         };
 
         Document {
             id: DocId(format!("fs:{}", meta.path_str)),
-            // meta.path_str is already canonical (set in
-            // index_incremental_batched / index_all), so this is
-            // equivalent to canonical_fs_doc_id(&meta.path) but
-            // avoids re-running canonicalize on every document.
             category: Category::File,
             title: meta.filename,
             subtitle: meta.path_str.clone(),
@@ -225,11 +224,6 @@ impl FsSource {
             path: meta.path_str,
             mtime: meta.mtime,
             size: meta.size,
-            // xdg-open and gio::AppInfo::launch_default_for_uri both
-            // route directories to the user's default file manager
-            // (nautilus/dolphin/nemo/...), so the same OpenFile
-            // variant works for both files and dirs without needing
-            // a separate OpenFolder action.
             action: Action::OpenFile {
                 path: meta.path.clone(),
             },
@@ -239,6 +233,7 @@ impl FsSource {
             extract_fail,
             source_instance: "builtin:fs".into(),
             extra: Vec::new(),
+            mime,
         }
     }
 

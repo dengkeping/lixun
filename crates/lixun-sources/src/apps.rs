@@ -184,6 +184,7 @@ impl AppsSource {
                         recipients: None,
                         source_instance: "builtin:apps".into(),
                         extra: Vec::new(),
+                        mime: None,
                     });
                 }
             }

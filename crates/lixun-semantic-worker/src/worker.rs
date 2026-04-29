@@ -6,7 +6,7 @@ use lixun_mutation::UpsertedDoc;
 use tokio::sync::mpsc;
 
 use crate::config::SemanticConfig;
-use crate::embedder::{ImageEmbedder, TextEmbedder};
+use crate::embedder::{ClipTextEmbedder, ImageEmbedder, TextEmbedder};
 use crate::journal::BackfillJournal;
 use crate::store::VectorStore;
 
@@ -50,6 +50,7 @@ pub fn spawn_worker(
     runtime: tokio::runtime::Handle,
     text_embedder: Arc<Mutex<TextEmbedder>>,
     image_embedder: Arc<Mutex<ImageEmbedder>>,
+    clip_text_embedder: Arc<Mutex<ClipTextEmbedder>>,
 ) -> Result<WorkerHandle> {
     let (tx, rx) = mpsc::channel::<EmbedJob>(QUEUE_CAPACITY);
 
@@ -61,8 +62,10 @@ pub fn spawn_worker(
         runtime: runtime.clone(),
         text: text_embedder,
         image: image_embedder,
+        clip_text: clip_text_embedder,
         rx,
         pending_text: Vec::new(),
+        pending_images: Vec::new(),
         pending_deletes: Vec::new(),
         last_flush: Instant::now(),
     };
@@ -82,16 +85,18 @@ struct WorkerThread {
     journal: Arc<Mutex<BackfillJournal>>,
     runtime: tokio::runtime::Handle,
     text: Arc<Mutex<TextEmbedder>>,
-    #[allow(dead_code)]
     image: Arc<Mutex<ImageEmbedder>>,
+    clip_text: Arc<Mutex<ClipTextEmbedder>>,
     rx: mpsc::Receiver<EmbedJob>,
     pending_text: Vec<UpsertedDoc>,
+    pending_images: Vec<UpsertedDoc>,
     pending_deletes: Vec<String>,
     last_flush: Instant,
 }
 
 enum Channel {
     Text,
+    Image,
     Skip,
 }
 
@@ -121,20 +126,24 @@ impl WorkerThread {
                         tracing::warn!("semantic embed worker: handle_job failed: {e:#}");
                     }
                     if self.pending_text.len() >= batch_size
+                        || self.pending_images.len() >= batch_size
                         || self.pending_deletes.len() >= batch_size
                     {
                         self.flush_text();
+                        self.flush_images();
                         self.flush_deletes();
                     }
                 }
                 Ok(None) => {
                     self.flush_text();
+                    self.flush_images();
                     self.flush_deletes();
                     tracing::info!("semantic embed worker: channel closed, exiting");
                     return;
                 }
                 Err(()) => {
                     self.flush_text();
+                    self.flush_images();
                     self.flush_deletes();
                 }
             }
@@ -146,6 +155,10 @@ impl WorkerThread {
             EmbedJob::Upsert(doc) => match classify(&doc) {
                 Channel::Text => {
                     self.pending_text.push(doc);
+                    Ok(())
+                }
+                Channel::Image => {
+                    self.pending_images.push(doc);
                     Ok(())
                 }
                 Channel::Skip => {
@@ -270,15 +283,109 @@ impl WorkerThread {
             }
         }
     }
+
+    fn flush_images(&mut self) {
+        if self.pending_images.is_empty() {
+            return;
+        }
+        let batch = std::mem::take(&mut self.pending_images);
+
+        let paths: Vec<std::path::PathBuf> = batch
+            .iter()
+            .filter_map(|d| {
+                d.doc_id
+                    .strip_prefix("fs:")
+                    .map(|p| std::path::PathBuf::from(p))
+            })
+            .collect();
+
+        if paths.is_empty() {
+            tracing::warn!(
+                "semantic embed worker: image batch of {} had no valid fs: paths; dropping",
+                batch.len()
+            );
+            return;
+        }
+
+        let vectors = match self.image.lock() {
+            Ok(mut img) => match img.embed(paths) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        "semantic embed worker: image embed batch of {} failed: {e:#}",
+                        batch.len()
+                    );
+                    return;
+                }
+            },
+            Err(e) => {
+                tracing::error!("semantic embed worker: image embedder mutex poisoned: {e}");
+                return;
+            }
+        };
+
+        if vectors.len() != batch.len() {
+            tracing::warn!(
+                "semantic embed worker: image embed returned {} vectors for {} docs; dropping batch",
+                vectors.len(),
+                batch.len()
+            );
+            return;
+        }
+
+        let now = unix_seconds();
+        let rows: Vec<crate::store::VectorRow> = batch
+            .iter()
+            .zip(vectors.iter())
+            .map(|(doc, vector)| crate::store::VectorRow {
+                doc_id: doc.doc_id.clone(),
+                source_instance: doc.source_instance.clone(),
+                mtime: doc.mtime,
+                vector: vector.clone(),
+            })
+            .collect();
+
+        let store = self.store.clone();
+        let upsert_res = self
+            .runtime
+            .block_on(async move { store.upsert_image_batch(&rows).await });
+        match upsert_res {
+            Ok(()) => {
+                if let Ok(mut j) = self.journal.lock() {
+                    for doc in &batch {
+                        if let Err(e) = j.record(&doc.doc_id, CHANNEL_IMAGE, now) {
+                            tracing::warn!(
+                                doc_id = %doc.doc_id,
+                                "semantic embed worker: journal record failed: {e:#}"
+                            );
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    batch_len = batch.len(),
+                    "semantic embed worker: lancedb upsert_image_batch failed: {e:#}"
+                );
+            }
+        }
+    }
 }
 
 fn classify(doc: &UpsertedDoc) -> Channel {
     if doc.mime.as_deref().is_some_and(|m| m.starts_with("image/")) {
-        return Channel::Skip;
+        tracing::debug!("classify: doc_id={} mime={:?} -> Channel::Image", doc.doc_id, doc.mime);
+        return Channel::Image;
     }
     match doc.body.as_deref() {
-        Some(body) if !body.trim().is_empty() => Channel::Text,
-        _ => Channel::Skip,
+        Some(body) if !body.trim().is_empty() => {
+            tracing::debug!("classify: doc_id={} mime={:?} body_len={} -> Channel::Text", doc.doc_id, doc.mime, body.len());
+            Channel::Text
+        }
+        _ => {
+            tracing::debug!("classify: doc_id={} mime={:?} body=None -> Channel::Skip", doc.doc_id, doc.mime);
+            Channel::Skip
+        }
     }
 }
 
@@ -312,11 +419,15 @@ pub async fn start_backfill(
     let mut submitted = 0u64;
     for doc_id in all_ids {
         total += 1;
-        let already = match journal.lock() {
+        let already_text = match journal.lock() {
             Ok(j) => j.was_embedded(&doc_id, CHANNEL_TEXT).unwrap_or(false),
             Err(_) => false,
         };
-        if already {
+        let already_image = match journal.lock() {
+            Ok(j) => j.was_embedded(&doc_id, CHANNEL_IMAGE).unwrap_or(false),
+            Err(_) => false,
+        };
+        if already_text && already_image {
             continue;
         }
 
@@ -340,7 +451,7 @@ pub async fn start_backfill(
             doc_id: doc_id.clone(),
             source_instance: hit.source_instance.clone(),
             mtime: 0,
-            mime: None,
+            mime: hit.mime.clone(),
             body,
         };
 

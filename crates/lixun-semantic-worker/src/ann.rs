@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use lixun_mutation::{AnnHandle, AnnHit};
 
-use crate::embedder::TextEmbedder;
+use crate::embedder::{ClipTextEmbedder, TextEmbedder};
 use crate::store::VectorStore;
 
 /// Approximate-nearest-neighbour handle backed by LanceDB. Both
@@ -17,6 +17,7 @@ use crate::store::VectorStore;
 pub struct LanceDbAnnHandle {
     store: OnceLock<Arc<VectorStore>>,
     text_embedder: OnceLock<Arc<Mutex<TextEmbedder>>>,
+    clip_text_embedder: OnceLock<Arc<Mutex<ClipTextEmbedder>>>,
 }
 
 impl LanceDbAnnHandle {
@@ -24,6 +25,7 @@ impl LanceDbAnnHandle {
         Self {
             store: OnceLock::new(),
             text_embedder: OnceLock::new(),
+            clip_text_embedder: OnceLock::new(),
         }
     }
 
@@ -36,6 +38,13 @@ impl LanceDbAnnHandle {
         embedder: Arc<Mutex<TextEmbedder>>,
     ) -> Result<(), Arc<Mutex<TextEmbedder>>> {
         self.text_embedder.set(embedder)
+    }
+
+    pub fn install_clip_text_embedder(
+        &self,
+        embedder: Arc<Mutex<ClipTextEmbedder>>,
+    ) -> Result<(), Arc<Mutex<ClipTextEmbedder>>> {
+        self.clip_text_embedder.set(embedder)
     }
 
     pub fn store(&self) -> Option<Arc<VectorStore>> {
@@ -52,6 +61,19 @@ impl LanceDbAnnHandle {
         let mut vectors = guard
             .embed(vec![query.to_string()])
             .context("ann query: text embed")?;
+        Ok(vectors.pop())
+    }
+
+    fn embed_query_clip_text(&self, query: &str) -> Result<Option<Vec<f32>>> {
+        let Some(embedder) = self.clip_text_embedder.get() else {
+            return Ok(None);
+        };
+        let mut guard = embedder
+            .lock()
+            .map_err(|_| anyhow::anyhow!("CLIP text embedder mutex poisoned"))?;
+        let mut vectors = guard
+            .embed(vec![query.to_string()])
+            .context("ann query: CLIP text embed")?;
         Ok(vectors.pop())
     }
 }
@@ -74,12 +96,13 @@ impl AnnHandle for LanceDbAnnHandle {
         store.search_text(&vector, k).await
     }
 
-    /// Cross-modal text→image search needs a CLIP-text encoder.
-    /// fastembed 5.13.3's `clip-vit-b-32` ships only the vision
-    /// tower, so the text-prompt path has no compatible encoder
-    /// to project the query into the image vector space. Returns
-    /// empty until a paired text encoder is wired (parked for v1.1).
-    async fn search_image(&self, _query: &str, _k: usize) -> Result<Vec<AnnHit>> {
-        Ok(Vec::new())
+    async fn search_image(&self, query: &str, k: usize) -> Result<Vec<AnnHit>> {
+        let Some(store) = self.store() else {
+            return Ok(Vec::new());
+        };
+        let Some(vector) = self.embed_query_clip_text(query)? else {
+            return Ok(Vec::new());
+        };
+        store.search_image(&vector, k).await
     }
 }

@@ -193,6 +193,7 @@ impl MaildirSource {
             } else {
                 Some(recipients_all)
             },
+            mime: None,
             source_instance: String::new(),
             secondary_action: None,
             extra,
