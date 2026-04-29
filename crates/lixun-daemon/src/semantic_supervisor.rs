@@ -296,6 +296,9 @@ async fn handle_msg(msg: Msg, conn: &Arc<SemanticConnection>, writer: &mpsc::Sen
         Msg::SearchResult { req_id, hits } => {
             conn.complete_search(req_id, Ok(hits));
         }
+        Msg::ClassifyResult { req_id, modality } => {
+            conn.complete_classify(req_id, Ok(modality));
+        }
         Msg::BackfillComplete {
             req_id,
             submitted,
@@ -316,6 +319,7 @@ async fn handle_msg(msg: Msg, conn: &Arc<SemanticConnection>, writer: &mpsc::Sen
                 detail: detail.clone(),
             };
             conn.complete_search(req_id, Err(err.clone()));
+            conn.complete_classify(req_id, Err(err.clone()));
             conn.complete_backfill(req_id, Err(err));
             if req_id == 0 {
                 tracing::warn!("semantic worker async error: {detail}");

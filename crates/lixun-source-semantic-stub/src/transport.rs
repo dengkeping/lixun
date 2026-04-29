@@ -3,11 +3,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::Result;
-use lixun_mutation::{AnnHit, DocStore};
+use lixun_mutation::{AnnHit, DocStore, Modality};
 use lixun_semantic_proto::{Cmd, ErrorCode};
 use tokio::sync::{mpsc, oneshot};
 
 pub type SearchReply = Result<Vec<AnnHit>, SemanticIpcError>;
+pub type ClassifyReply = Result<Modality, SemanticIpcError>;
 pub type BackfillReply = Result<BackfillStats, SemanticIpcError>;
 
 #[derive(Debug, Clone)]
@@ -41,6 +42,7 @@ pub struct SemanticConnection {
     writer: mpsc::Sender<Cmd>,
     next_req_id: AtomicU64,
     pending_search: Mutex<HashMap<u64, oneshot::Sender<SearchReply>>>,
+    pending_classify: Mutex<HashMap<u64, oneshot::Sender<ClassifyReply>>>,
     pending_backfill: Mutex<HashMap<u64, oneshot::Sender<BackfillReply>>>,
 }
 
@@ -52,6 +54,7 @@ impl SemanticConnection {
             wire protocol; start the counter at 1 so we never collide. */
             next_req_id: AtomicU64::new(1),
             pending_search: Mutex::new(HashMap::new()),
+            pending_classify: Mutex::new(HashMap::new()),
             pending_backfill: Mutex::new(HashMap::new()),
         })
     }
@@ -73,6 +76,23 @@ impl SemanticConnection {
     pub fn complete_search(&self, req_id: u64, reply: SearchReply) {
         let tx = self
             .pending_search
+            .lock()
+            .ok()
+            .and_then(|mut g| g.remove(&req_id));
+        if let Some(tx) = tx {
+            let _ = tx.send(reply);
+        }
+    }
+
+    pub fn register_classify(&self, req_id: u64, tx: oneshot::Sender<ClassifyReply>) {
+        if let Ok(mut g) = self.pending_classify.lock() {
+            g.insert(req_id, tx);
+        }
+    }
+
+    pub fn complete_classify(&self, req_id: u64, reply: ClassifyReply) {
+        let tx = self
+            .pending_classify
             .lock()
             .ok()
             .and_then(|mut g| g.remove(&req_id));
@@ -103,6 +123,11 @@ impl SemanticConnection {
     /// stop waiting on a dead socket.
     pub fn fail_all_pending(&self, err: SemanticIpcError) {
         if let Ok(mut g) = self.pending_search.lock() {
+            for (_, tx) in g.drain() {
+                let _ = tx.send(Err(err.clone()));
+            }
+        }
+        if let Ok(mut g) = self.pending_classify.lock() {
             for (_, tx) in g.drain() {
                 let _ = tx.send(Err(err.clone()));
             }

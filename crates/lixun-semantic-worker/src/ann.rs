@@ -2,9 +2,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use lixun_mutation::{AnnHandle, AnnHit};
+use lixun_mutation::{AnnHandle, AnnHit, Modality};
 
 use crate::embedder::{ClipTextEmbedder, TextEmbedder};
+use crate::query_router::QueryRouter;
 use crate::store::VectorStore;
 
 /// Approximate-nearest-neighbour handle backed by LanceDB. Both
@@ -18,6 +19,7 @@ pub struct LanceDbAnnHandle {
     store: OnceLock<Arc<VectorStore>>,
     text_embedder: OnceLock<Arc<Mutex<TextEmbedder>>>,
     clip_text_embedder: OnceLock<Arc<Mutex<ClipTextEmbedder>>>,
+    query_router: OnceLock<Arc<QueryRouter>>,
 }
 
 impl LanceDbAnnHandle {
@@ -26,6 +28,7 @@ impl LanceDbAnnHandle {
             store: OnceLock::new(),
             text_embedder: OnceLock::new(),
             clip_text_embedder: OnceLock::new(),
+            query_router: OnceLock::new(),
         }
     }
 
@@ -45,6 +48,13 @@ impl LanceDbAnnHandle {
         embedder: Arc<Mutex<ClipTextEmbedder>>,
     ) -> Result<(), Arc<Mutex<ClipTextEmbedder>>> {
         self.clip_text_embedder.set(embedder)
+    }
+
+    pub fn install_query_router(
+        &self,
+        router: Arc<QueryRouter>,
+    ) -> Result<(), Arc<QueryRouter>> {
+        self.query_router.set(router)
     }
 
     pub fn store(&self) -> Option<Arc<VectorStore>> {
@@ -104,5 +114,15 @@ impl AnnHandle for LanceDbAnnHandle {
             return Ok(Vec::new());
         };
         store.search_image(&vector, k).await
+    }
+
+    async fn classify_query(&self, query: &str) -> Result<Modality> {
+        let Some(router) = self.query_router.get() else {
+            return Ok(Modality::Text);
+        };
+        let Some(vector) = self.embed_query_clip_text(query)? else {
+            return Ok(Modality::Text);
+        };
+        Ok(router.classify(&vector))
     }
 }

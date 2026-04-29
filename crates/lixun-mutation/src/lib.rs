@@ -81,6 +81,17 @@ impl MutationBroadcaster for MultiBroadcaster {
     }
 }
 
+/// Query modality classification result. Determines which ANN backend(s)
+/// to invoke for a given query. `Both` triggers fan-out to text and image
+/// search in parallel, merging results with image hits prioritized.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Modality {
+    Text,
+    Image,
+    Both,
+}
+
 /// Async query interface implemented by ANN-providing plugins.
 /// Lives in this leaf crate so `lixun-fusion` (the RRF consumer)
 /// and `lixun-source-semantic-stub` (the producer) can share the type
@@ -89,6 +100,14 @@ impl MutationBroadcaster for MultiBroadcaster {
 pub trait AnnHandle: Send + Sync {
     async fn search_text(&self, query: &str, k: usize) -> anyhow::Result<Vec<AnnHit>>;
     async fn search_image(&self, query: &str, k: usize) -> anyhow::Result<Vec<AnnHit>>;
+
+    /// Classify query intent to determine which ANN backend(s) to invoke.
+    /// Default implementation returns `Modality::Text` for backward compatibility
+    /// with non-semantic AnnHandle implementations (e.g., test stubs, noop).
+    /// Semantic worker overrides this with anchor-based CLIP classification.
+    async fn classify_query(&self, _query: &str) -> anyhow::Result<Modality> {
+        Ok(Modality::Text)
+    }
 }
 
 /// One result from an approximate-nearest-neighbour query. Lives in
