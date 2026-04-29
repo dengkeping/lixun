@@ -719,9 +719,24 @@ impl Config {
     }
 
     pub fn build_fs_source(&self) -> Result<lixun_sources::fs::FsSource> {
+        // Always exclude lixun's own state, data, cache and config
+        // directories. Without this guard, the fs source watches
+        // LanceDB's `_transactions/*.txn` and `_versions/*.manifest`
+        // rotations under $XDG_DATA_HOME/lixun/semantic/vectors/, the
+        // SQLite WAL/SHM under $XDG_STATE_HOME/lixun/, and the
+        // extract/fastembed caches \u2014 and re-injects them into the
+        // index as user files, which then floods the semantic worker
+        // with Delete events for its own internal storage. The
+        // hardcoded prefix list is derived from XDG dirs so it
+        // follows whatever the user has configured, and it is
+        // applied unconditionally on top of the user-supplied
+        // `exclude` list (cannot be turned off via config).
+        let mut exclude = lixun_self_excludes();
+        exclude.extend(self.exclude.iter().cloned());
+
         Ok(lixun_sources::fs::FsSource::with_regex_and_ocr(
             self.roots.clone(),
-            self.exclude.clone(),
+            exclude,
             self.exclude_regex.clone(),
             self.max_file_size_mb,
             self.caps_arc(),
@@ -873,6 +888,44 @@ fn state_dir() -> PathBuf {
             PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/state")
         })
         .join("lixun")
+}
+
+/// Absolute paths of every directory lixun itself writes to, used as
+/// substring excludes for the fs source. The set must cover XDG
+/// data, state, cache and config so the indexer never sees its own
+/// LanceDB rotations, SQLite WAL files or extract caches as user
+/// content. `LIXUN_SEMANTIC_DATA_DIR` is honoured as well so a user
+/// who relocates the worker storage doesn't reintroduce the loop.
+fn lixun_self_excludes() -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |p: PathBuf| {
+        if let Some(s) = p.to_str() {
+            if !s.is_empty() {
+                out.push(s.to_string());
+            }
+        }
+    };
+    if let Some(p) = dirs::data_dir() {
+        push(p.join("lixun"));
+    }
+    if let Some(p) = dirs::state_dir() {
+        push(p.join("lixun"));
+    } else {
+        let home = std::env::var("HOME").unwrap_or_default();
+        if !home.is_empty() {
+            push(PathBuf::from(&home).join(".local/state/lixun"));
+        }
+    }
+    if let Some(p) = dirs::cache_dir() {
+        push(p.join("lixun"));
+    }
+    push(config_dir().join("lixun"));
+    if let Ok(custom) = std::env::var("LIXUN_SEMANTIC_DATA_DIR") {
+        if !custom.is_empty() {
+            push(PathBuf::from(custom));
+        }
+    }
+    out
 }
 
 #[cfg(test)]

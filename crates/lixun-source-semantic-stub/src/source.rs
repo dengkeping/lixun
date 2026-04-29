@@ -126,22 +126,74 @@ impl MutationBroadcaster for SemanticIpcBroadcaster {
             let cmd = Cmd::Embed {
                 docs: chunk.to_vec(),
             };
-            if let Err(e) = conn.writer().try_send(cmd) {
-                tracing::warn!(
-                    upserts = chunk.len(),
-                    "semantic stub: failed to forward Embed to worker: {e}"
-                );
+            match conn.writer().try_send(cmd) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(cmd)) => {
+                    /* Channel full: spawn a task that awaits send so
+                    the upsert is delivered with backpressure instead
+                    of being dropped. The previous code logged WARN
+                    and silently lost the batch. */
+                    let writer = conn.writer().clone();
+                    let len = match &cmd {
+                        Cmd::Embed { docs } => docs.len(),
+                        _ => 0,
+                    };
+                    tokio::spawn(async move {
+                        if writer.send(cmd).await.is_err() {
+                            tracing::warn!(
+                                upserts = len,
+                                "semantic stub: writer channel closed while awaiting Embed send"
+                            );
+                        }
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        upserts = chunk.len(),
+                        "semantic stub: failed to forward Embed to worker: {e}"
+                    );
+                }
             }
         }
+        // Dedup deletes before forwarding. LanceDB rotates many
+        // internal files under `_transactions/` and `_versions/` and
+        // an exclude regression upstream could replay the same
+        // doc_id many times per second; deduping here caps fan-out at
+        // one Cmd::Delete per unique id per batch. Backpressure is
+        // handled the same way as Embed: try_send fast path, spawn
+        // await on Full.
+        let mut seen: std::collections::HashSet<&str> =
+            std::collections::HashSet::with_capacity(batch.deletes.len());
         for doc_id in &batch.deletes {
+            if !seen.insert(doc_id.as_str()) {
+                continue;
+            }
             let cmd = Cmd::Delete {
                 doc_id: doc_id.clone(),
             };
-            if let Err(e) = conn.writer().try_send(cmd) {
-                tracing::warn!(
-                    doc_id = %doc_id,
-                    "semantic stub: failed to forward Delete to worker: {e}"
-                );
+            match conn.writer().try_send(cmd) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(cmd)) => {
+                    let writer = conn.writer().clone();
+                    let id = match &cmd {
+                        Cmd::Delete { doc_id } => doc_id.clone(),
+                        _ => String::new(),
+                    };
+                    tokio::spawn(async move {
+                        if writer.send(cmd).await.is_err() {
+                            tracing::warn!(
+                                doc_id = %id,
+                                "semantic stub: writer channel closed while awaiting Delete send"
+                            );
+                        }
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        doc_id = %doc_id,
+                        "semantic stub: failed to forward Delete to worker: {e}"
+                    );
+                }
             }
         }
     }

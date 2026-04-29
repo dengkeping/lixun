@@ -63,6 +63,7 @@ pub fn spawn_worker(
         image: image_embedder,
         rx,
         pending_text: Vec::new(),
+        pending_deletes: Vec::new(),
         last_flush: Instant::now(),
     };
 
@@ -85,6 +86,7 @@ struct WorkerThread {
     image: Arc<Mutex<ImageEmbedder>>,
     rx: mpsc::Receiver<EmbedJob>,
     pending_text: Vec<UpsertedDoc>,
+    pending_deletes: Vec<String>,
     last_flush: Instant,
 }
 
@@ -118,17 +120,22 @@ impl WorkerThread {
                     if let Err(e) = self.handle_job(job) {
                         tracing::warn!("semantic embed worker: handle_job failed: {e:#}");
                     }
-                    if self.pending_text.len() >= batch_size {
+                    if self.pending_text.len() >= batch_size
+                        || self.pending_deletes.len() >= batch_size
+                    {
                         self.flush_text();
+                        self.flush_deletes();
                     }
                 }
                 Ok(None) => {
                     self.flush_text();
+                    self.flush_deletes();
                     tracing::info!("semantic embed worker: channel closed, exiting");
                     return;
                 }
                 Err(()) => {
                     self.flush_text();
+                    self.flush_deletes();
                 }
             }
         }
@@ -151,24 +158,41 @@ impl WorkerThread {
                     Ok(())
                 }
             },
-            EmbedJob::Delete(doc_id) => self.handle_delete(&doc_id),
+            EmbedJob::Delete(doc_id) => {
+                self.pending_deletes.push(doc_id);
+                Ok(())
+            }
         }
     }
 
-    fn handle_delete(&mut self, doc_id: &str) -> Result<()> {
+    fn flush_deletes(&mut self) {
+        if self.pending_deletes.is_empty() {
+            return;
+        }
+        /* Dedup at flush time as a second line of defence; the
+        broadcaster also dedupes per-batch but a worker can see
+        repeats across flush windows. One LanceDB delete per unique
+        id is far cheaper than one per event. */
+        let mut ids: Vec<String> = std::mem::take(&mut self.pending_deletes);
+        ids.sort_unstable();
+        ids.dedup();
         let store = self.store.clone();
-        let id = doc_id.to_string();
+        let ids_for_delete = ids.clone();
         let res = self
             .runtime
-            .block_on(async move { store.delete(&[id]).await });
+            .block_on(async move { store.delete(&ids_for_delete).await });
         if let Err(e) = res {
-            tracing::warn!("semantic embed worker: lancedb delete failed: {e:#}");
-            return Ok(());
+            tracing::warn!(
+                count = ids.len(),
+                "semantic embed worker: lancedb delete batch failed: {e:#}"
+            );
+            return;
         }
         if let Ok(mut j) = self.journal.lock() {
-            let _ = j.forget(doc_id);
+            for id in &ids {
+                let _ = j.forget(id);
+            }
         }
-        Ok(())
     }
 
     fn flush_text(&mut self) {
