@@ -530,9 +530,7 @@ fn upserted_doc_from(doc: &Document) -> UpsertedDoc {
         doc_id: doc.id.0.clone(),
         source_instance: doc.source_instance.clone(),
         mtime: doc.mtime,
-        // `Document` carries no MIME today; reserved so the broadcast
-        // surface stays stable when extractors start preserving it.
-        mime: None,
+        mime: doc.mime.clone(),
         body: doc.body.clone(),
     }
 }
@@ -637,6 +635,7 @@ pub fn index_file(
         extract_fail,
         sender: None,
         recipients: None,
+        mime: None,
         source_instance: "builtin:fs".into(),
         secondary_action: Some(Action::ShowInFileManager {
             path: path.to_path_buf(),

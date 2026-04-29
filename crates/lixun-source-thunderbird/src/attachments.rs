@@ -134,6 +134,7 @@ impl ThunderbirdAttachmentsSource {
                         extract_fail,
                         sender: None,
                         recipients: None,
+                        mime: Some(part.mime.clone()),
                         source_instance: "builtin:tb_attachments".into(),
                         secondary_action: part.message_id.as_ref().map(|mid| Action::OpenUri {
                             uri: format!("mid:{mid}"),

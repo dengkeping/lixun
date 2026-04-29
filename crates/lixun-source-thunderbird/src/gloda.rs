@@ -285,6 +285,7 @@ pub fn query_messages(
             extract_fail: false,
             sender: author_clean,
             recipients: recipients_clean,
+            mime: None,
             source_instance: "builtin:gloda".into(),
             secondary_action: None,
             extra: Vec::new(),

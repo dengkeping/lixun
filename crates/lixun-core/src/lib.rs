@@ -307,6 +307,10 @@ pub struct Hit {
     /// `row_menu()` declaration. Empty when the source opts out.
     #[serde(default, skip_serializing_if = "RowMenuDef::is_empty")]
     pub row_menu: RowMenuDef,
+    /// MIME type inferred from file extension or content. Used by semantic
+    /// worker backfill to classify documents into text/image/skip channels.
+    #[serde(default)]
+    pub mime: Option<String>,
 }
 
 /// Per-hit score breakdown (Wave B T6) — carries the raw multipliers
@@ -367,6 +371,9 @@ pub struct Document {
     pub source_instance: String,
     pub extra: Vec<ExtraFieldValue>,
     pub secondary_action: Option<Action>,
+    /// MIME type inferred from file extension or content. Used by semantic
+    /// worker to classify documents into text/image/skip channels.
+    pub mime: Option<String>,
 }
 
 #[derive(Debug, Clone)]

@@ -89,7 +89,23 @@ impl HybridSearchHandle {
             .max(target_limit);
 
         let lex_fut = self.inner.search_with_breakdown(query);
-        let ann_fut = ann.search_text(&query.text, ann_k);
+        
+        // Image search heuristic: if query contains image-related keywords,
+        // route to search_image() instead of search_text(). This allows
+        // natural-language queries like "photos of dogs" to match image
+        // embeddings from CLIP rather than text embeddings from bge-small.
+        let query_lower = query.text.to_lowercase();
+        let is_image_query = query_lower.contains("photo")
+            || query_lower.contains("image")
+            || query_lower.contains("picture")
+            || query_lower.contains("screenshot")
+            || query_lower.contains("pic ");
+        
+        let ann_fut = if is_image_query {
+            ann.search_image(&query.text, ann_k)
+        } else {
+            ann.search_text(&query.text, ann_k)
+        };
         let (lex_pairs, ann_hits) = tokio::try_join!(lex_fut, ann_fut)?;
 
         tracing::debug!(
@@ -126,9 +142,14 @@ impl HybridSearchHandle {
             Vec::with_capacity(target_limit);
         let mut seen: HashSet<String> = HashSet::with_capacity(lex_pairs.len() + ann_hits.len());
 
-        for (hit, bd) in lex_pairs.into_iter().take(target_limit) {
-            seen.insert(hit.id.0.clone());
-            out.push((hit, bd));
+        // For image queries the ANN signal is the only meaningful one
+        // (BM25 over filenames matches "photo" in mime-type stub files
+        // like x-photo-cd.xml, drowning real photos). Put ANN first.
+        if !is_image_query {
+            for (hit, bd) in lex_pairs.iter().take(target_limit) {
+                seen.insert(hit.id.0.clone());
+                out.push((hit.clone(), bd.clone()));
+            }
         }
 
         if out.len() < target_limit {
@@ -161,6 +182,19 @@ impl HybridSearchHandle {
                 bd.latch_mult = 1.0;
                 bd.stage2_clamped = 1.0;
                 bd.final_score = 0.0;
+                out.push((hit, bd));
+            }
+        }
+
+        if is_image_query && out.len() < target_limit {
+            for (hit, bd) in lex_pairs.into_iter() {
+                if out.len() >= target_limit {
+                    break;
+                }
+                if seen.contains(&hit.id.0) {
+                    continue;
+                }
+                seen.insert(hit.id.0.clone());
                 out.push((hit, bd));
             }
         }

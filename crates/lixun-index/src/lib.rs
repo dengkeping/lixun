@@ -55,6 +55,7 @@ pub struct LixunSchema {
     pub sender: tantivy::schema::Field,
     pub recipients: tantivy::schema::Field,
     pub source_instance: tantivy::schema::Field,
+    pub mime: tantivy::schema::Field,
 }
 
 impl LixunSchema {
@@ -99,6 +100,7 @@ impl LixunSchema {
         let sender = builder.add_text_field("sender", stored_spotlight_text());
         let recipients = builder.add_text_field("recipients", stored_spotlight_text());
         let source_instance = builder.add_text_field("source_instance", STRING | STORED);
+        let mime = builder.add_text_field("mime", STORED);
 
         let plugins =
             plugin_schema::add_plugin_fields_to_schema(&mut builder, plugin_fields_by_kind)?;
@@ -127,6 +129,7 @@ impl LixunSchema {
                 sender,
                 recipients,
                 source_instance,
+                mime,
             },
             plugins,
         ))
@@ -249,6 +252,7 @@ impl LixunIndex {
             s.sender => doc.sender.as_deref().unwrap_or(""),
             s.recipients => doc.recipients.as_deref().unwrap_or(""),
             s.source_instance => doc.source_instance.as_str(),
+            s.mime => doc.mime.as_deref().unwrap_or(""),
         ];
 
         for extra in &doc.extra {
@@ -414,6 +418,7 @@ impl LixunIndex {
                 .and_then(|value| value.as_str())
                 .unwrap_or("")
                 .to_string();
+            let mime = stored_optional_text(&doc, s.mime);
 
             let coord_mult =
                 if (2..=3).contains(&q_tokens_count) && all_match_set.contains(&doc_address) {
@@ -452,6 +457,7 @@ impl LixunIndex {
                 secondary_action,
                 source_instance,
                 row_menu: lixun_core::RowMenuDef::empty(),
+                mime,
             };
             let breakdown = ScoreBreakdown {
                 tantivy: score,
@@ -577,6 +583,7 @@ impl LixunIndex {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+        let mime = stored_optional_text(&doc, s.mime);
 
         let hit = Hit {
             id: lixun_core::DocId(id_str),
@@ -594,6 +601,7 @@ impl LixunIndex {
             secondary_action,
             source_instance,
             row_menu: lixun_core::RowMenuDef::empty(),
+            mime,
         };
         let breakdown = ScoreBreakdown {
             tantivy: 0.0,
@@ -775,6 +783,7 @@ impl LixunIndex {
             source_instance,
             extra,
             secondary_action,
+            mime: None,
         }
     }
 

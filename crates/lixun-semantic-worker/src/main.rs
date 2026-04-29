@@ -33,7 +33,7 @@ use lixun_semantic_proto::{Cmd, ErrorCode, Msg, PROTOCOL_VERSION, WorkerCodec};
 
 use crate::ann::LanceDbAnnHandle;
 use crate::config::SemanticConfig;
-use crate::embedder::{load_image_embedder, load_text_embedder};
+use crate::embedder::{load_clip_text_embedder, load_image_embedder, load_text_embedder};
 use crate::ipc_doc_store::IpcDocStore;
 use crate::journal::BackfillJournal;
 use crate::store::VectorStore;
@@ -113,10 +113,13 @@ async fn main() -> Result<()> {
         .with_context(|| format!("loading text embedder '{}'", cfg.text_model))?;
     let image_embedder = load_image_embedder(&cfg.image_model, &cache_dir, 1, 1)
         .with_context(|| format!("loading image embedder '{}'", cfg.image_model))?;
+    let clip_text_embedder = load_clip_text_embedder(&cache_dir, 1, 1)
+        .context("loading CLIP text embedder")?;
     let text_dim = text_embedder.dim();
     let image_dim = image_embedder.dim();
     let text_embedder = Arc::new(Mutex::new(text_embedder));
     let image_embedder = Arc::new(Mutex::new(image_embedder));
+    let clip_text_embedder = Arc::new(Mutex::new(clip_text_embedder));
 
     let vectors_dir = data_root.join("vectors");
     let store = Arc::new(
@@ -140,6 +143,7 @@ async fn main() -> Result<()> {
         runtime,
         text_embedder.clone(),
         image_embedder.clone(),
+        clip_text_embedder.clone(),
     )
     .context("spawning embed worker thread")?;
     let embed_tx = worker_handle.sender();
@@ -147,6 +151,7 @@ async fn main() -> Result<()> {
     let ann = Arc::new(LanceDbAnnHandle::new());
     let _ = ann.install_store(store.clone());
     let _ = ann.install_text_embedder(text_embedder.clone());
+    let _ = ann.install_clip_text_embedder(clip_text_embedder.clone());
 
     /* Reads come from the dispatch loop, writes from spawned ANN
     tasks. A bounded mpsc funnels every outbound Msg through a

@@ -70,6 +70,7 @@ impl IndexerSource for ShellSource {
             secondary_action: None,
             source_instance: ctx.instance_id.to_string(),
             row_menu: RowMenuDef::empty(),
+            mime: None,
         }]
     }
 
