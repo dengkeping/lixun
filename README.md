@@ -338,9 +338,10 @@ not just filename matches. Indexed images live in `~/.local/share/lixun/semantic
 - BM25 + text semantic: 30-50ms
 - BM25 + text + image (full 3-way RRF): 40-60ms
 
-See [`docs/search-fusion.md`](docs/search-fusion.md) for the fusion
-architecture and [`docs/wave-d-semantic.md`](docs/wave-d-semantic.md) for
-worker configuration and operations.
+See [`docs/architecture.md`](docs/architecture.md) for the full block diagram,
+[`docs/search-fusion.md`](docs/search-fusion.md) for the fusion algorithm, and
+[`docs/wave-d-semantic.md`](docs/wave-d-semantic.md) for worker configuration
+and operations.
 
 ---
 

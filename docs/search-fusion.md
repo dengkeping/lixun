@@ -186,6 +186,10 @@ graceful degradation when semantic is disabled.
   (LambdaMART, LightGBM) trained on click logs. Requires user opt-in for
   telemetry.
 
+## See also
+
+- [docs/architecture.md](architecture.md) — full block diagram from user interface to result delivery
+
 ## References
 
 - Apple WWDC24: "Support semantic search with Core Spotlight"
