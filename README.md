@@ -1,6 +1,6 @@
 # Lixun 利寻
 
-[![version](https://img.shields.io/badge/version-0.5.0-blue)](https://repo.dkp.hk/denis/lixun/releases)
+[![version](https://img.shields.io/badge/version-0.6.0-blue)](https://github.com/dengkeping/lixun/releases)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-green)](#license)
 [![platform](https://img.shields.io/badge/platform-Linux-lightgrey)]()
 [![rust](https://img.shields.io/badge/rust-2024-orange)](https://www.rust-lang.org/)
@@ -15,11 +15,13 @@
 > when reporting bugs.
 
 A **Spotlight-style launcher for Linux**. Press `Super + Space`, start typing,
-get instant results across applications, files, and email. Backed by a
-local [Tantivy](https://github.com/quickwit-oss/tantivy) full-text index
-and a long-lived daemon that keeps everything fresh via filesystem watchers.
-Now with semantic search (Wave D), preview pane, and system-impact presets
-(Wave E).
+get instant results across applications, files, email, and **photos by
+content**. Backed by a local
+[Tantivy](https://github.com/quickwit-oss/tantivy) full-text index, dense
+vector search via CLIP, and a long-lived daemon that keeps everything fresh
+via filesystem watchers. Lexical (BM25) and semantic (text + image) results
+fuse with Reciprocal Rank Fusion — same architecture Apple Spotlight and
+Microsoft Windows Search use.
 
 ---
 
@@ -37,10 +39,14 @@ Now with semantic search (Wave D), preview pane, and system-impact presets
   overlay showing text, images, PDFs, code, email, office documents, or
   audio/video content.
 - **Semantic search** — hybrid lexical + dense-vector retrieval via
-  Reciprocal Rank Fusion. Runs as a sidecar process: install the
+  Reciprocal Rank Fusion. Three parallel backends: BM25 (always on), text
+  semantic (bge-small-en-v1.5), and **image semantic** (CLIP cross-modal
+  text→image search). Query "photos of dogs" and get actual photos ranked by
+  content, not just filename matches. Runs as a sidecar process: install the
   `lixun-semantic-worker` binary on `$PATH` (or set
   `LIXUN_SEMANTIC_WORKER` to its path) and add `[semantic] enabled = true`
-  to the config to activate it at runtime (default is off).
+  to the config to activate it at runtime (default is off). See
+  [docs/search-fusion.md](docs/search-fusion.md) for architecture details.
 - **Calculator** — type `= sqrt(16) + pi` and get `7.1415…` at the top.
 - **Shell** — type `> ls -la` to spawn a terminal via `xdg-terminal-exec`.
 - **Automatic OCR** — index scanned PDFs and images via Tesseract.
@@ -57,13 +63,13 @@ Everything local. No telemetry, no cloud, no vendor.
 ### Arch Linux (binary package)
 
 ```sh
-git clone https://repo.dkp.hk/denis/lixun.git
+git clone https://github.com/dengkeping/lixun.git
 cd lixun
 cargo build --workspace --release
 cp target/release/{lixun-cli,lixund,lixun-gui,lixun-preview} /tmp/lixun-arch-tarball/
-tar -C /tmp/lixun-arch-tarball -czf packaging/arch/lixun-0.5.0-x86_64.tar.gz .
+tar -C /tmp/lixun-arch-tarball -czf packaging/arch/lixun-0.6.0-x86_64.tar.gz .
 cd packaging/arch && makepkg -f
-sudo pacman -U lixun-bin-0.5.0-1-x86_64.pkg.tar.zst
+sudo pacman -U lixun-bin-0.6.0-1-x86_64.pkg.tar.zst
 systemctl --user enable --now lixund.service
 ```
 
@@ -296,8 +302,17 @@ plugins work normally.
 
 ## Semantic search
 
-Semantic search adds dense-vector retrieval to the lexical BM25 index.
-Results from both paths are fused with Reciprocal Rank Fusion (RRF).
+Semantic search adds dense-vector retrieval to the lexical BM25 index. Three
+backends run **in parallel** for every query — BM25, text semantic
+(bge-small-en-v1.5), and image semantic (CLIP cross-modal text→image). Their
+results merge via Reciprocal Rank Fusion (RRF, k=60), the same fusion
+strategy Apple Spotlight and Microsoft Windows Search use. There is **no
+query classifier** — fan-out-and-merge is more robust than trying to guess
+upfront whether a query is "text" or "image".
+
+**Cross-modal image search.** Query "photos of dogs" or "screenshot of
+terminal" and get actual photos ranked by their visual content via CLIP,
+not just filename matches. Indexed images live in `~/.local/share/lixun/semantic/vectors/image_vectors.lance/`.
 
 **Requirements:**
 - Install the `lixun-semantic-worker` sidecar binary (the daemon
@@ -307,16 +322,25 @@ Results from both paths are fused with Reciprocal Rank Fusion (RRF).
 - GLIBC >= 2.27 (ONNX Runtime requirement)
 
 **Configuration:**
-- Embeddings produced by `fastembed` (default text model: `bge-small-en-v1.5`)
-- Model cache: `~/.cache/lixun/fastembed/` (~100–500 MB depending on model)
-- Vector store: `~/.local/share/lixun/vectors/` (LanceDB tables)
+- Text embeddings: `fastembed` with `bge-small-en-v1.5` (384-dim)
+- Image embeddings: `fastembed` with `clip-vit-b-32` vision (512-dim)
+- Cross-modal text encoder: `clip-vit-b-32` text (512-dim, same space)
+- Model cache: `~/.cache/lixun/fastembed/` (~400 MB total)
+- Vector store: `~/.local/share/lixun/semantic/vectors/` (LanceDB tables)
 
 **Memory footprint:**
-- ONNX heap: ~400 MB
+- ONNX heap: ~400 MB (worker process, not daemon)
 - Lance/Arrow staging during backfill: ~1.5–1.7 GB
 - Backfill command: `lixun-cli semantic backfill` (resume-safe)
 
-See [`docs/wave-d-semantic.md`](docs/wave-d-semantic.md) for full details.
+**Latency** (p50/p95 on a 4-core laptop, NVMe SSD):
+- BM25 only: 10-20ms
+- BM25 + text semantic: 30-50ms
+- BM25 + text + image (full 3-way RRF): 40-60ms
+
+See [`docs/search-fusion.md`](docs/search-fusion.md) for the fusion
+architecture and [`docs/wave-d-semantic.md`](docs/wave-d-semantic.md) for
+worker configuration and operations.
 
 ---
 
@@ -628,6 +652,27 @@ user-visible search downtime. Expect transient CPU and I/O for the
 duration of the reindex (minutes on typical home corpora).
 
 Recent version bumps:
+
+- **v0.6.0** (cross-modal image search + Spotlight-style RRF fusion). Added
+  CLIP-based text→image search: query "photos of dogs" returns photos ranked
+  by visual content, not filename. Fusion refactored to 3-way parallel
+  fan-out (BM25 + text ANN + image ANN) merged via Reciprocal Rank Fusion
+  (k=60), matching Apple Spotlight and Microsoft Windows Search architecture.
+  Removed the experimental anchor-based query classifier (CLIP text space is
+  asymmetric for short queries — fan-out-and-merge is more robust).
+  **INDEX_VERSION bump:** Tantivy schema gained a `mime` field needed for
+  routing image documents into the CLIP image embedder. Daemon detects the
+  mismatch on startup and reindexes from scratch; existing index stays
+  queryable until rebuild completes. See `docs/search-fusion.md` for
+  architecture details.
+
+- **v0.5.1** (packaging hardening). Fixed Arch makepkg link failure (LTO
+  was dropping `cargo:rustc-link-lib=static` metadata from
+  libsqlite3-sys/tikv-jemalloc-sys/zstd-sys). PKGBUILDs now set
+  `options=(!lto)` plus a `cargo clean` and pinned linker. Also fixed the
+  semantic worker self-indexing storm (LanceDB transaction/manifest files
+  under `~/.local/share/lixun/` were being indexed by the fs source,
+  saturating the worker's Delete channel). No INDEX_VERSION bump.
 
 - **v0.4.0** (Wave D, semantic search). Added the semantic search
   feature. As of the sidecar refactor, semantic runs in a separate

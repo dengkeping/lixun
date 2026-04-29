@@ -30,7 +30,7 @@ use lixun_core::{
 };
 use normalize::normalize_for_match;
 
-const INDEX_VERSION: u32 = 9;
+const INDEX_VERSION: u32 = 10;
 const INDEX_VERSION_FILE: &str = "index_version.txt";
 
 /// Tantivy schema fields.
