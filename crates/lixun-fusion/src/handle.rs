@@ -11,6 +11,11 @@ use std::sync::Arc;
 pub struct HybridSearchHandle {
     inner: SearchHandle,
     ann: Option<Arc<dyn crate::ann::AnnHandle>>,
+    // Retained for API compatibility and future RRF mode toggle (see
+    // fused_search): callers configure k through `new()`, and re-
+    // enabling rrf::rrf_fuse can pull this back into the active path
+    // without a constructor break.
+    #[allow(dead_code)]
     rrf_k: f32,
     overfetch: usize,
 }
@@ -76,8 +81,7 @@ impl HybridSearchHandle {
         query: &lixun_core::Query,
         ann: Arc<dyn crate::ann::AnnHandle>,
     ) -> Result<Vec<(lixun_core::Hit, lixun_core::ScoreBreakdown)>> {
-        use crate::rrf::rrf_fuse;
-        use std::collections::HashMap;
+        use std::collections::HashSet;
 
         let target_limit = query.limit.max(1) as usize;
         let ann_k = target_limit
@@ -88,27 +92,15 @@ impl HybridSearchHandle {
         let ann_fut = ann.search_text(&query.text, ann_k);
         let (lex_pairs, ann_hits) = tokio::try_join!(lex_fut, ann_fut)?;
 
-        let bm25_ranked: Vec<(String, f32)> = lex_pairs
-            .iter()
-            .map(|(h, _)| (h.id.0.clone(), h.score))
-            .collect();
-        let ann_ranked: Vec<(String, f32)> = ann_hits
-            .iter()
-            .map(|h| (h.doc_id.clone(), h.distance))
-            .collect();
-
-        let fused = rrf_fuse(&bm25_ranked, &ann_ranked, self.rrf_k);
-
         tracing::debug!(
             target: "lixun_fusion",
             bm25 = lex_pairs.len(),
             ann = ann_hits.len(),
-            fused = fused.len(),
-            "fusion: ranked input sizes"
+            "fusion: ranked input sizes (text-priority mode)"
         );
         // ANN=0 while BM25>0 on a non-empty query is the signature of
         // an unpopulated ANN handle (store or text-embedder OnceLock
-        // empty); `ann::search_text` returns Ok(empty) in that case
+        // empty); ann::search_text returns Ok(empty) in that case
         // and would otherwise hide a misconfigured semantic plugin
         // behind a green hybrid path.
         if ann_hits.is_empty() && !lex_pairs.is_empty() && !query.text.trim().is_empty() {
@@ -120,33 +112,57 @@ impl HybridSearchHandle {
             );
         }
 
-        let mut by_id: HashMap<String, (lixun_core::Hit, lixun_core::ScoreBreakdown)> = lex_pairs
-            .into_iter()
-            .map(|(h, b)| (h.id.0.clone(), (h, b)))
-            .collect();
+        // Text-priority composition: lexical hits first in their own
+        // BM25 order, then ANN-only hits as a semantic suffix. RRF is
+        // intentionally NOT used here — for short symbolic queries
+        // (e.g. ticket ids, filename codes like "AQL-HSSA") RRF
+        // collapses BM25 and ANN scores into the same 1/(60+rank)
+        // band, and noisy semantic neighbours rank alongside exact
+        // text matches. Showing BM25 first preserves precision; the
+        // ANN suffix preserves recall for natural-language queries
+        // when BM25 returns few or no results. rrf::rrf_fuse is kept
+        // in the crate for future modes selectable via config.
+        let mut out: Vec<(lixun_core::Hit, lixun_core::ScoreBreakdown)> =
+            Vec::with_capacity(target_limit);
+        let mut seen: HashSet<String> = HashSet::with_capacity(lex_pairs.len() + ann_hits.len());
 
-        let mut out = Vec::with_capacity(fused.len().min(target_limit));
-        for (doc_id, fused_score) in fused.into_iter().take(target_limit) {
-            let pair = if let Some(p) = by_id.remove(&doc_id) {
-                Some(p)
-            } else {
-                self.inner.hydrate_doc(&doc_id).await?
-            };
-            let Some((mut hit, mut bd)) = pair else {
-                continue;
-            };
-            hit.score = fused_score;
-            bd.tantivy = fused_score;
-            bd.category_mult = 1.0;
-            bd.prefix_mult = 1.0;
-            bd.acronym_mult = 1.0;
-            bd.recency_mult = 1.0;
-            bd.coord_mult = 1.0;
-            bd.frecency_mult = 1.0;
-            bd.latch_mult = 1.0;
-            bd.stage2_clamped = 1.0;
-            bd.final_score = fused_score;
+        for (hit, bd) in lex_pairs.into_iter().take(target_limit) {
+            seen.insert(hit.id.0.clone());
             out.push((hit, bd));
+        }
+
+        if out.len() < target_limit {
+            // Hydrate ANN-only docs through the lexical SearchHandle so
+            // they get the same Hit/ScoreBreakdown shape as BM25 hits,
+            // then mark them as semantic-suffix entries.
+            for h in ann_hits.into_iter() {
+                if out.len() >= target_limit {
+                    break;
+                }
+                if seen.contains(&h.doc_id) {
+                    continue;
+                }
+                seen.insert(h.doc_id.clone());
+                let Some((mut hit, mut bd)) = self.inner.hydrate_doc(&h.doc_id).await? else {
+                    continue;
+                };
+                // Semantic-suffix marker: zero out lexical score so the
+                // text-first ordering is unambiguous for downstream
+                // consumers, and stash the raw ANN distance in tantivy
+                // so callers can still inspect the embedding signal.
+                hit.score = 0.0;
+                bd.tantivy = h.distance;
+                bd.category_mult = 1.0;
+                bd.prefix_mult = 1.0;
+                bd.acronym_mult = 1.0;
+                bd.recency_mult = 1.0;
+                bd.coord_mult = 1.0;
+                bd.frecency_mult = 1.0;
+                bd.latch_mult = 1.0;
+                bd.stage2_clamped = 1.0;
+                bd.final_score = 0.0;
+                out.push((hit, bd));
+            }
         }
 
         Ok(out)
