@@ -90,36 +90,36 @@ impl HybridSearchHandle {
 
         let lex_fut = self.inner.search_with_breakdown(query);
         
-        // Image search heuristic: if query contains image-related keywords,
-        // route to search_image() instead of search_text(). This allows
-        // natural-language queries like "photos of dogs" to match image
-        // embeddings from CLIP rather than text embeddings from bge-small.
-        let query_lower = query.text.to_lowercase();
-        let is_image_query = query_lower.contains("photo")
-            || query_lower.contains("image")
-            || query_lower.contains("picture")
-            || query_lower.contains("screenshot")
-            || query_lower.contains("pic ");
+        let modality = ann.classify_query(&query.text).await.unwrap_or(lixun_mutation::Modality::Text);
         
-        let ann_fut = if is_image_query {
-            ann.search_image(&query.text, ann_k)
-        } else {
-            ann.search_text(&query.text, ann_k)
+        let (lex_pairs, text_hits, image_hits) = match modality {
+            lixun_mutation::Modality::Text => {
+                let ann_hits = ann.search_text(&query.text, ann_k).await?;
+                let lex = lex_fut.await?;
+                (lex, ann_hits, Vec::new())
+            }
+            lixun_mutation::Modality::Image => {
+                let ann_hits = ann.search_image(&query.text, ann_k).await?;
+                let lex = lex_fut.await?;
+                (lex, Vec::new(), ann_hits)
+            }
+            lixun_mutation::Modality::Both => {
+                let text_fut = ann.search_text(&query.text, ann_k);
+                let image_fut = ann.search_image(&query.text, ann_k);
+                let (lex, text, image) = tokio::try_join!(lex_fut, text_fut, image_fut)?;
+                (lex, text, image)
+            }
         };
-        let (lex_pairs, ann_hits) = tokio::try_join!(lex_fut, ann_fut)?;
 
         tracing::debug!(
             target: "lixun_fusion",
             bm25 = lex_pairs.len(),
-            ann = ann_hits.len(),
-            "fusion: ranked input sizes (text-priority mode)"
+            text_ann = text_hits.len(),
+            image_ann = image_hits.len(),
+            ?modality,
+            "fusion: ranked input sizes"
         );
-        // ANN=0 while BM25>0 on a non-empty query is the signature of
-        // an unpopulated ANN handle (store or text-embedder OnceLock
-        // empty); ann::search_text returns Ok(empty) in that case
-        // and would otherwise hide a misconfigured semantic plugin
-        // behind a green hybrid path.
-        if ann_hits.is_empty() && !lex_pairs.is_empty() && !query.text.trim().is_empty() {
+        if text_hits.is_empty() && image_hits.is_empty() && !lex_pairs.is_empty() && !query.text.trim().is_empty() {
             tracing::warn!(
                 target: "lixun_fusion",
                 query_len = query.text.len(),
@@ -128,74 +128,139 @@ impl HybridSearchHandle {
             );
         }
 
-        // Text-priority composition: lexical hits first in their own
-        // BM25 order, then ANN-only hits as a semantic suffix. RRF is
-        // intentionally NOT used here — for short symbolic queries
-        // (e.g. ticket ids, filename codes like "AQL-HSSA") RRF
-        // collapses BM25 and ANN scores into the same 1/(60+rank)
-        // band, and noisy semantic neighbours rank alongside exact
-        // text matches. Showing BM25 first preserves precision; the
-        // ANN suffix preserves recall for natural-language queries
-        // when BM25 returns few or no results. rrf::rrf_fuse is kept
-        // in the crate for future modes selectable via config.
         let mut out: Vec<(lixun_core::Hit, lixun_core::ScoreBreakdown)> =
             Vec::with_capacity(target_limit);
-        let mut seen: HashSet<String> = HashSet::with_capacity(lex_pairs.len() + ann_hits.len());
+        let mut seen: HashSet<String> = HashSet::with_capacity(lex_pairs.len() + text_hits.len() + image_hits.len());
 
-        // For image queries the ANN signal is the only meaningful one
-        // (BM25 over filenames matches "photo" in mime-type stub files
-        // like x-photo-cd.xml, drowning real photos). Put ANN first.
-        if !is_image_query {
-            for (hit, bd) in lex_pairs.iter().take(target_limit) {
-                seen.insert(hit.id.0.clone());
-                out.push((hit.clone(), bd.clone()));
+        match modality {
+            lixun_mutation::Modality::Image => {
+                for h in image_hits.into_iter() {
+                    if out.len() >= target_limit {
+                        break;
+                    }
+                    if seen.contains(&h.doc_id) {
+                        continue;
+                    }
+                    seen.insert(h.doc_id.clone());
+                    let Some((mut hit, mut bd)) = self.inner.hydrate_doc(&h.doc_id).await? else {
+                        continue;
+                    };
+                    hit.score = 0.0;
+                    bd.tantivy = h.distance;
+                    bd.category_mult = 1.0;
+                    bd.prefix_mult = 1.0;
+                    bd.acronym_mult = 1.0;
+                    bd.recency_mult = 1.0;
+                    bd.coord_mult = 1.0;
+                    bd.frecency_mult = 1.0;
+                    bd.latch_mult = 1.0;
+                    bd.stage2_clamped = 1.0;
+                    bd.final_score = 0.0;
+                    out.push((hit, bd));
+                }
+                if out.len() < target_limit {
+                    for (hit, bd) in lex_pairs.iter().take(target_limit - out.len()) {
+                        if seen.contains(&hit.id.0) {
+                            continue;
+                        }
+                        seen.insert(hit.id.0.clone());
+                        out.push((hit.clone(), bd.clone()));
+                    }
+                }
             }
-        }
-
-        if out.len() < target_limit {
-            // Hydrate ANN-only docs through the lexical SearchHandle so
-            // they get the same Hit/ScoreBreakdown shape as BM25 hits,
-            // then mark them as semantic-suffix entries.
-            for h in ann_hits.into_iter() {
-                if out.len() >= target_limit {
-                    break;
+            lixun_mutation::Modality::Text => {
+                for (hit, bd) in lex_pairs.iter().take(target_limit) {
+                    seen.insert(hit.id.0.clone());
+                    out.push((hit.clone(), bd.clone()));
                 }
-                if seen.contains(&h.doc_id) {
-                    continue;
+                if out.len() < target_limit {
+                    for h in text_hits.into_iter() {
+                        if out.len() >= target_limit {
+                            break;
+                        }
+                        if seen.contains(&h.doc_id) {
+                            continue;
+                        }
+                        seen.insert(h.doc_id.clone());
+                        let Some((mut hit, mut bd)) = self.inner.hydrate_doc(&h.doc_id).await? else {
+                            continue;
+                        };
+                        hit.score = 0.0;
+                        bd.tantivy = h.distance;
+                        bd.category_mult = 1.0;
+                        bd.prefix_mult = 1.0;
+                        bd.acronym_mult = 1.0;
+                        bd.recency_mult = 1.0;
+                        bd.coord_mult = 1.0;
+                        bd.frecency_mult = 1.0;
+                        bd.latch_mult = 1.0;
+                        bd.stage2_clamped = 1.0;
+                        bd.final_score = 0.0;
+                        out.push((hit, bd));
+                    }
                 }
-                seen.insert(h.doc_id.clone());
-                let Some((mut hit, mut bd)) = self.inner.hydrate_doc(&h.doc_id).await? else {
-                    continue;
-                };
-                // Semantic-suffix marker: zero out lexical score so the
-                // text-first ordering is unambiguous for downstream
-                // consumers, and stash the raw ANN distance in tantivy
-                // so callers can still inspect the embedding signal.
-                hit.score = 0.0;
-                bd.tantivy = h.distance;
-                bd.category_mult = 1.0;
-                bd.prefix_mult = 1.0;
-                bd.acronym_mult = 1.0;
-                bd.recency_mult = 1.0;
-                bd.coord_mult = 1.0;
-                bd.frecency_mult = 1.0;
-                bd.latch_mult = 1.0;
-                bd.stage2_clamped = 1.0;
-                bd.final_score = 0.0;
-                out.push((hit, bd));
             }
-        }
-
-        if is_image_query && out.len() < target_limit {
-            for (hit, bd) in lex_pairs.into_iter() {
-                if out.len() >= target_limit {
-                    break;
+            lixun_mutation::Modality::Both => {
+                for h in image_hits.into_iter() {
+                    if out.len() >= target_limit {
+                        break;
+                    }
+                    if seen.contains(&h.doc_id) {
+                        continue;
+                    }
+                    seen.insert(h.doc_id.clone());
+                    let Some((mut hit, mut bd)) = self.inner.hydrate_doc(&h.doc_id).await? else {
+                        continue;
+                    };
+                    hit.score = 0.0;
+                    bd.tantivy = h.distance;
+                    bd.category_mult = 1.0;
+                    bd.prefix_mult = 1.0;
+                    bd.acronym_mult = 1.0;
+                    bd.recency_mult = 1.0;
+                    bd.coord_mult = 1.0;
+                    bd.frecency_mult = 1.0;
+                    bd.latch_mult = 1.0;
+                    bd.stage2_clamped = 1.0;
+                    bd.final_score = 0.0;
+                    out.push((hit, bd));
                 }
-                if seen.contains(&hit.id.0) {
-                    continue;
+                for (hit, bd) in lex_pairs.iter() {
+                    if out.len() >= target_limit {
+                        break;
+                    }
+                    if seen.contains(&hit.id.0) {
+                        continue;
+                    }
+                    seen.insert(hit.id.0.clone());
+                    out.push((hit.clone(), bd.clone()));
                 }
-                seen.insert(hit.id.0.clone());
-                out.push((hit, bd));
+                if out.len() < target_limit {
+                    for h in text_hits.into_iter() {
+                        if out.len() >= target_limit {
+                            break;
+                        }
+                        if seen.contains(&h.doc_id) {
+                            continue;
+                        }
+                        seen.insert(h.doc_id.clone());
+                        let Some((mut hit, mut bd)) = self.inner.hydrate_doc(&h.doc_id).await? else {
+                            continue;
+                        };
+                        hit.score = 0.0;
+                        bd.tantivy = h.distance;
+                        bd.category_mult = 1.0;
+                        bd.prefix_mult = 1.0;
+                        bd.acronym_mult = 1.0;
+                        bd.recency_mult = 1.0;
+                        bd.coord_mult = 1.0;
+                        bd.frecency_mult = 1.0;
+                        bd.latch_mult = 1.0;
+                        bd.stage2_clamped = 1.0;
+                        bd.final_score = 0.0;
+                        out.push((hit, bd));
+                    }
+                }
             }
         }
 

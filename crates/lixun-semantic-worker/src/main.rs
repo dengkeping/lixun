@@ -14,6 +14,7 @@ mod config;
 mod embedder;
 mod ipc_doc_store;
 mod journal;
+mod query_router;
 mod store;
 mod worker;
 
@@ -36,6 +37,7 @@ use crate::config::SemanticConfig;
 use crate::embedder::{load_clip_text_embedder, load_image_embedder, load_text_embedder};
 use crate::ipc_doc_store::IpcDocStore;
 use crate::journal::BackfillJournal;
+use crate::query_router::QueryRouter;
 use crate::store::VectorStore;
 use crate::worker::{EmbedJob, spawn_worker, start_backfill};
 
@@ -153,6 +155,47 @@ async fn main() -> Result<()> {
     let _ = ann.install_text_embedder(text_embedder.clone());
     let _ = ann.install_clip_text_embedder(clip_text_embedder.clone());
 
+    let ann_for_router = ann.clone();
+    let clip_for_router = clip_text_embedder.clone();
+    tokio::spawn(async move {
+        tracing::info!("embedding query router anchors...");
+        let image_anchor_embeddings: Vec<Vec<f32>> = {
+            let mut embedder = clip_for_router.lock().unwrap();
+            let texts: Vec<String> = QueryRouter::image_anchor_texts()
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            match embedder.embed(texts) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!("failed to embed image anchors: {e}");
+                    return;
+                }
+            }
+        };
+        let text_anchor_embeddings: Vec<Vec<f32>> = {
+            let mut embedder = clip_for_router.lock().unwrap();
+            let texts: Vec<String> = QueryRouter::text_anchor_texts()
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            match embedder.embed(texts) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!("failed to embed text anchors: {e}");
+                    return;
+                }
+            }
+        };
+        let query_router = Arc::new(QueryRouter::new(
+            image_anchor_embeddings,
+            text_anchor_embeddings,
+            0.05,
+        ));
+        let _ = ann_for_router.install_query_router(query_router);
+        tracing::info!("query router ready");
+    });
+
     /* Reads come from the dispatch loop, writes from spawned ANN
     tasks. A bounded mpsc funnels every outbound Msg through a
     single writer task that owns the sink half — this avoids
@@ -231,6 +274,21 @@ async fn main() -> Result<()> {
                 tokio::spawn(async move {
                     let reply = match ann.search_image(&query, k as usize).await {
                         Ok(hits) => Msg::SearchResult { req_id, hits },
+                        Err(e) => Msg::Error {
+                            req_id,
+                            code: ErrorCode::Internal,
+                            detail: format!("{e:#}"),
+                        },
+                    };
+                    let _ = tx.send(reply).await;
+                });
+            }
+            Cmd::ClassifyQuery { req_id, query } => {
+                let ann = ann.clone();
+                let tx = reply_tx.clone();
+                tokio::spawn(async move {
+                    let reply = match ann.classify_query(&query).await {
+                        Ok(modality) => Msg::ClassifyResult { req_id, modality },
                         Err(e) => Msg::Error {
                             req_id,
                             code: ErrorCode::Internal,

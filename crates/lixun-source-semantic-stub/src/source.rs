@@ -3,12 +3,12 @@ use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use lixun_mutation::{AnnHandle, AnnHit, CliManifest, CliVerb, MutationBatch, MutationBroadcaster};
+use lixun_mutation::{AnnHandle, AnnHit, CliManifest, CliVerb, Modality, MutationBatch, MutationBroadcaster};
 use lixun_semantic_proto::Cmd;
 use lixun_sources::{IndexerSource, MutationSink, SourceContext};
 use tokio::time::timeout;
 
-use crate::transport::{SearchReply, SemanticConnection, current_connection};
+use crate::transport::{ClassifyReply, SearchReply, SemanticConnection, current_connection};
 
 const VERB_TOP: &str = "semantic";
 const VERB_BACKFILL: &str = "backfill";
@@ -271,5 +271,47 @@ impl AnnHandle for SemanticIpcAnnHandle {
             k: k_u32,
         })
         .await
+    }
+
+    async fn classify_query(&self, query: &str) -> Result<Modality> {
+        let Some(conn) = current_connection() else {
+            return Ok(Modality::Text);
+        };
+        let req_id = conn.alloc_req_id();
+        let (tx, rx) = tokio::sync::oneshot::channel::<ClassifyReply>();
+        conn.register_classify(req_id, tx);
+        let cmd = Cmd::ClassifyQuery {
+            req_id,
+            query: query.to_string(),
+        };
+        if conn.writer().send(cmd).await.is_err() {
+            conn.complete_classify(
+                req_id,
+                Err(crate::transport::SemanticIpcError {
+                    code: lixun_semantic_proto::ErrorCode::Internal,
+                    detail: "writer channel closed".into(),
+                }),
+            );
+            tracing::warn!("semantic stub: classify dropped, writer closed");
+            return Ok(Modality::Text);
+        }
+        match timeout(SEARCH_TIMEOUT, rx).await {
+            Ok(Ok(Ok(modality))) => Ok(modality),
+            Ok(Ok(Err(e))) => {
+                tracing::warn!("semantic stub: worker error on classify: {e}");
+                Ok(Modality::Text)
+            }
+            Ok(Err(_)) => {
+                tracing::warn!("semantic stub: classify response channel dropped");
+                Ok(Modality::Text)
+            }
+            Err(_) => {
+                tracing::warn!(
+                    timeout_ms = SEARCH_TIMEOUT.as_millis(),
+                    "semantic stub: classify timeout"
+                );
+                Ok(Modality::Text)
+            }
+        }
     }
 }

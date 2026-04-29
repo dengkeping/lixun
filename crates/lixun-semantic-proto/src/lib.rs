@@ -49,10 +49,10 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio_util::codec::{Decoder, Encoder};
 
 use lixun_core::Hit;
-use lixun_mutation::{AnnHit, UpsertedDoc};
+use lixun_mutation::{AnnHit, Modality, UpsertedDoc};
 
-pub const PROTOCOL_VERSION: u16 = 1;
-pub const MIN_PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
+pub const MIN_PROTOCOL_VERSION: u16 = 2;
 
 /// Daemon → worker. Either a fire-and-forget mutation
 /// ([`Cmd::Embed`], [`Cmd::Delete`]) or a request expecting a single
@@ -73,6 +73,10 @@ pub enum Cmd {
     /// ANN search by image — same shape as [`Cmd::SearchText`] but
     /// routes through the image embedder/channel.
     SearchImage { req_id: u64, query: String, k: u32 },
+    /// Anchor-based query modality classification. Worker embeds the
+    /// query via CLIP text encoder, computes cosine against pre-embedded
+    /// image/text anchors, returns [`Msg::ClassifyResult`].
+    ClassifyQuery { req_id: u64, query: String },
     /// Trigger a backfill walk. Worker drives the loop and pulls
     /// missing docs via callback messages
     /// ([`Msg::CallAllDocIds`] etc.). Reply on completion is
@@ -99,6 +103,8 @@ pub enum Msg {
     },
     /// Reply to [`Cmd::SearchText`] or [`Cmd::SearchImage`].
     SearchResult { req_id: u64, hits: Vec<AnnHit> },
+    /// Reply to [`Cmd::ClassifyQuery`].
+    ClassifyResult { req_id: u64, modality: Modality },
     /// Worker → daemon DocStore callback: list every indexed doc id.
     CallAllDocIds { req_id: u64 },
     /// Worker → daemon DocStore callback: hydrate one doc by id.
@@ -292,6 +298,7 @@ mod tests {
             secondary_action: None,
             source_instance: "semantic".into(),
             row_menu: RowMenuDef::empty(),
+            mime: None,
         }
     }
 
@@ -369,6 +376,14 @@ mod tests {
     }
 
     #[test]
+    fn cmd_classify_query_round_trip() {
+        round_trip(Cmd::ClassifyQuery {
+            req_id: 9,
+            query: "photos of dogs".into(),
+        });
+    }
+
+    #[test]
     fn cmd_shutdown_round_trip() {
         round_trip(Cmd::Shutdown);
     }
@@ -389,6 +404,14 @@ mod tests {
                 doc_id: "d1".into(),
                 distance: 0.25,
             }],
+        });
+    }
+
+    #[test]
+    fn msg_classify_result_round_trip() {
+        round_trip(Msg::ClassifyResult {
+            req_id: 9,
+            modality: Modality::Both,
         });
     }
 
