@@ -297,7 +297,9 @@ async fn coalescer_task(
                         }
                     }
                     RawEvent::Delete(p) => {
-                        pending.insert(p, Intent::Delete);
+                        if !exclude.matches(&p) {
+                            pending.insert(p, Intent::Delete);
+                        }
                     }
                 }
             }
