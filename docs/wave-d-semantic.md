@@ -1,16 +1,25 @@
 # Wave D — Semantic search
 
+> **See also:** [`docs/search-fusion.md`](search-fusion.md) — the Spotlight-style
+> 3-way fan-out + RRF architecture (BM25 + text semantic + image semantic),
+> shipped in v0.6.0. This document focuses on worker setup, model management,
+> and operations; `search-fusion.md` covers the fusion layer and why we don't
+> use a query classifier.
+
 ## Overview
 
-Lixun's hybrid search combines two retrieval paths: lexical scoring
-(BM25 over Tantivy, always on) and dense-vector semantic similarity
-(opt-in). When both paths are active the daemon fuses their results
-with Reciprocal Rank Fusion (RRF, default `k = 60`) so a hit ranked
-well by either side surfaces in the merged list. The heavy ML stack
-(ONNX Runtime, LanceDB, fastembed) lives in a separate
-`lixun-semantic-worker` sidecar process, not in `lixund` itself; the
-daemon talks to the worker over IPC. Semantic is gated by two
-conditions: a reachable `lixun-semantic-worker` binary on disk
+Lixun's hybrid search combines three retrieval paths: lexical scoring
+(BM25 over Tantivy, always on), dense-vector text semantic similarity
+(opt-in, `bge-small-en-v1.5`), and dense-vector cross-modal image
+semantic similarity (opt-in, CLIP `clip-vit-b-32`). When semantic is
+enabled, all three paths run in parallel for every query and the daemon
+fuses their results with Reciprocal Rank Fusion (RRF, default `k = 60`)
+— same architecture Apple Spotlight and Microsoft Windows Search use.
+A hit ranked well by any of the three backends surfaces in the merged
+list. The heavy ML stack (ONNX Runtime, LanceDB, fastembed) lives in a
+separate `lixun-semantic-worker` sidecar process, not in `lixund`
+itself; the daemon talks to the worker over IPC. Semantic is gated by
+two conditions: a reachable `lixun-semantic-worker` binary on disk
 (daemon probes at startup) and `[semantic] enabled = true` in the
 user config (the daemon-side stub defaults to disabled, matching
 the legacy plugin's opt-in semantics). Without both, the daemon
@@ -23,10 +32,10 @@ opened, no models are downloaded, no worker is spawned.
   vector op) refuses to initialise on older systems. Check with
   `ldd --version`.
 - **Disk.** Two stores grow with use:
-  - Model cache (~100–500 MB depending on `text_model`) at
+  - Model cache (~400 MB for default text + image models) at
     `$FASTEMBED_CACHE_DIR`. The shipped systemd unit pins this to
     `~/.cache/lixun/fastembed/`.
-  - Vector index at `~/.local/share/lixun/vectors/`. Two LanceDB
+  - Vector index at `~/.local/share/lixun/semantic/vectors/`. Two LanceDB
     tables (`text_vectors`, `image_vectors`); size scales roughly
     linearly with corpus size.
 - **The `lixun-semantic-worker` sidecar binary.** The daemon probes
@@ -65,7 +74,7 @@ systemctl --user restart lixund
 ```
 
 On the next start, the semantic plugin opens the vector store under
-`~/.local/share/lixun/vectors/`, downloads the configured models
+`~/.local/share/lixun/semantic/vectors/`, downloads the configured models
 into `$FASTEMBED_CACHE_DIR` if they are not yet cached, and starts
 embedding new documents as the indexer commits them.
 

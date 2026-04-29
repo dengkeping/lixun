@@ -1,6 +1,6 @@
 # Maintainer: Denis Kopin <deng@lixun.app>
 pkgname=lixun-semantic
-pkgver=0.5.1
+pkgver=0.6.0
 pkgrel=1
 pkgdesc="Lixun semantic sidecar worker: dense-vector hybrid retrieval via fastembed + LanceDB"
 arch=('x86_64')
