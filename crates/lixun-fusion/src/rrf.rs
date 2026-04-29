@@ -30,6 +30,38 @@ pub fn rrf_fuse(bm25: &[(String, f32)], ann: &[(String, f32)], k: f32) -> Vec<(S
     out
 }
 
+pub fn rrf_fuse_3way(
+    bm25: &[(String, f32)],
+    text_ann: &[(String, f32)],
+    image_ann: &[(String, f32)],
+    k: f32,
+) -> Vec<(String, f32)> {
+    let mut fused: HashMap<&str, f32> =
+        HashMap::with_capacity(bm25.len() + text_ann.len() + image_ann.len());
+    for (rank0, (doc_id, _)) in bm25.iter().enumerate() {
+        let rank1 = (rank0 + 1) as f32;
+        *fused.entry(doc_id.as_str()).or_insert(0.0) += 1.0 / (k + rank1);
+    }
+    for (rank0, (doc_id, _)) in text_ann.iter().enumerate() {
+        let rank1 = (rank0 + 1) as f32;
+        *fused.entry(doc_id.as_str()).or_insert(0.0) += 1.0 / (k + rank1);
+    }
+    for (rank0, (doc_id, _)) in image_ann.iter().enumerate() {
+        let rank1 = (rank0 + 1) as f32;
+        *fused.entry(doc_id.as_str()).or_insert(0.0) += 1.0 / (k + rank1);
+    }
+    let mut out: Vec<(String, f32)> = fused
+        .into_iter()
+        .map(|(id, score)| (id.to_string(), score))
+        .collect();
+    out.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
