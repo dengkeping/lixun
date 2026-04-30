@@ -3,8 +3,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-pub mod paths;
 pub mod impact;
+pub mod paths;
 
 pub use impact::{ImpactProfile, SystemImpact};
 
@@ -57,6 +57,7 @@ pub struct RankingConfig {
     // stable; first consumed by Wave A tasks T3..T6.
     pub prefix_boost: f32,
     pub acronym_boost: f32,
+    pub exact_title_boost: f32,
     pub recency_weight: f32,
     pub recency_tau_days: f32,
     pub frecency_alpha: f32,
@@ -94,6 +95,7 @@ impl Default for RankingConfig {
             attachments: 0.9,
             prefix_boost: 1.4,
             acronym_boost: 1.25,
+            exact_title_boost: 4.0,
             recency_weight: 0.2,
             recency_tau_days: 30.0,
             frecency_alpha: 0.1,
@@ -330,6 +332,7 @@ pub struct Hit {
 pub struct ScoreBreakdown {
     pub tantivy: f32,
     pub category_mult: f32,
+    pub exact_title_mult: f32,
     pub prefix_mult: f32,
     pub acronym_mult: f32,
     pub recency_mult: f32,

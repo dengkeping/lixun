@@ -429,6 +429,8 @@ impl LixunIndex {
                 };
 
             let category_mult = self.ranking.multiplier_for(category);
+            let exact_title_mult =
+                scoring::exact_title_mult(&title_norm, &q_norm, self.ranking.exact_title_boost);
             let prefix_mult = scoring::prefix_mult(&title_norm, &q_norm, self.ranking.prefix_boost);
             let acronym_mult = scoring::acronym_mult(&title, &q_norm, self.ranking.acronym_boost);
             let recency_mult = scoring::recency_mult(
@@ -438,7 +440,12 @@ impl LixunIndex {
                 self.ranking.recency_weight,
                 self.ranking.recency_tau_days,
             );
-            let doc_mult = category_mult * prefix_mult * acronym_mult * recency_mult * coord_mult;
+            let doc_mult = category_mult
+                * exact_title_mult
+                * prefix_mult
+                * acronym_mult
+                * recency_mult
+                * coord_mult;
             let final_score = score * doc_mult;
 
             let hit = Hit {
@@ -462,6 +469,7 @@ impl LixunIndex {
             let breakdown = ScoreBreakdown {
                 tantivy: score,
                 category_mult,
+                exact_title_mult,
                 prefix_mult,
                 acronym_mult,
                 recency_mult,
@@ -606,6 +614,7 @@ impl LixunIndex {
         let breakdown = ScoreBreakdown {
             tantivy: 0.0,
             category_mult: 1.0,
+            exact_title_mult: 1.0,
             prefix_mult: 1.0,
             acronym_mult: 1.0,
             recency_mult: 1.0,
@@ -1028,6 +1037,7 @@ mod tests {
             source_instance: "test".into(),
             secondary_action: None,
             extra: Vec::new(),
+            mime: None,
         }
     }
 
@@ -1967,9 +1977,9 @@ mod tests {
 
     // ------- T6 search_with_breakdown tests (Wave B) -------
 
-    // Product invariant: `final_score == tantivy * category_mult * prefix_mult
-    // * acronym_mult * recency_mult * coord_mult` within f32 epsilon. Stage-2
-    // fields stay at 1.0 inside the index layer (daemon fills them). Use a
+    // Product invariant: `final_score == tantivy * category_mult * exact_title_mult
+    // * prefix_mult * acronym_mult * recency_mult * coord_mult` within f32 epsilon.
+    // Stage-2 fields stay at 1.0 inside the index layer (daemon fills them). Use a
     // q=2 coord-match doc so `coord_mult != 1.0` and the test exercises the
     // full product, not a degenerate all-ones path.
     #[test]
@@ -1985,6 +1995,7 @@ mod tests {
         let (hit, b) = &pairs[0];
         let product = b.tantivy
             * b.category_mult
+            * b.exact_title_mult
             * b.prefix_mult
             * b.acronym_mult
             * b.recency_mult

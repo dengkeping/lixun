@@ -100,8 +100,7 @@ impl HybridSearchHandle {
         let lex_fut = self.inner.search_with_breakdown(query);
         let text_fut = ann.search_text(&query.text, ann_k);
         let image_fut = ann.search_image(&query.text, ann_k);
-        let (lex_pairs, text_hits, image_hits) =
-            tokio::try_join!(lex_fut, text_fut, image_fut)?;
+        let (lex_pairs, text_hits, image_hits) = tokio::try_join!(lex_fut, text_fut, image_fut)?;
 
         tracing::debug!(
             target: "lixun_fusion",
@@ -137,12 +136,8 @@ impl HybridSearchHandle {
             .map(|h| (h.doc_id.clone(), h.distance))
             .collect();
 
-        let fused = crate::rrf::rrf_fuse_3way(
-            &bm25_ranked,
-            &text_ranked,
-            &image_ranked,
-            self.rrf_k,
-        );
+        let fused =
+            crate::rrf::rrf_fuse_3way(&bm25_ranked, &text_ranked, &image_ranked, self.rrf_k);
 
         let mut out: Vec<(lixun_core::Hit, lixun_core::ScoreBreakdown)> =
             Vec::with_capacity(target_limit);
@@ -160,6 +155,7 @@ impl HybridSearchHandle {
                     bd.tantivy = *distance;
                 }
                 bd.category_mult = 1.0;
+                bd.exact_title_mult = 1.0;
                 bd.prefix_mult = 1.0;
                 bd.acronym_mult = 1.0;
                 bd.recency_mult = 1.0;

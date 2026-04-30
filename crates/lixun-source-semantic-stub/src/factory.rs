@@ -91,12 +91,10 @@ mod tests {
 
     #[test]
     fn unknown_extra_fields_are_ignored() {
-        assert!(is_enabled(&val(
-            r#"
+        assert!(is_enabled(&val(r#"
             enabled = true
             text_model = "bge-small-en-v1.5"
             batch_size = 32
-            "#
-        )));
+            "#)));
     }
 }

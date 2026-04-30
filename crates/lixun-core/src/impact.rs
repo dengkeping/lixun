@@ -261,7 +261,10 @@ mod tests {
 
     #[test]
     fn fromstr_ok_and_err() {
-        assert_eq!("medium".parse::<SystemImpact>().unwrap(), SystemImpact::Medium);
+        assert_eq!(
+            "medium".parse::<SystemImpact>().unwrap(),
+            SystemImpact::Medium
+        );
         let err = "BOGUS".parse::<SystemImpact>().unwrap_err();
         assert_eq!(
             err,
