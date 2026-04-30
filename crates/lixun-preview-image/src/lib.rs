@@ -19,6 +19,8 @@ use lixun_preview::{PreviewPlugin, PreviewPluginCfg, PreviewPluginEntry};
 
 const STRONG_EXTENSIONS: &[&str] = &[
     "png", "jpg", "jpeg", "gif", "webp", "avif", "bmp", "tiff", "tif", "svg", "ico",
+    "heic", "heif", "jxl",
+    "cr2", "cr3", "nef", "nrw", "arw", "srf", "sr2", "dng", "raf", "orf", "rw2", "pef",
 ];
 
 /// Extensions we route to `MediaFile` instead of `Texture` because
@@ -91,19 +93,47 @@ impl PreviewPlugin for ImagePreview {
             media.play();
             picture.set_paintable(Some(&media));
         } else {
-            match gdk::Texture::from_filename(&path) {
-                Ok(texture) => {
-                    intrinsic = Some((texture.width(), texture.height()));
-                    picture.set_paintable(Some(&texture));
+            #[cfg(feature = "image-decode")]
+            let texture_result = {
+                match lixun_image_decode::decode_to_dynamic_image(&path) {
+                    Ok(img) => {
+                        let width = img.width() as i32;
+                        let height = img.height() as i32;
+                        intrinsic = Some((width, height));
+                        
+                        let rgba = img.to_rgba8();
+                        let bytes = gdk::glib::Bytes::from_owned(rgba.into_raw());
+                        
+                        match gdk::MemoryTexture::new(
+                            width,
+                            height,
+                            gdk::MemoryFormat::R8g8b8a8,
+                            &bytes,
+                            (width * 4) as usize,
+                        ) {
+                            texture => {
+                                picture.set_paintable(Some(&texture));
+                                Ok(())
+                            }
+                        }
+                    }
+                    Err(e) => Err(e),
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        "image: texture decode failed for {:?} ({}), falling back to Picture::set_filename",
-                        path,
-                        e
-                    );
-                    picture.set_filename(Some(&path));
-                }
+            };
+            
+            #[cfg(not(feature = "image-decode"))]
+            let texture_result = gdk::Texture::from_filename(&path).map(|texture| {
+                intrinsic = Some((texture.width(), texture.height()));
+                picture.set_paintable(Some(&texture));
+            });
+            
+            if let Err(e) = texture_result {
+                tracing::warn!(
+                    "image: texture decode failed for {:?} ({}), falling back to Picture::set_filename",
+                    path,
+                    e
+                );
+                picture.set_filename(Some(&path));
             }
         }
 
