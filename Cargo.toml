@@ -13,6 +13,7 @@ members = [
     "crates/lixun-indexer",
     "crates/lixun-mutation",
     "crates/lixun-fusion",
+    "crates/lixun-image-decode",
     "crates/lixun-semantic-proto",
     "crates/lixun-semantic-worker",
     "crates/lixun-source-semantic-stub",

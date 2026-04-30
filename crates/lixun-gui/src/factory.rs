@@ -138,6 +138,7 @@ pub(crate) fn synthetic_history_hits(queries: &[String]) -> Vec<Hit> {
             secondary_action: None,
             source_instance: String::new(),
             row_menu: lixun_core::RowMenuDef::empty(),
+            mime: None,
         })
         .collect()
 }

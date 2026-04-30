@@ -290,7 +290,7 @@ impl WorkerThread {
         }
         let batch = std::mem::take(&mut self.pending_images);
 
-        let paths: Vec<std::path::PathBuf> = batch
+        let original_paths: Vec<std::path::PathBuf> = batch
             .iter()
             .filter_map(|d| {
                 d.doc_id
@@ -299,7 +299,7 @@ impl WorkerThread {
             })
             .collect();
 
-        if paths.is_empty() {
+        if original_paths.is_empty() {
             tracing::warn!(
                 "semantic embed worker: image batch of {} had no valid fs: paths; dropping",
                 batch.len()
@@ -307,8 +307,36 @@ impl WorkerThread {
             return;
         }
 
+        let original_count = original_paths.len();
+
+        #[cfg(feature = "image-decode")]
+        let (paths_for_embed, _temp_files) = match lixun_image_decode::prepare_batch(&original_paths) {
+            Ok(result) => result,
+            Err(e) => {
+                tracing::warn!("image pre-decode failed, skipping batch: {:#}", e);
+                return;
+            }
+        };
+
+        #[cfg(not(feature = "image-decode"))]
+        let paths_for_embed = original_paths;
+
+        #[cfg(feature = "image-decode")]
+        if paths_for_embed.len() < original_count {
+            tracing::debug!(
+                "image batch: {} files after pre-decode ({} skipped)",
+                paths_for_embed.len(),
+                original_count - paths_for_embed.len()
+            );
+        }
+
+        if paths_for_embed.is_empty() {
+            tracing::warn!("image batch: all {} files skipped after pre-decode", original_count);
+            return;
+        }
+
         let vectors = match self.image.lock() {
-            Ok(mut img) => match img.embed(paths) {
+            Ok(mut img) => match img.embed(paths_for_embed) {
                 Ok(v) => v,
                 Err(e) => {
                     tracing::warn!(

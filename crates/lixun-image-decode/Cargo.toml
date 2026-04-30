@@ -1,0 +1,28 @@
+[package]
+name = "lixun-image-decode"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Image format decoder for unsupported formats (HEIC, JPEG XL, RAW)"
+
+[dependencies]
+image = { workspace = true }
+tempfile = "3.0"
+anyhow = { workspace = true }
+tracing = { workspace = true }
+
+# HEIC/HEIF support
+libheif-rs = { version = "2.7", features = ["image"], optional = true }
+
+# JPEG XL support
+jxl-oxide = { version = "0.12.5", features = ["image", "rayon"], optional = true }
+
+# RAW support
+rawler = { version = "0.7.2", optional = true }
+imagepipe = { version = "0.5.0", optional = true }
+
+[features]
+default = ["heic", "jxl", "raw"]
+heic = ["dep:libheif-rs"]
+jxl = ["dep:jxl-oxide"]
+raw = ["dep:rawler", "dep:imagepipe"]

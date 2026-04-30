@@ -7,12 +7,17 @@ license.workspace = true
 [dependencies]
 lixun-core = { path = "../lixun-core" }
 lixun-preview = { path = "../lixun-preview" }
+lixun-image-decode = { path = "../lixun-image-decode", optional = true }
 anyhow.workspace = true
 inventory.workspace = true
 tracing.workspace = true
 gtk = { package = "gtk4", version = "0.9", features = ["v4_12"] }
 gdk = { package = "gdk4", version = "0.9" }
 gio = "0.20"
+
+[features]
+default = ["image-decode"]
+image-decode = ["lixun-image-decode"]
 
 [lib]
 name = "lixun_preview_image"
