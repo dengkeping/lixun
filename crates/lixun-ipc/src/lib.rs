@@ -14,7 +14,7 @@ use lixun_core::{Hit, ImpactProfile, SystemImpact};
 
 pub mod gui;
 
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WatcherStats {
@@ -60,7 +60,13 @@ pub struct OcrStats {
 }
 
 /// The oldest protocol version this build can negotiate with.
-pub const MIN_PROTOCOL_VERSION: u16 = 1;
+///
+/// Bumped to 4 alongside [`PROTOCOL_VERSION`]: v4 redesigns the search
+/// reply path as a stream of `SearchChunk` frames (`Phase::Initial`
+/// then `Phase::Final`) per query epoch. v1–v3 frames are no longer
+/// accepted — backward compat was dropped intentionally to clean up
+/// the contract. Older clients must upgrade.
+pub const MIN_PROTOCOL_VERSION: u16 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Request {
@@ -70,13 +76,16 @@ pub enum Request {
     Search {
         q: String,
         limit: u32,
-        /// When `true`, daemon populates `Response::HitsWithExtras{,V3}.explanations`
-        /// with one human-readable score-breakdown string per hit. Default
-        /// `false` via `#[serde(default)]` so older clients that omit the
-        /// field keep decoding as non-explain requests \u2014 no `PROTOCOL_VERSION`
-        /// bump needed (plan DB-11).
-        #[serde(default)]
         explain: bool,
+        /// Monotonically increasing per-connection query id assigned by
+        /// the GUI. The daemon echoes it back on every
+        /// [`Response::SearchChunk`] so the client can discard chunks
+        /// for queries it has already superseded. Each new `Search`
+        /// request also signals the daemon to cancel any in-flight
+        /// search on the same connection — there is at most one active
+        /// search per connection at any time. Required (no default):
+        /// every v4 client tracks its own epoch.
+        epoch: u64,
     },
     Reindex {
         paths: Vec<PathBuf>,
@@ -150,26 +159,40 @@ pub enum Request {
     ImpactExplain,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Phase {
+    Initial,
+    Final,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Response {
     Ok,
-    Hits(Vec<Hit>),
-    HitsWithExtras {
-        hits: Vec<Hit>,
-        calculation: Option<lixun_core::Calculation>,
-        /// Per-hit human-readable score breakdown, one entry per `hits`
-        /// item. Empty (via `#[serde(default)]`) unless the caller sent
-        /// `Request::Search { explain: true, .. }`. Old clients that
-        /// omit the field on deserialize see an empty vec and stay on
-        /// the non-explain code path \u2014 no `PROTOCOL_VERSION` bump.
-        #[serde(default)]
-        explanations: Vec<String>,
-    },
-    HitsWithExtrasV3 {
+    /// Streaming search reply. The daemon emits **one or two**
+    /// `SearchChunk` frames per `Request::Search`, both carrying the
+    /// same `epoch` as the request:
+    ///
+    /// * `Phase::Initial` — provisional. BM25-only hits with cheap
+    ///   local rerank (frecency, latch). `calculation`, `top_hit`
+    ///   and `explanations` are always omitted (None / empty). May
+    ///   be skipped entirely in lexical-only mode (no ANN
+    ///   configured): the daemon then sends a single `Phase::Final`
+    ///   chunk and nothing else.
+    /// * `Phase::Final` — authoritative. Full RRF over BM25 + text
+    ///   ANN + image ANN, plugin fan-out, top-hit selection,
+    ///   explanations populated when `Request::Search.explain` was
+    ///   true. The client must treat removals as authoritative only
+    ///   on `Final`.
+    ///
+    /// The client merges by stable [`Hit`] identity (source +
+    /// doc_id). Empty `Initial` in hybrid mode does **not** clear
+    /// the visible model — only `Final` may do that.
+    SearchChunk {
+        epoch: u64,
+        phase: Phase,
         hits: Vec<Hit>,
         calculation: Option<lixun_core::Calculation>,
         top_hit: Option<lixun_core::DocId>,
-        #[serde(default)]
         explanations: Vec<String>,
     },
     Status {
@@ -403,60 +426,24 @@ mod tests {
             q: "hello world".to_string(),
             limit: 10,
             explain: false,
+            epoch: 42,
         };
         codec.encode(req.clone(), &mut buf).unwrap();
 
         let decoded = codec.decode(&mut buf).unwrap().unwrap();
         match decoded {
-            Request::Search { q, limit, explain } => {
+            Request::Search {
+                q,
+                limit,
+                explain,
+                epoch,
+            } => {
                 assert_eq!(q, "hello world");
                 assert_eq!(limit, 10);
                 assert!(!explain);
+                assert_eq!(epoch, 42);
             }
             _ => panic!("Expected Search variant"),
-        }
-    }
-
-    #[test]
-    fn test_search_explain_defaults_false_on_missing_field() {
-        // Back-compat guard for `Request::Search.explain` (plan DB-11):
-        // payloads from pre-T6 clients omit the field entirely; serde
-        // must synthesize `explain: false` rather than rejecting the
-        // frame. Exercises the `#[serde(default)]` path directly.
-        let legacy_json = br#"{"Search":{"q":"hi","limit":5}}"#;
-        let req: Request = serde_json::from_slice(legacy_json).unwrap();
-        match req {
-            Request::Search { q, limit, explain } => {
-                assert_eq!(q, "hi");
-                assert_eq!(limit, 5);
-                assert!(!explain, "legacy payload must default to explain=false");
-            }
-            _ => panic!("Expected Search variant"),
-        }
-    }
-
-    #[test]
-    fn test_hits_with_extras_v3_explanations_defaults_empty_on_missing_field() {
-        // Back-compat guard for `Response::HitsWithExtrasV3.explanations`
-        // (plan DB-11). A v3 payload shipped by a pre-T6 daemon omits
-        // `explanations`; serde must synthesize an empty vec so the
-        // CLI/GUI keep treating the response as non-explain. Mirrors
-        // the Request-side guard above.
-        let legacy_json = br#"{"HitsWithExtrasV3":{"hits":[],"calculation":null,"top_hit":null}}"#;
-        let resp: Response = serde_json::from_slice(legacy_json).unwrap();
-        match resp {
-            Response::HitsWithExtrasV3 {
-                hits,
-                calculation,
-                top_hit,
-                explanations,
-            } => {
-                assert!(hits.is_empty());
-                assert!(calculation.is_none());
-                assert!(top_hit.is_none());
-                assert!(explanations.is_empty());
-            }
-            _ => panic!("Expected HitsWithExtrasV3 variant"),
         }
     }
 
@@ -509,7 +496,111 @@ mod tests {
     }
 
     #[test]
-    fn test_protocol_v3_record_query_click_roundtrip() {
+    fn test_codec_rejects_protocol_v3_frame() {
+        // v4 breaks backward compat: MIN_PROTOCOL_VERSION=4.
+        // v3 frames must be rejected.
+        let mut codec = FrameCodec::default();
+        let mut buf = BytesMut::new();
+        let json = serde_json::to_vec(&Request::Toggle).unwrap();
+        buf.put_u32((2 + json.len()) as u32);
+        buf.put_u16(3);
+        buf.put_slice(&json);
+
+        let result = codec.decode(&mut buf);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("outside supported"),
+            "expected 'outside supported' in error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_search_chunk_roundtrip_initial() {
+        let resp = Response::SearchChunk {
+            epoch: 1,
+            phase: Phase::Initial,
+            hits: vec![],
+            calculation: None,
+            top_hit: None,
+            explanations: vec![],
+        };
+        let json = serde_json::to_vec(&resp).unwrap();
+        let decoded: Response = serde_json::from_slice(&json).unwrap();
+        match decoded {
+            Response::SearchChunk {
+                epoch,
+                phase,
+                hits,
+                calculation,
+                top_hit,
+                explanations,
+            } => {
+                assert_eq!(epoch, 1);
+                assert_eq!(phase, Phase::Initial);
+                assert!(hits.is_empty());
+                assert!(calculation.is_none());
+                assert!(top_hit.is_none());
+                assert!(explanations.is_empty());
+            }
+            _ => panic!("expected SearchChunk"),
+        }
+    }
+
+    #[test]
+    fn test_search_chunk_roundtrip_final() {
+        let resp = Response::SearchChunk {
+            epoch: 2,
+            phase: Phase::Final,
+            hits: vec![fake_hit()],
+            calculation: Some(lixun_core::Calculation {
+                expr: "2+2".into(),
+                result: "4".into(),
+            }),
+            top_hit: Some(lixun_core::DocId("fs:/tmp/demo.txt".into())),
+            explanations: vec!["test".into()],
+        };
+        let json = serde_json::to_vec(&resp).unwrap();
+        let decoded: Response = serde_json::from_slice(&json).unwrap();
+        match decoded {
+            Response::SearchChunk {
+                epoch,
+                phase,
+                hits,
+                calculation,
+                top_hit,
+                explanations,
+            } => {
+                assert_eq!(epoch, 2);
+                assert_eq!(phase, Phase::Final);
+                assert_eq!(hits.len(), 1);
+                assert_eq!(hits[0].id.0, "fs:/tmp/demo.txt");
+                let c = calculation.expect("calculation present");
+                assert_eq!(c.expr, "2+2");
+                assert_eq!(c.result, "4");
+                assert_eq!(top_hit.as_ref().map(|d| d.0.as_str()), Some("fs:/tmp/demo.txt"));
+                assert_eq!(explanations, vec!["test".to_string()]);
+            }
+            _ => panic!("expected SearchChunk"),
+        }
+    }
+
+    #[test]
+    fn test_phase_serialization_stability() {
+        let initial_json = serde_json::to_string(&Phase::Initial).unwrap();
+        assert_eq!(initial_json, r#""Initial""#);
+        let final_json = serde_json::to_string(&Phase::Final).unwrap();
+        assert_eq!(final_json, r#""Final""#);
+
+        let initial_back: Phase = serde_json::from_str(&initial_json).unwrap();
+        assert_eq!(initial_back, Phase::Initial);
+        let final_back: Phase = serde_json::from_str(&final_json).unwrap();
+        assert_eq!(final_back, Phase::Final);
+    }
+
+    #[test]
+    fn test_record_query_click_roundtrip() {
         let mut codec = FrameCodec::default();
         let mut buf = BytesMut::new();
         let req = Request::RecordQueryClick {
@@ -526,23 +617,6 @@ mod tests {
             }
             other => panic!("Expected RecordQueryClick, got {:?}", other),
         }
-    }
-
-    #[test]
-    fn test_codec_accepts_protocol_v2_frame() {
-        let mut codec = FrameCodec::default();
-        let mut buf = BytesMut::new();
-        let json = serde_json::to_vec(&Request::Toggle).unwrap();
-        buf.put_u32((2 + json.len()) as u32);
-        buf.put_u16(2);
-        buf.put_slice(&json);
-
-        let decoded = codec.decode(&mut buf).unwrap();
-        assert!(
-            matches!(decoded, Some(Request::Toggle)),
-            "expected Some(Request::Toggle), got {:?}",
-            decoded
-        );
     }
 
     #[test]
@@ -582,59 +656,6 @@ mod tests {
         assert!(path.to_string_lossy().contains("lixun.sock"));
     }
 
-    #[test]
-    fn test_hits_with_extras_roundtrip_empty() {
-        let resp = Response::HitsWithExtras {
-            hits: vec![],
-            calculation: None,
-            explanations: vec![],
-        };
-        let json = serde_json::to_vec(&resp).unwrap();
-        let decoded: Response = serde_json::from_slice(&json).unwrap();
-        match decoded {
-            Response::HitsWithExtras {
-                hits,
-                calculation,
-                explanations,
-            } => {
-                assert!(hits.is_empty());
-                assert!(calculation.is_none());
-                assert!(explanations.is_empty());
-            }
-            _ => panic!("expected HitsWithExtras"),
-        }
-    }
-
-    #[test]
-    fn test_hits_with_extras_roundtrip_with_calculation() {
-        let resp = Response::HitsWithExtras {
-            hits: vec![],
-            calculation: Some(lixun_core::Calculation {
-                expr: "2+2".into(),
-                result: "4".into(),
-            }),
-            explanations: vec![],
-        };
-        let json = serde_json::to_vec(&resp).unwrap();
-        let decoded: Response = serde_json::from_slice(&json).unwrap();
-        match decoded {
-            Response::HitsWithExtras { calculation, .. } => {
-                let c = calculation.expect("calculation present");
-                assert_eq!(c.expr, "2+2");
-                assert_eq!(c.result, "4");
-            }
-            _ => panic!("expected HitsWithExtras"),
-        }
-    }
-
-    #[test]
-    fn test_hits_variant_still_parses_v1() {
-        let resp = Response::Hits(vec![]);
-        let json = serde_json::to_vec(&resp).unwrap();
-        let decoded: Response = serde_json::from_slice(&json).unwrap();
-        assert!(matches!(decoded, Response::Hits(h) if h.is_empty()));
-    }
-
     fn fake_hit() -> Hit {
         use lixun_core::{Action, Category, DocId};
         Hit {
@@ -655,6 +676,7 @@ mod tests {
             secondary_action: None,
             source_instance: String::new(),
             row_menu: lixun_core::RowMenuDef::empty(),
+            mime: None,
         }
     }
 

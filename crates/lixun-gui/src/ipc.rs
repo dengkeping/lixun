@@ -8,24 +8,24 @@
 //! session and are discarded.
 
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
+use std::time::Duration;
 
 use lixun_core::{Calculation, DocId, Hit};
-use lixun_ipc::{PROTOCOL_VERSION, Request, Response, socket_path};
+use lixun_ipc::{PROTOCOL_VERSION, Phase, Request, Response, socket_path};
+
+pub(crate) const PHASE_NONE: u8 = 0;
+pub(crate) const PHASE_INITIAL: u8 = 1;
+pub(crate) const PHASE_FINAL: u8 = 2;
 
 pub(crate) struct IpcClient {
     pub(crate) request_tx: mpsc::Sender<(String, u32, u64)>,
     pub(crate) responses: Arc<Mutex<Vec<Hit>>>,
     pub(crate) calculation: Arc<Mutex<Option<Calculation>>>,
-    /// Protocol v3: id of the hit the daemon selected as Top Hit for
-    /// the last search reply (`None` if no confident pick). The
-    /// window render path uses this to decide whether to populate the
-    /// hero region above the results list. Reset to `None` on any v1
-    /// or v2 response arm so a v3 → v2 downgrade (unlikely in practice
-    /// but defensive) does not leave stale hero state.
     pub(crate) top_hit: Arc<Mutex<Option<DocId>>>,
     pub(crate) response_epoch: Arc<AtomicU64>,
+    pub(crate) response_phase: Arc<AtomicU8>,
 }
 
 impl Clone for IpcClient {
@@ -36,6 +36,7 @@ impl Clone for IpcClient {
             calculation: Arc::clone(&self.calculation),
             top_hit: Arc::clone(&self.top_hit),
             response_epoch: Arc::clone(&self.response_epoch),
+            response_phase: Arc::clone(&self.response_phase),
         }
     }
 }
@@ -46,18 +47,27 @@ pub(crate) fn start_ipc_thread(session_epoch: Arc<AtomicU64>) -> IpcClient {
     let calculation: Arc<Mutex<Option<Calculation>>> = Arc::new(Mutex::new(None));
     let top_hit: Arc<Mutex<Option<DocId>>> = Arc::new(Mutex::new(None));
     let response_epoch: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+    let response_phase: Arc<AtomicU8> = Arc::new(AtomicU8::new(PHASE_NONE));
     let resp_clone = Arc::clone(&responses);
     let calc_clone = Arc::clone(&calculation);
     let top_hit_clone = Arc::clone(&top_hit);
     let epoch_clone = Arc::clone(&response_epoch);
+    let phase_clone = Arc::clone(&response_phase);
 
     std::thread::spawn(move || {
         while let Ok((query, limit, epoch_at_send)) = rx.recv() {
+            let resp_clone_inner = Arc::clone(&resp_clone);
+            let calc_clone_inner = Arc::clone(&calc_clone);
+            let top_hit_clone_inner = Arc::clone(&top_hit_clone);
+            let epoch_clone_inner = Arc::clone(&epoch_clone);
+            let phase_clone_inner = Arc::clone(&phase_clone);
+
             let sock = socket_path();
             let req = Request::Search {
                 q: query,
                 limit,
                 explain: false,
+                epoch: epoch_at_send,
             };
             let json = match serde_json::to_vec(&req) {
                 Ok(j) => j,
@@ -85,87 +95,97 @@ pub(crate) fn start_ipc_thread(session_epoch: Arc<AtomicU64>) -> IpcClient {
                 continue;
             }
 
-            let mut header = [0u8; 4];
-            if let Err(e) = stream.read_exact(&mut header) {
-                tracing::error!("Failed to read response header: {}", e);
-                continue;
-            }
-            let resp_len = u32::from_be_bytes(header) as usize;
-            if resp_len < 2 {
-                tracing::error!("Response frame too short");
-                continue;
-            }
-            let mut _version = [0u8; 2];
-            if let Err(e) = stream.read_exact(&mut _version) {
-                tracing::error!("Failed to read response version: {}", e);
-                continue;
-            }
-            let mut resp_buf = vec![0u8; resp_len - 2];
-            if let Err(e) = stream.read_exact(&mut resp_buf) {
-                tracing::error!("Failed to read response body: {}", e);
+            if let Err(e) = stream.set_read_timeout(Some(Duration::from_secs(3))) {
+                tracing::error!("Failed to set read timeout: {}", e);
                 continue;
             }
 
-            if epoch_at_send != session_epoch.load(Ordering::SeqCst) {
-                tracing::debug!(
-                    "ipc: dropping reply from stale session (sent in epoch {})",
-                    epoch_at_send
-                );
-                continue;
-            }
+            loop {
+                if epoch_at_send != session_epoch.load(Ordering::SeqCst) {
+                    tracing::debug!(
+                        "ipc: dropping reply from stale session (sent in epoch {})",
+                        epoch_at_send
+                    );
+                    break;
+                }
 
-            match serde_json::from_slice::<Response>(&resp_buf) {
-                Ok(Response::Hits(hits)) => {
-                    if let Ok(mut r) = resp_clone.lock() {
-                        *r = hits;
+                let mut header = [0u8; 4];
+                match stream.read_exact(&mut header) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
+                        tracing::debug!("ipc: read timeout, treating as Final");
+                        phase_clone_inner.store(PHASE_FINAL, Ordering::SeqCst);
+                        epoch_clone_inner.fetch_add(1, Ordering::SeqCst);
+                        break;
                     }
-                    if let Ok(mut c) = calc_clone.lock() {
-                        *c = None;
+                    Err(e) => {
+                        tracing::error!("Failed to read response header: {}", e);
+                        break;
                     }
-                    if let Ok(mut t) = top_hit_clone.lock() {
-                        *t = None;
-                    }
-                    epoch_clone.fetch_add(1, Ordering::SeqCst);
                 }
-                Ok(Response::HitsWithExtras {
-                    hits,
-                    calculation,
-                    explanations: _,
-                }) => {
-                    if let Ok(mut r) = resp_clone.lock() {
-                        *r = hits;
-                    }
-                    if let Ok(mut c) = calc_clone.lock() {
-                        *c = calculation;
-                    }
-                    if let Ok(mut t) = top_hit_clone.lock() {
-                        *t = None;
-                    }
-                    epoch_clone.fetch_add(1, Ordering::SeqCst);
+                let resp_len = u32::from_be_bytes(header) as usize;
+                if resp_len < 2 {
+                    tracing::error!("Response frame too short");
+                    break;
                 }
-                Ok(Response::HitsWithExtrasV3 {
-                    hits,
-                    calculation,
-                    top_hit,
-                    explanations: _,
-                }) => {
-                    if let Ok(mut r) = resp_clone.lock() {
-                        *r = hits;
-                    }
-                    if let Ok(mut c) = calc_clone.lock() {
-                        *c = calculation;
-                    }
-                    if let Ok(mut t) = top_hit_clone.lock() {
-                        *t = top_hit;
-                    }
-                    epoch_clone.fetch_add(1, Ordering::SeqCst);
+                let mut _version = [0u8; 2];
+                if let Err(e) = stream.read_exact(&mut _version) {
+                    tracing::error!("Failed to read response version: {}", e);
+                    break;
                 }
-                Ok(Response::Error(msg)) => {
-                    tracing::error!("Daemon error: {}", msg);
+                let mut resp_buf = vec![0u8; resp_len - 2];
+                if let Err(e) = stream.read_exact(&mut resp_buf) {
+                    tracing::error!("Failed to read response body: {}", e);
+                    break;
                 }
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::error!("Failed to parse response: {}", e);
+
+                match serde_json::from_slice::<Response>(&resp_buf) {
+                    Ok(Response::SearchChunk {
+                        epoch: resp_epoch,
+                        phase,
+                        hits,
+                        calculation,
+                        top_hit,
+                        explanations: _,
+                    }) => {
+                        if resp_epoch != epoch_at_send {
+                            tracing::debug!(
+                                "ipc: dropping chunk with mismatched epoch (got {}, expected {})",
+                                resp_epoch,
+                                epoch_at_send
+                            );
+                            break;
+                        }
+
+                        if let Ok(mut r) = resp_clone_inner.lock() {
+                            *r = hits;
+                        }
+                        if let Ok(mut c) = calc_clone_inner.lock() {
+                            *c = calculation;
+                        }
+                        if let Ok(mut t) = top_hit_clone_inner.lock() {
+                            *t = top_hit;
+                        }
+
+                        let phase_u8 = match phase {
+                            Phase::Initial => PHASE_INITIAL,
+                            Phase::Final => PHASE_FINAL,
+                        };
+                        phase_clone_inner.store(phase_u8, Ordering::SeqCst);
+                        epoch_clone_inner.fetch_add(1, Ordering::SeqCst);
+
+                        if phase == Phase::Final {
+                            break;
+                        }
+                    }
+                    Ok(other) => {
+                        tracing::warn!("ipc: unexpected response variant: {:?}", other);
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to deserialize response: {}", e);
+                        break;
+                    }
                 }
             }
         }
@@ -177,6 +197,7 @@ pub(crate) fn start_ipc_thread(session_epoch: Arc<AtomicU64>) -> IpcClient {
         calculation,
         top_hit,
         response_epoch,
+        response_phase,
     }
 }
 
@@ -351,8 +372,10 @@ mod tests {
     }
 
     #[test]
-    fn v3_response_parses_with_top_hit() {
-        let resp = Response::HitsWithExtrasV3 {
+    fn v4_search_chunk_roundtrip() {
+        let resp = Response::SearchChunk {
+            epoch: 42,
+            phase: Phase::Initial,
             hits: Vec::new(),
             calculation: None,
             top_hit: Some(lixun_core::DocId("app:firefox".into())),
@@ -361,10 +384,12 @@ mod tests {
         let bytes = serde_json::to_vec(&resp).unwrap();
         let roundtrip: Response = serde_json::from_slice(&bytes).unwrap();
         match roundtrip {
-            Response::HitsWithExtrasV3 { top_hit, .. } => {
+            Response::SearchChunk { epoch, phase, top_hit, .. } => {
+                assert_eq!(epoch, 42);
+                assert_eq!(phase, Phase::Initial);
                 assert_eq!(top_hit.as_ref().map(|d| d.0.as_str()), Some("app:firefox"));
             }
-            other => panic!("expected HitsWithExtrasV3, got {:?}", other),
+            other => panic!("expected SearchChunk, got {:?}", other),
         }
     }
 }

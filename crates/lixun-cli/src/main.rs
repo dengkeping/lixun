@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use bytes::{BufMut, BytesMut};
 use clap::{Arg, ArgMatches, Command};
 use lixun_core::SystemImpact;
-use lixun_ipc::{ImpactProfileWire, PROTOCOL_VERSION, Request, Response};
+use lixun_ipc::{ImpactProfileWire, PROTOCOL_VERSION, Phase, Request, Response};
 use lixun_mutation::CliVerb;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -15,22 +15,27 @@ const BUILTIN_VERBS: &[&str] = &[
     "toggle", "show", "hide", "search", "reindex", "status", "impact",
 ];
 
-async fn send_request(req: Request) -> Result<Response> {
+async fn open_daemon_stream() -> Result<UnixStream> {
     let socket_path = lixun_ipc::socket_path();
-
-    let mut stream = UnixStream::connect(&socket_path).await.context(format!(
+    let stream = UnixStream::connect(&socket_path).await.context(format!(
         "lixund not running; start with: systemctl --user start lixund\n(socket: {:?})",
         socket_path
     ))?;
+    Ok(stream)
+}
 
-    let json = serde_json::to_vec(&req)?;
+async fn write_request(stream: &mut UnixStream, req: &Request) -> Result<()> {
+    let json = serde_json::to_vec(req)?;
     let total_len = (2 + json.len()) as u32;
     let mut buf = BytesMut::with_capacity(4 + 2 + json.len());
     buf.put_u32(total_len);
     buf.put_u16(PROTOCOL_VERSION);
     buf.put_slice(&json);
     stream.write_all(&buf).await?;
+    Ok(())
+}
 
+async fn read_response_frame(stream: &mut UnixStream) -> Result<Response> {
     let mut header = [0u8; 4];
     stream.read_exact(&mut header).await?;
     let resp_len = u32::from_be_bytes(header) as usize;
@@ -41,9 +46,39 @@ async fn send_request(req: Request) -> Result<Response> {
     stream.read_exact(&mut version_buf).await?;
     let mut resp_buf = vec![0u8; resp_len - 2];
     stream.read_exact(&mut resp_buf).await?;
-
     let resp: Response = serde_json::from_slice(&resp_buf)?;
     Ok(resp)
+}
+
+async fn send_request(req: Request) -> Result<Response> {
+    let mut stream = open_daemon_stream().await?;
+    write_request(&mut stream, &req).await?;
+    read_response_frame(&mut stream).await
+}
+
+async fn run_search(query: String, limit: u32, explain: bool) -> Result<Response> {
+    let mut stream = open_daemon_stream().await?;
+    write_request(
+        &mut stream,
+        &Request::Search {
+            q: query,
+            limit,
+            explain,
+            epoch: 1,
+        },
+    )
+    .await?;
+
+    loop {
+        let frame = read_response_frame(&mut stream).await?;
+        match frame {
+            Response::SearchChunk {
+                phase: Phase::Initial,
+                ..
+            } => continue,
+            other => return Ok(other),
+        }
+    }
 }
 
 /// Recursively translate one [`CliVerb`] into the [`Command`] tree
@@ -218,12 +253,7 @@ async fn main() -> Result<()> {
                 .unwrap_or_default();
             let limit = *sub_matches.get_one::<u32>("limit").unwrap_or(&20);
             let explain = sub_matches.get_flag("explain");
-            let resp = send_request(Request::Search {
-                q: query,
-                limit,
-                explain,
-            })
-            .await?;
+            let resp = run_search(query, limit, explain).await?;
             handle_response(resp, false);
         }
         "reindex" => {
@@ -422,39 +452,11 @@ fn handle_plugin_response(resp: Response) {
 fn handle_response(resp: Response, ocr_only: bool) {
     match resp {
         Response::Ok => {}
-        Response::Hits(hits) => {
-            for hit in hits {
-                println!(
-                    "{:.2} | {:?} | {} | {}",
-                    hit.score, hit.category, hit.title, hit.subtitle
-                );
-            }
-        }
-        Response::HitsWithExtras {
+        Response::SearchChunk {
             hits,
             calculation,
             explanations,
-        } => {
-            if let Some(c) = calculation {
-                println!("= {} = {}", c.expr, c.result);
-            }
-            for (i, hit) in hits.iter().enumerate() {
-                println!(
-                    "{:.2} | {:?} | {} | {}",
-                    hit.score, hit.category, hit.title, hit.subtitle
-                );
-                if let Some(expl) = explanations.get(i)
-                    && !expl.is_empty()
-                {
-                    println!("    {}", expl);
-                }
-            }
-        }
-        Response::HitsWithExtrasV3 {
-            hits,
-            calculation,
-            top_hit: _,
-            explanations,
+            ..
         } => {
             if let Some(c) = calculation {
                 println!("= {} = {}", c.expr, c.result);
