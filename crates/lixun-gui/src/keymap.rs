@@ -159,8 +159,12 @@ pub(crate) fn install_keyboard_handler(
     keybindings: Keybindings,
     controller: std::rc::Rc<LauncherController>,
 ) {
-    // Main key controller attached to window with Capture phase
-    // This ensures all key handling works regardless of focus state
+    // Main key controller attached to window with Capture phase.
+    // Capture is required so bare-Space `quick_look` fires when focus is on
+    // GtkListView — in Bubble phase the list view consumes Space (default
+    // row-activate handler) before the accel dispatcher sees it, breaking
+    // preview. The entry_has_focus + is_printable_key short-circuit below
+    // returns Proceed so GtkText IM still receives printable text input.
     let key_controller = gtk::EventControllerKey::new();
     key_controller.set_propagation_phase(gtk::PropagationPhase::Capture);
     key_controller.connect_key_pressed(clone!(
@@ -181,6 +185,12 @@ pub(crate) fn install_keyboard_handler(
         #[strong]
         controller,
         move |_, key, _keycode, state| {
+            let entry_focus = entry_has_focus(&entry, &window);
+            let printable = is_printable_key(key, state);
+            tracing::info!(
+                "gui: window key_controller fired key={:?} entry_focus={} printable={}",
+                key.name(), entry_focus, printable
+            );
             // Hard rule: printable unmodified keys belong to the focused
             // Entry. Forward them before any accel dispatch can swallow
             // them (e.g. bare-Space `quick_look` binding).
@@ -420,6 +430,7 @@ pub(crate) fn install_keyboard_handler(
         #[strong]
         chips_container,
         move |_, key, _keycode, state| {
+            tracing::info!("gui: ENTRY key_controller fired key={:?}", key.name());
             if accel_matches(&keybindings.history_up, key, state) && entry.text().is_empty() {
                 let queries = request_search_history(10);
                 if queries.is_empty() {

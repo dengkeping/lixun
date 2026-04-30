@@ -108,6 +108,12 @@ pub(crate) struct SessionSnapshot {
     /// from `category` because chip 0 is All (category=None) but
     /// distinct from a future explicit "uncategorized" filter.
     pub(crate) chip_index: usize,
+    /// Vertical scroll position of the results list at hide time.
+    /// Restored by writing into the scrolled window's vadjustment
+    /// after the model is repopulated; without this the list jumps
+    /// back to the top on every reopen even when the cursor is far
+    /// down the results.
+    pub(crate) scroll_position: f64,
 }
 
 const EMBEDDED_STYLESHEET: &str = include_str!("../style.css");
@@ -186,7 +192,9 @@ impl LauncherController {
         self.recompute_monitor();
 
         let snapshot = self.cached_session.borrow_mut().take();
+        tracing::info!("gui: show() snapshot_present={} entry_text_before={:?}", snapshot.is_some(), self.entry.text().to_string());
         if let Some(snapshot) = snapshot {
+            tracing::info!("gui: show() restoring snapshot query={:?} hits={}", snapshot.query, snapshot.hits.len());
             self.restore_session(&snapshot);
         }
 
@@ -194,6 +202,7 @@ impl LauncherController {
         self.window.add_css_class("lixun-showing");
         self.window.set_visible(true);
         self.entry.grab_focus();
+        tracing::info!("gui: show() called entry.grab_focus(); entry has_focus={}", self.entry.has_focus());
         self.entry.set_position(-1);
         self.just_showed_until
             .set(Instant::now() + Duration::from_millis(JUST_SHOWED_GUARD_MS));
@@ -356,7 +365,9 @@ impl LauncherController {
         }
 
         let query = self.entry.text().to_string();
+        tracing::info!("gui: persist_session() query={:?}", query);
         if query.is_empty() {
+            tracing::info!("gui: persist_session() empty query → CLEARING cached_session");
             self.cached_session.borrow_mut().take();
             return;
         }
@@ -377,6 +388,7 @@ impl LauncherController {
             selected_doc_id,
             category: self.current_category.get(),
             chip_index: self.chips.active_index().unwrap_or(0),
+            scroll_position: self.scrolled.vadjustment().value(),
         };
         *self.cached_session.borrow_mut() = Some(snapshot);
     }
@@ -440,6 +452,28 @@ impl LauncherController {
 
         self.entry.set_text(&snapshot.query);
         self.entry.set_position(-1);
+
+        // Defer scroll restore until after GTK lays out the new rows;
+        // vadjustment.upper() is only valid post-allocate, so calling
+        // set_value() inline here clamps to the current (still-zero)
+        // upper bound and the list lands at the top. ListView is
+        // virtualised and computes upper across several frames as it
+        // measures rows, so retry until upper covers target or we've
+        // burned the budget. 16 ms × 30 ≈ half a second cap.
+        let scrolled = self.scrolled.clone();
+        let target = snapshot.scroll_position;
+        let attempts = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
+            let adj = scrolled.vadjustment();
+            let upper = adj.upper() - adj.page_size();
+            if upper >= target || attempts.get() >= 30 {
+                adj.set_value(target.min(upper.max(0.0)));
+                glib::ControlFlow::Break
+            } else {
+                attempts.set(attempts.get() + 1);
+                glib::ControlFlow::Continue
+            }
+        });
 
         // The restored cursor is user intent from the prior session;
         // arm the override so the silent refresh's poller run
@@ -737,15 +771,18 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
     let focus_ctrl = gtk::EventControllerFocus::new();
     let entry_for_focus_enter = entry.clone();
     focus_ctrl.connect_enter(move |_| {
+        tracing::info!("gui: focus_ctrl ENTER, calling entry.grab_focus()");
         entry_for_focus_enter.grab_focus();
     });
     let controller_for_leave = std::rc::Rc::clone(&controller);
     let just_showed_for_leave = std::rc::Rc::clone(&just_showed_until);
     focus_ctrl.connect_leave(move |_| {
+        tracing::info!("gui: focus_ctrl LEAVE fired, just_showed_until check");
         if Instant::now() < just_showed_for_leave.get() {
-            tracing::debug!("gui: spurious leave during show transition, ignored");
+            tracing::info!("gui: spurious leave during show transition, ignored");
             return;
         }
+        tracing::info!("gui: focus_ctrl LEAVE → controller.hide()");
         controller_for_leave.hide();
     });
     window.add_controller(focus_ctrl);
@@ -800,8 +837,14 @@ fn install_response_poller(
     glib::timeout_add_local(Duration::from_millis(50), move || {
         let current = epoch.load(Ordering::SeqCst);
         if current != last_epoch.get() {
-            last_epoch.set(current);
             let current_phase = phase.load(Ordering::SeqCst);
+            tracing::debug!(
+                "gui: poller tick epoch_change {} -> {} phase={}",
+                last_epoch.get(),
+                current,
+                current_phase
+            );
+            last_epoch.set(current);
 
             let preserve_doc_id = user_selected_override.get();
             let prior_selected = if preserve_doc_id {
@@ -836,6 +879,7 @@ fn install_response_poller(
 
             if current_phase == PHASE_INITIAL {
                 seen_initial.set(true);
+                tracing::debug!("gui: poller render Initial hits={}", plan.hits.len());
                 if !plan.hits.is_empty() {
                     update_results_merge(&model, &selection, &plan.hits, top_hit_doc_id);
                     searching_indicator.set(true);
@@ -843,6 +887,11 @@ fn install_response_poller(
                     searching_indicator.set(true);
                 }
             } else if current_phase == PHASE_FINAL {
+                tracing::debug!(
+                    "gui: poller render Final hits={} seen_initial={}",
+                    plan.hits.len(),
+                    seen_initial.get()
+                );
                 if seen_initial.get() {
                     update_results_merge(&model, &selection, &plan.hits, top_hit_doc_id);
                 } else {
@@ -930,11 +979,14 @@ fn install_entry_handler(
     is_restoring: std::rc::Rc<std::cell::Cell<bool>>,
     user_selected_override: std::rc::Rc<std::cell::Cell<bool>>,
 ) {
+    tracing::info!("gui: install_entry_handler called, registering connect_changed");
     entry.connect_changed(move |e| {
         if is_restoring.get() {
+            tracing::debug!("gui: entry changed but is_restoring=true, skipping");
             return;
         }
         let text = e.text().to_string();
+        tracing::debug!("gui: entry changed, text={:?}", text);
 
         if let Some(id) = pending_debounce.borrow_mut().take() {
             id.remove();
@@ -1012,6 +1064,7 @@ fn install_entry_handler(
             *last_q.borrow_mut() = q.clone();
             status.show_loading();
             let epoch_snapshot = epoch.load(Ordering::SeqCst);
+            tracing::debug!("gui: debounce fired, sending search query={:?} epoch={}", q, epoch_snapshot);
             let _ = ipc.request_tx.send((q, 30, epoch_snapshot));
             *pending_self.borrow_mut() = None;
         });
