@@ -50,10 +50,7 @@ impl LanceDbAnnHandle {
         self.clip_text_embedder.set(embedder)
     }
 
-    pub fn install_query_router(
-        &self,
-        router: Arc<QueryRouter>,
-    ) -> Result<(), Arc<QueryRouter>> {
+    pub fn install_query_router(&self, router: Arc<QueryRouter>) -> Result<(), Arc<QueryRouter>> {
         self.query_router.set(router)
     }
 

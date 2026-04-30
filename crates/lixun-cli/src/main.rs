@@ -376,7 +376,12 @@ fn format_impact_table(p: &ImpactProfileWire) -> String {
     let key_width = rows.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
     let mut out = String::new();
     out.push_str(&format!("level: {}\n", p.level));
-    out.push_str(&format!("{:width$}  {}\n", "knob", "value", width = key_width));
+    out.push_str(&format!(
+        "{:width$}  {}\n",
+        "knob",
+        "value",
+        width = key_width
+    ));
     out.push_str(&format!(
         "{:-<width$}  {:-<10}\n",
         "",

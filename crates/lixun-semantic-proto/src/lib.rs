@@ -132,15 +132,24 @@ pub enum Msg {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CallbackResp {
-    AllDocIds { ids: Vec<String> },
+    AllDocIds {
+        ids: Vec<String>,
+    },
     /// `hit` is `None` when the doc is gone (race with a delete).
     /// `ScoreBreakdown` from `DocStore::hydrate_doc` is intentionally
     /// not part of this payload: the only consumer (semantic
     /// backfill) does not read it, so keeping it off the wire avoids
     /// adding `serde` derives to `lixun_core::ScoreBreakdown`.
-    HydrateDoc { hit: Option<Hit> },
-    GetBody { body: Option<String> },
-    Error { code: ErrorCode, detail: String },
+    HydrateDoc {
+        hit: Option<Hit>,
+    },
+    GetBody {
+        body: Option<String>,
+    },
+    Error {
+        code: ErrorCode,
+        detail: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -516,10 +525,7 @@ mod tests {
         let msg_json = serde_json::to_string(&msg).unwrap();
         let mut buf = BytesMut::new();
         worker.encode(msg, &mut buf).expect("encode msg");
-        let decoded = daemon
-            .decode(&mut buf)
-            .expect("decode msg")
-            .expect("frame");
+        let decoded = daemon.decode(&mut buf).expect("decode msg").expect("frame");
         assert_eq!(serde_json::to_string(&decoded).unwrap(), msg_json);
         assert!(buf.is_empty());
     }

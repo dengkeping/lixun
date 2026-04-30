@@ -77,10 +77,11 @@ fn clamp_stage2_mult(stage2: f32, cap: f32) -> f32 {
 /// so each multiplier is visible alongside the final ranking score.
 fn format_breakdown(b: &lixun_core::ScoreBreakdown, _h: &lixun_core::Hit) -> String {
     format!(
-        "score={:.4} = tantivy({:.4}) × cat({:.3}) × prefix({:.3}) × acronym({:.3}) × recency({:.3}) × coord({:.3}) × stage2({:.3})",
+        "score={:.4} = tantivy({:.4}) × cat({:.3}) × exact({:.3}) × prefix({:.3}) × acronym({:.3}) × recency({:.3}) × coord({:.3}) × stage2({:.3})",
         b.final_score,
         b.tantivy,
         b.category_mult,
+        b.exact_title_mult,
         b.prefix_mult,
         b.acronym_mult,
         b.recency_mult,
@@ -892,6 +893,7 @@ async fn handle_client(
                                 breakdowns.push(lixun_core::ScoreBreakdown {
                                     tantivy: h.score,
                                     category_mult: 1.0,
+                                    exact_title_mult: 1.0,
                                     prefix_mult: 1.0,
                                     acronym_mult: 1.0,
                                     recency_mult: 1.0,

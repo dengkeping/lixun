@@ -3,7 +3,9 @@ use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use lixun_mutation::{AnnHandle, AnnHit, CliManifest, CliVerb, Modality, MutationBatch, MutationBroadcaster};
+use lixun_mutation::{
+    AnnHandle, AnnHit, CliManifest, CliVerb, Modality, MutationBatch, MutationBroadcaster,
+};
 use lixun_semantic_proto::Cmd;
 use lixun_sources::{IndexerSource, MutationSink, SourceContext};
 use tokio::time::timeout;

@@ -374,16 +374,29 @@ impl WorkerThread {
 
 fn classify(doc: &UpsertedDoc) -> Channel {
     if doc.mime.as_deref().is_some_and(|m| m.starts_with("image/")) {
-        tracing::debug!("classify: doc_id={} mime={:?} -> Channel::Image", doc.doc_id, doc.mime);
+        tracing::debug!(
+            "classify: doc_id={} mime={:?} -> Channel::Image",
+            doc.doc_id,
+            doc.mime
+        );
         return Channel::Image;
     }
     match doc.body.as_deref() {
         Some(body) if !body.trim().is_empty() => {
-            tracing::debug!("classify: doc_id={} mime={:?} body_len={} -> Channel::Text", doc.doc_id, doc.mime, body.len());
+            tracing::debug!(
+                "classify: doc_id={} mime={:?} body_len={} -> Channel::Text",
+                doc.doc_id,
+                doc.mime,
+                body.len()
+            );
             Channel::Text
         }
         _ => {
-            tracing::debug!("classify: doc_id={} mime={:?} body=None -> Channel::Skip", doc.doc_id, doc.mime);
+            tracing::debug!(
+                "classify: doc_id={} mime={:?} body=None -> Channel::Skip",
+                doc.doc_id,
+                doc.mime
+            );
             Channel::Skip
         }
     }

@@ -115,8 +115,8 @@ async fn main() -> Result<()> {
         .with_context(|| format!("loading text embedder '{}'", cfg.text_model))?;
     let image_embedder = load_image_embedder(&cfg.image_model, &cache_dir, 1, 1)
         .with_context(|| format!("loading image embedder '{}'", cfg.image_model))?;
-    let clip_text_embedder = load_clip_text_embedder(&cache_dir, 1, 1)
-        .context("loading CLIP text embedder")?;
+    let clip_text_embedder =
+        load_clip_text_embedder(&cache_dir, 1, 1).context("loading CLIP text embedder")?;
     let text_dim = text_embedder.dim();
     let image_dim = image_embedder.dim();
     let text_embedder = Arc::new(Mutex::new(text_embedder));

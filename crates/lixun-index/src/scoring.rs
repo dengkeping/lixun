@@ -20,6 +20,29 @@ pub fn prefix_mult(title_norm: &str, q_norm: &str, weight: f32) -> f32 {
     }
 }
 
+/// Applies the exact-title-match multiplier when the normalized query equals
+/// the normalized title in full (not just a prefix). Both inputs must already
+/// be run through `normalize_for_match`. Returns `weight` on match, `1.0`
+/// otherwise.
+///
+/// Necessary: this is the symmetric counterpart to `prefix_mult` that fires
+/// only on full-name equality. Without it, popular terms (e.g. "firefox")
+/// suffer classical BM25 IDF pathology in heterogeneous collections — the
+/// term occurs in thousands of long File documents (paths, OCR body), so the
+/// IDF for the App entry whose title is just "Firefox" becomes too small for
+/// it to reach the BM25 top-N at all, even though it is the obvious "name
+/// match wins" answer (Apple Spotlight semantics). Fires alongside
+/// `prefix_mult`, multiplying its boost: an exact match is also a prefix
+/// match by definition. Weight is sourced from `RankingConfig::exact_title`.
+#[must_use]
+pub fn exact_title_mult(title_norm: &str, q_norm: &str, weight: f32) -> f32 {
+    if q_norm.is_empty() {
+        return 1.0;
+    }
+
+    if title_norm == q_norm { weight } else { 1.0 }
+}
+
 /// Computes the acronym initials of `title` per D4 (VSCode-style), normalizes
 /// them via `normalize_for_match`, and returns `weight` if the initials string
 /// starts with `q_norm`. Empty query returns `1.0`.
@@ -408,6 +431,7 @@ mod tests {
             source_instance: "test".into(),
             secondary_action: None,
             extra: Vec::new(),
+            mime: None,
         }
     }
 }
