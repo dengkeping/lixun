@@ -18,10 +18,12 @@ mod status;
 mod window;
 
 pub fn run() -> Result<()> {
+    // RUST_LOG wins; fall back to lixun_gui=info only when env is unset/empty so
+    // operators can still raise the level for diagnosis without recompiling.
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("lixun_gui=info".parse().unwrap()),
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("lixun_gui=info")),
         )
         .init();
 

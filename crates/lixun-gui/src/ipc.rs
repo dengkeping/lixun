@@ -56,6 +56,7 @@ pub(crate) fn start_ipc_thread(session_epoch: Arc<AtomicU64>) -> IpcClient {
 
     std::thread::spawn(move || {
         while let Ok((query, limit, epoch_at_send)) = rx.recv() {
+            tracing::debug!("ipc: received search request query={:?} limit={} epoch={}", query, limit, epoch_at_send);
             let resp_clone_inner = Arc::clone(&resp_clone);
             let calc_clone_inner = Arc::clone(&calc_clone);
             let top_hit_clone_inner = Arc::clone(&top_hit_clone);
@@ -94,6 +95,7 @@ pub(crate) fn start_ipc_thread(session_epoch: Arc<AtomicU64>) -> IpcClient {
                 tracing::error!("Failed to send search request: {}", e);
                 continue;
             }
+            tracing::debug!("ipc: request written ({} bytes), entering read loop", buf.len());
 
             if let Err(e) = stream.set_read_timeout(Some(Duration::from_secs(3))) {
                 tracing::error!("Failed to set read timeout: {}", e);
@@ -171,6 +173,7 @@ pub(crate) fn start_ipc_thread(session_epoch: Arc<AtomicU64>) -> IpcClient {
                             Phase::Initial => PHASE_INITIAL,
                             Phase::Final => PHASE_FINAL,
                         };
+                        tracing::debug!("ipc: chunk received epoch={} phase={:?} hits_committed", resp_epoch, phase);
                         phase_clone_inner.store(phase_u8, Ordering::SeqCst);
                         epoch_clone_inner.fetch_add(1, Ordering::SeqCst);
 

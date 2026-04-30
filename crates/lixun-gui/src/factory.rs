@@ -157,6 +157,17 @@ pub(crate) fn update_results_merge(
     let mut existing_doc_ids: std::collections::HashSet<String> =
         std::collections::HashSet::new();
 
+    // CRITICAL: cache_hits MUST run before any model mutation.
+    // model.remove/append both fire `items-changed` synchronously,
+    // which re-enters on_item_notify → with_cached_hits to look up
+    // the bound hit by doc_id. If cached_hits still holds the prior
+    // snapshot at that point, the new doc_id resolves to `found=false`
+    // and the row renders with empty title/subtitle until the next
+    // unrelated rebind. Stamping the new snapshot first means every
+    // notify triggered by the mutations below sees authoritative data.
+    cache_hits(new_hits.to_vec());
+    cache_top_hit_doc_id(top_hit_doc_id);
+
     let mut i = 0;
     while i < model.n_items() {
         let Some(obj) = model.item(i) else {
@@ -185,9 +196,6 @@ pub(crate) fn update_results_merge(
             model.append(&hit.id.0);
         }
     }
-
-    cache_hits(new_hits.to_vec());
-    cache_top_hit_doc_id(top_hit_doc_id);
 
     if let Some(want) = prior_selected_doc_id {
         let n = model.n_items();
