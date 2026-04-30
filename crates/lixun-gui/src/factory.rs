@@ -117,6 +117,94 @@ pub(crate) fn update_results(
     selection.set_autoselect(prev_autoselect);
 }
 
+/// Merge `new_hits` into `model` keyed by stable Hit identity
+/// `(source_instance, doc_id)`. Rows already in `model` whose key
+/// is also in `new_hits` are kept in place. Rows in `model` whose
+/// key is no longer in `new_hits` are removed. Rows in `new_hits`
+/// not yet in `model` are appended. The CACHED_HITS store is
+/// updated to reflect the merged set so row factories can render
+/// against the latest snapshot. Selection is restored by doc_id
+/// when possible.
+pub(crate) fn update_results_merge(
+    model: &gtk::StringList,
+    selection: &gtk::SingleSelection,
+    new_hits: &[Hit],
+    top_hit_doc_id: Option<String>,
+) {
+    let prev_autoselect = selection.is_autoselect();
+    selection.set_autoselect(false);
+
+    let prior_selected_doc_id: Option<String> = {
+        let idx = selection.selected();
+        selection.item(idx).and_then(|obj| {
+            obj.downcast::<gtk::StringObject>()
+                .ok()
+                .map(|s| s.string().to_string())
+        })
+    };
+
+    let new_keys: std::collections::HashSet<(String, String)> = new_hits
+        .iter()
+        .map(|h| (h.source_instance.clone(), h.id.0.clone()))
+        .collect();
+
+    let prior_hits: Vec<Hit> = with_cached_hits(|h| h.to_vec());
+    let prior_doc_to_key: std::collections::HashMap<String, (String, String)> = prior_hits
+        .iter()
+        .map(|h| (h.id.0.clone(), (h.source_instance.clone(), h.id.0.clone())))
+        .collect();
+
+    let mut existing_doc_ids: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+
+    let mut i = 0;
+    while i < model.n_items() {
+        let Some(obj) = model.item(i) else {
+            i += 1;
+            continue;
+        };
+        let Some(str_obj) = obj.downcast::<gtk::StringObject>().ok() else {
+            i += 1;
+            continue;
+        };
+        let doc_id = str_obj.string().to_string();
+        let key = prior_doc_to_key
+            .get(&doc_id)
+            .cloned()
+            .unwrap_or_else(|| (String::new(), doc_id.clone()));
+        if new_keys.contains(&key) {
+            existing_doc_ids.insert(doc_id);
+            i += 1;
+        } else {
+            model.remove(i);
+        }
+    }
+
+    for hit in new_hits {
+        if !existing_doc_ids.contains(&hit.id.0) {
+            model.append(&hit.id.0);
+        }
+    }
+
+    cache_hits(new_hits.to_vec());
+    cache_top_hit_doc_id(top_hit_doc_id);
+
+    if let Some(want) = prior_selected_doc_id {
+        let n = model.n_items();
+        for idx in 0..n {
+            if let Some(obj) = model.item(idx)
+                && let Some(str_obj) = obj.downcast::<gtk::StringObject>().ok()
+                && str_obj.string() == want
+            {
+                selection.set_selected(idx);
+                break;
+            }
+        }
+    }
+
+    selection.set_autoselect(prev_autoselect);
+}
+
 pub(crate) fn synthetic_history_hits(queries: &[String]) -> Vec<Hit> {
     use lixun_core::{Action, DocId};
     queries

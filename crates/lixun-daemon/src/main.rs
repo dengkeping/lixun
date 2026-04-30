@@ -17,7 +17,8 @@ use lixun_sources::QueryContext;
 use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
+use tokio_util::sync::CancellationToken;
 
 mod battery;
 mod frecency;
@@ -779,9 +780,318 @@ fn collect_memory_stats() -> lixun_ipc::MemoryStats {
     m
 }
 
+struct SearchSlot {
+    generation: u64,
+    cancel: CancellationToken,
+}
+
+struct ConnectionState {
+    active_search_slot: Arc<tokio::sync::Mutex<Option<SearchSlot>>>,
+    next_search_generation: std::sync::atomic::AtomicU64,
+}
+
+impl ConnectionState {
+    fn new() -> Self {
+        Self {
+            active_search_slot: Arc::new(tokio::sync::Mutex::new(None)),
+            next_search_generation: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+const PLUGIN_BUDGET: std::time::Duration = std::time::Duration::from_millis(50);
+
+async fn process_search_chunk(
+    mut hits: Vec<lixun_core::Hit>,
+    mut breakdowns: Vec<lixun_core::ScoreBreakdown>,
+    phase: lixun_fusion::Phase,
+    explain: bool,
+    q: &str,
+    frecency: &Arc<RwLock<FrecencyStore>>,
+    query_latch: &Arc<RwLock<QueryLatchStore>>,
+    config: &Arc<config::Config>,
+    registry: &Arc<lixun_indexer::SourceRegistry>,
+) -> anyhow::Result<(
+    Vec<lixun_core::Hit>,
+    Option<lixun_core::Calculation>,
+    Option<lixun_core::DocId>,
+    Vec<String>,
+)> {
+    let now = chrono::Utc::now().timestamp();
+    
+    {
+        let frecency_store = frecency.read().await;
+        let latch_store = query_latch.read().await;
+        let alpha = config.ranking_frecency_alpha;
+        let w = config.ranking_latch_weight;
+        let cap = config.ranking_latch_cap;
+        let total_cap = config.ranking_total_multiplier_cap;
+        for (i, hit) in hits.iter_mut().enumerate() {
+            let frec = frecency_store.mult(&hit.id.0, now, alpha);
+            let lat = latch_store.mult(q, &hit.id.0, now, w, cap);
+            let stage2 = frec * lat;
+            let clamped = clamp_stage2_mult(stage2, total_cap);
+            hit.score *= clamped;
+            if explain {
+                if let Some(b) = breakdowns.get_mut(i) {
+                    b.frecency_mult = frec;
+                    b.latch_mult = lat;
+                    b.stage2_clamped = clamped;
+                    b.final_score = hit.score;
+                }
+            }
+        }
+    }
+
+    if phase == lixun_fusion::Phase::Final {
+        let mut plugin_tasks = Vec::new();
+        for entry in &registry.instances {
+            let plugin = entry.source.clone();
+            let q_str = q.to_string();
+            let instance_id = entry.instance_id.clone();
+            let state_dir = entry.state_dir.clone();
+            plugin_tasks.push(tokio::task::spawn_blocking(move || {
+                let ctx = QueryContext {
+                    instance_id: &instance_id,
+                    state_dir: &state_dir,
+                };
+                let start = std::time::Instant::now();
+                let result = plugin.on_query(&q_str, &ctx);
+                let elapsed = start.elapsed();
+                if elapsed > PLUGIN_BUDGET {
+                    tracing::warn!(
+                        instance = %instance_id,
+                        elapsed_ms = elapsed.as_millis(),
+                        "plugin on_query exceeded budget"
+                    );
+                }
+                result
+            }));
+        }
+        for task in plugin_tasks {
+            let plugin_hits = match task.await {
+                Ok(h) => h,
+                Err(_) => continue,
+            };
+            if explain {
+                for h in &plugin_hits {
+                    breakdowns.push(lixun_core::ScoreBreakdown {
+                        tantivy: h.score,
+                        category_mult: 1.0,
+                        exact_title_mult: 1.0,
+                        prefix_mult: 1.0,
+                        acronym_mult: 1.0,
+                        recency_mult: 1.0,
+                        coord_mult: 1.0,
+                        frecency_mult: 1.0,
+                        latch_mult: 1.0,
+                        stage2_clamped: 1.0,
+                        final_score: h.score,
+                    });
+                }
+            }
+            hits.extend(plugin_hits);
+        }
+    }
+
+    for hit in hits.iter_mut() {
+        if hit.source_instance.is_empty() {
+            continue;
+        }
+        if let Some(menu) = registry.row_menu_for(&hit.source_instance) {
+            hit.row_menu = menu;
+        }
+    }
+
+    let explanations: Vec<String> = if explain {
+        let mut idx: Vec<usize> = (0..hits.len()).collect();
+        idx.sort_by(|&a, &b| compare_hits_for_ranking(&hits[a], &hits[b]));
+        let hits_sorted: Vec<_> = idx.iter().map(|&i| hits[i].clone()).collect();
+        let brk_sorted: Vec<_> = idx.iter().map(|&i| breakdowns[i].clone()).collect();
+        hits = hits_sorted;
+        breakdowns = brk_sorted;
+        breakdowns
+            .iter()
+            .zip(hits.iter())
+            .map(|(b, h)| format_breakdown(b, h))
+            .collect()
+    } else {
+        hits.sort_by(compare_hits_for_ranking);
+        Vec::new()
+    };
+
+    let top_hit_id = if phase == lixun_fusion::Phase::Final {
+        let frecency_store = frecency.read().await;
+        let latch_store = query_latch.read().await;
+        let decision = top_hit::select_top_hit(
+            q,
+            &hits,
+            &frecency_store,
+            &latch_store,
+            now,
+            config.ranking_top_hit_min_confidence,
+            config.ranking_top_hit_min_margin,
+            config.ranking_strong_latch_threshold,
+        );
+        tracing::debug!(
+            query = %q,
+            top_hit = ?decision.id,
+            confidence = decision.confidence,
+            margin = decision.margin,
+            prefix_match = decision.prefix_match,
+            acronym_match = decision.acronym_match,
+            has_strong_latch = decision.has_strong_latch,
+            dominance = decision.dominance,
+            "top_hit selection"
+        );
+        decision.id
+    } else {
+        None
+    };
+
+    let calculation: Option<lixun_core::Calculation> = None;
+    Ok((hits, calculation, top_hit_id, explanations))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_search(
+    generation: u64,
+    cancel: CancellationToken,
+    write_tx: mpsc::Sender<Response>,
+    epoch: u64,
+    q: String,
+    limit: u32,
+    explain: bool,
+    fusion: Arc<SearchSurface>,
+    frecency: Arc<RwLock<FrecencyStore>>,
+    query_latch: Arc<RwLock<QueryLatchStore>>,
+    config: Arc<config::Config>,
+    registry: Arc<lixun_indexer::SourceRegistry>,
+    active_search_slot: Arc<tokio::sync::Mutex<Option<SearchSlot>>>,
+) -> anyhow::Result<()> {
+    let query_obj = lixun_core::Query {
+        text: q.clone(),
+        limit,
+    };
+
+    let mut rx = fusion.search_streaming(&query_obj, cancel.clone()).await?;
+
+    while let Some(chunk) = rx.recv().await {
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
+
+        let (hits, breakdowns) = if explain {
+            let mut hits_v = Vec::with_capacity(chunk.hits.len());
+            let mut brk_v = Vec::with_capacity(chunk.hits.len());
+            for (h, b) in chunk.hits {
+                hits_v.push(h);
+                brk_v.push(b);
+            }
+            (hits_v, brk_v)
+        } else {
+            (chunk.hits.into_iter().map(|(h, _)| h).collect(), Vec::new())
+        };
+
+        let (processed_hits, calculation, top_hit_id, explanations) = process_search_chunk(
+            hits,
+            breakdowns,
+            chunk.phase,
+            explain,
+            &q,
+            &frecency,
+            &query_latch,
+            &config,
+            &registry,
+        )
+        .await?;
+
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
+
+        let phase = match chunk.phase {
+            lixun_fusion::Phase::Initial => lixun_ipc::Phase::Initial,
+            lixun_fusion::Phase::Final => lixun_ipc::Phase::Final,
+        };
+
+        let resp = Response::SearchChunk {
+            epoch,
+            phase,
+            hits: processed_hits,
+            calculation,
+            top_hit: top_hit_id,
+            explanations,
+        };
+
+        if write_tx.send(resp).await.is_err() {
+            return Ok(());
+        }
+    }
+
+    let mut slot = active_search_slot.lock().await;
+    if let Some(s) = slot.as_ref() {
+        if s.generation == generation {
+            *slot = None;
+        }
+    }
+
+    Ok(())
+}
+
+async fn writer_task(
+    mut stream_write: tokio::io::WriteHalf<tokio::net::UnixStream>,
+    mut rx: mpsc::Receiver<Response>,
+    negotiated_version: u16,
+) -> anyhow::Result<()> {
+    while let Some(resp) = rx.recv().await {
+        let json = serde_json::to_vec(&resp)?;
+        let total_len = (2 + json.len()) as u32;
+        let mut out = BytesMut::with_capacity(4 + total_len as usize);
+        out.put_u32(total_len);
+        out.put_u16(negotiated_version);
+        out.put_slice(&json);
+        stream_write.write_all(&out).await?;
+    }
+    Ok(())
+}
+
+async fn read_request(
+    stream_read: &mut tokio::io::ReadHalf<tokio::net::UnixStream>,
+    frame_buf: &mut Vec<u8>,
+) -> anyhow::Result<Option<(u16, Request)>> {
+    let mut hdr = [0u8; 4];
+    match stream_read.read_exact(&mut hdr).await {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => return Ok(None),
+        Err(e) => return Err(e.into()),
+    }
+    let frame_len = u32::from_be_bytes(hdr) as usize;
+    if frame_len < 2 {
+        anyhow::bail!("frame too short for version");
+    }
+    let mut ver_buf = [0u8; 2];
+    stream_read.read_exact(&mut ver_buf).await?;
+    let version = u16::from_be_bytes(ver_buf);
+    if !(MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&version) {
+        anyhow::bail!(
+            "unsupported protocol version: got {}, supported {}..={}",
+            version,
+            MIN_PROTOCOL_VERSION,
+            PROTOCOL_VERSION
+        );
+    }
+    frame_buf.clear();
+    frame_buf.resize(frame_len - 2, 0);
+    stream_read.read_exact(frame_buf).await?;
+    let parsed: Request = serde_json::from_slice(frame_buf)?;
+    Ok(Some((version, parsed)))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_client(
-    mut stream: tokio::net::UnixStream,
+    stream: tokio::net::UnixStream,
     search: SearchSurface,
     mutation_tx: IndexMutationTx,
     frecency: Arc<RwLock<FrecencyStore>>,
@@ -796,287 +1106,202 @@ async fn handle_client(
     ocr_worker_stats: Arc<lixun_indexer::ocr_tick::OcrWorkerStats>,
     profile_swap: Arc<ArcSwap<lixun_core::ImpactProfile>>,
 ) -> anyhow::Result<()> {
-    let mut header = [0u8; 4];
-    stream.read_exact(&mut header).await?;
-    let len = u32::from_be_bytes(header) as usize;
-    if len < 2 {
-        anyhow::bail!("frame too short for version");
-    }
-    let mut version_buf = [0u8; 2];
-    stream.read_exact(&mut version_buf).await?;
-    let version = u16::from_be_bytes(version_buf);
-    if !(MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&version) {
-        let resp = Response::Error(format!(
-            "unsupported protocol version: got {}, supported {}..={}",
-            version, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION
-        ));
-        let json = serde_json::to_vec(&resp)?;
-        let out_len = (json.len() as u32).to_be_bytes();
-        stream.write_all(&out_len).await?;
-        stream.write_all(&json).await?;
-        return Ok(());
-    }
-    let negotiated_version = version;
-    let mut buf = vec![0u8; len - 2];
-    stream.read_exact(&mut buf).await?;
+    let (mut stream_read, stream_write) = tokio::io::split(stream);
 
-    let req: Request = serde_json::from_slice(&buf)?;
+    let mut frame_buf: Vec<u8> = Vec::new();
 
-    let resp = match req {
-        Request::Toggle => gui_result_to_response(gui_control.dispatch(GuiCommand::Toggle).await),
-        Request::Show => gui_result_to_response(gui_control.dispatch(GuiCommand::Show).await),
-        Request::Hide => gui_result_to_response(gui_control.dispatch(GuiCommand::Hide).await),
-        Request::Search { q, limit, explain } => {
-            let query_obj = lixun_core::Query {
-                text: q.clone(),
-                limit,
-            };
-            // Dual-path to avoid breakdown cost when the caller doesn't ask
-            // for explanations. Both paths produce the same `hits` vec and
-            // differ only in whether `breakdowns` is populated (T6).
-            let search_result: Result<
-                (Vec<lixun_core::Hit>, Vec<lixun_core::ScoreBreakdown>),
-                anyhow::Error,
-            > = if explain {
-                search.search_with_breakdown(&query_obj).await.map(|pairs| {
-                    let mut hits_v = Vec::with_capacity(pairs.len());
-                    let mut brk_v = Vec::with_capacity(pairs.len());
-                    for (h, b) in pairs {
-                        hits_v.push(h);
-                        brk_v.push(b);
-                    }
-                    (hits_v, brk_v)
-                })
-            } else {
-                search.search(&query_obj).await.map(|h| (h, Vec::new()))
-            };
-            match search_result {
-                Ok((mut hits, mut breakdowns)) => {
-                    let now = chrono::Utc::now().timestamp();
-                    {
-                        let frecency = frecency.read().await;
-                        let latch = query_latch.read().await;
-                        let alpha = config.ranking_frecency_alpha;
-                        let w = config.ranking_latch_weight;
-                        let cap = config.ranking_latch_cap;
-                        let total_cap = config.ranking_total_multiplier_cap;
-                        for (i, hit) in hits.iter_mut().enumerate() {
-                            let frec = frecency.mult(&hit.id.0, now, alpha);
-                            let lat = latch.mult(&q, &hit.id.0, now, w, cap);
-                            let stage2 = frec * lat;
-                            let clamped = clamp_stage2_mult(stage2, total_cap);
-                            hit.score *= clamped;
-                            if explain && let Some(b) = breakdowns.get_mut(i) {
-                                b.frecency_mult = frec;
-                                b.latch_mult = lat;
-                                b.stage2_clamped = clamped;
-                                b.final_score = hit.score;
-                            }
-                        }
-                    }
-                    // Fan-out `on_query` to every registered source plugin.
-                    // Plugins set their own scores; frecency and latch do not
-                    // apply. Host names no plugin (AGENTS.md hard-modularity).
-                    //
-                    // Each plugin runs in its own `spawn_blocking` task with a
-                    // PLUGIN_BUDGET cap. on_query is synchronous and may do
-                    // arbitrary work (calculator parses, shell forks, sources
-                    // hit local DBs); a single blocking plugin used to stall
-                    // every search behind the sequential for-loop. Bounded
-                    // parallelism + per-plugin timeout keeps the search
-                    // handler responsive even when one plugin misbehaves.
-                    const PLUGIN_BUDGET: std::time::Duration =
-                        std::time::Duration::from_millis(50);
-                    let plugin_jobs: Vec<_> = registry
-                        .instances
-                        .iter()
-                        .map(|inst| {
-                            let source = std::sync::Arc::clone(&inst.source);
-                            let instance_id = inst.instance_id.clone();
-                            let state_dir = inst.state_dir.clone();
-                            let q_owned = q.clone();
-                            let inst_label = inst.instance_id.clone();
-                            let fut = tokio::task::spawn_blocking(move || {
-                                let qctx = QueryContext {
-                                    instance_id: instance_id.as_str(),
-                                    state_dir: state_dir.as_path(),
-                                };
-                                source.on_query(&q_owned, &qctx)
-                            });
-                            (inst_label, tokio::time::timeout(PLUGIN_BUDGET, fut))
-                        })
-                        .collect();
-                    for (inst_label, plugin_fut) in plugin_jobs {
-                        let plugin_hits = match plugin_fut.await {
-                            Ok(Ok(hits)) => hits,
-                            Ok(Err(e)) => {
-                                tracing::warn!(
-                                    plugin = %inst_label,
-                                    error = %e,
-                                    "plugin on_query panicked"
-                                );
-                                Vec::new()
-                            }
-                            Err(_elapsed) => {
-                                tracing::debug!(
-                                    plugin = %inst_label,
-                                    budget_ms = PLUGIN_BUDGET.as_millis() as u64,
-                                    "plugin on_query exceeded budget, dropping its hits"
-                                );
-                                Vec::new()
-                            }
-                        };
-                        if explain {
-                            // Plugins never populate ScoreBreakdown because
-                            // they bypass the Tantivy scoring path entirely.
-                            // Synthesize a minimal breakdown so the parallel
-                            // `breakdowns` vec stays the same length as `hits`
-                            // and downstream indexing by position stays safe.
-                            for h in &plugin_hits {
-                                breakdowns.push(lixun_core::ScoreBreakdown {
-                                    tantivy: h.score,
-                                    category_mult: 1.0,
-                                    exact_title_mult: 1.0,
-                                    prefix_mult: 1.0,
-                                    acronym_mult: 1.0,
-                                    recency_mult: 1.0,
-                                    coord_mult: 1.0,
-                                    frecency_mult: 1.0,
-                                    latch_mult: 1.0,
-                                    stage2_clamped: 1.0,
-                                    final_score: h.score,
-                                });
-                            }
-                        }
-                        hits.extend(plugin_hits);
-                    }
-                    // Stamp row_menu onto every hit by looking up its
-                    // opaque source_instance in the registry. This keeps
-                    // the host from naming any concrete plugin while
-                    // giving the GUI a cache key + menu schema per row.
-                    // Hits with an empty source_instance (legacy / test
-                    // fixtures) keep RowMenuDef::empty().
-                    for hit in hits.iter_mut() {
-                        if hit.source_instance.is_empty() {
-                            continue;
-                        }
-                        if let Some(menu) = registry.row_menu_for(&hit.source_instance) {
-                            hit.row_menu = menu;
-                        }
-                    }
-                    // Sort hits + breakdowns together by building a paired
-                    // index and permuting both vectors. Ensures breakdowns
-                    // stay 1:1 with hits after ranking reorders them.
-                    let explanations: Vec<String> = if explain {
-                        let mut idx: Vec<usize> = (0..hits.len()).collect();
-                        idx.sort_by(|&a, &b| compare_hits_for_ranking(&hits[a], &hits[b]));
-                        let hits_sorted: Vec<_> = idx.iter().map(|&i| hits[i].clone()).collect();
-                        let brk_sorted: Vec<_> =
-                            idx.iter().map(|&i| breakdowns[i].clone()).collect();
-                        hits = hits_sorted;
-                        breakdowns = brk_sorted;
-                        breakdowns
-                            .iter()
-                            .zip(hits.iter())
-                            .map(|(b, h)| format_breakdown(b, h))
-                            .collect()
-                    } else {
-                        hits.sort_by(compare_hits_for_ranking);
-                        Vec::new()
-                    };
-                    let decision = {
-                        let frecency = frecency.read().await;
-                        let latch = query_latch.read().await;
-                        top_hit::select_top_hit(
-                            &q,
-                            &hits,
-                            &frecency,
-                            &latch,
-                            now,
-                            config.ranking_top_hit_min_confidence,
-                            config.ranking_top_hit_min_margin,
-                            config.ranking_strong_latch_threshold,
-                        )
-                    };
-                    tracing::debug!(
-                        query = %q,
-                        top_hit = ?decision.id,
-                        confidence = decision.confidence,
-                        margin = decision.margin,
-                        prefix_match = decision.prefix_match,
-                        acronym_match = decision.acronym_match,
-                        has_strong_latch = decision.has_strong_latch,
-                        dominance = decision.dominance,
-                        "top_hit selection"
-                    );
-                    let top_hit_id = decision.id;
-                    let calculation: Option<lixun_core::Calculation> = None;
-                    match negotiated_version {
-                        1 => Response::Hits(hits),
-                        2 => Response::HitsWithExtras {
-                            hits,
-                            calculation,
-                            explanations,
-                        },
-                        _ => Response::HitsWithExtrasV3 {
-                            hits,
-                            calculation,
-                            top_hit: top_hit_id,
-                            explanations,
-                        },
-                    }
+    let (negotiated_version, first_req) = match read_request(&mut stream_read, &mut frame_buf).await {
+        Ok(Some(pair)) => pair,
+        Ok(None) => return Ok(()),
+        Err(e) => return Err(e),
+    };
+
+    let conn_state = ConnectionState::new();
+    let (write_tx, write_rx) = mpsc::channel::<Response>(32);
+
+    let mut writer_handle = tokio::spawn(writer_task(stream_write, write_rx, negotiated_version));
+
+    let mut search_tasks = tokio::task::JoinSet::<anyhow::Result<()>>::new();
+
+    let fusion = Arc::new(search);
+
+    let mut pending_first: Option<Request> = Some(first_req);
+
+    loop {
+        let req: Request = if let Some(r) = pending_first.take() {
+            r
+        } else {
+            tokio::select! {
+            biased;
+            res = &mut writer_handle => {
+                match res {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => tracing::debug!("writer task error: {}", e),
+                    Err(e) => tracing::debug!("writer join error: {}", e),
                 }
-                Err(e) => Response::Error(e.to_string()),
+                break;
             }
-        }
-        Request::Reindex { paths } => {
-            let already_running = {
-                let mut s = stats.write().await;
-                if s.reindex_in_progress {
-                    true
-                } else {
-                    s.reindex_in_progress = true;
-                    s.reindex_started = Some(Utc::now());
-                    false
+            Some(joined) = search_tasks.join_next(), if !search_tasks.is_empty() => {
+                match joined {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => tracing::warn!("search task error: {}", e),
+                    Err(e) => tracing::warn!("search task join error: {}", e),
                 }
-            };
-            if already_running {
-                let s = stats.read().await;
-                let started = s
-                    .reindex_started
-                    .map(|t| t.to_rfc3339())
-                    .unwrap_or_else(|| "unknown".into());
-                Response::Error(format!("Reindex already in progress (started {})", started))
-            } else {
-                let stats_for_task = Arc::clone(&stats);
-                let mutation_tx_for_task = mutation_tx.clone();
-                let config_for_task = Arc::clone(&config);
-                let registry_for_task = Arc::clone(&registry);
-                let state_dir_for_task = config.state_dir.clone();
-                tokio::spawn(async move {
-                    let result = do_reindex(
-                        &mutation_tx_for_task,
-                        &stats_for_task,
-                        &config_for_task,
-                        registry_for_task.as_ref(),
-                        &state_dir_for_task,
-                        paths,
-                    )
-                    .await;
-                    let mut s = stats_for_task.write().await;
-                    s.reindex_in_progress = false;
-                    s.reindex_started = None;
-                    match result {
-                        Ok(count) => {
-                            tracing::info!("Background reindex complete: {} docs", count);
+                continue;
+            }
+            read = read_request(&mut stream_read, &mut frame_buf) => {
+                match read {
+                    Ok(Some((ver, r))) => {
+                        if ver != negotiated_version {
+                            tracing::debug!(
+                                "client switched protocol version mid-connection: {} -> {}",
+                                negotiated_version,
+                                ver
+                            );
+                            break;
                         }
-                        Err(e) => {
-                            tracing::error!("Background reindex failed: {}", e);
-                        }
+                        r
                     }
-                });
+                    Ok(None) => break,
+                    Err(e) => {
+                        tracing::debug!("read error: {}", e);
+                        break;
+                    }
+                }
+            }
+            }
+        };
+
+        match req {
+            Request::Search { q, limit, explain, epoch } => {
+                {
+                    let mut slot = conn_state.active_search_slot.lock().await;
+                    if let Some(prev) = slot.take() {
+                        prev.cancel.cancel();
+                    }
+                    let generation = conn_state
+                        .next_search_generation
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let cancel = CancellationToken::new();
+                    *slot = Some(SearchSlot {
+                        generation,
+                        cancel: cancel.clone(),
+                    });
+                    drop(slot);
+
+                    let write_tx_c = write_tx.clone();
+                    let fusion_c = Arc::clone(&fusion);
+                    let frecency_c = Arc::clone(&frecency);
+                    let query_latch_c = Arc::clone(&query_latch);
+                    let config_c = Arc::clone(&config);
+                    let registry_c = Arc::clone(&registry);
+                    let active_slot_c = Arc::clone(&conn_state.active_search_slot);
+
+                    search_tasks.spawn(handle_search(
+                        generation,
+                        cancel,
+                        write_tx_c,
+                        epoch,
+                        q,
+                        limit,
+                        explain,
+                        fusion_c,
+                        frecency_c,
+                        query_latch_c,
+                        config_c,
+                        registry_c,
+                        active_slot_c,
+                    ));
+                }
+            }
+            Request::Toggle => {
+                let resp = gui_result_to_response(gui_control.dispatch(GuiCommand::Toggle).await);
+                if write_tx.send(resp).await.is_err() {
+                    break;
+                }
+            }
+            Request::Show => {
+                let resp = gui_result_to_response(gui_control.dispatch(GuiCommand::Show).await);
+                if write_tx.send(resp).await.is_err() {
+                    break;
+                }
+            }
+            Request::Hide => {
+                let resp = gui_result_to_response(gui_control.dispatch(GuiCommand::Hide).await);
+                if write_tx.send(resp).await.is_err() {
+                    break;
+                }
+            }
+            Request::Reindex { paths } => {
+                let already_running = {
+                    let mut s = stats.write().await;
+                    if s.reindex_in_progress {
+                        true
+                    } else {
+                        s.reindex_in_progress = true;
+                        s.reindex_started = Some(Utc::now());
+                        false
+                    }
+                };
+                let resp = if already_running {
+                    let s = stats.read().await;
+                    let started = s
+                        .reindex_started
+                        .map(|t| t.to_rfc3339())
+                        .unwrap_or_else(|| "unknown".into());
+                    Response::Error(format!("Reindex already in progress (started {})", started))
+                } else {
+                    let stats_for_task = Arc::clone(&stats);
+                    let mutation_tx_for_task = mutation_tx.clone();
+                    let config_for_task = Arc::clone(&config);
+                    let registry_for_task = Arc::clone(&registry);
+                    let state_dir_for_task = config.state_dir.clone();
+                    tokio::spawn(async move {
+                        let result = do_reindex(
+                            &mutation_tx_for_task,
+                            &stats_for_task,
+                            &config_for_task,
+                            registry_for_task.as_ref(),
+                            &state_dir_for_task,
+                            paths,
+                        )
+                        .await;
+                        let mut s = stats_for_task.write().await;
+                        s.reindex_in_progress = false;
+                        s.reindex_started = None;
+                        match result {
+                            Ok(count) => {
+                                tracing::info!("Background reindex complete: {} docs", count);
+                            }
+                            Err(e) => {
+                                tracing::error!("Background reindex failed: {}", e);
+                            }
+                        }
+                    });
+                    let s = stats.read().await;
+                    Response::Status {
+                        indexed_docs: s.indexed_docs,
+                        last_reindex: s.last_reindex,
+                        errors: 0,
+                        watcher: Some(collect_watcher_stats()),
+                        writer: Some(collect_writer_stats()),
+                        memory: Some(collect_memory_stats()),
+                        reindex_in_progress: s.reindex_in_progress,
+                        reindex_started: s.reindex_started,
+                        ocr: collect_ocr_stats(
+                            ocr_queue.as_deref(),
+                            &ocr_worker_stats,
+                            OCR_MAX_ATTEMPTS,
+                        ),
+                    }
+                };
+                if write_tx.send(resp).await.is_err() {
+                    break;
+                }
+            }
+            Request::Status => {
                 let s = stats.read().await;
-                Response::Status {
+                let resp = Response::Status {
                     indexed_docs: s.indexed_docs,
                     last_reindex: s.last_reindex,
                     errors: 0,
@@ -1085,147 +1310,176 @@ async fn handle_client(
                     memory: Some(collect_memory_stats()),
                     reindex_in_progress: s.reindex_in_progress,
                     reindex_started: s.reindex_started,
-                    ocr: collect_ocr_stats(
-                        ocr_queue.as_deref(),
-                        &ocr_worker_stats,
-                        OCR_MAX_ATTEMPTS,
-                    ),
+                    ocr: collect_ocr_stats(ocr_queue.as_deref(), &ocr_worker_stats, OCR_MAX_ATTEMPTS),
+                };
+                if write_tx.send(resp).await.is_err() {
+                    break;
                 }
             }
-        }
-        Request::Status => {
-            let s = stats.read().await;
-            Response::Status {
-                indexed_docs: s.indexed_docs,
-                last_reindex: s.last_reindex,
-                errors: 0,
-                watcher: Some(collect_watcher_stats()),
-                writer: Some(collect_writer_stats()),
-                memory: Some(collect_memory_stats()),
-                reindex_in_progress: s.reindex_in_progress,
-                reindex_started: s.reindex_started,
-                ocr: collect_ocr_stats(ocr_queue.as_deref(), &ocr_worker_stats, OCR_MAX_ATTEMPTS),
+            Request::RecordClick { doc_id } => {
+                {
+                    let mut frec = frecency.write().await;
+                    frec.record_click(&doc_id, chrono::Utc::now().timestamp());
+                }
+                if write_tx.send(Response::Ok).await.is_err() {
+                    break;
+                }
             }
-        }
-        Request::RecordClick { doc_id } => {
-            let mut frecency = frecency.write().await;
-            frecency.record_click(&doc_id, chrono::Utc::now().timestamp());
-            Response::Ok
-        }
-        Request::RecordQuery { q } => {
-            let excluded = registry
-                .instances
-                .iter()
-                .any(|inst| inst.source.excludes_from_query_log(&q));
-            if excluded {
-                Response::Ok
-            } else {
-                let mut log = query_log.write().await;
-                log.record_query(&q);
-                Response::Ok
+            Request::RecordQuery { q } => {
+                let excluded = registry
+                    .instances
+                    .iter()
+                    .any(|inst| inst.source.excludes_from_query_log(&q));
+                if !excluded {
+                    let mut log = query_log.write().await;
+                    log.record_query(&q);
+                }
+                if write_tx.send(Response::Ok).await.is_err() {
+                    break;
+                }
             }
-        }
-        Request::RecordQueryClick { doc_id, query } => {
-            let now = chrono::Utc::now().timestamp();
-            {
-                let mut latch = query_latch.write().await;
-                latch.record(&query, &doc_id, now);
+            Request::RecordQueryClick { doc_id, query } => {
+                let now = chrono::Utc::now().timestamp();
+                {
+                    let mut latch = query_latch.write().await;
+                    latch.record(&query, &doc_id, now);
+                }
+                let excluded = registry
+                    .instances
+                    .iter()
+                    .any(|inst| inst.source.excludes_from_query_log(&query));
+                if !excluded {
+                    let mut log = query_log.write().await;
+                    log.record_query(&query);
+                }
+                if write_tx.send(Response::Ok).await.is_err() {
+                    break;
+                }
             }
-            let excluded = registry
-                .instances
-                .iter()
-                .any(|inst| inst.source.excludes_from_query_log(&query));
-            if !excluded {
-                let mut log = query_log.write().await;
-                log.record_query(&query);
+            Request::SearchHistory { limit } => {
+                let log = query_log.read().await;
+                let resp = Response::Queries(log.recent(limit as usize));
+                if write_tx.send(resp).await.is_err() {
+                    break;
+                }
             }
-            Response::Ok
-        }
-        Request::SearchHistory { limit } => {
-            let log = query_log.read().await;
-            Response::Queries(log.recent(limit as usize))
-        }
-        Request::Preview { hit, monitor } => match preview_spawner.dispatch(*hit, monitor).await {
-            Ok(()) => Response::Ok,
-            Err(e) => {
-                tracing::error!("preview_spawn: dispatch failed: {}", e);
-                Response::Error(format!("preview dispatch failed: {}", e))
-            }
-        },
-        Request::EnumeratePlugins => Response::PluginManifest(registry.cli_manifest()),
-        Request::PluginCommand { verb_path, args } => {
-            match registry.cli_invoke(&verb_path, &args).await {
-                Ok(value) => Response::PluginResult(value),
-                Err(e) => Response::PluginError(format!("{e:#}")),
-            }
-        }
-        Request::ImpactGet => {
-            let p = profile_swap.load_full();
-            Response::ImpactSnapshot {
-                level: p.level,
-                profile: ImpactProfileWire::from(p.as_ref()),
-                applied_hot: Vec::new(),
-                requires_restart: Vec::new(),
-                persisted: false,
-            }
-        }
-        Request::ImpactExplain => {
-            let p = profile_swap.load_full();
-            Response::ImpactSnapshot {
-                level: p.level,
-                profile: ImpactProfileWire::from(p.as_ref()),
-                applied_hot: Vec::new(),
-                requires_restart: Vec::new(),
-                persisted: false,
-            }
-        }
-        Request::ImpactSet { level, persist } => {
-            let old = profile_swap.load_full();
-            let new_profile = lixun_core::ImpactProfile::from_level(level, num_cpus::get());
-            let (applied_hot, requires_restart) = impact_diff_hot_cold(old.as_ref(), &new_profile);
-            sched::apply_nice_only(new_profile.daemon_nice);
-            profile_swap.store(Arc::new(new_profile.clone()));
-            let persist_outcome: Result<bool, String> = if persist {
-                match config::Config::persist_impact_level(level) {
-                    Ok(path) => {
-                        tracing::info!("impact: persisted level={} to {}", level, path.display());
-                        Ok(true)
-                    }
+            Request::Preview { hit, monitor } => {
+                let resp = match preview_spawner.dispatch(*hit, monitor).await {
+                    Ok(()) => Response::Ok,
                     Err(e) => {
-                        tracing::error!("impact: persist failed: {e:#}");
-                        Err(format!("persist failed: {e}"))
+                        tracing::error!("preview_spawn: dispatch failed: {}", e);
+                        Response::Error(format!("preview dispatch failed: {}", e))
                     }
+                };
+                if write_tx.send(resp).await.is_err() {
+                    break;
                 }
-            } else {
-                Ok(false)
-            };
-            tracing::info!(
-                "impact level changed: {:?} -> {:?} (hot={} cold={})",
-                old.level,
-                new_profile.level,
-                applied_hot.len(),
-                requires_restart.len(),
-            );
-            match persist_outcome {
-                Ok(persisted) => Response::ImpactSnapshot {
-                    level: new_profile.level,
-                    profile: ImpactProfileWire::from(&new_profile),
-                    applied_hot,
-                    requires_restart,
-                    persisted,
-                },
-                Err(msg) => Response::Error(msg),
+            }
+            Request::EnumeratePlugins => {
+                let resp = Response::PluginManifest(registry.cli_manifest());
+                if write_tx.send(resp).await.is_err() {
+                    break;
+                }
+            }
+            Request::PluginCommand { verb_path, args } => {
+                let resp = match registry.cli_invoke(&verb_path, &args).await {
+                    Ok(value) => Response::PluginResult(value),
+                    Err(e) => Response::PluginError(format!("{e:#}")),
+                };
+                if write_tx.send(resp).await.is_err() {
+                    break;
+                }
+            }
+            Request::ImpactGet => {
+                let p = profile_swap.load_full();
+                let resp = Response::ImpactSnapshot {
+                    level: p.level,
+                    profile: ImpactProfileWire::from(p.as_ref()),
+                    applied_hot: Vec::new(),
+                    requires_restart: Vec::new(),
+                    persisted: false,
+                };
+                if write_tx.send(resp).await.is_err() {
+                    break;
+                }
+            }
+            Request::ImpactExplain => {
+                let p = profile_swap.load_full();
+                let resp = Response::ImpactSnapshot {
+                    level: p.level,
+                    profile: ImpactProfileWire::from(p.as_ref()),
+                    applied_hot: Vec::new(),
+                    requires_restart: Vec::new(),
+                    persisted: false,
+                };
+                if write_tx.send(resp).await.is_err() {
+                    break;
+                }
+            }
+            Request::ImpactSet { level, persist } => {
+                let old = profile_swap.load_full();
+                let new_profile = lixun_core::ImpactProfile::from_level(level, num_cpus::get());
+                let (applied_hot, requires_restart) = impact_diff_hot_cold(old.as_ref(), &new_profile);
+                sched::apply_nice_only(new_profile.daemon_nice);
+                profile_swap.store(Arc::new(new_profile.clone()));
+                let persist_outcome: Result<bool, String> = if persist {
+                    match config::Config::persist_impact_level(level) {
+                        Ok(path) => {
+                            tracing::info!("impact: persisted level={} to {}", level, path.display());
+                            Ok(true)
+                        }
+                        Err(e) => {
+                            tracing::error!("impact: persist failed: {e:#}");
+                            Err(format!("persist failed: {e}"))
+                        }
+                    }
+                } else {
+                    Ok(false)
+                };
+                tracing::info!(
+                    "impact level changed: {:?} -> {:?} (hot={} cold={})",
+                    old.level,
+                    new_profile.level,
+                    applied_hot.len(),
+                    requires_restart.len(),
+                );
+                let resp = match persist_outcome {
+                    Ok(persisted) => Response::ImpactSnapshot {
+                        level: new_profile.level,
+                        profile: ImpactProfileWire::from(&new_profile),
+                        applied_hot,
+                        requires_restart,
+                        persisted,
+                    },
+                    Err(msg) => Response::Error(msg),
+                };
+                if write_tx.send(resp).await.is_err() {
+                    break;
+                }
             }
         }
-    };
 
-    let json = serde_json::to_vec(&resp)?;
-    let total_len = (2 + json.len()) as u32;
-    let mut out = BytesMut::with_capacity(4 + total_len as usize);
-    out.put_u32(total_len);
-    out.put_u16(negotiated_version);
-    out.put_slice(&json);
-    stream.write_all(&out).await?;
+        // Drain finished search tasks (logs panics, non-blocking).
+        while let Some(joined) = search_tasks.try_join_next() {
+            match joined {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::warn!("search task error: {}", e),
+                Err(e) => tracing::warn!("search task join error: {}", e),
+            }
+        }
+    }
+
+    // Cleanup on disconnect.
+    {
+        let mut slot = conn_state.active_search_slot.lock().await;
+        if let Some(prev) = slot.take() {
+            prev.cancel.cancel();
+        }
+    }
+    drop(write_tx);
+    search_tasks.abort_all();
+    while search_tasks.join_next().await.is_some() {}
+    let _ = writer_handle.await;
 
     Ok(())
 }
@@ -1585,6 +1839,7 @@ mod tests {
             secondary_action: None,
             source_instance: String::new(),
             row_menu: lixun_core::RowMenuDef::empty(),
+            mime: None,
         }
     }
 

@@ -8,4 +8,4 @@ mod handle;
 mod rrf;
 
 pub use debug::FusionDebug;
-pub use handle::HybridSearchHandle;
+pub use handle::{FusionChunk, HybridSearchHandle, Phase};

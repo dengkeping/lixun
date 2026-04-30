@@ -125,6 +125,7 @@ fn mock_hit(id: &str, title: &str) -> Hit {
         secondary_action: None,
         source_instance: "mock".to_string(),
         row_menu: RowMenuDef::empty(),
+        mime: None,
     }
 }
 

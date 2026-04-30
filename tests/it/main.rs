@@ -35,6 +35,7 @@ fn make_doc(id: &str, title: &str, body: Option<&str>) -> Document {
         source_instance: "test".into(),
         secondary_action: None,
         extra: Vec::new(),
+        mime: None,
     }
 }
 
@@ -137,6 +138,7 @@ fn ipc_codec_roundtrip_v1_hits() {
                 q: "hello".into(),
                 limit: 10,
                 explain: false,
+                epoch: 1,
             },
             &mut buf,
         )

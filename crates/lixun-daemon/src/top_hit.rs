@@ -157,7 +157,6 @@ fn frecency_dominance(candidate: &Hit, hits: &[Hit], frecency: &FrecencyStore, n
 mod tests {
     use super::*;
     use lixun_core::{Action, Category, DocId, Hit};
-    use lixun_ipc::Response;
 
     fn make_hit(id: &str, title: &str, score: f32) -> Hit {
         Hit {
@@ -182,11 +181,10 @@ mod tests {
             secondary_action: None,
             source_instance: String::new(),
             row_menu: lixun_core::RowMenuDef::empty(),
+            mime: None,
         }
     }
 
-    /// D5 happy path: a clear prefix match with a wide score lead
-    /// satisfies both gates and promotes hits[0] to Top Hit.
     #[test]
     fn prefix_match_sets_top_hit() {
         let hits = vec![
@@ -258,47 +256,9 @@ mod tests {
         assert_eq!(decision.dominance, 0.0);
     }
 
-    /// Mirror of the `match negotiated_version { .. }` arm in
-    /// `handle_client::Search`. Guards that v2 clients continue to
-    /// receive the pre-v3 `HitsWithExtras` shape.
-    fn dispatch_response(
-        negotiated_version: u16,
-        hits: Vec<Hit>,
-        top_hit: Option<DocId>,
-    ) -> Response {
-        match negotiated_version {
-            1 => Response::Hits(hits),
-            2 => Response::HitsWithExtras {
-                hits,
-                calculation: None,
-                explanations: vec![],
-            },
-            _ => Response::HitsWithExtrasV3 {
-                hits,
-                calculation: None,
-                top_hit,
-                explanations: vec![],
-            },
-        }
-    }
-
     #[test]
-    fn v2_response_shape_preserved() {
-        let hits = vec![make_hit("app:firefox", "Firefox", 10.0)];
-        let resp = dispatch_response(2, hits, Some(DocId("app:firefox".into())));
-        match resp {
-            Response::HitsWithExtras { .. } => {}
-            other => panic!("expected HitsWithExtras for v2, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn v1_response_shape_preserved() {
-        let hits = vec![make_hit("app:firefox", "Firefox", 10.0)];
-        let resp = dispatch_response(1, hits, None);
-        match resp {
-            Response::Hits(_) => {}
-            other => panic!("expected Hits for v1, got {:?}", other),
-        }
+    fn v4_protocol_only() {
+        assert_eq!(lixun_ipc::MIN_PROTOCOL_VERSION, 4);
+        assert_eq!(lixun_ipc::PROTOCOL_VERSION, 4);
     }
 }

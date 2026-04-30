@@ -18,9 +18,10 @@ use gtk4_layer_shell::{Edge, LayerShell};
 use lixun_core::Category;
 
 use crate::factory::{
-    add_css_class, clear_cached_hits, create_list_factory, update_results, with_cached_hits,
+    add_css_class, clear_cached_hits, create_list_factory, update_results, update_results_merge,
+    with_cached_hits,
 };
-use crate::ipc::{IpcClient, start_ipc_thread};
+use crate::ipc::{IpcClient, PHASE_FINAL, PHASE_INITIAL, start_ipc_thread};
 use crate::status::StatusBar;
 use lixun_core::{DocId, Hit};
 
@@ -145,6 +146,7 @@ pub(crate) struct LauncherController {
     /// `restore_session` on next show, emptied by `clear_session`
     /// on any launch action.
     cached_session: std::rc::Rc<std::cell::RefCell<Option<SessionSnapshot>>>,
+    #[allow(dead_code)]
     ipc: IpcClient,
     /// Latch set by `restore_session` so the entry's
     /// connect_changed handler can short-circuit its debounced
@@ -162,6 +164,8 @@ pub(crate) struct LauncherController {
     /// the new ranking happens to place it (reported as "ends up in
     /// middle of list after second query").
     user_selected_override: std::rc::Rc<std::cell::Cell<bool>>,
+    #[allow(dead_code)]
+    searching_indicator: std::rc::Rc<std::cell::Cell<bool>>,
 }
 
 impl LauncherController {
@@ -443,12 +447,6 @@ impl LauncherController {
         // the cursor to row 0.
         self.user_selected_override.set(true);
 
-        let epoch = self.session_epoch.load(Ordering::SeqCst);
-        let _ = self
-            .ipc
-            .request_tx
-            .send((snapshot.query.clone(), 30, epoch));
-
         self.is_restoring.set(false);
     }
 
@@ -653,6 +651,8 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
         std::rc::Rc::new(std::cell::Cell::new(false));
     let user_selected_override: std::rc::Rc<std::cell::Cell<bool>> =
         std::rc::Rc::new(std::cell::Cell::new(false));
+    let searching_indicator: std::rc::Rc<std::cell::Cell<bool>> =
+        std::rc::Rc::new(std::cell::Cell::new(false));
 
     let controller = std::rc::Rc::new(LauncherController {
         window: window.clone(),
@@ -672,6 +672,7 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
         ipc: ipc.clone(),
         is_restoring: std::rc::Rc::clone(&is_restoring),
         user_selected_override: std::rc::Rc::clone(&user_selected_override),
+        searching_indicator: std::rc::Rc::clone(&searching_indicator),
     });
 
     let close_action = gio::SimpleAction::new("close-launcher", None);
@@ -699,6 +700,7 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
         std::rc::Rc::clone(&status_bar),
         std::rc::Rc::clone(&last_query),
         std::rc::Rc::clone(&user_selected_override),
+        std::rc::Rc::clone(&searching_indicator),
     );
 
     install_entry_handler(
@@ -785,35 +787,22 @@ fn install_response_poller(
     status: std::rc::Rc<StatusBar>,
     last_query: std::rc::Rc<std::cell::RefCell<String>>,
     user_selected_override: std::rc::Rc<std::cell::Cell<bool>>,
+    searching_indicator: std::rc::Rc<std::cell::Cell<bool>>,
 ) {
     let responses = Arc::clone(&ipc.responses);
     let calculation = Arc::clone(&ipc.calculation);
     let top_hit = Arc::clone(&ipc.top_hit);
     let epoch = Arc::clone(&ipc.response_epoch);
+    let phase = Arc::clone(&ipc.response_phase);
     let last_epoch = std::rc::Rc::new(std::cell::Cell::new(0u64));
+    let seen_initial = std::rc::Rc::new(std::cell::Cell::new(false));
 
     glib::timeout_add_local(Duration::from_millis(50), move || {
         let current = epoch.load(Ordering::SeqCst);
         if current != last_epoch.get() {
             last_epoch.set(current);
-            // Snapshot the DocId of the currently-selected row before
-            // we clear the model. A silent refresh fired by
-            // restore_session lands here too, and we must not warp
-            // the cursor off the user's restored choice just because
-            // the index generated a fresh ranking. If the same DocId
-            // is present in the new hits we restore the cursor
-            // there; otherwise we fall back to position 0 as a new
-            // search does.
-            // DocId-based selection preservation only runs when
-            // the user has explicitly moved the cursor off row 0
-            // (via ↑/↓/click/restored snapshot). On plain typing
-            // the override is cleared by the entry handler, and
-            // the poller snaps to row 0 so ranking order wins —
-            // matching the Spotlight UX where each new query
-            // starts at the top. Without this distinction, the
-            // cursor landed on row 0 after one keystroke, then
-            // chased that row 0 DocId into wherever the next
-            // ranking placed it (often mid-list or near the end).
+            let current_phase = phase.load(Ordering::SeqCst);
+
             let preserve_doc_id = user_selected_override.get();
             let prior_selected = if preserve_doc_id {
                 let idx = selection.selected();
@@ -825,6 +814,7 @@ fn install_response_poller(
             } else {
                 None
             };
+
             let hits_snapshot = {
                 let mut hits = responses.lock().unwrap();
                 std::mem::take(&mut *hits)
@@ -837,19 +827,33 @@ fn install_response_poller(
                 let mut t = top_hit.lock().unwrap();
                 t.take()
             };
+
             let plan = compute_render_plan(&hits_snapshot, top_hit_snapshot.as_ref());
             let top_hit_doc_id = plan
                 .top_hit_index
                 .and_then(|i| plan.hits.get(i))
                 .map(|h| h.id.0.clone());
-            update_results(&model, &selection, &plan.hits, top_hit_doc_id);
+
+            if current_phase == PHASE_INITIAL {
+                seen_initial.set(true);
+                if !plan.hits.is_empty() {
+                    update_results_merge(&model, &selection, &plan.hits, top_hit_doc_id);
+                    searching_indicator.set(true);
+                } else {
+                    searching_indicator.set(true);
+                }
+            } else if current_phase == PHASE_FINAL {
+                if seen_initial.get() {
+                    update_results_merge(&model, &selection, &plan.hits, top_hit_doc_id);
+                } else {
+                    update_results(&model, &selection, &plan.hits, top_hit_doc_id);
+                }
+                searching_indicator.set(false);
+                seen_initial.set(false);
+            }
+
             filter.changed(gtk::FilterChange::Different);
             if !plan.hits.is_empty() {
-                // set_selected on a filter-backed SingleSelection
-                // silently no-ops when the requested index exceeds
-                // the post-filter n_items, so we must resolve
-                // against selection.n_items() after filter.changed
-                // above.
                 let wanted_doc = prior_selected
                     .clone()
                     .or_else(|| plan.hits.first().map(|h| h.id.0.clone()));
@@ -883,7 +887,11 @@ fn install_response_poller(
                     chips_container.set_visible(true);
                     scrolled.set_visible(false);
                     scrolled.set_vexpand(false);
-                    status.show_empty(&q);
+                    if searching_indicator.get() {
+                        status.show_empty("Searching...");
+                    } else {
+                        status.show_empty(&q);
+                    }
                     selection.set_selected(gtk::INVALID_LIST_POSITION);
                 } else {
                     chips_container.set_visible(false);
@@ -896,7 +904,11 @@ fn install_response_poller(
                 let list_has_rows = !plan.hits.is_empty();
                 scrolled.set_visible(list_has_rows);
                 scrolled.set_vexpand(list_has_rows);
-                status.hide();
+                if searching_indicator.get() {
+                    status.show_empty("Searching...");
+                } else {
+                    status.hide();
+                }
             }
         }
         glib::ControlFlow::Continue
@@ -1117,6 +1129,7 @@ mod tests {
             secondary_action: None,
             source_instance: String::new(),
             row_menu: lixun_core::RowMenuDef::empty(),
+            mime: None,
         }
     }
 
