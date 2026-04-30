@@ -194,8 +194,24 @@ impl LauncherController {
         let snapshot = self.cached_session.borrow_mut().take();
         tracing::info!("gui: show() snapshot_present={} entry_text_before={:?}", snapshot.is_some(), self.entry.text().to_string());
         if let Some(snapshot) = snapshot {
-            tracing::info!("gui: show() restoring snapshot query={:?} hits={}", snapshot.query, snapshot.hits.len());
-            self.restore_session(&snapshot);
+            // If the live UI already matches the snapshot (same query
+            // and the model is non-empty), the previous hide() left
+            // everything in place — just present the window. Skipping
+            // restore_session avoids a full model rebuild on every
+            // ESC→toggle cycle: model rows, selection, scroll position
+            // and entry text are already correct, and re-populating
+            // resets vadjustment to 0 which we then have to chase with
+            // a retry-poll. Falls through to restore_session only on
+            // the cold path (model was scrubbed, or this is a fresh
+            // GUI process started by the daemon).
+            let live_query = self.entry.text().to_string();
+            let model_populated = self.model.n_items() > 0;
+            if model_populated && live_query == snapshot.query {
+                tracing::info!("gui: show() reusing live state, skipping restore_session");
+            } else {
+                tracing::info!("gui: show() restoring snapshot query={:?} hits={}", snapshot.query, snapshot.hits.len());
+                self.restore_session(&snapshot);
+            }
         }
 
         self.window.remove_css_class("lixun-hiding");
