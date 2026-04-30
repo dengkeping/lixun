@@ -877,12 +877,55 @@ async fn handle_client(
                     // Fan-out `on_query` to every registered source plugin.
                     // Plugins set their own scores; frecency and latch do not
                     // apply. Host names no plugin (AGENTS.md hard-modularity).
-                    for inst in registry.instances.iter() {
-                        let qctx = QueryContext {
-                            instance_id: inst.instance_id.as_str(),
-                            state_dir: &inst.state_dir,
+                    //
+                    // Each plugin runs in its own `spawn_blocking` task with a
+                    // PLUGIN_BUDGET cap. on_query is synchronous and may do
+                    // arbitrary work (calculator parses, shell forks, sources
+                    // hit local DBs); a single blocking plugin used to stall
+                    // every search behind the sequential for-loop. Bounded
+                    // parallelism + per-plugin timeout keeps the search
+                    // handler responsive even when one plugin misbehaves.
+                    const PLUGIN_BUDGET: std::time::Duration =
+                        std::time::Duration::from_millis(50);
+                    let plugin_jobs: Vec<_> = registry
+                        .instances
+                        .iter()
+                        .map(|inst| {
+                            let source = std::sync::Arc::clone(&inst.source);
+                            let instance_id = inst.instance_id.clone();
+                            let state_dir = inst.state_dir.clone();
+                            let q_owned = q.clone();
+                            let inst_label = inst.instance_id.clone();
+                            let fut = tokio::task::spawn_blocking(move || {
+                                let qctx = QueryContext {
+                                    instance_id: instance_id.as_str(),
+                                    state_dir: state_dir.as_path(),
+                                };
+                                source.on_query(&q_owned, &qctx)
+                            });
+                            (inst_label, tokio::time::timeout(PLUGIN_BUDGET, fut))
+                        })
+                        .collect();
+                    for (inst_label, plugin_fut) in plugin_jobs {
+                        let plugin_hits = match plugin_fut.await {
+                            Ok(Ok(hits)) => hits,
+                            Ok(Err(e)) => {
+                                tracing::warn!(
+                                    plugin = %inst_label,
+                                    error = %e,
+                                    "plugin on_query panicked"
+                                );
+                                Vec::new()
+                            }
+                            Err(_elapsed) => {
+                                tracing::debug!(
+                                    plugin = %inst_label,
+                                    budget_ms = PLUGIN_BUDGET.as_millis() as u64,
+                                    "plugin on_query exceeded budget, dropping its hits"
+                                );
+                                Vec::new()
+                            }
                         };
-                        let plugin_hits = inst.source.on_query(&q, &qctx);
                         if explain {
                             // Plugins never populate ScoreBreakdown because
                             // they bypass the Tantivy scoring path entirely.
