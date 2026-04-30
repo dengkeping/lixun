@@ -22,6 +22,7 @@ depends=(
   'sqlite'
   'gcc-libs'
   'xz'
+  'libheif'
 )
 optdepends=(
   'lixun-semantic: dense-vector hybrid retrieval via the sidecar worker'
@@ -35,7 +36,7 @@ optdepends=(
   'gst-libav: ffmpeg-backed codec coverage'
   'xdg-terminal-exec: terminal-launching shell hits'
 )
-makedepends=('rust' 'cargo')
+makedepends=('rust' 'cargo' 'libheif')
 provides=('lixun-bin')
 conflicts=('lixun-bin' 'lupa' 'lupa-bin')
 source=("$pkgname-$pkgver.tar.gz::https://github.com/dengkeping/lixun/archive/refs/tags/v$pkgver.tar.gz")
