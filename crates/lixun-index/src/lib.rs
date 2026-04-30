@@ -30,7 +30,7 @@ use lixun_core::{
 };
 use normalize::normalize_for_match;
 
-const INDEX_VERSION: u32 = 10;
+const INDEX_VERSION: u32 = 11;
 const INDEX_VERSION_FILE: &str = "index_version.txt";
 
 /// Tantivy schema fields.
@@ -39,6 +39,11 @@ pub struct LixunSchema {
     pub id: tantivy::schema::Field,
     pub category: tantivy::schema::Field,
     pub title: tantivy::schema::Field,
+    /// Untokenized normalized title for O(1) exact-equality lookup.
+    /// Bypasses BM25 IDF collapse for popular terms (e.g. query "firefox"
+    /// where the term appears in thousands of files but the App entry
+    /// titled exactly "Firefox" should still surface as hero).
+    pub title_exact: tantivy::schema::Field,
     pub title_terms: tantivy::schema::Field,
     pub title_initials: tantivy::schema::Field,
     pub title_prefixes: tantivy::schema::Field,
@@ -84,6 +89,7 @@ impl LixunSchema {
         let id = builder.add_text_field("id", STRING | STORED);
         let category = builder.add_text_field("category", TEXT | STORED);
         let title = builder.add_text_field("title", stored_spotlight_text());
+        let title_exact = builder.add_text_field("title_exact", STRING | STORED);
         let title_terms = builder.add_text_field("title_terms", indexed_spotlight_text());
         let title_initials = builder.add_text_field("title_initials", indexed_spotlight_text());
         let title_prefixes = builder.add_text_field("title_prefixes", indexed_spotlight_text());
@@ -113,6 +119,7 @@ impl LixunSchema {
                 id,
                 category,
                 title,
+                title_exact,
                 title_terms,
                 title_initials,
                 title_prefixes,
@@ -236,6 +243,7 @@ impl LixunIndex {
             s.id => doc.id.0.as_str(),
             s.category => doc.category.as_str(),
             s.title => doc.title.as_str(),
+            s.title_exact => normalize_for_match(&doc.title).as_str(),
             s.title_terms => title_split.as_str(),
             s.title_initials => title_initials_indexed.as_str(),
             s.title_prefixes => title_prefixes_indexed.as_str(),
@@ -334,6 +342,42 @@ impl LixunIndex {
             &TopDocs::with_limit(query.limit as usize).order_by_score(),
         )?;
 
+        // Fast-path: exact title equality (bypasses BM25 IDF collapse).
+        //
+        // Popular terms like "firefox" appear in thousands of files (paths,
+        // OCR bodies, Mail), collapsing IDF to the point where an App entry
+        // whose title *is* that term never reaches BM25 top-N. We probe the
+        // dedicated `title_exact` STRING field for q_norm and union those
+        // doc addresses into the candidate set; `exact_title_mult` then
+        // fires naturally in the scoring loop below. Synthetic base score
+        // for exact-only hits = max(top_docs) or 1.0 — keeps them
+        // comparable to BM25 hits after the multiplier chain.
+        let max_top_score = top_docs
+            .iter()
+            .map(|(s, _)| *s)
+            .fold(0.0_f32, f32::max)
+            .max(1.0);
+        let exact_addrs: Vec<(f32, DocAddress)> = if !q_norm.is_empty() {
+            let term = Term::from_field_text(s.title_exact, &q_norm);
+            let tq = TermQuery::new(term, IndexRecordOption::Basic);
+            searcher
+                .search(&tq, &DocSetCollector)?
+                .into_iter()
+                .map(|addr| (max_top_score, addr))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let mut seen_addrs: HashSet<DocAddress> =
+            top_docs.iter().map(|(_, a)| *a).collect();
+        let mut merged: Vec<(f32, DocAddress)> = top_docs;
+        for (score, addr) in exact_addrs {
+            if seen_addrs.insert(addr) {
+                merged.push((score, addr));
+            }
+        }
+
         // Coordination probe (Wave B T2): precompute the set of docs where
         // every query token matches the title. v==q lookup is O(1) per hit.
         let all_match_set = build_coord_all_match_set(&self.index, &searcher, s.title, &query.text)
@@ -343,7 +387,7 @@ impl LixunIndex {
             .unwrap_or(0);
 
         let mut results: Vec<(Hit, ScoreBreakdown)> = Vec::new();
-        for (score, doc_address) in top_docs {
+        for (score, doc_address) in merged {
             let doc: TantivyDocument = searcher.doc(doc_address)?;
 
             let id = doc
@@ -481,6 +525,9 @@ impl LixunIndex {
             };
             results.push((hit, breakdown));
         }
+
+        results.sort_by(|a, b| b.0.score.partial_cmp(&a.0.score).unwrap_or(std::cmp::Ordering::Equal));
+        results.truncate(query.limit as usize);
 
         Ok(results)
     }
