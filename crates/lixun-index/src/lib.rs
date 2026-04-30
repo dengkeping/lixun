@@ -218,8 +218,13 @@ impl LixunIndex {
     }
 
     /// Upsert a document (delete by id, then insert).
+    ///
+    /// Takes `&self` (not `&mut self`) because all mutations land on
+    /// `writer` — `LixunIndex` itself is immutable. This is what lets
+    /// the daemon hold a single `Arc<LixunIndex>` shared between the
+    /// writer task and the search hot path without a `Mutex`.
     pub fn upsert(
-        &mut self,
+        &self,
         doc: &Document,
         writer: &mut IndexWriter<TantivyDocument>,
     ) -> Result<()> {
@@ -293,7 +298,7 @@ impl LixunIndex {
     }
 
     pub fn delete_by_source_instance(
-        &mut self,
+        &self,
         instance_id: &str,
         writer: &mut IndexWriter<TantivyDocument>,
     ) -> Result<()> {
@@ -304,7 +309,7 @@ impl LixunIndex {
 
     /// Delete a document by id.
     pub fn delete_by_id(
-        &mut self,
+        &self,
         id: &str,
         writer: &mut IndexWriter<TantivyDocument>,
     ) -> Result<()> {
@@ -533,7 +538,7 @@ impl LixunIndex {
     }
 
     /// Commit pending writes.
-    pub fn commit(&mut self, writer: &mut IndexWriter<TantivyDocument>) -> Result<()> {
+    pub fn commit(&self, writer: &mut IndexWriter<TantivyDocument>) -> Result<()> {
         writer.commit()?;
         Ok(())
     }

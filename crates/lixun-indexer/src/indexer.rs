@@ -339,6 +339,7 @@ mod tests {
                 sender: None,
                 recipients: None,
                 source_instance: ctx.instance_id.to_string(),
+                mime: None,
                 secondary_action: None,
                 extra: Vec::new(),
             };
@@ -377,6 +378,7 @@ mod tests {
             sender: None,
             recipients: None,
             source_instance: "x".into(),
+            mime: None,
             secondary_action: None,
             extra: Vec::new(),
         };
@@ -407,6 +409,7 @@ mod tests {
             sender: None,
             recipients: None,
             source_instance: "x".into(),
+            mime: None,
             secondary_action: None,
             extra: Vec::new(),
         };

@@ -12,7 +12,7 @@ use lixun_mutation::{MutationBatch, MutationBroadcaster, NoopBroadcaster, Upsert
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Semaphore, mpsc, oneshot};
 
 static COMMITS: AtomicU64 = AtomicU64::new(0);
 static LAST_COMMIT_LATENCY_MS: AtomicU64 = AtomicU64::new(0);
@@ -28,6 +28,19 @@ pub fn stats() -> (u64, u64, u64) {
 
 const COMMIT_MIN_INTERVAL: Duration = Duration::from_secs(3);
 const COMMIT_CHECK_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Bound on concurrent searches dispatched to `spawn_blocking`. Sized at
+/// 2× CPU cores per Meilisearch / Tantivy guidance: enough to soak the
+/// thread pool but not so much that a flood of slow queries starves the
+/// writer task or balloons RAM via pinned searcher generations. Floored
+/// at 4 so single-core dev machines still parallelise BM25/ANN fan-out.
+fn default_search_concurrency() -> usize {
+    (std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        * 2)
+    .max(4)
+}
 
 /// Default Tantivy writer heap when callers do not pass an explicit
 /// budget. Retained for `spawn_writer_service` legacy entry points and
@@ -86,36 +99,74 @@ impl IndexMutationTx {
     }
 }
 
-/// Read-only handle to the index for the search path. Cheap to clone. Briefly
-/// locks a tokio `Mutex` on query; never blocks on writer progress because the
-/// writer task only holds the mutex per individual upsert/delete, not across
-/// commits.
+/// Read-only handle to the index for the search path. Cheap to clone.
+///
+/// Holds an `Arc<LixunIndex>` directly — no `Mutex`. Tantivy's
+/// `IndexReader` is internally `Arc`-cloneable and lock-free, and
+/// `LixunIndex`'s read methods (`search`, `search_with_breakdown`,
+/// `all_doc_ids`, `hydrate_doc_by_id`, `get_body_by_id`,
+/// `get_doc_by_id`) all take `&self`. The writer task in this same
+/// crate also holds a clone of the same `Arc<LixunIndex>` and only
+/// touches its own `IndexWriter`; per the Tantivy ARCHITECTURE
+/// guarantee, a commit on the writer never blocks an in-flight
+/// searcher (segments are immutable, old generations stay mmap'd
+/// until all searchers drop them). All synchronous tantivy work is
+/// dispatched via `tokio::task::spawn_blocking` to keep the async
+/// runtime responsive, with a `Semaphore` bounding in-flight
+/// searches at ~2× CPU cores.
 #[derive(Clone)]
 pub struct SearchHandle {
-    index: Arc<Mutex<LixunIndex>>,
+    index: Arc<LixunIndex>,
+    permits: Arc<Semaphore>,
 }
 
 impl SearchHandle {
-    pub fn new(index: Arc<Mutex<LixunIndex>>) -> Self {
-        Self { index }
+    pub fn new(index: Arc<LixunIndex>) -> Self {
+        Self::with_concurrency(index, default_search_concurrency())
+    }
+
+    pub fn with_concurrency(index: Arc<LixunIndex>, concurrency: usize) -> Self {
+        Self {
+            index,
+            permits: Arc::new(Semaphore::new(concurrency.max(1))),
+        }
+    }
+
+    async fn run_blocking<F, R>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce(&LixunIndex) -> Result<R> + Send + 'static,
+        R: Send + 'static,
+    {
+        let _permit = self
+            .permits
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow::anyhow!("search semaphore closed"))?;
+        let index = Arc::clone(&self.index);
+        let res = tokio::task::spawn_blocking(move || f(&index))
+            .await
+            .map_err(|e| anyhow::anyhow!("search task join error: {e}"))?;
+        drop(_permit);
+        res
     }
 
     pub async fn search(&self, query: &lixun_core::Query) -> Result<Vec<lixun_core::Hit>> {
-        let idx = self.index.lock().await;
-        idx.search(query)
+        let q = query.clone();
+        self.run_blocking(move |idx| idx.search(&q)).await
     }
 
     pub async fn search_with_breakdown(
         &self,
         query: &lixun_core::Query,
     ) -> Result<Vec<(lixun_core::Hit, lixun_core::ScoreBreakdown)>> {
-        let idx = self.index.lock().await;
-        idx.search_with_breakdown(query)
+        let q = query.clone();
+        self.run_blocking(move |idx| idx.search_with_breakdown(&q))
+            .await
     }
 
     pub async fn all_doc_ids(&self) -> Result<std::collections::HashSet<String>> {
-        let idx = self.index.lock().await;
-        idx.all_doc_ids()
+        self.run_blocking(|idx| idx.all_doc_ids()).await
     }
 
     /// Returns true when the doc identified by `doc_id` exists in the
@@ -123,13 +174,14 @@ impl SearchHandle {
     /// OCR enqueue short-circuit so a fresh reindex does not re-queue
     /// documents whose body was recovered in a prior OCR pass.
     pub async fn has_body(&self, doc_id: &str) -> Result<bool> {
-        let idx = self.index.lock().await;
-        Ok(idx.get_body_by_id(doc_id)?.is_some())
+        let id = doc_id.to_string();
+        self.run_blocking(move |idx| Ok(idx.get_body_by_id(&id)?.is_some()))
+            .await
     }
 
     pub async fn get_body(&self, doc_id: &str) -> Result<Option<String>> {
-        let idx = self.index.lock().await;
-        idx.get_body_by_id(doc_id)
+        let id = doc_id.to_string();
+        self.run_blocking(move |idx| idx.get_body_by_id(&id)).await
     }
 
     /// Reconstruct a `Hit` + `ScoreBreakdown` for a single doc without
@@ -140,8 +192,9 @@ impl SearchHandle {
         &self,
         doc_id: &str,
     ) -> Result<Option<(lixun_core::Hit, lixun_core::ScoreBreakdown)>> {
-        let idx = self.index.lock().await;
-        idx.hydrate_doc_by_id(doc_id)
+        let id = doc_id.to_string();
+        self.run_blocking(move |idx| idx.hydrate_doc_by_id(&id))
+            .await
     }
 }
 
@@ -190,7 +243,7 @@ pub fn spawn_writer_service_with_broadcaster(
     let num_threads = tantivy_num_threads.max(1);
     let writer = index.writer_with_num_threads(num_threads, tantivy_heap_bytes)?;
 
-    let shared = Arc::new(Mutex::new(index));
+    let shared = Arc::new(index);
     let search = SearchHandle::new(Arc::clone(&shared));
 
     let (tx, rx) = mpsc::channel::<Mutation>(4096);
@@ -207,7 +260,7 @@ pub fn spawn_writer_service_with_broadcaster(
 }
 
 async fn writer_loop(
-    shared: Arc<Mutex<LixunIndex>>,
+    shared: Arc<LixunIndex>,
     mut writer: TantivyIndexWriter<TantivyDoc>,
     mut rx: mpsc::Receiver<Mutation>,
     broadcaster: Arc<dyn MutationBroadcaster>,
@@ -255,7 +308,7 @@ async fn writer_loop(
                             &mut pending_barriers,
                             &mut dirty,
                             &mut last_commit,
-                        ).await {
+                        ) {
                             Ok(()) => flush_post_commit(
                                 &mut pending_batch,
                                 generation,
@@ -268,7 +321,7 @@ async fn writer_loop(
                     }
 
                     Mutation::Upsert(doc) => {
-                        if let Err(e) = apply_upsert(&shared, &mut writer, doc.as_ref()).await {
+                        if let Err(e) = apply_upsert(&shared, &mut writer, doc.as_ref()) {
                             tracing::warn!("IndexService: upsert {} failed: {}", doc.id.0, e);
                         } else {
                             pending_batch.upserts.push(upserted_doc_from(doc.as_ref()));
@@ -278,7 +331,7 @@ async fn writer_loop(
 
                     Mutation::UpsertMany(docs) => {
                         for doc in &docs {
-                            if let Err(e) = apply_upsert(&shared, &mut writer, doc).await {
+                            if let Err(e) = apply_upsert(&shared, &mut writer, doc) {
                                 tracing::warn!("IndexService: upsert {} failed: {}", doc.id.0, e);
                             } else {
                                 pending_batch.upserts.push(upserted_doc_from(doc));
@@ -288,7 +341,7 @@ async fn writer_loop(
                     }
 
                     Mutation::Delete(id) => {
-                        if let Err(e) = apply_delete(&shared, &mut writer, &id).await {
+                        if let Err(e) = apply_delete(&shared, &mut writer, &id) {
                             tracing::warn!("IndexService: delete {} failed: {}", id, e);
                         } else {
                             pending_batch.deletes.push(id);
@@ -298,7 +351,7 @@ async fn writer_loop(
 
                     Mutation::DeleteMany(ids) => {
                         for id in ids {
-                            if let Err(e) = apply_delete(&shared, &mut writer, &id).await {
+                            if let Err(e) = apply_delete(&shared, &mut writer, &id) {
                                 tracing::warn!("IndexService: delete {} failed: {}", id, e);
                             } else {
                                 pending_batch.deletes.push(id);
@@ -309,7 +362,7 @@ async fn writer_loop(
 
                     Mutation::DeleteSourceInstance { instance_id } => {
                         if let Err(e) =
-                            apply_delete_source_instance(&shared, &mut writer, &instance_id).await
+                            apply_delete_source_instance(&shared, &mut writer, &instance_id)
                         {
                             tracing::warn!(
                                 "IndexService: delete_source_instance {} failed: {}",
@@ -330,7 +383,7 @@ async fn writer_loop(
                     }
 
                     Mutation::UpsertBody { doc_id, body } => {
-                        match apply_upsert_body(&shared, &mut writer, &doc_id, body).await {
+                        match apply_upsert_body(&shared, &mut writer, &doc_id, body) {
                             Ok(Some(updated)) => {
                                 pending_batch.upserts.push(upserted_doc_from(&updated));
                                 dirty = true;
@@ -362,7 +415,7 @@ async fn writer_loop(
                         &mut pending_barriers,
                         &mut dirty,
                         &mut last_commit,
-                    ).await {
+                    ) {
                         Ok(()) => flush_post_commit(
                             &mut pending_batch,
                             generation,
@@ -381,44 +434,39 @@ async fn writer_loop(
     while let Ok(mutation) = rx.try_recv() {
         match mutation {
             Mutation::Upsert(doc) => {
-                if apply_upsert(&shared, &mut writer, doc.as_ref())
-                    .await
-                    .is_ok()
-                {
+                if apply_upsert(&shared, &mut writer, doc.as_ref()).is_ok() {
                     pending_batch.upserts.push(upserted_doc_from(doc.as_ref()));
                 }
                 dirty = true;
             }
             Mutation::UpsertMany(docs) => {
                 for doc in &docs {
-                    if apply_upsert(&shared, &mut writer, doc).await.is_ok() {
+                    if apply_upsert(&shared, &mut writer, doc).is_ok() {
                         pending_batch.upserts.push(upserted_doc_from(doc));
                     }
                     dirty = true;
                 }
             }
             Mutation::Delete(id) => {
-                if apply_delete(&shared, &mut writer, &id).await.is_ok() {
+                if apply_delete(&shared, &mut writer, &id).is_ok() {
                     pending_batch.deletes.push(id);
                 }
                 dirty = true;
             }
             Mutation::DeleteMany(ids) => {
                 for id in ids {
-                    if apply_delete(&shared, &mut writer, &id).await.is_ok() {
+                    if apply_delete(&shared, &mut writer, &id).is_ok() {
                         pending_batch.deletes.push(id);
                     }
                     dirty = true;
                 }
             }
             Mutation::DeleteSourceInstance { instance_id } => {
-                let _ = apply_delete_source_instance(&shared, &mut writer, &instance_id).await;
+                let _ = apply_delete_source_instance(&shared, &mut writer, &instance_id);
                 dirty = true;
             }
             Mutation::UpsertBody { doc_id, body } => {
-                if let Ok(Some(updated)) =
-                    apply_upsert_body(&shared, &mut writer, &doc_id, body).await
-                {
+                if let Ok(Some(updated)) = apply_upsert_body(&shared, &mut writer, &doc_id, body) {
                     pending_batch.upserts.push(upserted_doc_from(&updated));
                     dirty = true;
                 }
@@ -436,8 +484,7 @@ async fn writer_loop(
             &mut pending_barriers,
             &mut dirty,
             &mut last_commit,
-        )
-        .await;
+        );
         flush_post_commit(&mut pending_batch, generation, &broadcaster);
     }
     for reply in pending_barriers.drain(..) {
@@ -449,53 +496,49 @@ async fn writer_loop(
     );
 }
 
-async fn apply_upsert(
-    shared: &Arc<Mutex<LixunIndex>>,
+fn apply_upsert(
+    shared: &LixunIndex,
     writer: &mut TantivyIndexWriter<TantivyDoc>,
     doc: &Document,
 ) -> Result<()> {
-    let mut idx = shared.lock().await;
-    idx.upsert(doc, writer)?;
+    shared.upsert(doc, writer)?;
     Ok(())
 }
 
-async fn apply_delete(
-    shared: &Arc<Mutex<LixunIndex>>,
+fn apply_delete(
+    shared: &LixunIndex,
     writer: &mut TantivyIndexWriter<TantivyDoc>,
     id: &str,
 ) -> Result<()> {
-    let mut idx = shared.lock().await;
-    idx.delete_by_id(id, writer)?;
+    shared.delete_by_id(id, writer)?;
     Ok(())
 }
 
-async fn apply_upsert_body(
-    shared: &Arc<Mutex<LixunIndex>>,
+fn apply_upsert_body(
+    shared: &LixunIndex,
     writer: &mut TantivyIndexWriter<TantivyDoc>,
     doc_id: &str,
     body: String,
 ) -> Result<Option<Document>> {
-    let mut idx = shared.lock().await;
-    let Some(mut doc) = idx.get_doc_by_id(doc_id)? else {
+    let Some(mut doc) = shared.get_doc_by_id(doc_id)? else {
         return Ok(None);
     };
     doc.body = Some(body);
-    idx.upsert(&doc, writer)?;
+    shared.upsert(&doc, writer)?;
     Ok(Some(doc))
 }
 
-async fn apply_delete_source_instance(
-    shared: &Arc<Mutex<LixunIndex>>,
+fn apply_delete_source_instance(
+    shared: &LixunIndex,
     writer: &mut TantivyIndexWriter<TantivyDoc>,
     instance_id: &str,
 ) -> Result<()> {
-    let mut idx = shared.lock().await;
-    idx.delete_by_source_instance(instance_id, writer)?;
+    shared.delete_by_source_instance(instance_id, writer)?;
     Ok(())
 }
 
-async fn do_commit(
-    shared: &Arc<Mutex<LixunIndex>>,
+fn do_commit(
+    shared: &LixunIndex,
     writer: &mut TantivyIndexWriter<TantivyDoc>,
     generation: &mut u64,
     pending_barriers: &mut Vec<oneshot::Sender<u64>>,
@@ -503,10 +546,7 @@ async fn do_commit(
     last_commit: &mut Instant,
 ) -> Result<()> {
     let start = Instant::now();
-    {
-        let mut idx = shared.lock().await;
-        idx.commit(writer)?;
-    }
+    shared.commit(writer)?;
     *generation += 1;
     *dirty = false;
     *last_commit = Instant::now();

@@ -1,9 +1,9 @@
 //! Abstract body-presence check so `FsSource` can skip OCR enqueue
 //! for documents whose body was already recovered in a prior pass,
 //! without pulling in the concrete `lixun-indexer::SearchHandle` (and
-//! its tokio `Mutex<LixunIndex>`). The daemon supplies an adapter
-//! that bridges this trait to the real `SearchHandle`; tests supply
-//! a simple mock.
+//! its tokio runtime + spawn_blocking machinery). The daemon supplies
+//! an adapter that bridges this trait to the real `SearchHandle`;
+//! tests supply a simple mock.
 //!
 //! AGENTS.md modularity rule: domain-specific infrastructure (the
 //! Tantivy reader, the tokio runtime that wraps it) must not leak
