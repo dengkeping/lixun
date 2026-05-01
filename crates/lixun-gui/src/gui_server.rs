@@ -111,6 +111,12 @@ fn dispatch(controller: &LauncherController, cmd: GuiCommand) -> GuiResponse {
                 visible: controller.is_visible(),
             }
         }
+        GuiCommand::ExitPreviewMode => {
+            controller.exit_preview_mode();
+            GuiResponse::Ok {
+                visible: controller.is_visible(),
+            }
+        }
     }
 }
 

@@ -172,6 +172,29 @@ pub(crate) struct LauncherController {
     user_selected_override: std::rc::Rc<std::cell::Cell<bool>>,
     #[allow(dead_code)]
     searching_indicator: std::rc::Rc<std::cell::Cell<bool>>,
+    /// True between Space-to-preview and Escape/launch. While true,
+    /// arrow-key selection changes fan out to the preview daemon
+    /// (debounced) so the user sees the highlighted row rendered
+    /// live, Spotlight-style. Also gates `focus_ctrl.connect_leave`:
+    /// clicking into the preview window yields launcher focus, and
+    /// without this gate the leave handler would auto-hide the
+    /// launcher and kill the preview session. Reset by Escape
+    /// (keymap), hide() (soft), clear_and_hide() (launch), and
+    /// quit(). Oracle invariant: preview-mode-active belongs to the
+    /// launcher, not the daemon — the daemon is source of truth for
+    /// the preview process lifecycle, the launcher is source of
+    /// truth for "should we still be live-previewing at all".
+    preview_mode_active: std::rc::Rc<std::cell::Cell<bool>>,
+    /// Pending debounce for selection-driven preview updates. 50ms
+    /// per Oracle compromise: short enough that the user sees the
+    /// preview track their arrows, long enough that holding an
+    /// arrow key does not fire one preview per row traversed
+    /// (which would thrash the preview plugin's build/update path
+    /// and defeat the Ready-state reuse in `preview_spawn.rs`). The
+    /// preview-side epoch-drop from lixun-ipc::preview::PROTOCOL_VERSION
+    /// protects against races we don't debounce out — this is a
+    /// belt-and-suspenders design (Oracle #10).
+    preview_debounce: std::rc::Rc<std::cell::RefCell<Option<glib::SourceId>>>,
 }
 
 impl LauncherController {
@@ -239,6 +262,8 @@ impl LauncherController {
     /// (Escape, focus-loss, toggle-off, preview-open, preview-close).
     /// Does NOT exit the process; only `quit()` does.
     pub(crate) fn hide(&self) -> bool {
+        self.cancel_preview_debounce();
+        self.preview_mode_active.set(false);
         self.persist_session();
         self.animate_hide();
         false
@@ -249,6 +274,8 @@ impl LauncherController {
     /// double-click, calculator copy) where the user has finished
     /// the task and expects a fresh launcher next time.
     pub(crate) fn clear_and_hide(&self) -> bool {
+        self.cancel_preview_debounce();
+        self.preview_mode_active.set(false);
         self.clear_session();
         self.animate_hide();
         false
@@ -310,6 +337,40 @@ impl LauncherController {
     /// in the entry handler.
     pub(crate) fn mark_user_selected(&self) {
         self.user_selected_override.set(true);
+    }
+
+    pub(crate) fn set_preview_mode_active(&self, active: bool) {
+        self.preview_mode_active.set(active);
+        if !active {
+            self.cancel_preview_debounce();
+        }
+    }
+
+    pub(crate) fn preview_mode_active(&self) -> bool {
+        self.preview_mode_active.get()
+    }
+
+    /// React to `GuiCommand::ExitPreviewMode` from the daemon: the
+    /// warm preview process reported that the user dismissed its
+    /// window (Escape/Space inside preview), so we must leave
+    /// preview mode and hand keyboard focus back to the search
+    /// entry. Without the `grab_focus`, the compositor may have
+    /// given focus to the preview window when it was first shown
+    /// (layer-shell + `KeyboardMode::OnDemand` does not guarantee
+    /// who owns keyboard focus), and after the preview hides its
+    /// surface the compositor has no obvious replacement — the
+    /// launcher would keep rendering but arrow keys would go
+    /// nowhere. The explicit grab brings keyboard focus back to
+    /// the entry so the user can keep typing / arrowing.
+    pub(crate) fn exit_preview_mode(&self) {
+        self.set_preview_mode_active(false);
+        self.entry.grab_focus();
+    }
+
+    fn cancel_preview_debounce(&self) {
+        if let Some(id) = self.preview_debounce.borrow_mut().take() {
+            id.remove();
+        }
     }
 
     /// Reset every piece of session state so the next show is clean.
@@ -527,7 +588,15 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
     window.set_widget_name("lixun-root");
 
     window.init_layer_shell();
-    window.set_layer(gtk4_layer_shell::Layer::Overlay);
+    // Layer::Top (not Overlay) so that the preview window
+    // (Layer::Overlay) and IM popups (fcitx5 candidate/language guides,
+    // which the compositor draws above launcher's layer) appear ABOVE
+    // the launcher rather than under it. Layer-shell protocol declares
+    // ordering between same-layer surfaces undefined, so when both
+    // launcher and preview lived on Overlay the preview lost the race
+    // and was hidden behind the launcher. Keeping launcher one layer
+    // below preview makes the z-order deterministic on every compositor.
+    window.set_layer(gtk4_layer_shell::Layer::Top);
     // Anchor only Top. Leaving Left and Right unanchored lets the
     // layer-shell compositor center the window horizontally on the
     // monitor — anchoring both edges would stretch the surface to
@@ -703,6 +772,10 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
         std::rc::Rc::new(std::cell::Cell::new(false));
     let searching_indicator: std::rc::Rc<std::cell::Cell<bool>> =
         std::rc::Rc::new(std::cell::Cell::new(false));
+    let preview_mode_active: std::rc::Rc<std::cell::Cell<bool>> =
+        std::rc::Rc::new(std::cell::Cell::new(false));
+    let preview_debounce: std::rc::Rc<std::cell::RefCell<Option<glib::SourceId>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
 
     let controller = std::rc::Rc::new(LauncherController {
         window: window.clone(),
@@ -723,6 +796,8 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
         is_restoring: std::rc::Rc::clone(&is_restoring),
         user_selected_override: std::rc::Rc::clone(&user_selected_override),
         searching_indicator: std::rc::Rc::clone(&searching_indicator),
+        preview_mode_active: std::rc::Rc::clone(&preview_mode_active),
+        preview_debounce: std::rc::Rc::clone(&preview_debounce),
     });
 
     let close_action = gio::SimpleAction::new("close-launcher", None);
@@ -731,6 +806,47 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
         controller_for_close.hide();
     });
     app.add_action(&close_action);
+
+    {
+        let controller_for_sel = std::rc::Rc::clone(&controller);
+        let window_for_sel = window.clone();
+        selection.connect_selected_notify(move |sel| {
+            if !controller_for_sel.preview_mode_active() {
+                return;
+            }
+            let idx = sel.selected();
+            if idx == gtk::INVALID_LIST_POSITION {
+                return;
+            }
+            let Some(obj) = sel.item(idx) else { return };
+            let Some(str_obj) = obj.downcast_ref::<gtk::StringObject>() else {
+                return;
+            };
+            let doc_id = str_obj.string().to_string();
+
+            controller_for_sel.cancel_preview_debounce();
+            let controller_inner = std::rc::Rc::clone(&controller_for_sel);
+            let window_inner = window_for_sel.clone();
+            let id = glib::timeout_add_local_once(Duration::from_millis(50), move || {
+                *controller_inner.preview_debounce.borrow_mut() = None;
+                if !controller_inner.preview_mode_active() {
+                    return;
+                }
+                let monitor = crate::ipc::current_monitor_connector(&window_inner);
+                crate::factory::with_cached_hits(|hits| {
+                    if let Some(hit) = hits.iter().find(|h| h.id.0 == doc_id) {
+                        crate::ipc::send_preview_request(hit, monitor.clone());
+                    }
+                });
+                // Keep keyboard focus in the search entry so the
+                // next arrow press is delivered to the launcher,
+                // not stolen by the preview surface the compositor
+                // may have just focused.
+                controller_inner.entry.grab_focus();
+            });
+            *controller_for_sel.preview_debounce.borrow_mut() = Some(id);
+        });
+    }
 
     let clear_action = gio::SimpleAction::new("clear-and-hide-launcher", None);
     let controller_for_clear = std::rc::Rc::clone(&controller);
@@ -796,6 +912,10 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
         tracing::info!("gui: focus_ctrl LEAVE fired, just_showed_until check");
         if Instant::now() < just_showed_for_leave.get() {
             tracing::info!("gui: spurious leave during show transition, ignored");
+            return;
+        }
+        if controller_for_leave.preview_mode_active() {
+            tracing::info!("gui: focus_ctrl LEAVE suppressed — preview mode active");
             return;
         }
         tracing::info!("gui: focus_ctrl LEAVE → controller.hide()");
