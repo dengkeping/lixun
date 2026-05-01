@@ -106,6 +106,17 @@ pub trait IndexerSource: Send + Sync {
         false
     }
 
+    /// Whether this source exclusively claims the query, suppressing
+    /// all other sources and the Tantivy/BM25 index search. When any
+    /// plugin returns `true`, the daemon skips fusion entirely and
+    /// runs ONLY the claiming plugin's `on_query`, returning a single
+    /// result (Spotlight-style exclusive UX). Used by calculator
+    /// (`= 2+2`) and shell (`> ls`) to prevent BM25 garbage flooding
+    /// the results. Default returns `false`.
+    fn claims_query(&self, _query: &str) -> bool {
+        false
+    }
+
     /// Declarative right-click menu for rows produced by this
     /// source. The GUI caches the translated menu model keyed by
     /// `Hit::source_instance`, so sources MUST return a stable,

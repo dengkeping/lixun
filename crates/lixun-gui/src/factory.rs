@@ -123,24 +123,37 @@ pub(crate) fn update_results(
 /// key is no longer in `new_hits` are removed. Rows in `new_hits`
 /// not yet in `model` are appended. The CACHED_HITS store is
 /// updated to reflect the merged set so row factories can render
-/// against the latest snapshot. Selection is restored by doc_id
-/// when possible.
+/// against the latest snapshot.
+///
+/// `preserve_selection` controls whether the prior selected doc_id
+/// is restored after the merge. Pass `true` only when the user has
+/// explicitly chosen a row (Up/Down arrow or click) and that choice
+/// must survive a streaming refresh. Pass `false` for fresh keystrokes
+/// — the response poller will pin selection to row 0 (top hit) after
+/// the merge returns. This separation is critical: without it, GTK's
+/// SingleSelection drifts to whatever doc_id was selected from the
+/// PREVIOUS query, and if that doc_id happens to appear in the new
+/// hits (common for substring queries like "AQL-HSSA" → "AQ"), the
+/// cursor lands on a non-row-0 position instead of the new top hit.
 pub(crate) fn update_results_merge(
     model: &gtk::StringList,
     selection: &gtk::SingleSelection,
     new_hits: &[Hit],
     top_hit_doc_id: Option<String>,
+    preserve_selection: bool,
 ) {
     let prev_autoselect = selection.is_autoselect();
     selection.set_autoselect(false);
 
-    let prior_selected_doc_id: Option<String> = {
+    let prior_selected_doc_id: Option<String> = if preserve_selection {
         let idx = selection.selected();
         selection.item(idx).and_then(|obj| {
             obj.downcast::<gtk::StringObject>()
                 .ok()
                 .map(|s| s.string().to_string())
         })
+    } else {
+        None
     };
 
     let new_keys: std::collections::HashSet<(String, String)> = new_hits

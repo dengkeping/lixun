@@ -524,7 +524,7 @@ impl LauncherController {
         self.chips.container.set_visible(true);
         if !snapshot.hits.is_empty() {
             self.scrolled.set_visible(true);
-            self.scrolled.set_vexpand(true);
+            self.scrolled.set_vexpand(false);
         }
 
         self.entry.set_text(&snapshot.query);
@@ -1017,7 +1017,13 @@ fn install_response_poller(
                 seen_initial.set(true);
                 tracing::debug!("gui: poller render Initial hits={}", plan.hits.len());
                 if !plan.hits.is_empty() {
-                    update_results_merge(&model, &selection, &plan.hits, top_hit_doc_id);
+                    update_results_merge(
+                        &model,
+                        &selection,
+                        &plan.hits,
+                        top_hit_doc_id,
+                        preserve_doc_id,
+                    );
                     searching_indicator.set(true);
                 } else {
                     searching_indicator.set(true);
@@ -1029,7 +1035,13 @@ fn install_response_poller(
                     seen_initial.get()
                 );
                 if seen_initial.get() {
-                    update_results_merge(&model, &selection, &plan.hits, top_hit_doc_id);
+                    update_results_merge(
+                        &model,
+                        &selection,
+                        &plan.hits,
+                        top_hit_doc_id,
+                        preserve_doc_id,
+                    );
                 } else {
                     update_results(&model, &selection, &plan.hits, top_hit_doc_id);
                 }
@@ -1088,7 +1100,7 @@ fn install_response_poller(
                 chips_container.set_visible(true);
                 let list_has_rows = !plan.hits.is_empty();
                 scrolled.set_visible(list_has_rows);
-                scrolled.set_vexpand(list_has_rows);
+                scrolled.set_vexpand(false);
                 if searching_indicator.get() {
                     status.show_empty("Searching...");
                 } else {
@@ -1162,6 +1174,19 @@ fn install_entry_handler(
             }
             last_query.borrow_mut().clear();
             clear_cached_hits();
+            
+            {
+                let mut resp = ipc.responses.lock().unwrap();
+                resp.clear();
+            }
+            {
+                let mut calc = ipc.calculation.lock().unwrap();
+                *calc = None;
+            }
+            {
+                let mut top = ipc.top_hit.lock().unwrap();
+                *top = None;
+            }
 
             // Disable autoselect around the bulk clear so
             // SingleSelection's interpolation formula
@@ -1187,6 +1212,35 @@ fn install_entry_handler(
         // Fresh keystroke => fresh ranking, row 0 wins. Clear the
         // override so the poller snaps to row 0 on this response.
         user_selected_override.set(false);
+
+        // Bump session epoch on every non-empty keystroke (not just
+        // empty). Without this, in-flight IPC replies for the
+        // PREVIOUS query land in the shared `ipc.responses` mutex
+        // with a matching epoch and the poller renders them as if
+        // they were results for the CURRENT query — visible as
+        // "type AQL-HSSA, backspace to AQ, see AQL-HSSA results
+        // back in the list". Bumping here invalidates every
+        // outstanding chunk: the IPC reader breaks its read loop
+        // (ipc.rs epoch_at_send check) and any chunk that did
+        // commit before the bump gets dropped on epoch mismatch
+        // (ipc.rs resp_epoch check).
+        //
+        // Also drain the shared response slots so the poller does
+        // not pick up stale leftovers between the bump and the
+        // next chunk arrival.
+        session_epoch.fetch_add(1, Ordering::SeqCst);
+        {
+            let mut resp = ipc.responses.lock().unwrap();
+            resp.clear();
+        }
+        {
+            let mut calc = ipc.calculation.lock().unwrap();
+            *calc = None;
+        }
+        {
+            let mut top = ipc.top_hit.lock().unwrap();
+            *top = None;
+        }
 
         chips_container.set_visible(true);
 

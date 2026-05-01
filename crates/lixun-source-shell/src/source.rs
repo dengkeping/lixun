@@ -36,10 +36,31 @@ impl IndexerSource for ShellSource {
     }
 
     fn on_query(&self, query: &str, ctx: &QueryContext) -> Vec<Hit> {
-        let cmd = match query.strip_prefix('>').map(str::trim_start) {
-            Some(s) if !s.is_empty() => s,
-            _ => return Vec::new(),
+        let body = match query.strip_prefix('>') {
+            Some(rest) => rest.trim_start(),
+            None => return Vec::new(),
         };
+        if body.is_empty() {
+            return vec![Hit {
+                id: DocId("shell:__placeholder__".into()),
+                category: Category::Shell,
+                title: "Run a shell command".into(),
+                subtitle: "Type a command after >".into(),
+                icon_name: Some("utilities-terminal".into()),
+                kind_label: Some("Shell".into()),
+                score: 900.0,
+                action: Action::ReplaceQuery { q: query.into() },
+                extract_fail: false,
+                sender: None,
+                recipients: None,
+                body: None,
+                secondary_action: None,
+                source_instance: ctx.instance_id.to_string(),
+                row_menu: RowMenuDef::empty(),
+                mime: None,
+            }];
+        }
+        let cmd = body;
         let risky = RISKY_RE.is_match(cmd);
         if self.strict_mode && risky {
             return Vec::new();
@@ -75,6 +96,10 @@ impl IndexerSource for ShellSource {
     }
 
     fn excludes_from_query_log(&self, query: &str) -> bool {
+        query.trim_start().starts_with('>')
+    }
+
+    fn claims_query(&self, query: &str) -> bool {
         query.trim_start().starts_with('>')
     }
 

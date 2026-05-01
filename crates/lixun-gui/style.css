@@ -67,13 +67,12 @@ window {
 
 /* ----- Results container -----
    Stretches vertically via scrolled.vexpand(true) to fill whatever
-   height the window has after entry + chips + margins. Absolute
-   floor below keeps the list visible if the window is pathologically
-   short for some reason. */
+   height the window has after entry + chips + margins. NO min-height:
+   single-hit results (shell/calc) must collapse to natural row height
+   without forcing dead space below. */
 .lixun-results {
     background-color: transparent;
     padding-top: 12px;
-    min-height: 200px;
 }
 
 /* ----- Hit row ----- */

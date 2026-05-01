@@ -159,6 +159,14 @@ pub(crate) fn start_ipc_thread(session_epoch: Arc<AtomicU64>) -> IpcClient {
                             break;
                         }
 
+                        if epoch_at_send != session_epoch.load(Ordering::SeqCst) {
+                            tracing::debug!(
+                                "ipc: session epoch changed after chunk read, dropping commit (sent in epoch {})",
+                                epoch_at_send
+                            );
+                            break;
+                        }
+
                         if let Ok(mut r) = resp_clone_inner.lock() {
                             *r = hits;
                         }
