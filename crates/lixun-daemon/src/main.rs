@@ -1375,6 +1375,18 @@ async fn handle_client(
                     break;
                 }
             }
+            Request::PreviewHide => {
+                let resp = match preview_spawner.hide().await {
+                    Ok(()) => Response::Ok,
+                    Err(e) => {
+                        tracing::error!("preview_spawn: hide failed: {}", e);
+                        Response::Error(format!("preview hide failed: {}", e))
+                    }
+                };
+                if write_tx.send(resp).await.is_err() {
+                    break;
+                }
+            }
             Request::EnumeratePlugins => {
                 let resp = Response::PluginManifest(registry.cli_manifest());
                 if write_tx.send(resp).await.is_err() {

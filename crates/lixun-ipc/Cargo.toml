@@ -13,3 +13,5 @@ tokio.workspace = true
 tokio-util = { workspace = true, features = ["codec"] }
 bytes.workspace = true
 chrono.workspace = true
+dirs = "5"
+libc = "0.2"

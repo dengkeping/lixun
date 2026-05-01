@@ -13,6 +13,7 @@ use tokio_util::codec::{Decoder, Encoder};
 use lixun_core::{Hit, ImpactProfile, SystemImpact};
 
 pub mod gui;
+pub mod preview;
 
 pub const PROTOCOL_VERSION: u16 = 4;
 
@@ -123,6 +124,15 @@ pub enum Request {
         hit: Box<Hit>,
         monitor: Option<String>,
     },
+    /// Tell the daemon to hide the currently-shown preview without
+    /// killing the warm preview process. Sent by the launcher when
+    /// the user presses Escape with `preview_mode_active=true`.
+    /// The daemon translates this into `PreviewCommand::Hide` over
+    /// the per-process preview socket; the preview hides its
+    /// window, schedules its 60s idle timer, and stays warm. The
+    /// daemon also replies to the launcher with
+    /// `GuiCommand::ExitPreviewMode` to flip the launcher's flag.
+    PreviewHide,
     /// Ask the daemon for the flattened CLI manifest contributed by
     /// every registered plugin. The host CLI uses this once at startup
     /// to synthesize subcommands without learning any plugin name at

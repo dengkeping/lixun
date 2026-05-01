@@ -40,6 +40,17 @@ pub enum GuiCommand {
     /// fired during the Space → preview handoff), so this command
     /// does not flip visibility.
     ClearSession,
+    /// Exit preview mode: reset the launcher's `preview_mode_active`
+    /// flag and restore keyboard focus to the search entry. Sent by
+    /// the daemon after the warm preview process reports
+    /// `PreviewEvent::Closed` (user dismissed preview via Escape or
+    /// Space inside the preview window). Without this, the launcher
+    /// stays stuck in preview mode: arrow-key scrub would keep
+    /// re-spawning preview windows, because `preview_mode_active`
+    /// would never flip back to false. Must arrive *after* `Show`
+    /// in the Closed handler so the launcher is already visible
+    /// when focus is grabbed.
+    ExitPreviewMode,
 }
 
 /// Response from the GUI to a `GuiCommand`.

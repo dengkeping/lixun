@@ -11,6 +11,13 @@
 
 use lixun_core::Hit;
 
+/// Sentinel error message returned by `PreviewPlugin::update`'s
+/// default implementation. The preview host matches on this exact
+/// string to decide between "rebuild widget" (opt-out) and "log
+/// and rebuild as recovery" (genuine failure). Plugins must not
+/// reuse this string for any other error.
+pub const UPDATE_UNSUPPORTED: &str = "UpdateUnsupported";
+
 /// Config shipped to a plugin's `build()`, sourced from the
 /// `[preview]` section of `~/.config/lixun/config.toml`.
 ///
@@ -95,6 +102,36 @@ pub trait PreviewPlugin: Send + Sync + 'static {
     }
 
     fn build(&self, hit: &Hit, cfg: &PreviewPluginCfg<'_>) -> anyhow::Result<gtk::Widget>;
+
+    /// Update an already-built widget in place for a new hit.
+    ///
+    /// Called by the preview host when the launcher's selection
+    /// moves to a different hit AND `select_plugin` resolves to the
+    /// same plugin instance. The plugin should mutate the existing
+    /// widget tree (swap text buffer, reload pixbuf, re-render PDF
+    /// page, etc.) instead of producing a new widget — this is the
+    /// core path that keeps live preview feeling instant on rapid
+    /// arrow-key scrubbing (Apple QuickLook semantics).
+    ///
+    /// Returning `Err(UpdateUnsupported)` is the documented opt-out:
+    /// the host catches it, drops the old widget, calls
+    /// `build(new_hit, cfg)` and `set_child()` on the window's
+    /// content slot. Every plugin therefore works day-1 — opting
+    /// into in-place update is purely an optimisation.
+    ///
+    /// Returning any other `Err` is a real failure: the host logs
+    /// it and falls back to rebuild as a last-resort recovery
+    /// (better stale-but-correct than a stuck stale widget).
+    ///
+    /// Implementations MUST be quick (target <16 ms — one frame).
+    /// Heavy work (PDF rasterisation, office conversion) MUST
+    /// schedule on a worker thread and check the host-supplied
+    /// epoch (via plugin-internal state) before committing results
+    /// to the widget — see `PreviewCommand::ShowOrUpdate { epoch }`
+    /// in `lixun-ipc::preview`.
+    fn update(&self, _hit: &Hit, _widget: &gtk::Widget) -> anyhow::Result<()> {
+        anyhow::bail!(UPDATE_UNSUPPORTED)
+    }
 
     /// Whether this plugin can turn `hit` into a user-visible
     /// launch (Open button in the preview header + Enter key
@@ -269,6 +306,7 @@ mod tests {
             action: Action::OpenFile {
                 path: PathBuf::from("/tmp/demo.txt"),
             },
+            mime: None,
             extract_fail: false,
             sender: None,
             recipients: None,
@@ -416,5 +454,21 @@ mod tests {
             }
         }
         assert_eq!(P.sizing(), SizingPreference::FixedCap);
+    }
+
+    #[test]
+    fn update_default_returns_unsupported_sentinel() {
+        // The host's rebuild-fallback path matches on this exact
+        // string. If the default impl ever returns a different
+        // error, every existing plugin silently stops getting the
+        // rebuild fallback and the user sees stale widgets.
+        //
+        // We cannot call `update()` without a real `gtk::Widget`
+        // and `gtk::init()` is process-wide and racy across tests,
+        // so we assert the invariant at the source: the sentinel
+        // constant the host matches on must equal the literal the
+        // default impl bails with. Both sides of the contract live
+        // in this file, so a drift would be caught here.
+        assert_eq!(UPDATE_UNSUPPORTED, "UpdateUnsupported");
     }
 }

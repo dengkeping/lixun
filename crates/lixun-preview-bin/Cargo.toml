@@ -17,6 +17,7 @@ lixun-core = { path = "../lixun-core" }
 lixun-preview = { path = "../lixun-preview" }
 lixun-preview-bundle = { path = "../lixun-preview-bundle" }
 lixun-daemon = { path = "../lixun-daemon" }
+lixun-ipc = { path = "../lixun-ipc" }
 anyhow.workspace = true
 clap.workspace = true
 inventory.workspace = true
@@ -24,6 +25,8 @@ serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+async-channel = "2"
+libc = "0.2"
 glib = "0.20"
 gtk = { package = "gtk4", version = "0.9", features = ["v4_12"] }
 gtk4-layer-shell = "0.5"

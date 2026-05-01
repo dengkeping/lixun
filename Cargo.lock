@@ -5200,6 +5200,8 @@ version = "0.6.0"
 dependencies = [
  "bytes",
  "chrono",
+ "dirs 5.0.1",
+ "libc",
  "lixun-core",
  "lixun-mutation",
  "serde",
@@ -5260,13 +5262,16 @@ name = "lixun-preview-bin"
 version = "0.6.0"
 dependencies = [
  "anyhow",
+ "async-channel",
  "clap",
  "glib 0.20.12",
  "gtk4",
  "gtk4-layer-shell",
  "inventory",
+ "libc",
  "lixun-core",
  "lixun-daemon",
+ "lixun-ipc",
  "lixun-preview",
  "lixun-preview-bundle",
  "serde",

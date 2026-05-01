@@ -204,7 +204,33 @@ pub(crate) fn install_keyboard_handler(
             // continue typing — that is the Raycast/Alfred contract.
             // Without this, once focus moves to the list the launcher
             // becomes a dead keyboard surface until Escape/Enter/click.
-            if !entry_has_focus(&entry, &window)
+            // Typing while preview is active dismisses the preview and
+            // forwards the key to the Entry. Mirrors Spotlight/Alfred:
+            // any printable key or Backspace ends the QuickLook session
+            // and resumes search-as-you-type. Returning Proceed lets
+            // GtkEntry's IM context (fcitx5 preedit/composition) own
+            // the keystroke — bypassing IM here is what produced the
+            // reversed-character / select-all chaos with Cyrillic input.
+            if controller.preview_mode_active()
+                && (is_printable_key(key, state) || key == gtk::gdk::Key::BackSpace)
+                && !accel_matches(&keybindings.quick_look, key, state)
+                && !accel_matches(&keybindings.close, key, state)
+                && !accel_matches(&keybindings.primary_action, key, state)
+                && !accel_matches(&keybindings.secondary_action, key, state)
+            {
+                crate::ipc::send_preview_hide_request();
+                controller.set_preview_mode_active(false);
+                entry.grab_focus();
+                return glib::signal::Propagation::Proceed;
+            }
+            // Synthetic printable-key warp is disabled while preview is
+            // active. Under the passive-preview model the launcher Entry
+            // always retains focus, so this path is unreachable in
+            // preview mode; running it anyway would bypass the IM
+            // context (fcitx5 preedit/composition) and produce reversed
+            // characters or stray select-all on language switch.
+            if !controller.preview_mode_active()
+                && !entry_has_focus(&entry, &window)
                 && is_printable_key(key, state)
                 && !accel_matches(&keybindings.quick_look, key, state)
                 && let Some(ch) = key.to_unicode()
@@ -215,8 +241,6 @@ pub(crate) fn install_keyboard_handler(
                 entry.set_text(&appended);
                 entry.set_position(-1);
                 entry.grab_focus();
-                // Move the caret to the end after grab_focus (which by
-                // default selects all text).
                 entry.set_position(-1);
                 return glib::signal::Propagation::Stop;
             }
@@ -231,7 +255,8 @@ pub(crate) fn install_keyboard_handler(
             // entry. Bare Backspace only — Ctrl/Alt/Super variants
             // fall through so future word-delete accels stay
             // available.
-            if !entry_has_focus(&entry, &window)
+            if !controller.preview_mode_active()
+                && !entry_has_focus(&entry, &window)
                 && key == gtk::gdk::Key::BackSpace
                 && !state.intersects(
                     gtk::gdk::ModifierType::CONTROL_MASK
@@ -277,7 +302,7 @@ pub(crate) fn install_keyboard_handler(
                         scroll_with_margin(&list_view, &selection, target, -1);
                         controller.mark_user_selected();
                     }
-                    if entry_had_focus {
+                    if entry_had_focus && !controller.preview_mode_active() {
                         list_view.grab_focus();
                     }
                     return glib::signal::Propagation::Stop;
@@ -288,7 +313,7 @@ pub(crate) fn install_keyboard_handler(
                     selection.set_selected(target);
                     controller.mark_user_selected();
                     scroll_with_margin(&list_view, &selection, target, -1);
-                    if entry_had_focus {
+                    if entry_had_focus && !controller.preview_mode_active() {
                         list_view.grab_focus();
                     }
                 } else {
@@ -310,7 +335,7 @@ pub(crate) fn install_keyboard_handler(
                         scroll_with_margin(&list_view, &selection, target, 1);
                         controller.mark_user_selected();
                     }
-                    if entry_had_focus {
+                    if entry_had_focus && !controller.preview_mode_active() {
                         list_view.grab_focus();
                     }
                     return glib::signal::Propagation::Stop;
@@ -323,12 +348,26 @@ pub(crate) fn install_keyboard_handler(
                     controller.mark_user_selected();
                     scroll_with_margin(&list_view, &selection, target, 1);
                 }
-                if entry_had_focus && n > 0 {
+                if entry_had_focus && n > 0 && !controller.preview_mode_active() {
                     list_view.grab_focus();
                 }
                 glib::signal::Propagation::Stop
             } else if accel_matches(&keybindings.close, key, state) {
-                controller.hide();
+                if controller.preview_mode_active() {
+                    // Two-stage Escape: first press dismisses
+                    // the preview only (warm process stays
+                    // running), second press (preview_mode_active
+                    // now false) hides the launcher. Spotlight
+                    // QuickLook semantics. The IPC roundtrips
+                    // through the daemon which then dispatches
+                    // ExitPreviewMode back — but we reset the
+                    // local flag synchronously here too so the
+                    // next arrow keypress doesn't race the IPC.
+                    crate::ipc::send_preview_hide_request();
+                    controller.set_preview_mode_active(false);
+                } else {
+                    controller.hide();
+                }
                 glib::signal::Propagation::Stop
             } else if accel_matches(&keybindings.primary_action, key, state)
                 || accel_matches(&keybindings.secondary_action, key, state)
@@ -361,6 +400,10 @@ pub(crate) fn install_keyboard_handler(
                 // ReplaceQuery keeps the launcher visible and is
                 // mid-session, so it must NOT clear.
                 if should_hide {
+                    if controller.preview_mode_active() {
+                        crate::ipc::send_preview_hide_request();
+                        controller.set_preview_mode_active(false);
+                    }
                     controller.clear_and_hide();
                 }
                 glib::signal::Propagation::Stop
@@ -379,10 +422,18 @@ pub(crate) fn install_keyboard_handler(
             {
                 // Only trigger when focus is NOT in entry (i.e. list is focused)
                 // so space can still be typed into the search field.
+                controller.set_preview_mode_active(true);
                 let monitor = current_monitor_connector(&window);
                 selected_hit_in(&selection, &filter_model, |hit| {
                     send_preview_request(hit, monitor.clone());
                 });
+                // Re-assert keyboard focus on the search entry.
+                // The preview window presents itself on a layer-
+                // shell surface and some compositors hand it
+                // keyboard focus even with KeyboardMode::OnDemand.
+                // Grabbing focus here ensures arrow-key scrub is
+                // delivered to the launcher, not the preview.
+                entry.grab_focus();
                 glib::signal::Propagation::Stop
             } else if accel_matches(&keybindings.filter_all, key, state) {
                 chips.activate_index(0);
