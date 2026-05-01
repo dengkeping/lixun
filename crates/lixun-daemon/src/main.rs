@@ -819,78 +819,123 @@ async fn process_search_chunk(
 )> {
     let now = chrono::Utc::now().timestamp();
     
-    {
-        let frecency_store = frecency.read().await;
-        let latch_store = query_latch.read().await;
-        let alpha = config.ranking_frecency_alpha;
-        let w = config.ranking_latch_weight;
-        let cap = config.ranking_latch_cap;
-        let total_cap = config.ranking_total_multiplier_cap;
-        for (i, hit) in hits.iter_mut().enumerate() {
-            let frec = frecency_store.mult(&hit.id.0, now, alpha);
-            let lat = latch_store.mult(q, &hit.id.0, now, w, cap);
-            let stage2 = frec * lat;
-            let clamped = clamp_stage2_mult(stage2, total_cap);
-            hit.score *= clamped;
-            if explain {
-                if let Some(b) = breakdowns.get_mut(i) {
-                    b.frecency_mult = frec;
-                    b.latch_mult = lat;
-                    b.stage2_clamped = clamped;
-                    b.final_score = hit.score;
-                }
-            }
-        }
-    }
+    let claiming_entry = if phase == lixun_fusion::Phase::Final {
+        registry.instances.iter().find(|e| e.source.claims_query(q))
+    } else {
+        None
+    };
 
-    if phase == lixun_fusion::Phase::Final {
-        let mut plugin_tasks = Vec::new();
-        for entry in &registry.instances {
-            let plugin = entry.source.clone();
-            let q_str = q.to_string();
-            let instance_id = entry.instance_id.clone();
-            let state_dir = entry.state_dir.clone();
-            plugin_tasks.push(tokio::task::spawn_blocking(move || {
-                let ctx = QueryContext {
-                    instance_id: &instance_id,
-                    state_dir: &state_dir,
-                };
-                let start = std::time::Instant::now();
-                let result = plugin.on_query(&q_str, &ctx);
-                let elapsed = start.elapsed();
-                if elapsed > PLUGIN_BUDGET {
-                    tracing::warn!(
-                        instance = %instance_id,
-                        elapsed_ms = elapsed.as_millis(),
-                        "plugin on_query exceeded budget"
-                    );
-                }
-                result
-            }));
-        }
-        for task in plugin_tasks {
-            let plugin_hits = match task.await {
-                Ok(h) => h,
-                Err(_) => continue,
+    if let Some(claimer) = claiming_entry {
+        hits.clear();
+        breakdowns.clear();
+        
+        let plugin = claimer.source.clone();
+        let q_str = q.to_string();
+        let instance_id = claimer.instance_id.clone();
+        let state_dir = claimer.state_dir.clone();
+        
+        let plugin_hits = tokio::task::spawn_blocking(move || {
+            let ctx = QueryContext {
+                instance_id: &instance_id,
+                state_dir: &state_dir,
             };
-            if explain {
-                for h in &plugin_hits {
-                    breakdowns.push(lixun_core::ScoreBreakdown {
-                        tantivy: h.score,
-                        category_mult: 1.0,
-                        exact_title_mult: 1.0,
-                        prefix_mult: 1.0,
-                        acronym_mult: 1.0,
-                        recency_mult: 1.0,
-                        coord_mult: 1.0,
-                        frecency_mult: 1.0,
-                        latch_mult: 1.0,
-                        stage2_clamped: 1.0,
-                        final_score: h.score,
-                    });
+            plugin.on_query(&q_str, &ctx)
+        })
+        .await
+        .unwrap_or_default();
+        
+        if explain {
+            for h in &plugin_hits {
+                breakdowns.push(lixun_core::ScoreBreakdown {
+                    tantivy: h.score,
+                    category_mult: 1.0,
+                    exact_title_mult: 1.0,
+                    prefix_mult: 1.0,
+                    acronym_mult: 1.0,
+                    recency_mult: 1.0,
+                    coord_mult: 1.0,
+                    frecency_mult: 1.0,
+                    latch_mult: 1.0,
+                    stage2_clamped: 1.0,
+                    final_score: h.score,
+                });
+            }
+        }
+        hits.extend(plugin_hits);
+    } else {
+        {
+            let frecency_store = frecency.read().await;
+            let latch_store = query_latch.read().await;
+            let alpha = config.ranking_frecency_alpha;
+            let w = config.ranking_latch_weight;
+            let cap = config.ranking_latch_cap;
+            let total_cap = config.ranking_total_multiplier_cap;
+            for (i, hit) in hits.iter_mut().enumerate() {
+                let frec = frecency_store.mult(&hit.id.0, now, alpha);
+                let lat = latch_store.mult(q, &hit.id.0, now, w, cap);
+                let stage2 = frec * lat;
+                let clamped = clamp_stage2_mult(stage2, total_cap);
+                hit.score *= clamped;
+                if explain {
+                    if let Some(b) = breakdowns.get_mut(i) {
+                        b.frecency_mult = frec;
+                        b.latch_mult = lat;
+                        b.stage2_clamped = clamped;
+                        b.final_score = hit.score;
+                    }
                 }
             }
-            hits.extend(plugin_hits);
+        }
+
+        if phase == lixun_fusion::Phase::Final {
+            let mut plugin_tasks = Vec::new();
+            for entry in &registry.instances {
+                let plugin = entry.source.clone();
+                let q_str = q.to_string();
+                let instance_id = entry.instance_id.clone();
+                let state_dir = entry.state_dir.clone();
+                plugin_tasks.push(tokio::task::spawn_blocking(move || {
+                    let ctx = QueryContext {
+                        instance_id: &instance_id,
+                        state_dir: &state_dir,
+                    };
+                    let start = std::time::Instant::now();
+                    let result = plugin.on_query(&q_str, &ctx);
+                    let elapsed = start.elapsed();
+                    if elapsed > PLUGIN_BUDGET {
+                        tracing::warn!(
+                            instance = %instance_id,
+                            elapsed_ms = elapsed.as_millis(),
+                            "plugin on_query exceeded budget"
+                        );
+                    }
+                    result
+                }));
+            }
+            for task in plugin_tasks {
+                let plugin_hits = match task.await {
+                    Ok(h) => h,
+                    Err(_) => continue,
+                };
+                if explain {
+                    for h in &plugin_hits {
+                        breakdowns.push(lixun_core::ScoreBreakdown {
+                            tantivy: h.score,
+                            category_mult: 1.0,
+                            exact_title_mult: 1.0,
+                            prefix_mult: 1.0,
+                            acronym_mult: 1.0,
+                            recency_mult: 1.0,
+                            coord_mult: 1.0,
+                            frecency_mult: 1.0,
+                            latch_mult: 1.0,
+                            stage2_clamped: 1.0,
+                            final_score: h.score,
+                        });
+                    }
+                }
+                hits.extend(plugin_hits);
+            }
         }
     }
 

@@ -194,7 +194,14 @@ pub(crate) fn install_keyboard_handler(
             // Hard rule: printable unmodified keys belong to the focused
             // Entry. Forward them before any accel dispatch can swallow
             // them (e.g. bare-Space `quick_look` binding).
-            if entry_has_focus(&entry, &window) && is_printable_key(key, state) {
+            // Exception: while preview is active, fall through so the
+            // preview-dismissal block below closes the preview first.
+            // Otherwise Space in preview mode would type ' ' into the
+            // query instead of closing the preview.
+            if entry_has_focus(&entry, &window)
+                && is_printable_key(key, state)
+                && !controller.preview_mode_active()
+            {
                 return glib::signal::Propagation::Proceed;
             }
             // BUG-5: focus has left the entry (list_view grabbed it on
@@ -211,9 +218,16 @@ pub(crate) fn install_keyboard_handler(
             // GtkEntry's IM context (fcitx5 preedit/composition) own
             // the keystroke — bypassing IM here is what produced the
             // reversed-character / select-all chaos with Cyrillic input.
+            //
+            // Space is special: it is the quick_look accel that opened
+            // the preview, so a second Space must CLOSE preview without
+            // typing ' ' into the query. Stop propagation for Space;
+            // Proceed for every other printable key and Backspace.
+            // The quick_look accel only OPENS preview when entry lacks
+            // focus (line 428), so suppressing it here while preview is
+            // already active is safe.
             if controller.preview_mode_active()
                 && (is_printable_key(key, state) || key == gtk::gdk::Key::BackSpace)
-                && !accel_matches(&keybindings.quick_look, key, state)
                 && !accel_matches(&keybindings.close, key, state)
                 && !accel_matches(&keybindings.primary_action, key, state)
                 && !accel_matches(&keybindings.secondary_action, key, state)
@@ -221,6 +235,9 @@ pub(crate) fn install_keyboard_handler(
                 crate::ipc::send_preview_hide_request();
                 controller.set_preview_mode_active(false);
                 entry.grab_focus();
+                if accel_matches(&keybindings.quick_look, key, state) {
+                    return glib::signal::Propagation::Stop;
+                }
                 return glib::signal::Propagation::Proceed;
             }
             // Synthetic printable-key warp is disabled while preview is
@@ -499,7 +516,7 @@ pub(crate) fn install_keyboard_handler(
                 // user sees nothing.
                 chips_container.set_visible(true);
                 scrolled.set_visible(true);
-                scrolled.set_vexpand(true);
+                scrolled.set_vexpand(false);
                 glib::signal::Propagation::Stop
             } else {
                 glib::signal::Propagation::Proceed

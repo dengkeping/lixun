@@ -25,8 +25,45 @@ impl IndexerSource for CalculatorSource {
             return Vec::new();
         };
         let expr = rest.trim();
+        if expr.is_empty() {
+            return vec![Hit {
+                id: DocId("calculator:__placeholder__".into()),
+                category: Category::Calculator,
+                title: "Calculator".into(),
+                subtitle: "Type an expression after =".into(),
+                icon_name: Some("accessories-calculator".into()),
+                kind_label: Some("Calculator".into()),
+                score: 999.0,
+                action: Action::ReplaceQuery { q: query.into() },
+                extract_fail: false,
+                sender: None,
+                recipients: None,
+                body: None,
+                secondary_action: None,
+                source_instance: ctx.instance_id.to_string(),
+                row_menu: RowMenuDef::empty(),
+                mime: None,
+            }];
+        }
         let Some(calc) = detect::detect(expr) else {
-            return Vec::new();
+            return vec![Hit {
+                id: DocId(format!("calculator:invalid:{expr}")),
+                category: Category::Calculator,
+                title: "Calculator".into(),
+                subtitle: format!("Invalid expression: {expr}"),
+                icon_name: Some("accessories-calculator".into()),
+                kind_label: Some("Calculator".into()),
+                score: 999.0,
+                action: Action::ReplaceQuery { q: query.into() },
+                extract_fail: false,
+                sender: None,
+                recipients: None,
+                body: None,
+                secondary_action: None,
+                source_instance: ctx.instance_id.to_string(),
+                row_menu: RowMenuDef::empty(),
+                mime: None,
+            }];
         };
 
         vec![Hit {
@@ -51,6 +88,10 @@ impl IndexerSource for CalculatorSource {
 
     fn excludes_from_query_log(&self, query: &str) -> bool {
         query.trim_start().starts_with('=')
+    }
+
+    fn claims_query(&self, query: &str) -> bool {
+        query.strip_prefix('=').is_some()
     }
 
     fn row_menu(&self) -> RowMenuDef {
