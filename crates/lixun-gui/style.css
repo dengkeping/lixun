@@ -38,7 +38,7 @@ window {
 .lixun-window {
     background: rgba(28, 28, 32, 0.92);
     border-radius: 14px;
-    border: 1px solid rgba(255, 255, 255, 0.08);
+    border: 0.5px solid rgba(255, 255, 255, 0.05);
     box-shadow: 0 24px 64px rgba(0, 0, 0, 0.7),
                 0 8px 16px rgba(0, 0, 0, 0.5);
     min-width: 480px;
@@ -59,7 +59,6 @@ window {
 .lixun-entry:focus,
 .lixun-entry:focus-within {
     outline: none;
-    box-shadow: inset 0 -1px 0 rgba(75, 141, 255, 0.6);
 }
 
 .lixun-entry placeholder {
@@ -73,8 +72,7 @@ window {
    short for some reason. */
 .lixun-results {
     background-color: transparent;
-    border-top: 1px solid rgba(255, 255, 255, 0.04);
-    padding-top: 4px;
+    padding-top: 12px;
     min-height: 200px;
 }
 
@@ -116,13 +114,11 @@ listview row:selected:hover {
    when selection moves between rows. ListView virtualization
    measures row height once; if selection grows the row, the last
    visible row gets clipped at the viewport edge (BUG-6). Visual
-   distinction is carried by background + inset outline, which do
-   not affect layout height. */
+   distinction is carried by background only (Spotlight-style),
+   no outline. */
 .lixun-top-hit {
     padding: 8px 12px;
-    background-color: rgba(255, 255, 255, 0.04);
-    outline: 1px solid rgba(255, 255, 255, 0.12);
-    outline-offset: -1px;
+    background-color: rgba(255, 255, 255, 0.06);
     border-radius: 10px;
 }
 
@@ -137,9 +133,7 @@ listview row:selected:hover {
    cursor off row 0. */
 .lixun-top-hit-hero {
     padding: 10px 12px;
-    background-color: rgba(255, 255, 255, 0.06);
-    outline: 1px solid rgba(255, 255, 255, 0.14);
-    outline-offset: -1px;
+    background-color: rgba(255, 255, 255, 0.08);
     border-radius: 10px;
 }
 
