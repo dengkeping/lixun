@@ -315,23 +315,29 @@ async fn async_main(
     let sources_state_dir = config.state_dir.join("sources");
     let mut registry = lixun_indexer::SourceRegistry::new();
 
-    /* The semantic worker is an out-of-process sidecar. When the
-    binary is on disk we spawn its supervisor before plugin
+    /* The semantic worker is an out-of-process sidecar that loads
+    a ~400 MB embedding model at startup. Spawn it only when the
+    operator explicitly opted in via `[semantic] enabled = true`;
+    the stub plugin factory applies the same gating to its own
+    registration, so either both run or neither does. When the
+    worker does run, we spawn the supervisor before plugin
     registration so the stub factory finds an installed connection
-    at build time; when it is absent we log once and continue —
-    the stub plugin will simply return empty results because its
-    AnnHandle never connects. */
-    match lixun_daemon::semantic_supervisor::probe_worker_binary() {
-        Some(path) => {
-            tracing::info!(
-                worker = %path.display(),
-                "semantic worker probed, supervisor starting"
-            );
-            tokio::spawn(lixun_daemon::semantic_supervisor::supervise(path));
+    at build time. */
+    if lixun_daemon::semantic_supervisor::should_spawn(config.plugin_sections.get("semantic")) {
+        match lixun_daemon::semantic_supervisor::probe_worker_binary() {
+            Some(path) => {
+                tracing::info!(
+                    worker = %path.display(),
+                    "semantic worker probed, supervisor starting"
+                );
+                tokio::spawn(lixun_daemon::semantic_supervisor::supervise(path));
+            }
+            None => {
+                tracing::info!("semantic worker binary not found, semantic plugin will be no-op");
+            }
         }
-        None => {
-            tracing::info!("semantic worker binary not found, semantic plugin will be no-op");
-        }
+    } else {
+        tracing::info!("semantic disabled in config, worker not spawned");
     }
 
     register_plugin_sources(

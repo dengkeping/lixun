@@ -440,3 +440,72 @@ fn random_suffix() -> String {
     }
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
+
+/// Decide whether the worker supervisor should spawn, based on the
+/// raw `[semantic]` config block the operator wrote. Returns false
+/// when the section is absent, when `enabled` is missing, when
+/// `enabled = false`, or when the value is the wrong type — in all
+/// cases spawning a 400-MB-model sidecar against the operator's
+/// opt-out (or silence) is wrong. Mirrors the gating logic the stub
+/// plugin factory applies to its own registration so the two stay in
+/// sync: either both run or neither runs.
+pub fn should_spawn(raw: Option<&toml::Value>) -> bool {
+    raw.and_then(|v| v.get("enabled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod should_spawn_tests {
+    use super::should_spawn;
+
+    fn val(s: &str) -> toml::Value {
+        toml::from_str(s).expect("test fixture parses")
+    }
+
+    #[test]
+    fn missing_section_returns_false() {
+        assert!(!should_spawn(None));
+    }
+
+    #[test]
+    fn empty_section_returns_false() {
+        assert!(!should_spawn(Some(&val(""))));
+    }
+
+    #[test]
+    fn enabled_true_returns_true() {
+        assert!(should_spawn(Some(&val("enabled = true"))));
+    }
+
+    #[test]
+    fn enabled_false_returns_false() {
+        assert!(!should_spawn(Some(&val("enabled = false"))));
+    }
+
+    #[test]
+    fn malformed_enabled_returns_false() {
+        assert!(!should_spawn(Some(&val(r#"enabled = "yes""#))));
+    }
+
+    #[test]
+    fn extra_fields_ignored_when_disabled() {
+        assert!(!should_spawn(Some(&val(
+            r#"
+            enabled = false
+            text_model = "bge-small-en-v1.5"
+            "#
+        ))));
+    }
+
+    #[test]
+    fn extra_fields_ignored_when_enabled() {
+        assert!(should_spawn(Some(&val(
+            r#"
+            enabled = true
+            text_model = "bge-small-en-v1.5"
+            batch_size = 32
+            "#
+        ))));
+    }
+}
