@@ -925,7 +925,12 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
             return;
         }
         if controller_for_leave.preview_mode_active() {
-            tracing::info!("gui: focus_ctrl LEAVE suppressed — preview mode active");
+            tracing::info!(
+                "gui: focus_ctrl LEAVE in preview mode → hide preview + launcher"
+            );
+            crate::ipc::send_preview_hide_request();
+            controller_for_leave.set_preview_mode_active(false);
+            controller_for_leave.hide();
             return;
         }
         tracing::info!("gui: focus_ctrl LEAVE → controller.hide()");
