@@ -10,12 +10,12 @@ lixun-preview = { path = "../lixun-preview" }
 anyhow.workspace = true
 inventory.workspace = true
 tracing.workspace = true
-gtk = { package = "gtk4", version = "0.9", features = ["v4_12"] }
+gtk = { package = "gtk4", version = "0.11", features = ["v4_16"] }
 poppler-rs = "0.26"
 cairo-rs = "0.22"
-gdk = { package = "gdk4", version = "0.9" }
-glib = "0.20"
-gio = "0.20"
+gdk = { package = "gdk4", version = "0.11" }
+glib = "0.22"
+gio = "0.22"
 
 [lib]
 name = "lixun_preview_pdf"

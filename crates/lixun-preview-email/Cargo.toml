@@ -10,7 +10,7 @@ lixun-preview = { path = "../lixun-preview" }
 anyhow.workspace = true
 inventory.workspace = true
 tracing.workspace = true
-gtk = { package = "gtk4", version = "0.9", features = ["v4_12"] }
+gtk = { package = "gtk4", version = "0.11", features = ["v4_16"] }
 mail-parser = "0.9"
 html2text = "0.12"
 
