@@ -15,4 +15,7 @@ anyhow.workspace = true
 serde.workspace = true
 toml = "0.8"
 tracing.workspace = true
-meval = "0.2"                     # unmaintained; tracked in plan R7
+# Maintained fork of meval (upstream rekka/meval-rs frozen on nom 1.x);
+# this fork tracks nom 8 and is API-compatible. Pinned to exact revision
+# for reproducibility.
+meval = { git = "https://github.com/ryanwohara/meval-rs", rev = "959239b2df5d746e5683277c8a86a1e07a140230" }
