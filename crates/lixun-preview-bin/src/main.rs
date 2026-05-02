@@ -202,12 +202,11 @@ fn main() -> Result<()> {
 
     let exit_code = app.run_with_args::<&str>(&[]);
 
-    // Best-effort socket cleanup. If the daemon already unlinked or
-    // the path was on a tmpfs that vanished, errors are not actionable.
     let _ = std::fs::remove_file(&socket_path);
 
-    if exit_code.value() != 0 {
-        std::process::exit(exit_code.value());
+    let code: i32 = exit_code.into();
+    if code != 0 {
+        std::process::exit(code);
     }
     Ok(())
 }

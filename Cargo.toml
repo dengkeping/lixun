@@ -36,7 +36,7 @@ resolver = "2"
 [workspace.package]
 version = "0.6.0"
 edition = "2024"
-rust-version = "1.91"
+rust-version = "1.92"
 description = "Spotlight-like launcher for Linux"
 license = "MIT OR Apache-2.0"
 authors = ["Denis Kopin <deng@lixun.app>"]
