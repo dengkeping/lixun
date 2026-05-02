@@ -26,3 +26,6 @@
 # Local knowledge-graph index caches (not distributed)
 /.gitnexus/
 /.code-review-graph/
+
+# Throwaway spike experiments (benchmarks, PoCs) — never committed
+/spike/
