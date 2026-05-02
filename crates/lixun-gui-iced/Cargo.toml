@@ -1,0 +1,22 @@
+[package]
+name = "lixun-gui-iced"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+lixun-core = { path = "../lixun-core" }
+lixun-ipc = { path = "../lixun-ipc" }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# Iced 0.14: wgpu backend (tiny-skia has known issues with transparent + shadow + frequent updates: #2712, #2917)
+iced = { version = "0.14", default-features = false, features = ["wgpu", "wayland", "tokio", "svg", "image"] }
+iced_layershell = "0.18"
+
+tokio.workspace = true
+serde_json.workspace = true
+freedesktop-icons = "0.4"
