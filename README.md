@@ -653,8 +653,92 @@ Zero changes to `lixund`. Config-driven, auto-registered.
   does the work in the background. Watch progress via `lixun-cli status`.
 
 - **gloda batch size:** tune `[thunderbird].gloda_batch_size` to trade off
-  catch-up latency vs peak memory. Default 2500 is balanced for a 255k-message
-  gloda database.
+   catch-up latency vs peak memory. Default 2500 is balanced for a 255k-message
+   gloda database.
+
+---
+
+## Roadmap
+
+Honest view of what is **not** shipped yet. Order reflects rough priority,
+not a schedule. Anything here can slip or be dropped based on what the
+existing codebase teaches us.
+
+### Preview parity (Phase 1)
+
+The preview window works, but is not at QuickLook parity yet. Missing:
+
+- Pan / zoom / paginate for images and PDFs.
+- Text selection inside preview (copy quote out without opening the file).
+- Image-region selection (drag a rectangle, copy as PNG).
+- A stable plugin API for third-party preview plugins (the current trait
+  is internal-only).
+
+Open architectural question: whether the preview window stays on GTK4 +
+`wlr-layer-shell`, moves to GTK4 + `xdg-toplevel` (~1 week, keeps the
+toolkit), or is rewritten in Qt6 / QML on `xdg-toplevel` (6–9 weeks,
+higher ceiling for pan/zoom and selection). The main window stays on
+GTK4 + `gtk4-layer-shell` regardless. Compositor matrix: KWin, Hyprland,
+sway, Niri are Tier 1; Cosmic is Tier 2 (smoke-test only); GNOME / Mutter
+does not support `wlr-layer-shell` and is out of scope until it does.
+
+### Next source plugins (Phase 2)
+
+Ranked roughly by how much each one stresses the indexing substrate and
+by how often people actually ask for it:
+
+1. **Files / folders** — richer than the current "recents via XDG";
+   Markdown / Jupyter / SQLite / archive / font preview; user-configurable
+   indexed roots.
+2. **Clipboard history** — `wl-clipboard` watcher, ring buffer, opt-in
+   capture, searchable.
+3. **Browser history / bookmarks / tabs** — Firefox `places.sqlite`,
+   Chromium `History` SQLite, MozLZ4 decompression for session tabs;
+   live-tabs via native-messaging host.
+4. **System control surfaces** — one-keystroke control over systemd units,
+   NetworkManager connections, BlueZ devices, PipeWire sinks / sources,
+   brightness, via D-Bus.
+5. **Thunderbird deepening** — surface mail threads and attachments as
+   first-class objects, not just single messages.
+6. **Resume-workspace** — compound local workspace recall: "what was I
+   working on yesterday afternoon" returns a coherent object joined from
+   files + mail threads + browser pages + downloads + attachments + code
+   folders, with live preview and one-step reopen. Deterministic signals
+   only (temporal proximity, shared paths, attachment relationships,
+   sender / domain repetition, project folder, browser host, repo). No ML.
+
+Explicitly **not** planned for v1.x: SaaS integrations (GitHub, Jira,
+Slack, Notion, Linear, Google Drive, cloud LLMs); password manager
+integrations beyond `pass` titles-only; smart home and cloud admin; an
+"AI assistant" plugin. If a plugin's value disappears offline, it is
+not v1.
+
+### Plugin trust model (Phase 3)
+
+Today every source and preview plugin is a trusted in-process Rust
+crate registered through `inventory` — fine for plugins shipped with
+lixun, not fine for third-party plugins. The plan is two explicit
+classes:
+
+- **Extensions** — trusted, in-process, heavy native deps welcome
+  (`poppler`, `gstreamer`, `libreoffice` headless, `syntect`,
+  `mail-parser`). Today's plugins stay here. Not marketed as sandboxed.
+- **Plugins** — untrusted third-party, out-of-process, declarative UI
+  tree (closed widget vocabulary modeled on Android RemoteViews — Text,
+  Image, Row, Column, Scroll, Divider, Badge, KeyValue, MarkdownLite,
+  ActionBar, ErrorView). Host materializes; plugins never touch GTK or
+  Qt directly.
+
+Sandbox layer is still open: WASM (Wasmtime, WASI Preview 2, fuel
+metering, ~5 ms cold start, cross-language, but no heavy native deps)
+versus subprocess + bwrap + seccomp + cgroups + capability drop
+(battle-tested, heavy deps welcome, ~20–50 ms cold start). A hybrid
+(WASM first-class, subprocess escape hatch for plugins that need native
+libraries) is the current working assumption.
+
+No existing Linux launcher ships a sandboxed third-party plugin tier.
+This is the longest-tail bet and the one that decides whether lixun
+stays a personal tool or grows an ecosystem.
 
 ---
 
