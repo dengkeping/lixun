@@ -533,6 +533,11 @@ fn handle_response(resp: Response, ocr_only: bool) {
         Response::ImpactSnapshot { .. } => {
             eprintln!("Error: impact response routed to built-in handler");
         }
+        Response::ClaimedPrefixes(prefixes) => {
+            for p in prefixes {
+                println!("{}", p);
+            }
+        }
         Response::Error(msg) => {
             eprintln!("Error: {}", msg);
         }

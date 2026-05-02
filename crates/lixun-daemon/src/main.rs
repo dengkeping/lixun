@@ -384,6 +384,32 @@ async fn async_main(
     // the builtin apps + fs sources. FsSource picks up the checker
     // via `config.build_fs_source` / `with_body_checker`.
     register_builtin_nonplugin_sources(&mut registry, &config, &sources_state_dir, &profile)?;
+
+    // Validate claimed_prefix uniqueness across all registered plugins.
+    // Two plugins claiming the same prefix would make exclusive-claim
+    // dispatch non-deterministic (first-hit wins, depending on
+    // registration order). Fail loudly at startup so the conflict is
+    // visible to the operator instead of manifesting as hard-to-debug
+    // query-routing bugs at runtime.
+    {
+        let mut seen: std::collections::HashMap<&'static str, String> =
+            std::collections::HashMap::new();
+        for entry in &registry.instances {
+            if let Some(prefix) = entry.source.claimed_prefix() {
+                if let Some(existing) = seen.get(prefix) {
+                    anyhow::bail!(
+                        "claimed_prefix conflict: `{}` is claimed by both `{}` and `{}`. \
+                         Each prefix must be unique across all registered plugins.",
+                        prefix,
+                        existing,
+                        entry.instance_id
+                    );
+                }
+                seen.insert(prefix, entry.instance_id.clone());
+            }
+        }
+    }
+
     let registry = Arc::new(registry);
 
     // Build the IPC-facing search surface. When a plugin advertises
@@ -816,6 +842,7 @@ async fn process_search_chunk(
     Option<lixun_core::Calculation>,
     Option<lixun_core::DocId>,
     Vec<String>,
+    bool,
 )> {
     let now = chrono::Utc::now().timestamp();
     
@@ -995,7 +1022,8 @@ async fn process_search_chunk(
     };
 
     let calculation: Option<lixun_core::Calculation> = None;
-    Ok((hits, calculation, top_hit_id, explanations))
+    let claimed = claiming_entry.is_some();
+    Ok((hits, calculation, top_hit_id, explanations, claimed))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1038,7 +1066,7 @@ async fn handle_search(
             (chunk.hits.into_iter().map(|(h, _)| h).collect(), Vec::new())
         };
 
-        let (processed_hits, calculation, top_hit_id, explanations) = process_search_chunk(
+        let (processed_hits, calculation, top_hit_id, explanations, claimed) = process_search_chunk(
             hits,
             breakdowns,
             chunk.phase,
@@ -1067,6 +1095,7 @@ async fn handle_search(
             calculation,
             top_hit: top_hit_id,
             explanations,
+            claimed,
         };
 
         if write_tx.send(resp).await.is_err() {
@@ -1434,6 +1463,17 @@ async fn handle_client(
             }
             Request::EnumeratePlugins => {
                 let resp = Response::PluginManifest(registry.cli_manifest());
+                if write_tx.send(resp).await.is_err() {
+                    break;
+                }
+            }
+            Request::ClaimedPrefixes => {
+                let prefixes: Vec<String> = registry
+                    .instances
+                    .iter()
+                    .filter_map(|e| e.source.claimed_prefix().map(|s| s.to_string()))
+                    .collect();
+                let resp = Response::ClaimedPrefixes(prefixes);
                 if write_tx.send(resp).await.is_err() {
                     break;
                 }

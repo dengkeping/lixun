@@ -103,6 +103,10 @@ impl IndexerSource for ShellSource {
         query.trim_start().starts_with('>')
     }
 
+    fn claimed_prefix(&self) -> Option<&'static str> {
+        Some(">")
+    }
+
     fn row_menu(&self) -> RowMenuDef {
         RowMenuDef {
             items: vec![RowMenuItem {

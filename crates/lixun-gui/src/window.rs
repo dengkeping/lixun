@@ -18,10 +18,10 @@ use gtk4_layer_shell::{Edge, LayerShell};
 use lixun_core::Category;
 
 use crate::factory::{
-    add_css_class, clear_cached_hits, create_list_factory, update_results, update_results_merge,
+    add_css_class, clear_cached_hits, create_list_factory, update_results,
     with_cached_hits,
 };
-use crate::ipc::{IpcClient, PHASE_FINAL, PHASE_INITIAL, start_ipc_thread};
+use crate::ipc::{IpcClient, fetch_claimed_prefixes, start_ipc_thread};
 use crate::status::StatusBar;
 use lixun_core::{DocId, Hit};
 
@@ -577,7 +577,7 @@ impl LauncherController {
 
 pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
     let session_epoch = Arc::new(AtomicU64::new(0));
-    let ipc = start_ipc_thread(Arc::clone(&session_epoch));
+    let (ipc, ipc_event_rx) = start_ipc_thread(Arc::clone(&session_epoch));
     let daemon_config = lixun_daemon::config::Config::load()?;
 
     let window = gtk::ApplicationWindow::builder()
@@ -759,6 +759,11 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
     let chips_rc = std::rc::Rc::new(chips);
     let pending_debounce: std::rc::Rc<std::cell::RefCell<Option<glib::SourceId>>> =
         std::rc::Rc::new(std::cell::RefCell::new(None));
+    let loading_timer: std::rc::Rc<std::cell::RefCell<Option<glib::SourceId>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
+    let claimed_prefixes: std::rc::Rc<Vec<String>> =
+        std::rc::Rc::new(fetch_claimed_prefixes());
+    tracing::info!("gui: fetched claimed_prefixes={:?}", claimed_prefixes);
     let last_query: std::rc::Rc<std::cell::RefCell<String>> =
         std::rc::Rc::new(std::cell::RefCell::new(String::new()));
     let just_showed_until: std::rc::Rc<std::cell::Cell<Instant>> =
@@ -855,8 +860,9 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
     });
     app.add_action(&clear_action);
 
-    install_response_poller(
-        ipc.clone(),
+    install_response_handler(
+        ipc_event_rx,
+        Arc::clone(&session_epoch),
         model.clone(),
         filter.clone(),
         selection.clone(),
@@ -867,6 +873,7 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
         std::rc::Rc::clone(&last_query),
         std::rc::Rc::clone(&user_selected_override),
         std::rc::Rc::clone(&searching_indicator),
+        std::rc::Rc::clone(&loading_timer),
     );
 
     install_entry_handler(
@@ -882,6 +889,9 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
         Arc::clone(&session_epoch),
         std::rc::Rc::clone(&is_restoring),
         std::rc::Rc::clone(&user_selected_override),
+        std::rc::Rc::clone(&searching_indicator),
+        std::rc::Rc::clone(&loading_timer),
+        std::rc::Rc::clone(&claimed_prefixes),
     );
 
     crate::keymap::install_keyboard_handler(
@@ -949,8 +959,9 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn install_response_poller(
-    ipc: IpcClient,
+fn install_response_handler(
+    event_rx: async_channel::Receiver<crate::ipc::IpcMessage>,
+    session_epoch: Arc<AtomicU64>,
     model: gtk::StringList,
     filter: gtk::CustomFilter,
     selection: gtk::SingleSelection,
@@ -961,154 +972,125 @@ fn install_response_poller(
     last_query: std::rc::Rc<std::cell::RefCell<String>>,
     user_selected_override: std::rc::Rc<std::cell::Cell<bool>>,
     searching_indicator: std::rc::Rc<std::cell::Cell<bool>>,
+    loading_timer: std::rc::Rc<std::cell::RefCell<Option<glib::SourceId>>>,
 ) {
-    let responses = Arc::clone(&ipc.responses);
-    let calculation = Arc::clone(&ipc.calculation);
-    let top_hit = Arc::clone(&ipc.top_hit);
-    let epoch = Arc::clone(&ipc.response_epoch);
-    let phase = Arc::clone(&ipc.response_phase);
+    let pending_hits = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
     let last_epoch = std::rc::Rc::new(std::cell::Cell::new(0u64));
-    let seen_initial = std::rc::Rc::new(std::cell::Cell::new(false));
 
-    glib::timeout_add_local(Duration::from_millis(50), move || {
-        let current = epoch.load(Ordering::SeqCst);
-        if current != last_epoch.get() {
-            let current_phase = phase.load(Ordering::SeqCst);
-            tracing::debug!(
-                "gui: poller tick epoch_change {} -> {} phase={}",
-                last_epoch.get(),
-                current,
-                current_phase
-            );
-            last_epoch.set(current);
-
-            let preserve_doc_id = user_selected_override.get();
-            let prior_selected = if preserve_doc_id {
-                let idx = selection.selected();
-                selection.item(idx).and_then(|obj| {
-                    obj.downcast::<gtk::StringObject>()
-                        .ok()
-                        .map(|s| s.string().to_string())
-                })
-            } else {
-                None
-            };
-
-            let hits_snapshot = {
-                let mut hits = responses.lock().unwrap();
-                std::mem::take(&mut *hits)
-            };
-            let calc_snapshot = {
-                let mut c = calculation.lock().unwrap();
-                c.take()
-            };
-            let top_hit_snapshot = {
-                let mut t = top_hit.lock().unwrap();
-                t.take()
-            };
-
-            let plan = compute_render_plan(&hits_snapshot, top_hit_snapshot.as_ref());
-            let top_hit_doc_id = plan
-                .top_hit_index
-                .and_then(|i| plan.hits.get(i))
-                .map(|h| h.id.0.clone());
-
-            if current_phase == PHASE_INITIAL {
-                seen_initial.set(true);
-                tracing::debug!("gui: poller render Initial hits={}", plan.hits.len());
-                if !plan.hits.is_empty() {
-                    update_results_merge(
-                        &model,
-                        &selection,
-                        &plan.hits,
-                        top_hit_doc_id,
-                        preserve_doc_id,
-                    );
-                    searching_indicator.set(true);
-                } else {
-                    searching_indicator.set(true);
-                }
-            } else if current_phase == PHASE_FINAL {
-                tracing::debug!(
-                    "gui: poller render Final hits={} seen_initial={}",
-                    plan.hits.len(),
-                    seen_initial.get()
-                );
-                if seen_initial.get() {
-                    update_results_merge(
-                        &model,
-                        &selection,
-                        &plan.hits,
-                        top_hit_doc_id,
-                        preserve_doc_id,
-                    );
-                } else {
-                    update_results(&model, &selection, &plan.hits, top_hit_doc_id);
-                }
-                searching_indicator.set(false);
-                seen_initial.set(false);
-            }
-
-            filter.changed(gtk::FilterChange::Different);
-            if !plan.hits.is_empty() {
-                let wanted_doc = prior_selected
-                    .clone()
-                    .or_else(|| plan.hits.first().map(|h| h.id.0.clone()));
-                let new_idx = wanted_doc
-                    .as_deref()
-                    .and_then(|want| {
-                        (0..selection.n_items()).find(|&i| {
-                            selection
-                                .item(i)
-                                .and_then(|o| o.downcast::<gtk::StringObject>().ok())
-                                .map(|s| s.string() == want)
-                                .unwrap_or(false)
-                        })
-                    })
-                    .unwrap_or(0);
-                if selection.n_items() > 0 {
-                    selection.set_selected(new_idx);
-                    list_view.scroll_to(new_idx, gtk::ListScrollFlags::NONE, None);
-                }
-            }
-
-            let has_anything = !plan.hits.is_empty();
-            if let Some(calc) = calc_snapshot.as_ref() {
-                chips_container.set_visible(true);
-                scrolled.set_visible(false);
-                scrolled.set_vexpand(false);
-                status.show_calculation(calc);
-            } else if !has_anything {
-                let q = last_query.borrow().clone();
-                if !q.is_empty() {
-                    chips_container.set_visible(true);
-                    scrolled.set_visible(false);
-                    scrolled.set_vexpand(false);
-                    if searching_indicator.get() {
-                        status.show_empty("Searching...");
-                    } else {
-                        status.show_empty(&q);
+    glib::spawn_future_local(async move {
+        while let Ok(msg) = event_rx.recv().await {
+            match msg {
+                crate::ipc::IpcMessage::SearchChunk { epoch, phase, hits, calculation, top_hit, claimed } => {
+                    let current_session_epoch = session_epoch.load(Ordering::SeqCst);
+                    if epoch < current_session_epoch {
+                        tracing::debug!("gui: dropping stale chunk epoch={} < session_epoch={}", epoch, current_session_epoch);
+                        continue;
                     }
-                    selection.set_selected(gtk::INVALID_LIST_POSITION);
-                } else {
-                    chips_container.set_visible(false);
-                    scrolled.set_visible(false);
-                    scrolled.set_vexpand(false);
-                    status.hide();
-                }
-            } else {
-                chips_container.set_visible(true);
-                let list_has_rows = !plan.hits.is_empty();
-                scrolled.set_visible(list_has_rows);
-                scrolled.set_vexpand(false);
-                if searching_indicator.get() {
-                    status.show_empty("Searching...");
-                } else {
-                    status.hide();
+
+                    if epoch > last_epoch.get() {
+                        tracing::debug!("gui: new epoch {} > {}, clearing pending", epoch, last_epoch.get());
+                        pending_hits.borrow_mut().clear();
+                        last_epoch.set(epoch);
+                    }
+
+                    match phase {
+                        lixun_ipc::Phase::Initial => {
+                            tracing::debug!("gui: buffering Initial chunk epoch={} hits={}", epoch, hits.len());
+                            *pending_hits.borrow_mut() = hits;
+                            searching_indicator.set(true);
+                        }
+                        lixun_ipc::Phase::Final => {
+                            tracing::debug!("gui: rendering Final chunk epoch={} hits={} claimed={}", epoch, hits.len(), claimed);
+                            if let Some(id) = loading_timer.borrow_mut().take() {
+                                id.remove();
+                            }
+                            let all_hits = hits;
+                            pending_hits.borrow_mut().clear();
+
+                            let preserve_doc_id = user_selected_override.get();
+                            let prior_selected = if preserve_doc_id {
+                                let idx = selection.selected();
+                                selection.item(idx).and_then(|obj| {
+                                    obj.downcast::<gtk::StringObject>()
+                                        .ok()
+                                        .map(|s| s.string().to_string())
+                                })
+                            } else {
+                                None
+                            };
+
+                            let plan = compute_render_plan(&all_hits, top_hit.as_ref());
+                            let top_hit_doc_id = plan
+                                .top_hit_index
+                                .and_then(|i| plan.hits.get(i))
+                                .map(|h| h.id.0.clone());
+
+                            update_results(&model, &selection, &plan.hits, top_hit_doc_id);
+                            searching_indicator.set(false);
+
+                            filter.changed(gtk::FilterChange::Different);
+                            if !plan.hits.is_empty() {
+                                let wanted_doc = prior_selected
+                                    .clone()
+                                    .or_else(|| plan.hits.first().map(|h| h.id.0.clone()));
+                                let new_idx = wanted_doc
+                                    .as_deref()
+                                    .and_then(|want| {
+                                        (0..selection.n_items()).find(|&i| {
+                                            selection
+                                                .item(i)
+                                                .and_then(|o| o.downcast::<gtk::StringObject>().ok())
+                                                .map(|s| s.string() == want)
+                                                .unwrap_or(false)
+                                        })
+                                    })
+                                    .unwrap_or(0);
+                                if selection.n_items() > 0 {
+                                    selection.set_selected(new_idx);
+                                    list_view.scroll_to(new_idx, gtk::ListScrollFlags::NONE, None);
+                                }
+                            }
+
+                            let has_anything = !plan.hits.is_empty();
+                            if let Some(calc) = calculation.as_ref() {
+                                chips_container.set_visible(true);
+                                scrolled.set_visible(false);
+                                scrolled.set_vexpand(false);
+                                status.show_calculation(calc);
+                            } else if !has_anything {
+                                let q = last_query.borrow().clone();
+                                if !q.is_empty() {
+                                    chips_container.set_visible(true);
+                                    scrolled.set_visible(false);
+                                    scrolled.set_vexpand(false);
+                                    if searching_indicator.get() {
+                                        status.show_empty("Searching...");
+                                    } else {
+                                        status.show_empty(&q);
+                                    }
+                                    selection.set_selected(gtk::INVALID_LIST_POSITION);
+                                } else {
+                                    chips_container.set_visible(false);
+                                    scrolled.set_visible(false);
+                                    scrolled.set_vexpand(false);
+                                    status.hide();
+                                }
+                            } else {
+                                chips_container.set_visible(true);
+                                let list_has_rows = !plan.hits.is_empty();
+                                scrolled.set_visible(list_has_rows);
+                                scrolled.set_vexpand(false);
+                                if searching_indicator.get() {
+                                    status.show_empty("Searching...");
+                                } else {
+                                    status.hide();
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
-        glib::ControlFlow::Continue
     });
 }
 
@@ -1126,6 +1108,9 @@ fn install_entry_handler(
     session_epoch: Arc<AtomicU64>,
     is_restoring: std::rc::Rc<std::cell::Cell<bool>>,
     user_selected_override: std::rc::Rc<std::cell::Cell<bool>>,
+    _searching_indicator: std::rc::Rc<std::cell::Cell<bool>>,
+    loading_timer: std::rc::Rc<std::cell::RefCell<Option<glib::SourceId>>>,
+    claimed_prefixes: std::rc::Rc<Vec<String>>,
 ) {
     tracing::info!("gui: install_entry_handler called, registering connect_changed");
     entry.connect_changed(move |e| {
@@ -1172,21 +1157,14 @@ fn install_entry_handler(
             if let Some(id) = pending_debounce.borrow_mut().take() {
                 id.remove();
             }
+            if let Some(id) = loading_timer.borrow_mut().take() {
+                id.remove();
+            }
             last_query.borrow_mut().clear();
             clear_cached_hits();
-            
-            {
-                let mut resp = ipc.responses.lock().unwrap();
-                resp.clear();
-            }
-            {
-                let mut calc = ipc.calculation.lock().unwrap();
-                *calc = None;
-            }
-            {
-                let mut top = ipc.top_hit.lock().unwrap();
-                *top = None;
-            }
+            // Stale IPC events with epoch < session_epoch are dropped
+            // by install_response_handler (push-based, no shared
+            // mutex to drain).
 
             // Disable autoselect around the bulk clear so
             // SingleSelection's interpolation formula
@@ -1229,32 +1207,35 @@ fn install_entry_handler(
         // not pick up stale leftovers between the bump and the
         // next chunk arrival.
         session_epoch.fetch_add(1, Ordering::SeqCst);
-        {
-            let mut resp = ipc.responses.lock().unwrap();
-            resp.clear();
-        }
-        {
-            let mut calc = ipc.calculation.lock().unwrap();
-            *calc = None;
-        }
-        {
-            let mut top = ipc.top_hit.lock().unwrap();
-            *top = None;
-        }
+        // Stale IPC events with epoch < session_epoch are dropped
+        // by install_response_handler (push-based, no shared
+        // mutex to drain).
 
         chips_container.set_visible(true);
 
         let ipc = ipc.clone();
-        let status = std::rc::Rc::clone(&status);
+        let status_for_debounce = std::rc::Rc::clone(&status);
         let q = text.clone();
         let last_q = std::rc::Rc::clone(&last_query);
         let pending_self = std::rc::Rc::clone(&pending_debounce);
         let epoch = Arc::clone(&session_epoch);
+        let prefixes_for_debounce = std::rc::Rc::clone(&claimed_prefixes);
         let id = glib::timeout_add_local_once(Duration::from_millis(80), move || {
             *last_q.borrow_mut() = q.clone();
-            status.show_loading();
             let epoch_snapshot = epoch.load(Ordering::SeqCst);
             tracing::debug!("gui: debounce fired, sending search query={:?} epoch={}", q, epoch_snapshot);
+            // Skip "Searching…" spinner for queries claimed by an
+            // instant plugin (shell `>`, calculator `=`). These
+            // respond in <10ms so the spinner would only flash.
+            // Claimed prefixes are fetched from the daemon on
+            // startup, so no plugin-specific strings live in GUI code.
+            let trimmed = q.trim_start();
+            let is_claimed = prefixes_for_debounce
+                .iter()
+                .any(|p| trimmed.starts_with(p.as_str()));
+            if !is_claimed {
+                status_for_debounce.show_loading();
+            }
             let _ = ipc.request_tx.send((q, 30, epoch_snapshot));
             *pending_self.borrow_mut() = None;
         });

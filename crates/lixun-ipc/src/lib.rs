@@ -167,6 +167,11 @@ pub enum Request {
     /// kept as a distinct request to leave room for future explain-only
     /// fields without forcing every Get caller to opt in.
     ImpactExplain,
+    /// Request the list of query prefixes that trigger exclusive plugin
+    /// claims (e.g., `>` for shell, `=` for calculator). The GUI uses
+    /// this on startup to skip the "Searching…" spinner for claimed
+    /// queries, which respond in <10ms and would only flash visibly.
+    ClaimedPrefixes,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -204,6 +209,8 @@ pub enum Response {
         calculation: Option<lixun_core::Calculation>,
         top_hit: Option<lixun_core::DocId>,
         explanations: Vec<String>,
+        #[serde(default)]
+        claimed: bool,
     },
     Status {
         indexed_docs: u64,
@@ -230,6 +237,7 @@ pub enum Response {
     PluginResult(serde_json::Value),
     PluginError(String),
     Error(String),
+    ClaimedPrefixes(Vec<String>),
     /// Reply to every `Impact*` request. `applied_hot` and
     /// `requires_restart` are populated only on `ImpactSet`; both
     /// empty for `ImpactGet` / `ImpactExplain`. `persisted` is true

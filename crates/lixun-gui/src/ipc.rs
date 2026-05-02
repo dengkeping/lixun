@@ -1,67 +1,52 @@
-//! IPC client: background thread sending search requests and a fire-and-forget
-//! record-click helper.
+//! IPC client: push-based event delivery via async_channel.
 //!
-//! Service-mode session epoch (G1.6): each request carries the session
-//! epoch at send-time. The response thread compares that snapshot to the
-//! current epoch before committing results; hides bump the epoch via
-//! `LauncherController::reset_session` so stale replies land in a new
-//! session and are discarded.
+//! Architecture change from polling: IPC thread sends typed IpcMessage events
+//! through async_channel, GUI receives via glib::spawn_future_local. Each
+//! message carries epoch for stale-detection. Final-only batching: Initial
+//! chunks buffered, only Final triggers GTK model update (single rebuild per
+//! query vs previous double rebuild).
 
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use lixun_core::{Calculation, DocId, Hit};
 use lixun_ipc::{PROTOCOL_VERSION, Phase, Request, Response, socket_path};
 
-pub(crate) const PHASE_NONE: u8 = 0;
-pub(crate) const PHASE_INITIAL: u8 = 1;
-pub(crate) const PHASE_FINAL: u8 = 2;
+#[derive(Debug, Clone)]
+pub(crate) enum IpcMessage {
+    SearchChunk {
+        epoch: u64,
+        phase: Phase,
+        hits: Vec<Hit>,
+        calculation: Option<Calculation>,
+        top_hit: Option<DocId>,
+        claimed: bool,
+    },
+}
 
 pub(crate) struct IpcClient {
     pub(crate) request_tx: mpsc::Sender<(String, u32, u64)>,
-    pub(crate) responses: Arc<Mutex<Vec<Hit>>>,
-    pub(crate) calculation: Arc<Mutex<Option<Calculation>>>,
-    pub(crate) top_hit: Arc<Mutex<Option<DocId>>>,
-    pub(crate) response_epoch: Arc<AtomicU64>,
-    pub(crate) response_phase: Arc<AtomicU8>,
 }
 
 impl Clone for IpcClient {
     fn clone(&self) -> Self {
         Self {
             request_tx: self.request_tx.clone(),
-            responses: Arc::clone(&self.responses),
-            calculation: Arc::clone(&self.calculation),
-            top_hit: Arc::clone(&self.top_hit),
-            response_epoch: Arc::clone(&self.response_epoch),
-            response_phase: Arc::clone(&self.response_phase),
         }
     }
 }
 
-pub(crate) fn start_ipc_thread(session_epoch: Arc<AtomicU64>) -> IpcClient {
+pub(crate) fn start_ipc_thread(
+    session_epoch: Arc<AtomicU64>,
+) -> (IpcClient, async_channel::Receiver<IpcMessage>) {
     let (tx, rx) = mpsc::channel::<(String, u32, u64)>();
-    let responses: Arc<Mutex<Vec<Hit>>> = Arc::new(Mutex::new(Vec::new()));
-    let calculation: Arc<Mutex<Option<Calculation>>> = Arc::new(Mutex::new(None));
-    let top_hit: Arc<Mutex<Option<DocId>>> = Arc::new(Mutex::new(None));
-    let response_epoch: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
-    let response_phase: Arc<AtomicU8> = Arc::new(AtomicU8::new(PHASE_NONE));
-    let resp_clone = Arc::clone(&responses);
-    let calc_clone = Arc::clone(&calculation);
-    let top_hit_clone = Arc::clone(&top_hit);
-    let epoch_clone = Arc::clone(&response_epoch);
-    let phase_clone = Arc::clone(&response_phase);
+    let (event_tx, event_rx) = async_channel::unbounded::<IpcMessage>();
 
     std::thread::spawn(move || {
         while let Ok((query, limit, epoch_at_send)) = rx.recv() {
             tracing::debug!("ipc: received search request query={:?} limit={} epoch={}", query, limit, epoch_at_send);
-            let resp_clone_inner = Arc::clone(&resp_clone);
-            let calc_clone_inner = Arc::clone(&calc_clone);
-            let top_hit_clone_inner = Arc::clone(&top_hit_clone);
-            let epoch_clone_inner = Arc::clone(&epoch_clone);
-            let phase_clone_inner = Arc::clone(&phase_clone);
 
             let sock = socket_path();
             let req = Request::Search {
@@ -116,8 +101,14 @@ pub(crate) fn start_ipc_thread(session_epoch: Arc<AtomicU64>) -> IpcClient {
                     Ok(()) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
                         tracing::debug!("ipc: read timeout, treating as Final");
-                        phase_clone_inner.store(PHASE_FINAL, Ordering::SeqCst);
-                        epoch_clone_inner.fetch_add(1, Ordering::SeqCst);
+                        let _ = event_tx.send_blocking(IpcMessage::SearchChunk {
+                            epoch: epoch_at_send,
+                            phase: Phase::Final,
+                            hits: Vec::new(),
+                            calculation: None,
+                            top_hit: None,
+                            claimed: false,
+                        });
                         break;
                     }
                     Err(e) => {
@@ -149,6 +140,7 @@ pub(crate) fn start_ipc_thread(session_epoch: Arc<AtomicU64>) -> IpcClient {
                         calculation,
                         top_hit,
                         explanations: _,
+                        claimed,
                     }) => {
                         if resp_epoch != epoch_at_send {
                             tracing::debug!(
@@ -167,25 +159,18 @@ pub(crate) fn start_ipc_thread(session_epoch: Arc<AtomicU64>) -> IpcClient {
                             break;
                         }
 
-                        if let Ok(mut r) = resp_clone_inner.lock() {
-                            *r = hits;
-                        }
-                        if let Ok(mut c) = calc_clone_inner.lock() {
-                            *c = calculation;
-                        }
-                        if let Ok(mut t) = top_hit_clone_inner.lock() {
-                            *t = top_hit;
-                        }
+                        let is_final = matches!(phase, Phase::Final);
+                        tracing::debug!("ipc: chunk received epoch={} phase={:?} hits={}", resp_epoch, phase, hits.len());
+                        let _ = event_tx.send_blocking(IpcMessage::SearchChunk {
+                            epoch: resp_epoch,
+                            phase,
+                            hits,
+                            calculation,
+                            top_hit,
+                            claimed,
+                        });
 
-                        let phase_u8 = match phase {
-                            Phase::Initial => PHASE_INITIAL,
-                            Phase::Final => PHASE_FINAL,
-                        };
-                        tracing::debug!("ipc: chunk received epoch={} phase={:?} hits_committed", resp_epoch, phase);
-                        phase_clone_inner.store(phase_u8, Ordering::SeqCst);
-                        epoch_clone_inner.fetch_add(1, Ordering::SeqCst);
-
-                        if phase == Phase::Final {
+                        if is_final {
                             break;
                         }
                     }
@@ -202,14 +187,7 @@ pub(crate) fn start_ipc_thread(session_epoch: Arc<AtomicU64>) -> IpcClient {
         }
     });
 
-    IpcClient {
-        request_tx: tx,
-        responses,
-        calculation,
-        top_hit,
-        response_epoch,
-        response_phase,
-    }
+    (IpcClient { request_tx: tx }, event_rx)
 }
 
 #[allow(dead_code)]
@@ -311,6 +289,47 @@ fn send_request_fire_and_forget(req: &Request) {
     }
 }
 
+pub(crate) fn fetch_claimed_prefixes() -> Vec<String> {
+    use std::io::Read;
+    let sock = socket_path();
+    let req = Request::ClaimedPrefixes;
+    let Ok(json) = serde_json::to_vec(&req) else {
+        return Vec::new();
+    };
+    let total_len = (2 + json.len()) as u32;
+    let mut buf = Vec::with_capacity(4 + 2 + json.len());
+    buf.extend_from_slice(&total_len.to_be_bytes());
+    buf.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
+    buf.extend_from_slice(&json);
+    let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&sock) else {
+        return Vec::new();
+    };
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+    if std::io::Write::write_all(&mut stream, &buf).is_err() {
+        return Vec::new();
+    }
+    let mut header = [0u8; 4];
+    if stream.read_exact(&mut header).is_err() {
+        return Vec::new();
+    }
+    let resp_len = u32::from_be_bytes(header) as usize;
+    if resp_len < 2 {
+        return Vec::new();
+    }
+    let mut version = [0u8; 2];
+    if stream.read_exact(&mut version).is_err() {
+        return Vec::new();
+    }
+    let mut body = vec![0u8; resp_len - 2];
+    if stream.read_exact(&mut body).is_err() {
+        return Vec::new();
+    }
+    match serde_json::from_slice::<Response>(&body) {
+        Ok(Response::ClaimedPrefixes(p)) => p,
+        _ => Vec::new(),
+    }
+}
+
 /// Resolve the connector name of the monitor that `window` is
 /// currently placed on. Returns `None` if the window hasn't been
 /// mapped yet or no monitor can be determined (unusual — happens
@@ -409,6 +428,7 @@ mod tests {
             calculation: None,
             top_hit: Some(lixun_core::DocId("app:firefox".into())),
             explanations: vec![],
+            claimed: false,
         };
         let bytes = serde_json::to_vec(&resp).unwrap();
         let roundtrip: Response = serde_json::from_slice(&bytes).unwrap();

@@ -117,6 +117,19 @@ pub trait IndexerSource: Send + Sync {
         false
     }
 
+    /// Prefix string that triggers this source's exclusive claim,
+    /// exposed to the GUI for latency-hint optimization. The GUI
+    /// fetches these on startup via `Request::ClaimedPrefixes` and
+    /// skips the "Searching…" spinner for queries matching any
+    /// returned prefix — claimed plugins respond in <10ms so the
+    /// spinner would only flash visibly. Sources that return
+    /// `Some(prefix)` here MUST also return `true` from
+    /// `claims_query()` for queries starting with that prefix;
+    /// the two are consistency-checked at the daemon. Default `None`.
+    fn claimed_prefix(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Declarative right-click menu for rows produced by this
     /// source. The GUI caches the translated menu model keyed by
     /// `Hit::source_instance`, so sources MUST return a stable,

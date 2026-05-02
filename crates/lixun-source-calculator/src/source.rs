@@ -94,6 +94,10 @@ impl IndexerSource for CalculatorSource {
         query.strip_prefix('=').is_some()
     }
 
+    fn claimed_prefix(&self) -> Option<&'static str> {
+        Some("=")
+    }
+
     fn row_menu(&self) -> RowMenuDef {
         RowMenuDef {
             items: vec![RowMenuItem {
