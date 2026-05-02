@@ -9,8 +9,8 @@ use gtk::prelude::*;
 use lixun_core::Action;
 use lixun_daemon::config::Keybindings;
 
-use crate::actions::{copy_to_clipboard, execute_action, execute_secondary_action};
-use crate::factory::{synthetic_history_hits, update_results, with_cached_hits};
+use crate::actions::{copy_to_clipboard, execute_action, execute_secondary_action, run_and_capture};
+use crate::factory::{cached_hit_by_id, synthetic_history_hits, update_results, with_cached_hits};
 use crate::ipc::{
     IpcClient, current_monitor_connector, dispatch_click_pair, request_search_history,
     send_preview_request,
@@ -28,11 +28,13 @@ fn selected_hit_in<F: FnOnce(&lixun_core::Hit)>(
         && let Some(str_obj) = item.downcast_ref::<gtk::StringObject>()
     {
         let doc_id = str_obj.string().to_string();
-        with_cached_hits(|hits| {
-            if let Some(hit) = hits.iter().find(|h| h.id.0 == doc_id) {
-                f(hit);
-            }
-        });
+        // Clone-out before invoking callback: callbacks for actions like
+        // ReplaceQuery call entry.set_text() which synchronously fires
+        // connect_changed → clear_cached_hits() → borrow_mut() panic
+        // (already-borrowed) if we held a live CACHED_HITS read borrow.
+        if let Some(hit) = cached_hit_by_id(&doc_id) {
+            f(&hit);
+        }
     }
 }
 
@@ -391,6 +393,9 @@ pub(crate) fn install_keyboard_handler(
             {
                 let mut should_hide = true;
                 let query_at_click = entry.text().to_string();
+                let is_secondary = accel_matches(&keybindings.secondary_action, key, state)
+                    || shift
+                    || ctrl;
                 selected_hit_in(&selection, &filter_model, |hit| {
                     if let Action::ReplaceQuery { q } = &hit.action {
                         entry.set_text(q);
@@ -399,11 +404,26 @@ pub(crate) fn install_keyboard_handler(
                         should_hide = false;
                         return;
                     }
+                    // Shift+Enter on a hit whose secondary action is
+                    // ExecCapture: run the command headless, capture
+                    // stdout, and replace the query text. Used by
+                    // shell plugin to pipe command output into the
+                    // launcher instead of opening a terminal.
+                    if is_secondary {
+                        if let Some(sec) = &hit.secondary_action
+                            && let Action::ExecCapture { cmdline, working_dir } = sec.as_ref()
+                        {
+                            if let Some(output) = run_and_capture(cmdline, working_dir.as_deref()) {
+                                entry.set_text(output.trim_end());
+                                entry.set_position(-1);
+                                entry.grab_focus();
+                            }
+                            should_hide = false;
+                            return;
+                        }
+                    }
                     dispatch_click_pair(&hit.id.0, &query_at_click);
-                    let result = if accel_matches(&keybindings.secondary_action, key, state)
-                        || shift
-                        || ctrl
-                    {
+                    let result = if is_secondary {
                         execute_secondary_action(hit)
                     } else {
                         execute_action(hit)

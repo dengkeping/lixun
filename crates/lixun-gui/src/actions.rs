@@ -201,6 +201,7 @@ fn dispatch_action(action: &Action) -> Result<()> {
             Ok(())
         }
         Action::ReplaceQuery { .. } => Ok(()),
+        Action::ExecCapture { .. } => Ok(()),
         Action::Exec {
             cmdline,
             working_dir,
@@ -293,6 +294,52 @@ pub(crate) fn copy_to_clipboard(hit: &Hit) {
         display.clipboard().set_text(&text);
     }
     tracing::info!("Copied to clipboard: {}", text);
+}
+
+pub(crate) fn run_and_capture(
+    cmdline: &[String],
+    working_dir: Option<&std::path::Path>,
+) -> Option<String> {
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    if cmdline.is_empty() {
+        return None;
+    }
+
+    let mut cmd = Command::new(&cmdline[0]);
+    cmd.args(&cmdline[1..])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+
+    if let Some(dir) = working_dir {
+        cmd.current_dir(dir);
+    }
+
+    let mut child = cmd.spawn().ok()?;
+    let timeout = Duration::from_millis(500);
+    let start = std::time::Instant::now();
+
+    loop {
+        if start.elapsed() > timeout {
+            tracing::warn!("run_and_capture: command timed out after 500ms");
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => {
+                let output = child.wait_with_output().ok()?;
+                return String::from_utf8(output.stdout).ok();
+            }
+            Ok(Some(_)) => {
+                tracing::warn!("run_and_capture: command exited with non-zero status");
+                return None;
+            }
+            Ok(None) => continue,
+            Err(_) => return None,
+        }
+    }
 }
 
 #[cfg(test)]

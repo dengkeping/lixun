@@ -173,6 +173,16 @@ pub enum Action {
         #[serde(default)]
         terminal: bool,
     },
+    /// Execute a command headless, capture stdout, and replace the
+    /// launcher query with the output. Used by shell plugin on
+    /// Shift+Enter: `> date` → captures stdout → replaces query with
+    /// the timestamp. The GUI runs this synchronously with a timeout
+    /// (500ms) to avoid blocking on hung commands. If the command
+    /// fails or times out, the query is left unchanged.
+    ExecCapture {
+        cmdline: Vec<String>,
+        working_dir: Option<PathBuf>,
+    },
     /// Open an arbitrary URI via the OS (xdg-open on Linux). Generic
     /// primitive for URI-dispatchable actions (e.g. `mid:<message-id>`,
     /// `mailto:`, `https:`). Plugin-agnostic: the host does not know

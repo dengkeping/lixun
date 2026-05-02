@@ -238,6 +238,9 @@ pub fn default_launch(hit: &lixun_core::Hit) -> anyhow::Result<()> {
         Action::ReplaceQuery { .. } => {
             anyhow::bail!("ReplaceQuery has no standalone launch semantics");
         }
+        Action::ExecCapture { .. } => {
+            anyhow::bail!("ExecCapture has no standalone launch semantics");
+        }
     }
 }
 

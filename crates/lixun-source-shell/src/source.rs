@@ -88,7 +88,10 @@ impl IndexerSource for ShellSource {
             sender: None,
             recipients: None,
             body: None,
-            secondary_action: None,
+            secondary_action: Some(Box::new(Action::ExecCapture {
+                cmdline: vec!["sh".into(), "-c".into(), cmd.into()],
+                working_dir: Some(self.working_dir.clone()),
+            })),
             source_instance: ctx.instance_id.to_string(),
             row_menu: RowMenuDef::empty(),
             mime: None,
