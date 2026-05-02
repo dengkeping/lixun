@@ -14,30 +14,24 @@
 > `lixun-cli status` and the relevant section of `~/.config/lixun/config.toml`
 > when reporting bugs.
 
-A **Spotlight-style launcher for Linux**. Press `Super + Space`, start typing,
-get instant results across applications, files, email, and **photos by
-content**. Backed by a local
+A **queryable personal workspace browser for Linux**. Press `Super + Space`,
+start typing, get instant results across applications, files, email, and
+**photos by content**. Inspect before you open: hit Space on any result to
+preview text, images, PDFs, code, email, office documents, or audio/video
+without launching an external app. Backed by a local
 [Tantivy](https://github.com/quickwit-oss/tantivy) full-text index, dense
 vector search via CLIP, and a long-lived daemon that keeps everything fresh
 via filesystem watchers. Lexical (BM25) and semantic (text + image) results
-fuse with Reciprocal Rank Fusion — same architecture Apple Spotlight and
-Microsoft Windows Search use.
+fuse with Reciprocal Rank Fusion.
 
 ---
 
 ## Features
 
-- **Apps** — all `.desktop` entries, launched with `GDK_BACKEND` respected.
-- **Files** — everything under your home (minus sensible excludes) with
-  full-text body extraction from PDF/DOCX/XLSX/PPTX/RTF/DOC/XLS/PPT/plain text.
-- **Email (Thunderbird)** — reads the running profile's
-  `global-messages-db.sqlite` directly; subjects, bodies, senders,
-  recipients all searchable. Optional attachment indexing from mbox files.
-- **Email (Maildir)** — any number of maildir roots (mutt/neomutt/offlineimap
-  /isync/fdm-style layouts).
-- **Preview pane** — press Space on any result to open a Quick Look-style
-  overlay showing text, images, PDFs, code, email, office documents, or
-  audio/video content.
+- **Preview pane** — inspect before you open. Hit Space on any result to see
+  text, images, PDFs, code, email, office documents, or audio/video content in
+  a warm overlay. No external app launch, no wait. The preview process stays
+  alive across queries so the second Space is instant.
 - **Semantic search** — hybrid lexical + dense-vector retrieval via
   Reciprocal Rank Fusion. Three parallel backends: BM25 (always on), text
   semantic (bge-small-en-v1.5), and **image semantic** (CLIP cross-modal
@@ -47,6 +41,14 @@ Microsoft Windows Search use.
   `LIXUN_SEMANTIC_WORKER` to its path) and add `[semantic] enabled = true`
   to the config to activate it at runtime (default is off). See
   [docs/search-fusion.md](docs/search-fusion.md) for architecture details.
+- **Apps** — all `.desktop` entries, launched with `GDK_BACKEND` respected.
+- **Files** — everything under your home (minus sensible excludes) with
+  full-text body extraction from PDF/DOCX/XLSX/PPTX/RTF/DOC/XLS/PPT/plain text.
+- **Email (Thunderbird)** — reads the running profile's
+  `global-messages-db.sqlite` directly; subjects, bodies, senders,
+  recipients all searchable. Optional attachment indexing from mbox files.
+- **Email (Maildir)** — any number of maildir roots (mutt/neomutt/offlineimap
+  /isync/fdm-style layouts).
 - **Calculator** — type `= sqrt(16) + pi` and get `7.1415…` at the top.
 - **Shell** — type `> ls -la` to spawn a terminal via `xdg-terminal-exec`.
 - **Automatic OCR** — index scanned PDFs and images via Tesseract.
@@ -127,7 +129,7 @@ Lance/Arrow staging during backfill. See [Semantic search](#semantic-search).
 
 ---
 
-## Quick start
+## Getting started
 
 ### Bind the global hotkey
 
@@ -159,7 +161,7 @@ lixun-cli impact explain                 # preview changes without applying
 
 Press **Space** on any focused result to open the preview overlay.
 Press **Space** or **Escape** to close it. The preview renders in a
-separate layer-shell window so the launcher stays visible underneath.
+separate layer-shell window so the main window stays visible underneath.
 
 ---
 
@@ -208,8 +210,8 @@ copy = "<Ctrl>c"
 quick_look = "space"
 
 [gui]
-width_percent = 40             # Launcher width (% of monitor)
-height_percent = 60            # Launcher height (% of monitor)
+width_percent = 40             # Window width (% of monitor)
+height_percent = 60            # Window height (% of monitor)
 max_width_px = 900             # Absolute pixel caps
 max_height_px = 800
 preview_width_percent = 80     # Preview pane dimensions
@@ -305,10 +307,9 @@ plugins work normally.
 Semantic search adds dense-vector retrieval to the lexical BM25 index. Three
 backends run **in parallel** for every query — BM25, text semantic
 (bge-small-en-v1.5), and image semantic (CLIP cross-modal text→image). Their
-results merge via Reciprocal Rank Fusion (RRF, k=60), the same fusion
-strategy Apple Spotlight and Microsoft Windows Search use. There is **no
-query classifier** — fan-out-and-merge is more robust than trying to guess
-upfront whether a query is "text" or "image".
+results merge via Reciprocal Rank Fusion (RRF, k=60). There is **no query
+classifier** — fan-out-and-merge is more robust than trying to guess upfront
+whether a query is "text" or "image".
 
 **Cross-modal image search.** Query "photos of dogs" or "screenshot of
 terminal" and get actual photos ranked by their visual content via CLIP,
@@ -478,44 +479,58 @@ all widgets of a kind.
 
 ## Architecture
 
-```
-┌────────────────────────────────────────────────────────────────────┐
-│  lixun-gui (GTK4 + layer-shell)   ◄──── unix socket ────►  lixund  │
-│                                                                    │
-│  lixun-cli                        ◄──── unix socket ────►          │
-└────────────────────────────────────────────────────────────────────┘
-                                                               │
-                                                               ▼
-    ┌─────────────────┐    ┌──────────────────┐    ┌──────────────────────┐
-    │  lixun-sources  │───►│  lixun-indexer   │───►│   lixun-index         │
-    │  (fs, apps,     │    │  (writer task,   │    │   (Tantivy wrapper)   │
-    │   plugin trait) │    │   tick scheduler)│    │                       │
-    └─────────────────┘    └──────────────────┘    └──────────────────────┘
-            ▲
-            │ inventory::submit!
-            │
-    ┌───────┴────────────────────────────┐
-    │  lixun-source-thunderbird  (gloda + attachments)
-    │  lixun-source-maildir
-    │  lixun-source-calculator  (= prefix)
-    │  lixun-source-shell        (> prefix)
-    │  lixun-source-semantic-stub (IPC client to lixun-semantic-worker sidecar)
-    │  … (add your own: see below)
-    └────────────────────────────────────┘
+Lixun is a **workspace browser with plugin-owned rendering**. The daemon
+(`lixund`) owns the index and serves IPC; the GUI is a thin GTK4 + layer-shell
+window spawned on demand; results come from source plugins discovered through
+`inventory::submit!`; previews come from format plugins spawned in a separate
+warm process. Nothing in the host binary names any concrete plugin — the
+domain logic for "what counts as a Thunderbird message", "how to render a PDF",
+"how to launch a `mid:` URI" all lives inside the plugin that owns that domain.
 
-    ┌─────────────────────────────────────────────────────────────────┐
-    │  Preview pane (spawned on Space)                                 │
-    │                                                                  │
-    │  lixund ──unix socket──► lixun-preview (layer-shell overlay)    │
-    │                               │                                  │
-    │                               ▼                                  │
-    │                    ┌─────────────────────┐                       │
-    │                    │  Format plugins     │                       │
-    │                    │  (text/image/pdf/   │                       │
-    │                    │   code/email/office/│                       │
-    │                    │   av)               │                       │
-    │                    └─────────────────────┘                       │
-    └─────────────────────────────────────────────────────────────────┘
+```
+┌─────────────────┐         ┌─────────────────────────────────┐
+│   lixun-gui     │◄───────►│          lixund (daemon)        │
+│  GTK4 +         │ IPC     │  • Tantivy writer               │
+│  layer-shell    │         │  • tick scheduler               │
+│  main window    │         │  • filesystem watcher (notify)  │
+└─────────────────┘         │  • IPC server (unix socket)     │
+                            └─────────────────────────────────┘
+┌─────────────────┐                    │        │
+│   lixun-cli     │◄───── IPC ─────────┘        │
+│  thin client    │                             │
+└─────────────────┘                             ▼
+                                    ┌───────────────────────┐
+                                    │    lixun-indexer      │
+                                    │  writer task, ticks   │
+                                    └───────────────────────┘
+                                                │
+                                                ▼
+                                    ┌───────────────────────┐
+                                    │     lixun-index       │
+                                    │    (Tantivy store)    │
+                                    └───────────────────────┘
+                                                ▲
+                                                │ inventory::submit!
+                                                │
+                        ┌───────────────────────┴──────────────┐
+                        │  Source plugins (config-gated):      │
+                        │  • lixun-source-thunderbird          │
+                        │  • lixun-source-maildir              │
+                        │  • lixun-source-calculator (= prefix)│
+                        │  • lixun-source-shell      (> prefix)│
+                        │  • lixun-source-semantic-stub        │
+                        │  • … (add your own — see below)      │
+                        └──────────────────────────────────────┘
+
+Preview path (spawned on first Space, kept warm between queries):
+
+    lixund ──unix socket──► lixun-preview  ──►  Format plugins
+                            layer-shell          (inventory::submit!)
+                            overlay
+                                                 • text   • image
+                                                 • pdf    • code
+                                                 • email  • office
+                                                 • av
 ```
 
 - **Daemon (`lixund`)** — owns the Tantivy writer, runs tick scheduler,
@@ -527,7 +542,7 @@ all widgets of a kind.
 - **Preview (`lixun-preview`)** — short-lived companion process spawned
   by the daemon when the user presses Space on a focused result row.
   Renders the hit in a second layer-shell overlay using a format plugin.
-  Closes on Escape, Space, or focus-loss; launcher remains alive underneath.
+  Closes on Escape, Space, or focus-loss; main window remains alive underneath.
 - **Plugin registration** — `inventory::submit!` + anchor crate pattern
   used twice: once for source plugins (`lixun-plugin-bundle`) and once
   for preview format plugins (`lixun-preview-bundle`). Adding either:
@@ -576,7 +591,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 | `lixun-sources` | `PluginFactory` trait + built-in `fs`/`apps` sources |
 | `lixun-indexer` | Writer task, tick scheduler, fs watcher glue |
 | `lixun-daemon` | IPC server, hotkey, startup, systemd glue |
-| `lixun-gui` | GTK4 launcher window |
+| `lixun-gui` | GTK4 main window |
 | `lixun-cli` | `lixun-cli` command (may be installed as `lixun`) |
 | `lixun-mutation` | Config mutation (TOML edit) for `impact set --persist` |
 | `lixun-fusion` | Reciprocal Rank Fusion + semantic search integration |
@@ -654,18 +669,16 @@ duration of the reindex (minutes on typical home corpora).
 
 Recent version bumps:
 
-- **v0.6.0** (cross-modal image search + Spotlight-style RRF fusion). Added
-  CLIP-based text→image search: query "photos of dogs" returns photos ranked
-  by visual content, not filename. Fusion refactored to 3-way parallel
-  fan-out (BM25 + text ANN + image ANN) merged via Reciprocal Rank Fusion
-  (k=60), matching Apple Spotlight and Microsoft Windows Search architecture.
-  Removed the experimental anchor-based query classifier (CLIP text space is
-  asymmetric for short queries — fan-out-and-merge is more robust).
-  **INDEX_VERSION bump:** Tantivy schema gained a `mime` field needed for
-  routing image documents into the CLIP image embedder. Daemon detects the
-  mismatch on startup and reindexes from scratch; existing index stays
-  queryable until rebuild completes. See `docs/search-fusion.md` for
-  architecture details.
+- **v0.6.0** (cross-modal image search + RRF fusion). Added CLIP-based
+  text→image search: query "photos of dogs" returns photos ranked by visual
+  content, not filename. Fusion refactored to 3-way parallel fan-out (BM25 +
+  text ANN + image ANN) merged via Reciprocal Rank Fusion (k=60). Removed the
+  experimental anchor-based query classifier (CLIP text space is asymmetric for
+  short queries — fan-out-and-merge is more robust). **INDEX_VERSION bump:**
+  Tantivy schema gained a `mime` field needed for routing image documents into
+  the CLIP image embedder. Daemon detects the mismatch on startup and reindexes
+  from scratch; existing index stays queryable until rebuild completes. See
+  `docs/search-fusion.md` for architecture details.
 
 - **v0.5.1** (packaging hardening). Fixed Arch makepkg link failure (LTO
   was dropping `cargo:rustc-link-lib=static` metadata from
