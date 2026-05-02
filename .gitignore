@@ -14,13 +14,14 @@
 # Local notes workspace (plans, notepads, transcripts — local only)
 /.local/
 /.local-plans/
-/.local-plans/
+/.sisyphus/
 
 # Local-only notes and instructions, not distributed with the repo
 /AGENTS.md
 
 # Local reference documents (PDFs, etc.) used for design research
 /docs/references/
+/docs/research/
 
 # Local knowledge-graph index caches (not distributed)
 /.gitnexus/
