@@ -291,7 +291,7 @@ pub fn extract_path(path: &Path) -> Result<String> {
     // Text-like: try encoding detection
     match ext.as_str() {
         "txt" | "md" | "log" | "csv" | "json" | "xml" | "html" | "htm" | "yaml" | "yml"
-        | "toml" | "ini" | "cfg" | "rs" | "py" | "js" | "ts" | "c" | "h" | "cpp" | "hpp"
+        | "toml" | "ini" | "cfg" | "conf" | "rs" | "py" | "js" | "ts" | "c" | "h" | "cpp" | "hpp"
         | "java" | "go" | "sh" | "css" | "scss" | "sql" | "rb" => extract_text_file(path),
         _ => {
             // Magic sniff for extension-less text files
