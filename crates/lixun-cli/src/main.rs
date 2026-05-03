@@ -12,7 +12,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
 const BUILTIN_VERBS: &[&str] = &[
-    "toggle", "show", "hide", "search", "reindex", "status", "impact",
+    "toggle", "show", "hide", "search", "reindex", "status", "impact", "check-exclude",
 ];
 
 async fn open_daemon_stream() -> Result<UnixStream> {
@@ -184,6 +184,11 @@ fn root_command(plugin_verbs: &[CliVerb]) -> Command {
                     Command::new("explain")
                         .about("Print the resolved profile knob table for the current level."),
                 ),
+        )
+        .subcommand(
+            Command::new("check-exclude")
+                .about("Check if a path would be excluded by current config.")
+                .arg(Arg::new("path").required(true).help("Path to check")),
         );
 
     for verb in plugin_verbs {
@@ -222,6 +227,81 @@ fn collect_plugin_invocation(head: &str, matches: &ArgMatches) -> (Vec<String>, 
         }
     }
     (path, serde_json::Value::Object(args))
+}
+
+fn handle_check_exclude(path_str: &str) -> Result<()> {
+    use std::path::Path;
+    
+    let config_path = dirs::config_dir()
+        .ok_or_else(|| anyhow::anyhow!("Cannot determine config directory"))?
+        .join("lixun/config.toml");
+    
+    let mut exclude_substrings = default_excludes();
+    let mut exclude_regexes = Vec::new();
+    
+    if config_path.exists() {
+        let content = std::fs::read_to_string(&config_path)?;
+        let parsed: toml::Value = toml::from_str(&content)?;
+        
+        if let Some(extra) = parsed.get("exclude").and_then(|v| v.as_array()) {
+            for item in extra {
+                if let Some(s) = item.as_str() {
+                    exclude_substrings.push(s.to_string());
+                }
+            }
+        }
+        
+        if let Some(patterns) = parsed.get("exclude_regex").and_then(|v| v.as_array()) {
+            for item in patterns {
+                if let Some(pat) = item.as_str() {
+                    match regex::Regex::new(pat) {
+                        Ok(r) => exclude_regexes.push((pat.to_string(), r)),
+                        Err(e) => eprintln!("warning: invalid regex '{}': {}", pat, e),
+                    }
+                }
+            }
+        }
+    }
+    
+    exclude_substrings.extend(lixun_sources::exclude::lixun_self_excludes());
+    
+    let path = Path::new(path_str);
+    let path_lossy = path.to_string_lossy();
+    
+    for substr in &exclude_substrings {
+        if path_lossy.contains(substr.as_str()) {
+            println!("EXCLUDED by substring: '{}'", substr);
+            return Ok(());
+        }
+    }
+    
+    for (pattern, regex) in &exclude_regexes {
+        if regex.is_match(&path_lossy) {
+            println!("EXCLUDED by regex: '{}'", pattern);
+            return Ok(());
+        }
+    }
+    
+    println!("NOT EXCLUDED");
+    Ok(())
+}
+
+fn default_excludes() -> Vec<String> {
+    vec![
+        ".cache".into(),
+        ".local/share/Trash".into(),
+        ".steam".into(),
+        ".var/app".into(),
+        "node_modules".into(),
+        "target".into(),
+        ".git".into(),
+        ".venv".into(),
+        "__pycache__".into(),
+        ".thunderbird".into(),
+        ".swp".into(),
+        ".swo".into(),
+        ".swx".into(),
+    ]
 }
 
 #[tokio::main]
@@ -300,6 +380,12 @@ async fn main() -> Result<()> {
                 }
                 other => anyhow::bail!("unknown impact subcommand: {}", other),
             }
+        }
+        "check-exclude" => {
+            let path = sub_matches
+                .get_one::<String>("path")
+                .expect("clap required arg");
+            handle_check_exclude(path)?;
         }
         other => {
             let (verb_path, args) = collect_plugin_invocation(other, sub_matches);

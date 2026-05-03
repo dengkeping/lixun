@@ -4975,11 +4975,13 @@ dependencies = [
  "lixun-ipc",
  "lixun-mutation",
  "lixun-sources",
+ "regex",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
  "tokio-util",
+ "toml 0.8.23",
 ]
 
 [[package]]
@@ -5474,6 +5476,7 @@ name = "lixun-sources"
 version = "0.6.0"
 dependencies = [
  "anyhow",
+ "dirs 5.0.1",
  "image 0.25.10",
  "inventory",
  "lixun-core",
