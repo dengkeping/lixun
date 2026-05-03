@@ -11,8 +11,10 @@ use std::str::FromStr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
+mod dashboard;
+
 const BUILTIN_VERBS: &[&str] = &[
-    "toggle", "show", "hide", "search", "reindex", "status", "impact", "check-exclude",
+    "toggle", "show", "hide", "search", "reindex", "status", "impact", "check-exclude", "dashboard",
 ];
 
 async fn open_daemon_stream() -> Result<UnixStream> {
@@ -189,6 +191,10 @@ fn root_command(plugin_verbs: &[CliVerb]) -> Command {
             Command::new("check-exclude")
                 .about("Check if a path would be excluded by current config.")
                 .arg(Arg::new("path").required(true).help("Path to check")),
+        )
+        .subcommand(
+            Command::new("dashboard")
+                .about("Launch btop-style TUI dashboard"),
         );
 
     for verb in plugin_verbs {
@@ -387,6 +393,9 @@ async fn main() -> Result<()> {
                 .expect("clap required arg");
             handle_check_exclude(path)?;
         }
+        "dashboard" => {
+            dashboard_main().await?;
+        }
         other => {
             let (verb_path, args) = collect_plugin_invocation(other, sub_matches);
             let resp = send_request(Request::PluginCommand { verb_path, args }).await?;
@@ -394,6 +403,181 @@ async fn main() -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+async fn dashboard_main() -> Result<()> {
+    use dashboard::{tui, App, EventHandler, ui, event::Event};
+    use std::process::Stdio;
+    use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::process::Command;
+    use tokio::sync::mpsc;
+    
+    tui::install_panic_hook();
+    let mut terminal = tui::enter_tui()?;
+    
+    let (log_tx, log_rx) = mpsc::unbounded_channel();
+    
+    let mut child = Command::new("journalctl")
+        .args(["--user", "-u", "lixund", "--follow", "--lines=100", "--output=json", "--output-fields=MESSAGE,PRIORITY"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn();
+    
+    if let Ok(ref mut child) = child {
+        if let Some(stdout) = child.stdout.take() {
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(stdout).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    if let Some(entry) = dashboard::LogEntry::parse(&line) {
+                        if log_tx.send(entry).is_err() {
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+    } else {
+        eprintln!("Failed to spawn journalctl subprocess; logs will be unavailable");
+    }
+    
+    let mut events = EventHandler::new(Duration::from_millis(250), Some(log_rx));
+    let mut app = App::new();
+    
+    let mut stream = open_daemon_stream().await?;
+    write_request(&mut stream, &Request::Status).await?;
+    if let Response::Status { indexed_docs, memory, watcher, writer, ocr, .. } = read_response_frame(&mut stream).await? {
+        app.indexed_docs = indexed_docs;
+        app.memory = memory;
+        app.watcher = watcher;
+        app.writer = writer;
+        app.ocr_stats = ocr;
+        app.connected = true;
+    }
+    app.update_semantic_status();
+    
+    loop {
+        terminal.draw(|frame| ui::render_dashboard(frame, &mut app))?;
+        
+        match events.next().await? {
+            Event::Key(key) => {
+                app.handle_key(key);
+                if app.should_quit {
+                    break;
+                }
+            }
+            Event::Mouse(mouse) => {
+                app.handle_mouse(mouse);
+            }
+            Event::LogLine(line) => {
+                app.push_log(line);
+            }
+            Event::Tick => {
+                if app.reindex_pending {
+                    app.reindex_pending = false;
+                    if let Ok(mut s) = open_daemon_stream().await {
+                        let _ = write_request(&mut s, &Request::Reindex { paths: vec![] }).await;
+                    }
+                }
+                
+                if app.restart_pending {
+                    app.restart_pending = false;
+                    app.restart_status = dashboard::app::RestartStatus::Restarting;
+                    app.connected = false;
+                    app.push_log_message("Restarting daemon...".to_string(), dashboard::LogLevel::Info);
+                    
+                    let restart_result = Command::new("systemctl")
+                        .args(["--user", "restart", "lixund.service"])
+                        .output()
+                        .await;
+                    
+                    if let Err(e) = restart_result {
+                        app.restart_status = dashboard::app::RestartStatus::Failed(format!("systemctl failed: {}", e));
+                        app.push_log_message(format!("Failed to restart daemon: {}", e), dashboard::LogLevel::Error);
+                        continue;
+                    }
+                    
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    
+                    app.restart_status = dashboard::app::RestartStatus::Reconnecting;
+                    let mut reconnected = false;
+                    for attempt in 1..=30 {
+                        app.push_log_message(format!("Reconnecting... (attempt {}/30)", attempt), dashboard::LogLevel::Info);
+                        if let Ok(mut s) = open_daemon_stream().await {
+                            if let Ok(_) = write_request(&mut s, &Request::Status).await {
+                                if let Ok(Response::Status { indexed_docs, memory, watcher, writer, ocr, .. }) = read_response_frame(&mut s).await {
+                                    app.indexed_docs = indexed_docs;
+                                    app.memory = memory;
+                                    app.watcher = watcher;
+                                    app.writer = writer;
+                                    app.ocr_stats = ocr;
+                                    app.connected = true;
+                                    app.restart_status = dashboard::app::RestartStatus::Idle;
+                                    app.update_semantic_status();
+                                    app.push_log_message("Daemon restarted successfully".to_string(), dashboard::LogLevel::Info);
+                                    reconnected = true;
+                                    break;
+                                }
+                            }
+                        }
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    }
+                    
+                    if !reconnected {
+                        app.restart_status = dashboard::app::RestartStatus::Failed("timeout waiting for daemon".to_string());
+                        app.push_log_message("Failed to reconnect after 30 attempts".to_string(), dashboard::LogLevel::Error);
+                    }
+                }
+                
+                if app.search_pending {
+                    app.search_pending = false;
+                    if let Ok(mut s) = open_daemon_stream().await {
+                        let _ = write_request(&mut s, &Request::Search {
+                            q: app.query_input.clone(),
+                            limit: 50,
+                            explain: false,
+                            epoch: 1,
+                        }).await;
+                        
+                        let mut results = Vec::new();
+                        loop {
+                            if let Ok(frame) = read_response_frame(&mut s).await {
+                                match frame {
+                                    Response::SearchChunk { hits, phase, .. } => {
+                                        results.extend(hits);
+                                        if phase == Phase::Final {
+                                            break;
+                                        }
+                                    }
+                                    _ => break,
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+                        app.set_search_results(results);
+                    }
+                }
+                
+                if let Ok(mut s) = open_daemon_stream().await {
+                    let _ = write_request(&mut s, &Request::Status).await;
+                    if let Ok(Response::Status { indexed_docs, memory, watcher, writer, ocr, .. }) = read_response_frame(&mut s).await {
+                        app.indexed_docs = indexed_docs;
+                        app.memory = memory;
+                        app.watcher = watcher;
+                        app.writer = writer;
+                        app.ocr_stats = ocr;
+                        app.connected = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    
+    tui::exit_tui(&mut terminal)?;
     Ok(())
 }
 
