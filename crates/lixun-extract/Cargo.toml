@@ -20,6 +20,7 @@ zstd = { workspace = true }
 uuid = { workspace = true }
 dirs = { workspace = true }
 image = { workspace = true }
+imageproc = "0.25"
 rusqlite = { workspace = true }
 
 [dev-dependencies]

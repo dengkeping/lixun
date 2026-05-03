@@ -118,6 +118,8 @@ pub struct OcrWorkerCfg {
     /// tesseract/pdftoppm spawn with reduced CPU and (optionally)
     /// I/O priority (DB-15).
     pub throttle: Option<(i32, bool)>,
+    pub content_filter_enabled: bool,
+    pub content_filter_min_text_components: u32,
 }
 
 /// Outcome of a single [`tick_once`] call. Enum shape supports
@@ -176,6 +178,34 @@ where
             return TickOutcome::Empty;
         }
     };
+
+    if cfg.content_filter_enabled {
+        let path_for_filter = PathBuf::from(&row.path);
+        match lixun_extract::ocr::content_filter_check(
+            &path_for_filter,
+            cfg.content_filter_min_text_components,
+        ) {
+            Ok(false) => {
+                tracing::info!(
+                    "ocr tick: content filter rejected {} (low text-like component count)",
+                    row.doc_id
+                );
+                if let Err(e) = queue.mark_failure(&row.doc_id, "content_filter: low-complexity image") {
+                    tracing::warn!("ocr tick: mark_failure after content filter failed: {e:#}");
+                }
+                return TickOutcome::PermanentSkip {
+                    doc_id: row.doc_id.clone(),
+                };
+            }
+            Ok(true) => {}
+            Err(e) => {
+                tracing::warn!(
+                    "ocr tick: content filter check failed for {}: {e:#} — proceeding with OCR",
+                    row.doc_id
+                );
+            }
+        }
+    }
 
     let doc_id = row.doc_id.clone();
     let path = PathBuf::from(&row.path);
@@ -501,6 +531,8 @@ mod tests {
             max_attempts: 3,
             jobs_per_tick: 1,
             throttle: None,
+            content_filter_enabled: false,
+            content_filter_min_text_components: 30,
         }
     }
 

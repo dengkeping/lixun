@@ -170,6 +170,33 @@ pub struct OcrConfig {
     pub nice_level: i32,
     #[serde(default)]
     pub io_class_idle: bool,
+    #[serde(default)]
+    pub content_filter: ContentFilterConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq)]
+pub struct ContentFilterConfig {
+    #[serde(default = "default_content_filter_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_min_text_components")]
+    pub min_text_components: u32,
+}
+
+impl Default for ContentFilterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_content_filter_enabled(),
+            min_text_components: default_min_text_components(),
+        }
+    }
+}
+
+fn default_content_filter_enabled() -> bool {
+    true
+}
+
+fn default_min_text_components() -> u32 {
+    30
 }
 
 impl Default for OcrConfig {
@@ -186,6 +213,7 @@ impl Default for OcrConfig {
             max_cpu_pressure_avg10: default_max_cpu_pressure_avg10(),
             nice_level: default_nice_level(),
             io_class_idle: false,
+            content_filter: ContentFilterConfig::default(),
         }
     }
 }
@@ -983,6 +1011,7 @@ mod tests {
             max_cpu_pressure_avg10: 25.0,
             nice_level: 10,
             io_class_idle: true,
+            content_filter: ContentFilterConfig::default(),
         };
         let s = toml::to_string(&oc).unwrap();
         let parsed: OcrConfig = toml::from_str(&s).unwrap();
