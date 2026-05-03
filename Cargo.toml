@@ -80,6 +80,7 @@ arc-swap = "1.7"
 # order intact). Plain `toml` would round-trip the file as a serde
 # value tree, dropping comments and reordering tables.
 toml_edit = "0.22"
+toml = "0.8"
 
 # Text
 regex = "1"

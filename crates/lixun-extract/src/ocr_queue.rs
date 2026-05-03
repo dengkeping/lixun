@@ -159,11 +159,16 @@ impl OcrQueue {
         .context("ocr queue: enqueue failed")
     }
 
-    /// Return the next pending row whose `attempts < max_attempts`,
-    /// ordered by `(attempts ASC, enqueued_at ASC)` so that freshly
-    /// enqueued rows drain first and rows that failed a lot are
-    /// considered only after nobody else is waiting. Returns
-    /// `Ok(None)` if nothing is pending.
+    /// Return the next pending row whose `attempts < max_attempts`.
+    ///
+    /// Ordering is hybrid: rows enqueued within the last 24 hours
+    /// drain in FIFO order (oldest `enqueued_at` first) so freshly
+    /// added files are processed promptly; older rows (zombies from
+    /// a backlog / reindex) drain by file modification time descending
+    /// so the newest files in the backlog surface first. Failed rows
+    /// (`attempts > 0`) always fall to the end regardless of age.
+    ///
+    /// Returns `Ok(None)` if nothing is pending.
     pub fn peek_next(&self, max_attempts: u32) -> Result<Option<OcrQueueRow>> {
         self.with_conn(|conn| {
             with_busy_retry(|| {
@@ -171,7 +176,14 @@ impl OcrQueue {
                     "SELECT doc_id, path, mtime, size, ext, enqueued_at, attempts, last_error
                      FROM ocr_queue
                      WHERE attempts < ?1
-                     ORDER BY attempts ASC, enqueued_at ASC
+                     ORDER BY attempts ASC,
+                              CASE WHEN (CAST(strftime('%s', 'now') AS INTEGER) - enqueued_at) < 86400
+                                   THEN 0 ELSE 1
+                              END ASC,
+                              CASE WHEN (CAST(strftime('%s', 'now') AS INTEGER) - enqueued_at) < 86400
+                                   THEN enqueued_at
+                                   ELSE -mtime
+                              END ASC
                      LIMIT 1",
                 )?;
                 let mut rows = stmt.query(params![max_attempts as i64])?;
@@ -574,16 +586,48 @@ mod tests {
     }
 
     #[test]
-    fn peek_next_orders_by_enqueued_at_asc() {
+    fn peek_next_hybrid_ordering() {
         let q = mem_queue();
-        let mut a = sample_row("older");
-        a.enqueued_at = 100;
-        let mut b = sample_row("newer");
-        b.enqueued_at = 200;
-        q.enqueue(b).unwrap();
-        q.enqueue(a).unwrap();
-        let row = q.peek_next(3).unwrap().unwrap();
-        assert_eq!(row.doc_id, "older");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        let mut fresh_old = sample_row("fresh-old");
+        fresh_old.enqueued_at = now - 3600;
+        fresh_old.mtime = now - 86400 * 30;
+
+        let mut fresh_new = sample_row("fresh-new");
+        fresh_new.enqueued_at = now - 1800;
+        fresh_new.mtime = now - 86400 * 10;
+
+        let mut backlog_old = sample_row("backlog-old");
+        backlog_old.enqueued_at = now - 86400 * 5;
+        backlog_old.mtime = now - 86400 * 100;
+
+        let mut backlog_new = sample_row("backlog-new");
+        backlog_new.enqueued_at = now - 86400 * 3;
+        backlog_new.mtime = now - 86400 * 2;
+
+        q.enqueue(backlog_old.clone()).unwrap();
+        q.enqueue(fresh_new.clone()).unwrap();
+        q.enqueue(backlog_new.clone()).unwrap();
+        q.enqueue(fresh_old.clone()).unwrap();
+
+        let first = q.peek_next(3).unwrap().unwrap();
+        assert_eq!(first.doc_id, "fresh-old");
+        q.remove(&first.doc_id).unwrap();
+
+        let second = q.peek_next(3).unwrap().unwrap();
+        assert_eq!(second.doc_id, "fresh-new");
+        q.remove(&second.doc_id).unwrap();
+
+        let third = q.peek_next(3).unwrap().unwrap();
+        assert_eq!(third.doc_id, "backlog-new");
+        q.remove(&third.doc_id).unwrap();
+
+        let fourth = q.peek_next(3).unwrap().unwrap();
+        assert_eq!(fourth.doc_id, "backlog-old");
     }
 
     #[test]

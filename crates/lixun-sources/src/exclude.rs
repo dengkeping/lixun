@@ -1,8 +1,48 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub fn path_excluded(path: &Path, substrings: &[String], regexes: &[regex::Regex]) -> bool {
     let s = path.to_string_lossy();
     substrings.iter().any(|p| s.contains(p.as_str())) || regexes.iter().any(|r| r.is_match(&s))
+}
+
+/// Absolute paths of every directory lixun itself writes to, used as
+/// substring excludes for the fs source. The set must cover XDG
+/// data, state, cache and config so the indexer never sees its own
+/// LanceDB rotations, SQLite WAL files or extract caches as user
+/// content. `LIXUN_SEMANTIC_DATA_DIR` is honoured as well so a user
+/// who relocates the worker storage doesn't reintroduce the loop.
+pub fn lixun_self_excludes() -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |p: PathBuf| {
+        if let Some(s) = p.to_str() {
+            if !s.is_empty() {
+                out.push(s.to_string());
+            }
+        }
+    };
+    if let Some(p) = dirs::data_dir() {
+        push(p.join("lixun"));
+    }
+    if let Some(p) = dirs::state_dir() {
+        push(p.join("lixun"));
+    } else {
+        let home = std::env::var("HOME").unwrap_or_default();
+        if !home.is_empty() {
+            push(PathBuf::from(&home).join(".local/state/lixun"));
+        }
+    }
+    if let Some(p) = dirs::cache_dir() {
+        push(p.join("lixun"));
+    }
+    if let Some(p) = dirs::config_dir() {
+        push(p.join("lixun"));
+    }
+    if let Ok(custom) = std::env::var("LIXUN_SEMANTIC_DATA_DIR") {
+        if !custom.is_empty() {
+            push(PathBuf::from(custom));
+        }
+    }
+    out
 }
 
 #[cfg(test)]

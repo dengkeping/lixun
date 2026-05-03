@@ -170,6 +170,33 @@ pub struct OcrConfig {
     pub nice_level: i32,
     #[serde(default)]
     pub io_class_idle: bool,
+    #[serde(default)]
+    pub content_filter: ContentFilterConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq)]
+pub struct ContentFilterConfig {
+    #[serde(default = "default_content_filter_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_min_text_components")]
+    pub min_text_components: u32,
+}
+
+impl Default for ContentFilterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_content_filter_enabled(),
+            min_text_components: default_min_text_components(),
+        }
+    }
+}
+
+fn default_content_filter_enabled() -> bool {
+    true
+}
+
+fn default_min_text_components() -> u32 {
+    30
 }
 
 impl Default for OcrConfig {
@@ -186,6 +213,7 @@ impl Default for OcrConfig {
             max_cpu_pressure_avg10: default_max_cpu_pressure_avg10(),
             nice_level: default_nice_level(),
             io_class_idle: false,
+            content_filter: ContentFilterConfig::default(),
         }
     }
 }
@@ -731,7 +759,7 @@ impl Config {
         // follows whatever the user has configured, and it is
         // applied unconditionally on top of the user-supplied
         // `exclude` list (cannot be turned off via config).
-        let mut exclude = lixun_self_excludes();
+        let mut exclude = lixun_sources::exclude::lixun_self_excludes();
         exclude.extend(self.exclude.iter().cloned());
 
         Ok(lixun_sources::fs::FsSource::with_regex_and_ocr(
@@ -890,44 +918,6 @@ fn state_dir() -> PathBuf {
         .join("lixun")
 }
 
-/// Absolute paths of every directory lixun itself writes to, used as
-/// substring excludes for the fs source. The set must cover XDG
-/// data, state, cache and config so the indexer never sees its own
-/// LanceDB rotations, SQLite WAL files or extract caches as user
-/// content. `LIXUN_SEMANTIC_DATA_DIR` is honoured as well so a user
-/// who relocates the worker storage doesn't reintroduce the loop.
-fn lixun_self_excludes() -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    let mut push = |p: PathBuf| {
-        if let Some(s) = p.to_str() {
-            if !s.is_empty() {
-                out.push(s.to_string());
-            }
-        }
-    };
-    if let Some(p) = dirs::data_dir() {
-        push(p.join("lixun"));
-    }
-    if let Some(p) = dirs::state_dir() {
-        push(p.join("lixun"));
-    } else {
-        let home = std::env::var("HOME").unwrap_or_default();
-        if !home.is_empty() {
-            push(PathBuf::from(&home).join(".local/state/lixun"));
-        }
-    }
-    if let Some(p) = dirs::cache_dir() {
-        push(p.join("lixun"));
-    }
-    push(config_dir().join("lixun"));
-    if let Ok(custom) = std::env::var("LIXUN_SEMANTIC_DATA_DIR") {
-        if !custom.is_empty() {
-            push(PathBuf::from(custom));
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -983,6 +973,7 @@ mod tests {
             max_cpu_pressure_avg10: 25.0,
             nice_level: 10,
             io_class_idle: true,
+            content_filter: ContentFilterConfig::default(),
         };
         let s = toml::to_string(&oc).unwrap();
         let parsed: OcrConfig = toml::from_str(&s).unwrap();

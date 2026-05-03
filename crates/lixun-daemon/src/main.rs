@@ -1838,6 +1838,8 @@ fn spawn_ocr_worker(
         max_attempts: OCR_MAX_ATTEMPTS,
         jobs_per_tick: config.ocr.jobs_per_tick as usize,
         throttle,
+        content_filter_enabled: config.ocr.content_filter.enabled,
+        content_filter_min_text_components: config.ocr.content_filter.min_text_components,
     };
     let idle: Arc<dyn lixun_indexer::ocr_tick::IdleGate> = if config.ocr.adaptive_throttle {
         let stats_gate: Arc<dyn lixun_indexer::ocr_tick::IdleGate> =

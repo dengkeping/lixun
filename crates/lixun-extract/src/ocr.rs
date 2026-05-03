@@ -13,6 +13,7 @@
 //! input to those binaries.
 
 use anyhow::{Context, Result, anyhow};
+use image::GenericImageView;
 use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -336,6 +337,100 @@ fn text_to_option(text: String) -> Option<String> {
     } else {
         Some(text)
     }
+}
+
+const TARGET_LONG_SIDE: u32 = 800;
+const MIN_COMPONENT_AREA: u32 = 8;
+const MAX_COMPONENT_AREA: u32 = 5000;
+const MIN_ASPECT: f32 = 0.15;
+const MAX_ASPECT: f32 = 8.0;
+const MIN_BBOX_SIDE: u32 = 4;
+
+pub fn content_filter_check(
+    path: &Path,
+    min_text_components: u32,
+) -> Result<bool> {
+    let img = image::open(path)
+        .with_context(|| format!("content filter: failed to open image: {}", path.display()))?;
+
+    let (w, h) = img.dimensions();
+    let long_side = w.max(h);
+
+    let resized = if long_side > TARGET_LONG_SIDE {
+        let scale = TARGET_LONG_SIDE as f32 / long_side as f32;
+        let new_w = (w as f32 * scale) as u32;
+        let new_h = (h as f32 * scale) as u32;
+        img.resize_exact(new_w, new_h, image::imageops::FilterType::Triangle)
+    } else {
+        img
+    };
+
+    let gray = resized.to_luma8();
+    let threshold = imageproc::contrast::otsu_level(&gray);
+    let binary: image::ImageBuffer<image::Luma<u8>, Vec<u8>> = 
+        image::ImageBuffer::from_fn(gray.width(), gray.height(), |x, y| {
+            if gray.get_pixel(x, y).0[0] >= threshold {
+                image::Luma([255u8])
+            } else {
+                image::Luma([0u8])
+            }
+        });
+
+    let components = imageproc::region_labelling::connected_components(
+        &binary,
+        imageproc::region_labelling::Connectivity::Eight,
+        image::Luma([0u8])
+    );
+
+    let mut component_stats: std::collections::HashMap<u32, ComponentStats> =
+        std::collections::HashMap::new();
+
+    for y in 0..components.height() {
+        for x in 0..components.width() {
+            let label = components.get_pixel(x, y).0[0];
+            if label == 0 {
+                continue;
+            }
+            let stats = component_stats.entry(label).or_insert_with(|| ComponentStats {
+                min_x: x,
+                max_x: x,
+                min_y: y,
+                max_y: y,
+                area: 0,
+            });
+            stats.min_x = stats.min_x.min(x);
+            stats.max_x = stats.max_x.max(x);
+            stats.min_y = stats.min_y.min(y);
+            stats.max_y = stats.max_y.max(y);
+            stats.area += 1;
+        }
+    }
+
+    let text_like_count = component_stats
+        .values()
+        .filter(|s| {
+            if s.area < MIN_COMPONENT_AREA || s.area > MAX_COMPONENT_AREA {
+                return false;
+            }
+            let bbox_w = (s.max_x - s.min_x + 1) as f32;
+            let bbox_h = (s.max_y - s.min_y + 1) as f32;
+            if bbox_w < MIN_BBOX_SIDE as f32 || bbox_h < MIN_BBOX_SIDE as f32 {
+                return false;
+            }
+            let aspect = bbox_w / bbox_h;
+            aspect >= MIN_ASPECT && aspect <= MAX_ASPECT
+        })
+        .count() as u32;
+
+    Ok(text_like_count >= min_text_components)
+}
+
+struct ComponentStats {
+    min_x: u32,
+    max_x: u32,
+    min_y: u32,
+    max_y: u32,
+    area: u32,
 }
 
 #[cfg(test)]
