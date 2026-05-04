@@ -58,7 +58,7 @@ window.background,
         linear-gradient(180deg,
             rgba(255, 255, 255, 0.035) 0%,
             rgba(255, 255, 255, 0.0)  50%),
-        rgba(28, 28, 32, 0.35);
+        rgba(28, 28, 32, 0.50);
     border-radius: 14px;
     border: 0.5px solid rgba(255, 255, 255, 0.12);
     box-shadow: 0 24px 64px rgba(0, 0, 0, 0.55),
@@ -98,15 +98,21 @@ window.background,
     padding-top: 12px;
 }
 
+scrolledwindow,
+listview {
+    background-color: transparent;
+}
+
 /* ----- Hit row ----- */
 .lixun-hit {
     padding: 8px 12px;
     border-radius: 10px;
     transition: background-color 0.12s ease;
+    background-color: transparent;
 }
 
 .lixun-hit:hover {
-    background-color: rgba(255, 255, 255, 0.04);
+    background-color: rgba(255, 255, 255, 0.06);
 }
 
 /* Selection indicator = hero frame only (see `.lixun-top-hit` below).
@@ -140,7 +146,7 @@ listview row:selected:hover {
    no outline. */
 .lixun-top-hit {
     padding: 8px 12px;
-    background-color: rgba(255, 255, 255, 0.06);
+    background-color: rgba(255, 255, 255, 0.08);
     border-radius: 10px;
 }
 
