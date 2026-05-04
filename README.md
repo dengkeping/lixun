@@ -475,6 +475,31 @@ Every themeable widget carries both a stable CSS id (`#lixun-root`,
 `.lixun-top-hit`, …) so you can target either the specific widget or
 all widgets of a kind.
 
+### Compositor blur (liquid-glass look)
+
+The default theme is translucent (background alpha `0.55`) so that a
+blurred backdrop can shine through. The launcher window asks the
+compositor to blur whatever is behind it on supported compositors:
+
+- **KDE Plasma 6 (KWin)** — the GUI auto-binds the
+  `org_kde_kwin_blur` protocol on every `map`. No user configuration
+  required; if the protocol is unavailable (non-KDE compositor, X11
+  session) the call is a silent no-op.
+- **Hyprland** — add to `~/.config/hypr/hyprland.conf`:
+
+  ```
+  layerrule = blur, lixun-gui
+  layerrule = ignorealpha 0.5, lixun-gui
+  ```
+
+- **sway, niri, GNOME** — no blur protocol available; the window
+  degrades to plain translucency, still readable on a mid-tone
+  wallpaper.
+
+Bumping the `.lixun-window` background alpha back up to `0.92` or `1.0`
+in your `style.css` opts out of the glass look entirely (no
+see-through, no blur dependency).
+
 ---
 
 ## Architecture

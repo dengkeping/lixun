@@ -12,6 +12,7 @@ mod factory;
 mod gui_server;
 mod icons;
 mod ipc;
+mod kde_blur;
 mod keymap;
 mod reaper;
 mod status;

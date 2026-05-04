@@ -51,13 +51,34 @@
    are only partially honored by GtkCssProvider, so we use hardcoded values
    below but group them visually for maintainability). ----- */
 
-/* ----- Main window ----- */
+/* ----- Main window -----
+ *
+ * The default theme aims for a "liquid glass" look. The base tint is
+ * deliberately translucent (alpha ~0.55) so that compositor-side blur
+ * can show through. On KDE Plasma 6 the GUI auto-binds the
+ * `org_kde_kwin_blur` protocol and KWin blurs the wallpaper / windows
+ * underneath. On Hyprland, add to your config:
+ *
+ *     layerrule = blur, lixun-gui
+ *     layerrule = ignorealpha 0.5, lixun-gui
+ *
+ * Other compositors (sway, niri, GNOME) gracefully degrade to plain
+ * translucency — still readable, just no blurred backdrop.
+ *
+ * If you prefer a fully opaque window (no blur, no see-through), bump
+ * the base alpha back up to 0.92 or 1.0 and drop the gradient overlay.
+ */
 .lixun-window {
-    background: rgba(28, 28, 32, 0.92);
+    background:
+        linear-gradient(180deg,
+                        rgba(255, 255, 255, 0.035) 0%,
+                        rgba(255, 255, 255, 0)    50%),
+        rgba(28, 28, 32, 0.55);
     border-radius: 14px;
-    border: 1px solid rgba(255, 255, 255, 0.08);
-    box-shadow: 0 24px 64px rgba(0, 0, 0, 0.7),
-                0 8px 16px rgba(0, 0, 0, 0.5);
+    border: 0.5px solid rgba(255, 255, 255, 0.12);
+    box-shadow: 0 24px 64px rgba(0, 0, 0, 0.55),
+                0 8px 16px  rgba(0, 0, 0, 0.40),
+                inset 0 1px 0 rgba(255, 255, 255, 0.06);
 }
 
 /* ----- Search entry ----- */
