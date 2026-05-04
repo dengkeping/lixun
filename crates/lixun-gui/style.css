@@ -36,7 +36,7 @@ window {
    scrolled.vexpand(false) on the initial ScrolledWindow builder in
    window.rs for the same reason. */
 /* Glass / liquid-glass treatment.
-   Background alpha is intentionally low (~0.55) so a compositor blur
+   Background alpha is intentionally low (~0.35) so a compositor blur
    behind the surface (KDE org_kde_kwin_blur, Hyprland `layerrule = blur`,
    ...) shines through with a tinted, slightly luminescent feel. On
    compositors without backdrop blur, this still degrades to a clean
@@ -54,7 +54,7 @@ window {
         linear-gradient(180deg,
             rgba(255, 255, 255, 0.035) 0%,
             rgba(255, 255, 255, 0.0)  50%),
-        rgba(28, 28, 32, 0.55);
+        rgba(28, 28, 32, 0.35);
     border-radius: 14px;
     border: 0.5px solid rgba(255, 255, 255, 0.12);
     box-shadow: 0 24px 64px rgba(0, 0, 0, 0.55),

@@ -477,7 +477,7 @@ all widgets of a kind.
 
 ### Compositor blur (liquid-glass look)
 
-The default theme is translucent (background alpha `0.55`) so that a
+The default theme is translucent (background alpha `0.35`) so that a
 blurred backdrop can shine through. The launcher window asks the
 compositor to blur whatever is behind it on supported compositors:
 
