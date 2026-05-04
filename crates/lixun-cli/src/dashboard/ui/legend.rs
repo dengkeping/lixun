@@ -59,7 +59,7 @@ pub fn render_legend(frame: &mut Frame, area: Rect, app: &App) {
                 let mut spans = vec![
                     Span::styled("q", Style::default().fg(Color::Yellow)),
                     Span::raw(" quit | "),
-                    Span::styled("Tab ↑↓", Style::default().fg(Color::Yellow)),
+                    Span::styled("Tab ↑↓←→", Style::default().fg(Color::Yellow)),
                     Span::raw(" navigate | "),
                     Span::styled("Enter", Style::default().fg(Color::Yellow)),
                     Span::raw(" focus | "),

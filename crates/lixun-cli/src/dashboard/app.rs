@@ -109,29 +109,86 @@ pub enum FocusedWidget {
 }
 
 impl FocusedWidget {
-    /// Cycle to the next widget in the tab order.
+    /// Cycle to the next widget in tab order — follows the physical layout
+    /// reading order: top row left-to-right, then each full-width row.
+    ///
+    /// Order: SocketPanel → IndexStats → ServicesPanel → ReindexControls
+    ///        → LogViewer → ResultsList → QueryInput → (wrap)
     pub fn next(self) -> Self {
         match self {
-            Self::SocketPanel => Self::LogViewer,
-            Self::LogViewer => Self::QueryInput,
-            Self::QueryInput => Self::ResultsList,
-            Self::ResultsList => Self::ReindexControls,
-            Self::ReindexControls => Self::IndexStats,
+            Self::SocketPanel => Self::IndexStats,
             Self::IndexStats => Self::ServicesPanel,
-            Self::ServicesPanel => Self::SocketPanel,
+            Self::ServicesPanel => Self::ReindexControls,
+            Self::ReindexControls => Self::LogViewer,
+            Self::LogViewer => Self::ResultsList,
+            Self::ResultsList => Self::QueryInput,
+            Self::QueryInput => Self::SocketPanel,
         }
     }
 
-    /// Cycle to the previous widget in the tab order.
+    /// Cycle to the previous widget in tab order (reverse of `next`).
     pub fn prev(self) -> Self {
         match self {
-            Self::SocketPanel => Self::ServicesPanel,
-            Self::LogViewer => Self::SocketPanel,
-            Self::QueryInput => Self::LogViewer,
-            Self::ResultsList => Self::QueryInput,
-            Self::ReindexControls => Self::ResultsList,
-            Self::IndexStats => Self::ReindexControls,
+            Self::SocketPanel => Self::QueryInput,
+            Self::IndexStats => Self::SocketPanel,
             Self::ServicesPanel => Self::IndexStats,
+            Self::ReindexControls => Self::ServicesPanel,
+            Self::LogViewer => Self::ReindexControls,
+            Self::ResultsList => Self::LogViewer,
+            Self::QueryInput => Self::ResultsList,
+        }
+    }
+
+    /// Move focus up in the 2D layout (physical position-aware).
+    pub fn move_up(self) -> Self {
+        match self {
+            // Top row → wraps to bottom (QueryInput)
+            Self::SocketPanel
+            | Self::IndexStats
+            | Self::ServicesPanel
+            | Self::ReindexControls => Self::QueryInput,
+            // LogViewer → top row (preserve column when possible: default to leftmost)
+            Self::LogViewer => Self::SocketPanel,
+            Self::ResultsList => Self::LogViewer,
+            Self::QueryInput => Self::ResultsList,
+        }
+    }
+
+    /// Move focus down in the 2D layout (physical position-aware).
+    pub fn move_down(self) -> Self {
+        match self {
+            // Top row → LogViewer (full-width below)
+            Self::SocketPanel
+            | Self::IndexStats
+            | Self::ServicesPanel
+            | Self::ReindexControls => Self::LogViewer,
+            Self::LogViewer => Self::ResultsList,
+            Self::ResultsList => Self::QueryInput,
+            // Bottom row → wraps to top (leftmost cell)
+            Self::QueryInput => Self::SocketPanel,
+        }
+    }
+
+    /// Move focus left in the 2D layout. Only top row has horizontal cells;
+    /// full-width widgets (LogViewer/ResultsList/QueryInput) ignore left/right.
+    pub fn move_left(self) -> Self {
+        match self {
+            Self::SocketPanel => Self::ReindexControls,
+            Self::IndexStats => Self::SocketPanel,
+            Self::ServicesPanel => Self::IndexStats,
+            Self::ReindexControls => Self::ServicesPanel,
+            other => other,
+        }
+    }
+
+    /// Move focus right in the 2D layout (mirror of `move_left`).
+    pub fn move_right(self) -> Self {
+        match self {
+            Self::SocketPanel => Self::IndexStats,
+            Self::IndexStats => Self::ServicesPanel,
+            Self::ServicesPanel => Self::ReindexControls,
+            Self::ReindexControls => Self::SocketPanel,
+            other => other,
         }
     }
 }
@@ -243,10 +300,16 @@ impl App {
                 self.focused_widget = self.focused_widget.prev();
             }
             KeyCode::Up => {
-                self.focused_widget = self.focused_widget.prev();
+                self.focused_widget = self.focused_widget.move_up();
             }
             KeyCode::Down => {
-                self.focused_widget = self.focused_widget.next();
+                self.focused_widget = self.focused_widget.move_down();
+            }
+            KeyCode::Left => {
+                self.focused_widget = self.focused_widget.move_left();
+            }
+            KeyCode::Right => {
+                self.focused_widget = self.focused_widget.move_right();
             }
             KeyCode::Char('o') => {
                 if self.focused_widget == FocusedWidget::ServicesPanel {
@@ -653,20 +716,38 @@ mod tests {
     fn test_focused_widget_next_prev() {
         let mut fw = FocusedWidget::QueryInput;
         fw = fw.next();
-        assert!(matches!(fw, FocusedWidget::ResultsList));
+        assert!(matches!(fw, FocusedWidget::SocketPanel));
         fw = fw.prev();
         assert!(matches!(fw, FocusedWidget::QueryInput));
     }
 
     #[test]
     fn test_focused_widget_cycles() {
-        // Going forward through all widgets should return to start
         let start = FocusedWidget::SocketPanel;
         let mut fw = start;
         for _ in 0..7 {
             fw = fw.next();
         }
         assert_eq!(fw, start);
+    }
+
+    #[test]
+    fn test_2d_navigation_top_row() {
+        let fw = FocusedWidget::SocketPanel;
+        assert_eq!(fw.move_right(), FocusedWidget::IndexStats);
+        assert_eq!(fw.move_left(), FocusedWidget::ReindexControls);
+        assert_eq!(fw.move_down(), FocusedWidget::LogViewer);
+        assert_eq!(fw.move_up(), FocusedWidget::QueryInput);
+    }
+
+    #[test]
+    fn test_2d_navigation_full_width_rows() {
+        assert_eq!(FocusedWidget::LogViewer.move_down(), FocusedWidget::ResultsList);
+        assert_eq!(FocusedWidget::ResultsList.move_down(), FocusedWidget::QueryInput);
+        assert_eq!(FocusedWidget::QueryInput.move_down(), FocusedWidget::SocketPanel);
+        assert_eq!(FocusedWidget::QueryInput.move_up(), FocusedWidget::ResultsList);
+        assert_eq!(FocusedWidget::LogViewer.move_left(), FocusedWidget::LogViewer);
+        assert_eq!(FocusedWidget::LogViewer.move_right(), FocusedWidget::LogViewer);
     }
 
     #[test]
@@ -681,7 +762,7 @@ mod tests {
         let mut app = App::new();
         assert!(matches!(app.focused_widget, FocusedWidget::QueryInput));
         app.handle_key(KeyEvent::from(KeyCode::Tab));
-        assert!(matches!(app.focused_widget, FocusedWidget::ResultsList));
+        assert!(matches!(app.focused_widget, FocusedWidget::SocketPanel));
     }
 
     #[test]
@@ -720,6 +801,7 @@ mod tests {
             app.push_log_message(format!("Line {}", i), LogLevel::Info);
         }
         app.focused_widget = FocusedWidget::LogViewer;
+        app.widget_mode = WidgetMode::Focused;
         assert_eq!(app.log_scroll, 9);
 
         app.handle_key(KeyEvent::from(KeyCode::Up));
@@ -745,7 +827,7 @@ mod tests {
         let mut app = App::new();
         assert!(!app.connected);
 
-        app.set_connected();
+        app.set_connected(true);
         assert!(app.connected);
 
         app.set_disconnected();
