@@ -608,7 +608,7 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
     window.set_margin(Edge::Top, DEFAULT_TOP_MARGIN);
     add_css_class(&window, "lixun-window");
 
-    crate::kde_blur::attach(&window);
+    crate::kde_blur::attach(&window, daemon_config.gui.blur);
 
     let display = gtk::gdk::Display::default().unwrap();
 

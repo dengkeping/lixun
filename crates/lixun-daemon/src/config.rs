@@ -109,6 +109,7 @@ struct GuiToml {
     preview_height_percent: Option<u8>,
     preview_max_width_px: Option<i32>,
     preview_max_height_px: Option<i32>,
+    blur: Option<bool>,
 }
 
 /// Text-extraction cache configuration. Shared by every extractor
@@ -408,6 +409,7 @@ pub struct GuiConfig {
     pub preview_height_percent: u8,
     pub preview_max_width_px: i32,
     pub preview_max_height_px: i32,
+    pub blur: bool,
 }
 
 impl Default for GuiConfig {
@@ -421,6 +423,7 @@ impl Default for GuiConfig {
             preview_height_percent: 80,
             preview_max_width_px: 2000,
             preview_max_height_px: 1400,
+            blur: true,
         }
     }
 }
@@ -647,6 +650,9 @@ impl Config {
             }
             if let Some(v) = gui.preview_max_height_px {
                 cfg.gui.preview_max_height_px = v.max(400);
+            }
+            if let Some(v) = gui.blur {
+                cfg.gui.blur = v;
             }
         }
         if let Some(impact_toml) = parsed.impact {

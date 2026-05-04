@@ -58,7 +58,10 @@ const WINDOW_BORDER_RADIUS: i32 = 14;
 /// Hooks `GdkSurface::layout` to re-attach blur on every resize (including
 /// the initial 1×1 placeholder → real size transition), and `connect_hide`
 /// to clean up when the window is hidden.
-pub fn attach(window: &gtk::ApplicationWindow) {
+pub fn attach(window: &gtk::ApplicationWindow, enabled: bool) {
+    if !enabled {
+        return;
+    }
     let state: Rc<RefCell<Option<BlurAttachment>>> = Rc::new(RefCell::new(None));
 
     let state_layout = Rc::clone(&state);
