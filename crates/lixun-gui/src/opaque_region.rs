@@ -47,20 +47,29 @@ use wayland_client::{Connection, Dispatch, Proxy, QueueHandle};
 /// corners GTK leaves transparent. Silently no-ops on non-Wayland
 /// sessions; logs a warning and keeps going if anything along the
 /// wayland-client path fails.
+///
+/// Hooks `GdkSurface::layout` to re-apply on every layout event (GTK
+/// resets the opaque region on every frame commit, so we must override
+/// it continuously, not just once on show).
 pub fn attach(window: &gtk::ApplicationWindow) {
-    window.connect_map(|w| match clear_opaque_region(w) {
-        Ok(true) => tracing::debug!("cleared opaque region on launcher surface"),
-        Ok(false) => tracing::debug!(
-            "opaque region clear skipped (not on Wayland or surface not ready)"
-        ),
-        Err(e) => tracing::warn!("opaque region clear failed: {e:#}"),
+    window.connect_realize(move |w| {
+        let Some(gdk_surface) = w.surface() else {
+            return;
+        };
+        gdk_surface.connect_layout(move |surface, width, height| {
+            if width <= 1 || height <= 1 {
+                return;
+            }
+            match clear_opaque_region(surface) {
+                Ok(true) => tracing::debug!("cleared opaque region: {width}×{height} (layout)"),
+                Ok(false) => {}
+                Err(e) => tracing::warn!("opaque region clear failed: {e:#}"),
+            }
+        });
     });
 }
 
-fn clear_opaque_region(window: &gtk::ApplicationWindow) -> anyhow::Result<bool> {
-    let Some(gdk_surface) = window.surface() else {
-        return Ok(false);
-    };
+fn clear_opaque_region(gdk_surface: &gtk::gdk::Surface) -> anyhow::Result<bool> {
     let display = gdk_surface.display();
     if display.backend() != gtk::gdk::Backend::Wayland {
         return Ok(false);
@@ -69,7 +78,7 @@ fn clear_opaque_region(window: &gtk::ApplicationWindow) -> anyhow::Result<bool> 
     let Ok(wayland_display) = display.downcast::<gdk4_wayland::WaylandDisplay>() else {
         return Ok(false);
     };
-    let Ok(wayland_surface) = gdk_surface.downcast::<gdk4_wayland::WaylandSurface>() else {
+    let Ok(wayland_surface) = gdk_surface.clone().downcast::<gdk4_wayland::WaylandSurface>() else {
         return Ok(false);
     };
 

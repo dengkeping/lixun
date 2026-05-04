@@ -14,10 +14,16 @@
 //! # Surface lifecycle
 //!
 //! `gtk4-layer-shell` may destroy and recreate the underlying `wl_surface`
-//! across hide/show cycles. The blur object is bound to a specific
-//! `wl_surface`, so we re-attach on every `map` signal rather than once
-//! at realize time. We unset on `unmap` so a stale blur object never
-//! references a dead surface.
+//! across hide/show cycles, and the surface is resized by the compositor
+//! AFTER it first becomes visible (GTK presents a 1×1 placeholder until
+//! the compositor confirms the real geometry). The blur region is bound
+//! to surface dimensions, so we re-attach on every `GdkSurface::layout`
+//! signal — that fires both on first sizing and on every resize, and
+//! gives us the new width/height directly. Hooking only `show` would
+//! pin the region to the 1×1 placeholder and KWin would fall back to a
+//! rectangular full-surface blur (visible as a halo around the rounded
+//! corners). We unset on `hide` so a stale blur object never references
+//! a dead surface.
 //!
 //! # Connection sharing
 //!
@@ -33,36 +39,54 @@ use gtk::prelude::*;
 use std::cell::RefCell;
 use std::rc::Rc;
 use wayland_client::globals::{registry_queue_init, GlobalList, GlobalListContents};
+use wayland_client::protocol::wl_compositor::WlCompositor;
+use wayland_client::protocol::wl_region::WlRegion;
 use wayland_client::protocol::wl_registry::WlRegistry;
 use wayland_client::protocol::wl_surface::WlSurface;
 use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle};
 use wayland_protocols_plasma::blur::client::org_kde_kwin_blur::OrgKdeKwinBlur;
 use wayland_protocols_plasma::blur::client::org_kde_kwin_blur_manager::OrgKdeKwinBlurManager;
 
+/// Border-radius (in CSS pixels) of `.lixun-window` in style.css. Must
+/// match so the blur region honours the rounded silhouette and the
+/// compositor doesn't blur outside the visible rounded body.
+const WINDOW_BORDER_RADIUS: i32 = 14;
+
 /// Wire compositor blur to a window. Returns silently on non-Wayland
 /// or non-KDE sessions; the caller never needs to branch on session type.
+///
+/// Hooks `GdkSurface::layout` to re-attach blur on every resize (including
+/// the initial 1×1 placeholder → real size transition), and `connect_hide`
+/// to clean up when the window is hidden.
 pub fn attach(window: &gtk::ApplicationWindow) {
     let state: Rc<RefCell<Option<BlurAttachment>>> = Rc::new(RefCell::new(None));
 
-    let state_map = Rc::clone(&state);
-    window.connect_map(move |w| match BlurAttachment::create(w) {
-        Ok(Some(att)) => {
-            tracing::debug!("KDE blur enabled on launcher surface");
-            *state_map.borrow_mut() = Some(att);
-        }
-        Ok(None) => {
-            tracing::debug!(
-                "KDE blur unavailable (not on Wayland, or compositor lacks org_kde_kwin_blur_manager)"
-            );
-        }
-        Err(e) => {
-            tracing::warn!("KDE blur attach failed: {e:#}");
-        }
+    let state_layout = Rc::clone(&state);
+    window.connect_realize(move |w| {
+        let Some(gdk_surface) = w.surface() else {
+            return;
+        };
+        let state_inner = Rc::clone(&state_layout);
+        gdk_surface.connect_layout(move |surface, width, height| {
+            if width <= 1 || height <= 1 {
+                return;
+            }
+            match BlurAttachment::create(surface, width, height) {
+                Ok(Some(att)) => {
+                    tracing::debug!("KDE blur enabled: {width}×{height} (layout)");
+                    *state_inner.borrow_mut() = Some(att);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!("KDE blur attach failed: {e:#}");
+                }
+            }
+        });
     });
 
-    let state_unmap = Rc::clone(&state);
-    window.connect_unmap(move |_| {
-        if let Some(att) = state_unmap.borrow_mut().take() {
+    let state_hide = Rc::clone(&state);
+    window.connect_hide(move |_| {
+        if let Some(att) = state_hide.borrow_mut().take() {
             att.detach();
         }
     });
@@ -77,10 +101,16 @@ struct BlurAttachment {
 }
 
 impl BlurAttachment {
-    fn create(window: &gtk::ApplicationWindow) -> anyhow::Result<Option<Self>> {
-        let Some(gdk_surface) = window.surface() else {
-            return Ok(None);
-        };
+    fn create(
+        gdk_surface: &gtk::gdk::Surface,
+        width: i32,
+        height: i32,
+    ) -> anyhow::Result<Option<Self>> {
+        let scale = gdk_surface.scale_factor();
+        tracing::debug!(
+            "blur region target: width={width} height={height} scale={scale} radius={WINDOW_BORDER_RADIUS}"
+        );
+
         let display = gdk_surface.display();
         if display.backend() != gtk::gdk::Backend::Wayland {
             return Ok(None);
@@ -89,7 +119,8 @@ impl BlurAttachment {
         let Ok(wayland_display) = display.downcast::<gdk4_wayland::WaylandDisplay>() else {
             return Ok(None);
         };
-        let Ok(wayland_surface) = gdk_surface.downcast::<gdk4_wayland::WaylandSurface>() else {
+        let Ok(wayland_surface) = gdk_surface.clone().downcast::<gdk4_wayland::WaylandSurface>()
+        else {
             return Ok(None);
         };
 
@@ -119,13 +150,35 @@ impl BlurAttachment {
             Ok(m) => m,
             Err(_) => return Ok(None),
         };
+        let compositor = match globals.bind::<WlCompositor, _, _>(&qh, 4..=6, ()) {
+            Ok(c) => c,
+            Err(_) => return Ok(None),
+        };
 
         let blur = manager.create(&wl_surface, &qh, ());
-        blur.set_region(None);
+
+        // Blur region follows the rounded silhouette so the compositor
+        // doesn't blur pixels outside the visible rounded body (which
+        // would produce a rectangular blur halo around the 14px corner
+        // radius cutouts).
+        let region = compositor.create_region(&qh, ());
+        add_rounded_rect(&region, width, height, WINDOW_BORDER_RADIUS);
+        blur.set_region(Some(&region));
+        region.destroy();
+
         blur.commit();
-        // The Connection we hold is a clone of GDK's; GDK flushes on
-        // its own ticks, but we want the request out immediately rather
-        // than at the next GDK roundtrip, so push it ourselves.
+        // Blur state is double-buffered: blur.commit() copies pending
+        // → current on the compositor side, but the change only takes
+        // effect on the next wl_surface.commit. GDK already committed
+        // the surface before our show hook ran, so we must commit the
+        // surface ourselves — otherwise KWin keeps the previous
+        // (infinite) blur region and the user sees a rectangular halo
+        // around the rounded corners. See blur-unstable-v1.xml: "The
+        // blur region is double-buffered state, and will be applied on
+        // the next wl_surface.commit."
+        wl_surface.commit();
+        // Push everything to the compositor immediately rather than
+        // waiting for the next GDK roundtrip.
         let _ = conn.flush();
 
         Ok(Some(Self {
@@ -184,4 +237,76 @@ impl Dispatch<OrgKdeKwinBlur, ()> for RegistryState {
         _: &QueueHandle<Self>,
     ) {
     }
+}
+
+impl Dispatch<WlCompositor, ()> for RegistryState {
+    fn event(
+        _: &mut Self,
+        _: &WlCompositor,
+        _: <WlCompositor as Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<WlRegion, ()> for RegistryState {
+    fn event(
+        _: &mut Self,
+        _: &WlRegion,
+        _: <WlRegion as Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+/// Approximate a rounded rectangle as a union of axis-aligned rectangles
+/// and add it to `region`. `wl_region` only understands rectangles, so we
+/// build the shape scanline-by-scanline: one tall rect covers the inner
+/// body (full width, height minus 2×radius), then for each of the top and
+/// bottom `radius` pixels we add a horizontally-inset rect whose inset is
+/// determined by the circle equation (cutting off the corner).
+///
+/// `radius` is clamped if it exceeds half the shorter side. On degenerate
+/// input the function falls back to a single full-surface rect.
+fn add_rounded_rect(region: &WlRegion, width: i32, height: i32, radius: i32) {
+    if width <= 0 || height <= 0 {
+        tracing::debug!("add_rounded_rect: degenerate input w={width} h={height}, skipping");
+        return;
+    }
+    let r = radius.min(width / 2).min(height / 2);
+    if r <= 0 {
+        tracing::debug!("add_rounded_rect: radius clamped to 0, fallback to full rect");
+        region.add(0, 0, width, height);
+        return;
+    }
+
+    tracing::debug!("add_rounded_rect: w={width} h={height} r={r} (requested radius={radius})");
+    // Inner body rect: full width minus top/bottom rounded bands.
+    region.add(0, r, width, height - 2 * r);
+    tracing::debug!("  body: x=0 y={r} w={width} h={}", height - 2 * r);
+
+    // Top and bottom bands: for each pixel row within `radius`, add a
+    // horizontally-inset rect. Inset = r - sqrt(r^2 - (r - y - 1)^2),
+    // rounded up to avoid over-blurring into the transparent corners.
+    let mut band_count = 0;
+    for y in 0..r {
+        let dy = r - y - 1;
+        let inset_sq = (r * r - dy * dy).max(0) as f64;
+        let chord = inset_sq.sqrt().floor() as i32;
+        let inset = r - chord;
+        let row_width = width - 2 * inset;
+        if row_width <= 0 {
+            continue;
+        }
+        // Top band: rows 0..r.
+        region.add(inset, y, row_width, 1);
+        // Bottom band: mirror around vertical center.
+        region.add(inset, height - 1 - y, row_width, 1);
+        band_count += 2;
+    }
+    tracing::debug!("  bands: {band_count} rects (top+bottom)");
 }

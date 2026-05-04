@@ -18,8 +18,12 @@
    same rule. GTK docs (class.Window.html#css-nodes) identify the
    `window` node as the site of the default paint. No Rust-side
    gdk_surface_set_opaque_region() is needed in GTK4 ≥ 4.16. */
-window {
-    background: transparent;
+window,
+window.background,
+.background,
+#lixun-root {
+    background: transparent !important;
+    background-color: transparent !important;
 }
 
 /* ----- Main window -----
