@@ -663,6 +663,53 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
         .build();
     entry.set_widget_name("lixun-entry");
     add_css_class(&entry, "lixun-entry");
+    
+    let icon_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../packaging/icons/lixun-logo-light.svg");
+    let icon_file = gtk::gio::File::for_path(&icon_path);
+    if let Ok(icon) = gtk::gdk::Texture::from_file(&icon_file) {
+        entry.set_icon_from_paintable(gtk::EntryIconPosition::Primary, Some(&icon));
+        entry.set_icon_activatable(gtk::EntryIconPosition::Primary, true);
+    }
+    
+    let semantic_enabled = daemon_config.plugin_sections.contains_key("semantic");
+    let ocr_enabled = daemon_config.ocr.enabled;
+    
+    let entry_for_menu = entry.clone();
+    let gesture = gtk::GestureClick::new();
+    gesture.set_button(3);
+    gesture.connect_pressed(move |_gesture, _n_press, x, _y| {
+        if x < 60.0 {
+            let menu = gtk::PopoverMenu::from_model(None::<&gtk::gio::MenuModel>);
+            let menu_model = gtk::gio::Menu::new();
+            
+            menu_model.append(Some("Relaunch Daemon"), Some("app.relaunch"));
+            
+            let semantic_label = if semantic_enabled {
+                "🟢 Semantic Search"
+            } else {
+                "🔴 Semantic Search"
+            };
+            menu_model.append(Some(semantic_label), Some("app.toggle-semantic"));
+            
+            let ocr_label = if ocr_enabled {
+                "🟢 OCR"
+            } else {
+                "🔴 OCR"
+            };
+            menu_model.append(Some(ocr_label), Some("app.toggle-ocr"));
+            
+            menu_model.append(Some("Open Config"), Some("app.open-config"));
+            
+            menu.set_menu_model(Some(&menu_model));
+            menu.set_parent(&entry_for_menu);
+            let rect = gtk::gdk::Rectangle::new(0, entry_for_menu.height(), 1, 1);
+            menu.set_pointing_to(Some(&rect));
+            menu.popup();
+        }
+    });
+    entry.add_controller(gesture);
+    
     vbox.append(&entry);
 
     let current_category: CategoryFilter = std::rc::Rc::new(std::cell::Cell::new(None));
@@ -861,6 +908,77 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
         controller_for_clear.clear_and_hide();
     });
     app.add_action(&clear_action);
+
+    let relaunch_action = gio::SimpleAction::new("relaunch", None);
+    relaunch_action.connect_activate(move |_, _| {
+        let _ = std::process::Command::new("systemctl")
+            .args(&["--user", "restart", "lixund.service"])
+            .spawn();
+    });
+    app.add_action(&relaunch_action);
+
+    let toggle_semantic_action = gio::SimpleAction::new("toggle-semantic", None);
+    let semantic_current = daemon_config.plugin_sections.contains_key("semantic");
+    toggle_semantic_action.connect_activate(move |_, _| {
+        let config_path = dirs::config_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("~/.config"))
+            .join("lixun/config.toml");
+        
+        if let Ok(content) = std::fs::read_to_string(&config_path) {
+            if let Ok(mut doc) = content.parse::<toml_edit::DocumentMut>() {
+                if semantic_current {
+                    doc.remove("semantic");
+                } else {
+                    let mut table = toml_edit::Table::new();
+                    table.insert("enabled", toml_edit::value(true));
+                    doc.insert("semantic", toml_edit::Item::Table(table));
+                }
+                let _ = std::fs::write(&config_path, doc.to_string());
+            }
+        }
+        
+        let _ = std::process::Command::new("systemctl")
+            .args(&["--user", "restart", "lixund.service"])
+            .spawn();
+    });
+    app.add_action(&toggle_semantic_action);
+
+    let toggle_ocr_action = gio::SimpleAction::new("toggle-ocr", None);
+    let ocr_current = daemon_config.ocr.enabled;
+    toggle_ocr_action.connect_activate(move |_, _| {
+        let config_path = dirs::config_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("~/.config"))
+            .join("lixun/config.toml");
+        
+        if let Ok(content) = std::fs::read_to_string(&config_path) {
+            if let Ok(mut doc) = content.parse::<toml_edit::DocumentMut>() {
+                if let Some(ocr_table) = doc.get_mut("ocr").and_then(|v| v.as_table_mut()) {
+                    ocr_table.insert("enabled", toml_edit::value(!ocr_current));
+                } else {
+                    let mut table = toml_edit::Table::new();
+                    table.insert("enabled", toml_edit::value(!ocr_current));
+                    doc.insert("ocr", toml_edit::Item::Table(table));
+                }
+                let _ = std::fs::write(&config_path, doc.to_string());
+            }
+        }
+        
+        let _ = std::process::Command::new("systemctl")
+            .args(&["--user", "restart", "lixund.service"])
+            .spawn();
+    });
+    app.add_action(&toggle_ocr_action);
+
+    let open_config_action = gio::SimpleAction::new("open-config", None);
+    open_config_action.connect_activate(move |_, _| {
+        let config_path = dirs::config_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("~/.config"))
+            .join("lixun/config.toml");
+        let _ = std::process::Command::new("xdg-open")
+            .arg(&config_path)
+            .spawn();
+    });
+    app.add_action(&open_config_action);
 
     install_response_handler(
         ipc_event_rx,

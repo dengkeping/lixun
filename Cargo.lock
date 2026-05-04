@@ -5222,6 +5222,7 @@ dependencies = [
  "opener",
  "quoted_printable",
  "serde_json",
+ "toml_edit 0.22.27",
  "tracing",
  "tracing-subscriber",
  "wayland-client",
