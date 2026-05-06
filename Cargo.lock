@@ -5351,6 +5351,7 @@ dependencies = [
  "anyhow",
  "async-channel",
  "clap",
+ "gdk4-wayland",
  "glib",
  "gtk4",
  "inventory",
@@ -5364,6 +5365,8 @@ dependencies = [
  "serde_json",
  "tracing",
  "tracing-subscriber",
+ "wayland-client",
+ "wayland-protocols",
 ]
 
 [[package]]

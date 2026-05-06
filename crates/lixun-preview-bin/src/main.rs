@@ -47,6 +47,7 @@ use lixun_preview_bundle as _;
 
 #[cfg(feature = "stub")]
 mod stub;
+mod wayland_xdg_foreign;
 
 const APP_ID: &str = "app.lixun.preview";
 const DEFAULT_WIDTH: i32 = 960;
@@ -123,6 +124,10 @@ struct PreviewState {
     /// the import call (Phase 1.2) can pick it up once the window
     /// surface exists. Cleared on [`PreviewCommand::ClearParent`].
     parent_handle: RefCell<Option<String>>,
+    /// xdg-foreign-v2 importer holding the active parent-of
+    /// relationship. Lazy-initialized on first SetParent receipt once
+    /// the window surface is realized. Cleared on ClearParent.
+    wayland_importer: RefCell<Option<wayland_xdg_foreign::WaylandImporter>>,
 }
 
 fn main() -> Result<()> {
@@ -398,15 +403,18 @@ fn handle_command(
             // Keepalive only. No state change, no event reply.
         }
         PreviewCommand::SetParent { handle } => {
-            // Wiring lands in Phase 1.2 (xdg-foreign-v2 import).
-            // For now record the handle on state so the import call
-            // can pick it up once the window exists.
             tracing::debug!("preview: SetParent received (handle={})", handle);
             state.parent_handle.replace(Some(handle));
+            if let Some(window) = state.window.borrow().as_ref() {
+                try_apply_pending_parent(state, window);
+            }
         }
         PreviewCommand::ClearParent => {
             tracing::debug!("preview: ClearParent received");
             state.parent_handle.replace(None);
+            if let Some(imp) = state.wayland_importer.borrow_mut().as_mut() {
+                imp.clear();
+            }
         }
     }
 }
@@ -514,6 +522,7 @@ fn show_or_update(
     if let Some(window) = state.window.borrow().as_ref() {
         window.set_visible(true);
         window.present();
+        try_apply_pending_parent(state, window);
     }
 
     tracing::info!(
@@ -585,6 +594,31 @@ fn build_window_skeleton(
     *state.content_scroll.borrow_mut() = Some(content_scroll);
     *state.window.borrow_mut() = Some(window);
     Ok(())
+}
+
+fn try_apply_pending_parent(state: &Rc<PreviewState>, window: &gtk::ApplicationWindow) {
+    let handle = match state.parent_handle.borrow().clone() {
+        Some(h) => h,
+        None => return,
+    };
+    let Some(gdk_surface) = window.surface() else { return };
+    let Some(wl_surface) = wayland_xdg_foreign::wl_surface_of(&gdk_surface) else { return };
+    let mut importer = state.wayland_importer.borrow_mut();
+    if importer.is_none() {
+        match wayland_xdg_foreign::WaylandImporter::new(&gdk_surface) {
+            Ok(Some(i)) => *importer = Some(i),
+            Ok(None) => return,
+            Err(e) => {
+                tracing::warn!("preview: xdg-foreign importer init failed: {}", e);
+                return;
+            }
+        }
+    }
+    if let Some(imp) = importer.as_mut() {
+        if let Err(e) = imp.import(&handle, &wl_surface) {
+            tracing::warn!("preview: xdg-foreign import failed: {}", e);
+        }
+    }
 }
 
 fn apply_monitor_and_cap(
