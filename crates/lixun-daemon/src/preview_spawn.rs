@@ -551,6 +551,12 @@ impl PreviewSpawner {
                             msg
                         );
                     }
+                    PreviewEvent::ParentLost => {
+                        tracing::debug!(
+                            "preview_spawn: pid={} parent lost; awaiting next SetParent",
+                            pid
+                        );
+                    }
                 }
             }
 

@@ -543,6 +543,7 @@ mod tests {
             calculation: None,
             top_hit: None,
             explanations: vec![],
+            claimed: false,
         };
         let json = serde_json::to_vec(&resp).unwrap();
         let decoded: Response = serde_json::from_slice(&json).unwrap();
@@ -554,6 +555,7 @@ mod tests {
                 calculation,
                 top_hit,
                 explanations,
+                claimed,
             } => {
                 assert_eq!(epoch, 1);
                 assert_eq!(phase, Phase::Initial);
@@ -561,6 +563,7 @@ mod tests {
                 assert!(calculation.is_none());
                 assert!(top_hit.is_none());
                 assert!(explanations.is_empty());
+                assert!(!claimed);
             }
             _ => panic!("expected SearchChunk"),
         }
@@ -578,6 +581,7 @@ mod tests {
             }),
             top_hit: Some(lixun_core::DocId("fs:/tmp/demo.txt".into())),
             explanations: vec!["test".into()],
+            claimed: false,
         };
         let json = serde_json::to_vec(&resp).unwrap();
         let decoded: Response = serde_json::from_slice(&json).unwrap();
@@ -589,6 +593,7 @@ mod tests {
                 calculation,
                 top_hit,
                 explanations,
+                claimed,
             } => {
                 assert_eq!(epoch, 2);
                 assert_eq!(phase, Phase::Final);
@@ -599,6 +604,7 @@ mod tests {
                 assert_eq!(c.result, "4");
                 assert_eq!(top_hit.as_ref().map(|d| d.0.as_str()), Some("fs:/tmp/demo.txt"));
                 assert_eq!(explanations, vec!["test".to_string()]);
+                assert!(!claimed);
             }
             _ => panic!("expected SearchChunk"),
         }

@@ -125,6 +125,31 @@ pub enum PreviewCommand {
     /// preview binary acks with no payload (the daemon notices the
     /// connection is alive). Not used by the current dispatcher.
     Ping,
+    /// Install the launcher's exported xdg-foreign-v2 surface as the
+    /// transient parent of the preview window. `handle` is the
+    /// opaque string produced by `zxdg_exporter_v2::export_toplevel`
+    /// on the launcher side. The preview binary feeds it to
+    /// `zxdg_importer_v2::import_toplevel` and calls
+    /// `xdg_imported_v2::set_parent_of` on its own toplevel surface.
+    ///
+    /// The daemon buffers this command if it arrives before
+    /// [`PreviewEvent::Ready`] (same `latest_desired` pattern as
+    /// `ShowOrUpdate`) and replays it once the preview side is up.
+    /// Sent eagerly on the first `ShowOrUpdate` for a launcher
+    /// session and re-sent if the launcher's surface changes (rare;
+    /// only on launcher restart while preview is warm).
+    ///
+    /// Falls back to a plain centred toplevel when the compositor
+    /// does not advertise xdg-foreign-v2; the launcher logs once
+    /// per session and skips emitting this command.
+    SetParent { handle: String },
+    /// Drop the current transient-parent relationship. Sent when
+    /// the launcher closes (Escape, focus-loss, launch) so the
+    /// preview window is no longer constrained by a now-defunct
+    /// parent surface. Best-effort — the preview also notices a
+    /// destroyed parent via `zxdg_imported_v2.destroy` and emits
+    /// [`PreviewEvent::ParentLost`].
+    ClearParent,
 }
 
 /// Preview → daemon. Spawn handshake, completion notifications,
@@ -147,6 +172,14 @@ pub enum PreviewEvent {
     /// visible with the previous content; the daemon logs and
     /// keeps the process running.
     Error { epoch: u64, msg: String },
+    /// The transient parent installed via
+    /// [`PreviewCommand::SetParent`] is no longer valid: the
+    /// compositor revoked the imported handle, the launcher
+    /// surface was destroyed, or the import call itself failed.
+    /// The preview window remains on screen as a plain toplevel;
+    /// the daemon clears its cached handle so the next launcher
+    /// session re-exports a fresh one.
+    ParentLost,
 }
 
 /// Length-prefixed JSON codec parameterised by what each side
@@ -466,6 +499,44 @@ mod tests {
                 assert_eq!(msg, "boom");
             }
             other => panic!("expected Error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn command_roundtrip_set_parent_and_clear_parent() {
+        let mut codec: PreviewBinCodec = FrameCodec::new();
+        let mut peer: DaemonPreviewCodec = FrameCodec::new();
+        let mut buf = BytesMut::new();
+        peer.encode(
+            PreviewCommand::SetParent {
+                handle: "xdg-foreign-handle-abc123".into(),
+            },
+            &mut buf,
+        )
+        .unwrap();
+        peer.encode(PreviewCommand::ClearParent, &mut buf).unwrap();
+        match codec.decode(&mut buf).unwrap().unwrap() {
+            PreviewCommand::SetParent { handle } => {
+                assert_eq!(handle, "xdg-foreign-handle-abc123");
+            }
+            other => panic!("expected SetParent, got {:?}", other),
+        }
+        match codec.decode(&mut buf).unwrap().unwrap() {
+            PreviewCommand::ClearParent => {}
+            other => panic!("expected ClearParent, got {:?}", other),
+        }
+        assert!(codec.decode(&mut buf).unwrap().is_none());
+    }
+
+    #[test]
+    fn event_roundtrip_parent_lost() {
+        let mut codec: DaemonPreviewCodec = FrameCodec::new();
+        let mut peer: PreviewBinCodec = FrameCodec::new();
+        let mut buf = BytesMut::new();
+        peer.encode(PreviewEvent::ParentLost, &mut buf).unwrap();
+        match codec.decode(&mut buf).unwrap().unwrap() {
+            PreviewEvent::ParentLost => {}
+            other => panic!("expected ParentLost, got {:?}", other),
         }
     }
 

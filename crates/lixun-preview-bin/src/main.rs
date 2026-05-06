@@ -119,6 +119,11 @@ struct PreviewState {
     /// warm lifetime; explicit `app.quit()` (idle timeout, DaemonGone,
     /// EOF) is the only way out.
     hold_guard: RefCell<Option<gtk::gio::ApplicationHoldGuard>>,
+    /// Latest xdg-foreign-v2 export handle ferried via
+    /// [`PreviewCommand::SetParent`]. Recorded here in Phase 1.3 so
+    /// the import call (Phase 1.2) can pick it up once the window
+    /// surface exists. Cleared on [`PreviewCommand::ClearParent`].
+    parent_handle: RefCell<Option<String>>,
 }
 
 fn main() -> Result<()> {
@@ -392,6 +397,17 @@ fn handle_command(
         }
         PreviewCommand::Ping => {
             // Keepalive only. No state change, no event reply.
+        }
+        PreviewCommand::SetParent { handle } => {
+            // Wiring lands in Phase 1.2 (xdg-foreign-v2 import).
+            // For now record the handle on state so the import call
+            // can pick it up once the window exists.
+            tracing::debug!("preview: SetParent received (handle={})", handle);
+            state.parent_handle.replace(Some(handle));
+        }
+        PreviewCommand::ClearParent => {
+            tracing::debug!("preview: ClearParent received");
+            state.parent_handle.replace(None);
         }
     }
 }
