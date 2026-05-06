@@ -5353,7 +5353,6 @@ dependencies = [
  "clap",
  "glib",
  "gtk4",
- "gtk4-layer-shell",
  "inventory",
  "libc",
  "lixun-core",

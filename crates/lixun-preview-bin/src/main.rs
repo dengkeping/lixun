@@ -34,7 +34,6 @@ use clap::Parser;
 use gtk::gio::ApplicationFlags;
 use gtk::glib;
 use gtk::prelude::*;
-use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use lixun_core::Hit;
 use lixun_ipc::preview::{
     PreviewCommand, PreviewEvent, read_frame_sync, write_frame_sync,
@@ -526,14 +525,24 @@ fn show_or_update(
     Ok(())
 }
 
-/// Build the persistent layer-shell window skeleton: ApplicationWindow
+/// Build the persistent xdg-toplevel window skeleton: ApplicationWindow
 /// + vbox + header_box + content_scroll. Called once per process
 /// lifetime; subsequent commands mutate the existing widgets.
 ///
-/// `KeyboardMode::OnDemand` (not Exclusive) is mandatory for the
-/// warm-process model: Exclusive would steal arrow keys from the
-/// launcher even after the preview is hidden but still mapped, and
-/// would interact badly with the GUI's own focus controllers.
+/// The preview is a regular xdg-toplevel (not a layer-shell surface).
+/// Stacking above the launcher is achieved via xdg-foreign-v2:
+/// the launcher exports its toplevel handle, the daemon forwards it
+/// as `PreviewCommand::SetParent`, and the preview imports it and
+/// calls `set_parent_of` so the compositor stacks the preview as a
+/// child of the launcher. See Phase 1 in
+/// `.workspace-local/plans/preview-rich-quicklook.md`.
+///
+/// Keyboard focus: under layer-shell we used `KeyboardMode::None` to
+/// keep the preview keyboard-passive. xdg-toplevel has no equivalent
+/// API; instead we rely on `set_can_focus(false)` plus the launcher
+/// retaining its own `KeyboardMode::OnDemand` focus. The launcher's
+/// existing keymap dispatches `PreviewCommand::Hide`/`Close` for the
+/// user-visible close paths.
 fn build_window_skeleton(
     app: &gtk::Application,
     state: &Rc<PreviewState>,
@@ -545,30 +554,14 @@ fn build_window_skeleton(
         .decorated(false)
         .default_width(DEFAULT_WIDTH)
         .default_height(DEFAULT_HEIGHT)
+        .resizable(false)
         .build();
     window.set_widget_name("lixun-preview-root");
-
-    window.init_layer_shell();
-    window.set_layer(Layer::Overlay);
-    window.set_anchor(Edge::Top, false);
-    window.set_anchor(Edge::Left, false);
-    window.set_anchor(Edge::Right, false);
-    window.set_anchor(Edge::Bottom, false);
-    // KeyboardMode::None: preview surface is intentionally
-    // keyboard-passive under Wayland. KWin and most layer-shell
-    // compositors give seat focus to a newly presented overlay
-    // when keyboard mode is OnDemand or Exclusive — that focus
-    // theft is invisible to the launcher (it only sees its own
-    // GtkEntry lose hover focus, which Wayland does not let it
-    // reclaim cross-process). Result: arrow keys, Escape and
-    // Enter would land on this preview window, leaving the
-    // launcher unable to scrub or close. With None, this surface
-    // never participates in the keyboard seat at all; all keys
-    // continue to flow to the launcher entry, which dispatches
-    // PreviewCommand::Hide / Close back via daemon when the user
-    // wants to close. Open button (mouse) still works because
-    // pointer focus is independent from keyboard focus.
-    window.set_keyboard_mode(KeyboardMode::None);
+    // Mirror the old `KeyboardMode::None` intent: keep the preview
+    // keyboard-passive so the launcher entry continues to receive
+    // every key, and the existing IPC-driven Hide/Close path stays
+    // the only way to dismiss the preview.
+    window.set_can_focus(false);
 
     install_user_css(display);
 
@@ -601,11 +594,10 @@ fn apply_monitor_and_cap(
     gui_cfg: &Rc<lixun_daemon::config::GuiConfig>,
 ) -> (i32, i32) {
     let window_ref = state.window.borrow();
-    let Some(window) = window_ref.as_ref() else {
+    let Some(_window) = window_ref.as_ref() else {
         return (MIN_WIDTH, MIN_HEIGHT);
     };
     if let Some(monitor) = pick_monitor(display, requested) {
-        window.set_monitor(Some(&monitor));
         let geometry = monitor.geometry();
         let w = (geometry.width() * i32::from(gui_cfg.preview_width_percent) / 100)
             .min(gui_cfg.preview_max_width_px)
