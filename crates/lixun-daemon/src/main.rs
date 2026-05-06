@@ -1467,6 +1467,18 @@ async fn handle_client(
                     break;
                 }
             }
+            Request::PreviewSetParent { handle } => {
+                preview_spawner.set_parent(handle).await;
+                if write_tx.send(Response::Ok).await.is_err() {
+                    break;
+                }
+            }
+            Request::PreviewClearParent => {
+                preview_spawner.clear_parent().await;
+                if write_tx.send(Response::Ok).await.is_err() {
+                    break;
+                }
+            }
             Request::EnumeratePlugins => {
                 let resp = Response::PluginManifest(registry.cli_manifest());
                 if write_tx.send(resp).await.is_err() {

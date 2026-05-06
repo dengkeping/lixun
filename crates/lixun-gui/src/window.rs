@@ -588,15 +588,14 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
     window.set_widget_name("lixun-root");
 
     window.init_layer_shell();
-    // Layer::Top (not Overlay) so that the preview window
-    // (Layer::Overlay) and IM popups (fcitx5 candidate/language guides,
-    // which the compositor draws above launcher's layer) appear ABOVE
-    // the launcher rather than under it. Layer-shell protocol declares
-    // ordering between same-layer surfaces undefined, so when both
-    // launcher and preview lived on Overlay the preview lost the race
-    // and was hidden behind the launcher. Keeping launcher one layer
-    // below preview makes the z-order deterministic on every compositor.
-    window.set_layer(gtk4_layer_shell::Layer::Top);
+    // Preview is now a regular xdg-toplevel transient-parented to
+    // the launcher via xdg-foreign-v2 (Phase 1 migration), so the
+    // launcher no longer needs to sit on Layer::Top to dodge a
+    // same-layer ordering race against another layer-shell surface.
+    // Back to Overlay so the launcher draws above ordinary toplevels
+    // (panels still resolve via fcitx5 popups using the compositor's
+    // standard above-overlay rule).
+    window.set_layer(gtk4_layer_shell::Layer::Overlay);
     // Anchor only Top. Leaving Left and Right unanchored lets the
     // layer-shell compositor center the window horizontally on the
     // monitor — anchoring both edges would stretch the surface to

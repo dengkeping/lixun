@@ -133,6 +133,25 @@ pub enum Request {
     /// daemon also replies to the launcher with
     /// `GuiCommand::ExitPreviewMode` to flip the launcher's flag.
     PreviewHide,
+    /// Hand the launcher's xdg-foreign-v2 export handle to the daemon
+    /// so the preview process can transient-parent its xdg-toplevel
+    /// onto the launcher's surface. The daemon forwards this to
+    /// [`PreviewCommand::SetParent`] over the per-process preview
+    /// socket, buffering until the preview reports `Ready` if the
+    /// preview is still in `Starting`. Sent by the launcher right
+    /// after its own surface realises and exports successfully; on
+    /// compositors lacking `zxdg_exporter_v2` the launcher skips
+    /// emitting this and the preview falls back to a plain centred
+    /// xdg-toplevel.
+    PreviewSetParent {
+        handle: String,
+    },
+    /// Tell the daemon to drop any currently-imported launcher parent
+    /// on the warm preview process. Forwarded as
+    /// [`PreviewCommand::ClearParent`]. Sent by the launcher on hide
+    /// so a subsequent re-export (with a new handle string) starts
+    /// from a clean slate.
+    PreviewClearParent,
     /// Ask the daemon for the flattened CLI manifest contributed by
     /// every registered plugin. The host CLI uses this once at startup
     /// to synthesize subcommands without learning any plugin name at
