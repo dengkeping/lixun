@@ -95,6 +95,13 @@ enum PreviewLifecycle {
         /// task replays it verbatim so epoch ordering is
         /// preserved across the state transition.
         latest_desired: Option<(u64, Hit, Option<String>)>,
+        /// Latest-wins buffer for the launcher's exported
+        /// xdg-foreign-v2 handle. Drained alongside
+        /// `latest_desired` when `Ready` arrives, and replayed
+        /// as `PreviewCommand::SetParent` *before* the buffered
+        /// `ShowOrUpdate` so the import resolves before the
+        /// preview window is presented.
+        latest_parent_handle: Option<String>,
     },
     Ready {
         pid: u32,
@@ -187,6 +194,7 @@ impl PreviewSpawner {
                     pid,
                     socket_path: socket_path.clone(),
                     latest_desired: Some((epoch, hit, monitor)),
+                    latest_parent_handle: None,
                 };
                 // Supervisor task owns the socket, reader and
                 // writer lifetimes; it locks `state` to promote
@@ -263,6 +271,63 @@ impl PreviewSpawner {
                     *state = PreviewLifecycle::Dead;
                 }
                 Ok(())
+            }
+        }
+    }
+
+    /// Apply or update the launcher's exported xdg-foreign-v2
+    /// handle on the live preview. Buffered until `Ready` if
+    /// the preview is still warming up; sent immediately when
+    /// already `Ready`. No-op when `Dead` — the launcher always
+    /// dispatches a preview before exporting, so this branch is
+    /// only reached on a teardown race and is logged at warn.
+    pub async fn set_parent(&self, handle: String) {
+        let mut state = self.state.lock().await;
+        match &mut *state {
+            PreviewLifecycle::Dead => {
+                tracing::warn!(
+                    "preview_spawn: SetParent received while Dead, dropping handle"
+                );
+            }
+            PreviewLifecycle::Starting {
+                latest_parent_handle,
+                ..
+            } => {
+                *latest_parent_handle = Some(handle);
+            }
+            PreviewLifecycle::Ready { cmd_tx, .. } => {
+                if cmd_tx
+                    .send(PreviewCommand::SetParent { handle })
+                    .is_err()
+                {
+                    tracing::warn!(
+                        "preview_spawn: writer channel closed during set_parent"
+                    );
+                    *state = PreviewLifecycle::Dead;
+                }
+            }
+        }
+    }
+
+    /// Clear any previously set xdg-foreign-v2 parent. Mirrors
+    /// `set_parent`'s state handling.
+    pub async fn clear_parent(&self) {
+        let mut state = self.state.lock().await;
+        match &mut *state {
+            PreviewLifecycle::Dead => {}
+            PreviewLifecycle::Starting {
+                latest_parent_handle,
+                ..
+            } => {
+                *latest_parent_handle = None;
+            }
+            PreviewLifecycle::Ready { cmd_tx, .. } => {
+                if cmd_tx.send(PreviewCommand::ClearParent).is_err() {
+                    tracing::warn!(
+                        "preview_spawn: writer channel closed during clear_parent"
+                    );
+                    *state = PreviewLifecycle::Dead;
+                }
             }
         }
     }
@@ -480,11 +545,13 @@ impl PreviewSpawner {
                                 break;
                             }
                             let old = std::mem::replace(&mut *s, PreviewLifecycle::Dead);
-                            let latest = match old {
+                            let (latest, parent) = match old {
                                 PreviewLifecycle::Starting {
-                                    latest_desired, ..
-                                } => latest_desired,
-                                _ => None,
+                                    latest_desired,
+                                    latest_parent_handle,
+                                    ..
+                                } => (latest_desired, latest_parent_handle),
+                                _ => (None, None),
                             };
                             *s = PreviewLifecycle::Ready {
                                 pid,
@@ -492,13 +559,25 @@ impl PreviewSpawner {
                                 cmd_tx: cmd_tx.clone(),
                                 last_used: tokio::time::Instant::now(),
                             };
-                            latest
+                            (latest, parent)
                         };
                         tracing::info!(
                             "preview_spawn: Ready from preview pid={} (wire pid={})",
                             pid,
                             preview_pid
                         );
+                        let (buffered, parent_handle) = buffered;
+                        if let Some(handle) = parent_handle
+                            && cmd_tx
+                                .send(PreviewCommand::SetParent { handle })
+                                .is_err()
+                        {
+                            tracing::warn!(
+                                "preview_spawn: pid={} writer gone before buffered SetParent",
+                                pid
+                            );
+                            break;
+                        }
                         if let Some((epoch, hit, monitor)) = buffered {
                             let cmd = PreviewCommand::ShowOrUpdate {
                                 epoch,
@@ -728,6 +807,7 @@ mod tests {
             pid: 1234,
             socket_path: PathBuf::from("/tmp/lixun-preview-1234.sock"),
             latest_desired: Some((7, fake_hit(), Some("eDP-1".into()))),
+            latest_parent_handle: Some("export-handle-xyz".into()),
         };
         assert_eq!(s.pid(), Some(1234));
         assert_eq!(
