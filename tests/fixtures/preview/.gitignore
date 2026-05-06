@@ -1,0 +1,6 @@
+# Large generated fixtures — regenerate via ./generate.sh
+pdf/sample-huge.pdf
+image/sample-large.png
+
+# Stamp files used for idempotency
+*.stamp
