@@ -588,13 +588,17 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
     window.set_widget_name("lixun-root");
 
     window.init_layer_shell();
-    // Preview is now a regular xdg-toplevel transient-parented to
-    // the launcher via xdg-foreign-v2 (Phase 1 migration), so the
-    // launcher no longer needs to sit on Layer::Top to dodge a
-    // same-layer ordering race against another layer-shell surface.
-    // Back to Overlay so the launcher draws above ordinary toplevels
-    // (panels still resolve via fcitx5 popups using the compositor's
-    // standard above-overlay rule).
+    // Overlay keeps the launcher above ordinary toplevels; the preview
+    // xdg-toplevel still renders above per compositor stacking rules,
+    // and fcitx5 popups resolve above by the standard above-overlay rule.
+    //
+    // xdg-foreign-v2 transient parenting is intentionally NOT wired:
+    // the protocol restricts zxdg_exporter_v2.export_toplevel to
+    // xdg_toplevel surfaces, and wlroots/Mutter/KWin reject layer_surface
+    // with invalid_surface. Parenting is cosmetic (window-switcher
+    // grouping) — preview already draws above the launcher via stacking.
+    // Request::PreviewSetParent remains in the IPC for a future
+    // xdg_toplevel launcher mode.
     window.set_layer(gtk4_layer_shell::Layer::Overlay);
     // Anchor only Top. Leaving Left and Right unanchored lets the
     // layer-shell compositor center the window horizontally on the
