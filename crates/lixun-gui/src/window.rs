@@ -616,7 +616,23 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
     window.set_anchor(Edge::Top, true);
     window.set_keyboard_mode(gtk4_layer_shell::KeyboardMode::OnDemand);
 
-    window.set_margin(Edge::Top, DEFAULT_TOP_MARGIN);
+    // Restore per-monitor saved position if the user has dragged
+    // the launcher before. Anchor Left as well so the saved
+    // (top, left) margin pair lands at an exact pixel offset
+    // instead of the compositor recentring horizontally.
+    let connector_for_load = gtk::gdk::Display::default()
+        .and_then(|d| d.monitors().item(0).and_downcast::<gtk::gdk::Monitor>())
+        .and_then(|m| m.connector())
+        .map(|gs| gs.to_string());
+    if let Some(pos) =
+        crate::launcher_position::load(connector_for_load.as_deref())
+    {
+        window.set_anchor(Edge::Left, true);
+        window.set_margin(Edge::Top, pos.top);
+        window.set_margin(Edge::Left, pos.left);
+    } else {
+        window.set_margin(Edge::Top, DEFAULT_TOP_MARGIN);
+    }
     add_css_class(&window, "lixun-window");
 
     crate::kde_blur::attach(&window, daemon_config.gui.blur);
@@ -1075,6 +1091,9 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
     });
     window.add_controller(focus_ctrl);
 
+    install_drag_gesture(&window, &entry, &scrolled);
+    install_reset_position_shortcut(&window);
+
     // In daemon-spawned (service) mode the GUI must start hidden
     // and wait for the daemon's first command. Calling show() here
     // unconditionally would race the post-spawn Toggle that the
@@ -1098,6 +1117,107 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
 
     tracing::info!("Lixun GUI window built");
     Ok(())
+}
+
+fn install_drag_gesture(
+    window: &gtk::ApplicationWindow,
+    entry: &gtk::Entry,
+    scrolled: &gtk::ScrolledWindow,
+) {
+    use gtk::prelude::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    let gesture = gtk::GestureDrag::new();
+    let base_top = Rc::new(Cell::new(0i32));
+    let base_left = Rc::new(Cell::new(0i32));
+    let pending_save: Rc<std::cell::RefCell<Option<glib::SourceId>>> =
+        Rc::new(std::cell::RefCell::new(None));
+
+    let entry_for_begin = entry.clone();
+    let scrolled_for_begin = scrolled.clone();
+    let window_for_begin = window.clone();
+    let base_top_for_begin = Rc::clone(&base_top);
+    let base_left_for_begin = Rc::clone(&base_left);
+    gesture.connect_drag_begin(move |gesture, x, y| {
+        if let Some(target) = window_for_begin.pick(x, y, gtk::PickFlags::DEFAULT) {
+            if target == entry_for_begin.clone().upcast::<gtk::Widget>()
+                || target.is_ancestor(&entry_for_begin)
+                || target == scrolled_for_begin.clone().upcast::<gtk::Widget>()
+                || target.is_ancestor(&scrolled_for_begin)
+            {
+                gesture.set_state(gtk::EventSequenceState::Denied);
+                return;
+            }
+        }
+
+        use gtk4_layer_shell::LayerShell;
+        let top = window_for_begin.margin(gtk4_layer_shell::Edge::Top);
+        let left = window_for_begin.margin(gtk4_layer_shell::Edge::Left);
+        base_top_for_begin.set(top);
+        base_left_for_begin.set(left);
+    });
+
+    let window_for_update = window.clone();
+    let base_top_for_update = Rc::clone(&base_top);
+    let base_left_for_update = Rc::clone(&base_left);
+    gesture.connect_drag_update(move |_gesture, offset_x, offset_y| {
+        use gtk4_layer_shell::LayerShell;
+        let new_top = base_top_for_update.get() + offset_y as i32;
+        let new_left = base_left_for_update.get() + offset_x as i32;
+        window_for_update.set_margin(gtk4_layer_shell::Edge::Top, new_top.max(0));
+        window_for_update.set_margin(gtk4_layer_shell::Edge::Left, new_left.max(0));
+    });
+
+    let window_for_end = window.clone();
+    gesture.connect_drag_end(move |gesture, _offset_x, _offset_y| {
+        if let Some(prev_id) = pending_save.borrow_mut().take() {
+            prev_id.remove();
+        }
+
+        let window_clone = window_for_end.clone();
+        let pending_clone = Rc::clone(&pending_save);
+        let source_id = glib::timeout_add_local_once(std::time::Duration::from_millis(250), move || {
+            use gtk4_layer_shell::LayerShell;
+            let top = window_clone.margin(gtk4_layer_shell::Edge::Top);
+            let left = window_clone.margin(gtk4_layer_shell::Edge::Left);
+
+            let connector = gtk::gdk::Display::default()
+                .and_then(|d| d.monitors().item(0).and_downcast::<gtk::gdk::Monitor>())
+                .and_then(|m| m.connector())
+                .map(|gs| gs.to_string());
+
+            crate::launcher_position::save(connector.as_deref(), top, left);
+            pending_clone.borrow_mut().take();
+        });
+        *pending_save.borrow_mut() = Some(source_id);
+    });
+
+    window.add_controller(gesture);
+}
+
+fn install_reset_position_shortcut(window: &gtk::ApplicationWindow) {
+    use gtk::prelude::*;
+    let key_ctrl = gtk::EventControllerKey::new();
+    let window_for_reset = window.clone();
+    key_ctrl.connect_key_pressed(move |_ctrl, key, _code, state| {
+        let ctrl = state.contains(gtk::gdk::ModifierType::CONTROL_MASK);
+        if ctrl && (key == gtk::gdk::Key::_0 || key == gtk::gdk::Key::KP_0) {
+            let connector = gtk::gdk::Display::default()
+                .and_then(|d| d.monitors().item(0).and_downcast::<gtk::gdk::Monitor>())
+                .and_then(|m| m.connector())
+                .map(|gs| gs.to_string());
+            crate::launcher_position::clear(connector.as_deref());
+
+            use gtk4_layer_shell::LayerShell;
+            window_for_reset.set_anchor(gtk4_layer_shell::Edge::Left, false);
+            window_for_reset.set_margin(gtk4_layer_shell::Edge::Top, DEFAULT_TOP_MARGIN);
+            window_for_reset.set_margin(gtk4_layer_shell::Edge::Left, 0);
+            return glib::signal::Propagation::Stop;
+        }
+        glib::signal::Propagation::Proceed
+    });
+    window.add_controller(key_ctrl);
 }
 
 #[allow(clippy::too_many_arguments)]
