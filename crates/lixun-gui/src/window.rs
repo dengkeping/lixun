@@ -1152,21 +1152,44 @@ fn install_drag_gesture(
         }
 
         use gtk4_layer_shell::LayerShell;
-        let top = window_for_begin.margin(gtk4_layer_shell::Edge::Top);
-        let left = window_for_begin.margin(gtk4_layer_shell::Edge::Left);
-        base_top_for_begin.set(top);
-        base_left_for_begin.set(left);
+
+        // First-drag bootstrap: when no saved position has been
+        // restored, Left is unanchored and the compositor centers
+        // the window. Anchoring Left mid-drag would make the
+        // window snap to left=0 then back — visible jitter. So we
+        // freeze the current centered x by computing it from the
+        // monitor and window allocation, anchor Left, and seed
+        // base_left with that value.
+        if !window_for_begin.is_anchor(gtk4_layer_shell::Edge::Left) {
+            let alloc_width = window_for_begin.allocated_width();
+            let monitor_width = gtk::gdk::Display::default()
+                .and_then(|d| d.monitors().item(0).and_downcast::<gtk::gdk::Monitor>())
+                .map(|m| m.geometry().width())
+                .unwrap_or(0);
+            let centered_left = ((monitor_width - alloc_width) / 2).max(0);
+            window_for_begin.set_margin(gtk4_layer_shell::Edge::Left, centered_left);
+            window_for_begin.set_anchor(gtk4_layer_shell::Edge::Left, true);
+            base_left_for_begin.set(centered_left);
+        } else {
+            base_left_for_begin.set(window_for_begin.margin(gtk4_layer_shell::Edge::Left));
+        }
+        base_top_for_begin.set(window_for_begin.margin(gtk4_layer_shell::Edge::Top));
     });
 
     let window_for_update = window.clone();
     let base_top_for_update = Rc::clone(&base_top);
     let base_left_for_update = Rc::clone(&base_left);
+    let last_applied: Rc<Cell<(i32, i32)>> = Rc::new(Cell::new((i32::MIN, i32::MIN)));
     gesture.connect_drag_update(move |_gesture, offset_x, offset_y| {
         use gtk4_layer_shell::LayerShell;
-        let new_top = base_top_for_update.get() + offset_y as i32;
-        let new_left = base_left_for_update.get() + offset_x as i32;
-        window_for_update.set_margin(gtk4_layer_shell::Edge::Top, new_top.max(0));
-        window_for_update.set_margin(gtk4_layer_shell::Edge::Left, new_left.max(0));
+        let new_top = (base_top_for_update.get() + offset_y as i32).max(0);
+        let new_left = (base_left_for_update.get() + offset_x as i32).max(0);
+        if last_applied.get() == (new_top, new_left) {
+            return;
+        }
+        last_applied.set((new_top, new_left));
+        window_for_update.set_margin(gtk4_layer_shell::Edge::Top, new_top);
+        window_for_update.set_margin(gtk4_layer_shell::Edge::Left, new_left);
     });
 
     let window_for_end = window.clone();
