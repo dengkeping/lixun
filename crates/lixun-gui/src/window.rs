@@ -1176,38 +1176,25 @@ fn install_drag_gesture(
         base_top_for_begin.set(window_for_begin.margin(gtk4_layer_shell::Edge::Top));
     });
 
-    let window_for_update = window.clone();
-    let base_top_for_update = Rc::clone(&base_top);
-    let base_left_for_update = Rc::clone(&base_left);
-    // Throttle drag_update to ~16ms (60fps) to match compositor frame
-    // rate. GestureDrag fires much faster; each set_margin triggers a
-    // layer_surface configure/commit that KWin animates, producing
-    // jitter. Store latest target and apply from a throttled timeout.
-    let pending: Rc<Cell<Option<(i32, i32)>>> = Rc::new(Cell::new(None));
-    let throttle_id: Rc<std::cell::RefCell<Option<glib::SourceId>>> =
-        Rc::new(std::cell::RefCell::new(None));
+    // Jump-on-release: don't move window during drag (eliminates jitter
+    // and lag on high-refresh monitors). Just track offset; apply once
+    // on drag_end. Standard pattern for Wayland layer-shell drag.
+    let drag_offset: Rc<Cell<(f64, f64)>> = Rc::new(Cell::new((0.0, 0.0)));
     gesture.connect_drag_update(move |_gesture, offset_x, offset_y| {
-        let new_top = (base_top_for_update.get() + offset_y as i32).max(0);
-        let new_left = (base_left_for_update.get() + offset_x as i32).max(0);
-        pending.set(Some((new_top, new_left)));
-        if throttle_id.borrow().is_none() {
-            let window_clone = window_for_update.clone();
-            let pending_clone = Rc::clone(&pending);
-            let throttle_clone = Rc::clone(&throttle_id);
-            let id = glib::timeout_add_local_once(std::time::Duration::from_millis(16), move || {
-                use gtk4_layer_shell::LayerShell;
-                if let Some((top, left)) = pending_clone.take() {
-                    window_clone.set_margin(gtk4_layer_shell::Edge::Top, top);
-                    window_clone.set_margin(gtk4_layer_shell::Edge::Left, left);
-                }
-                throttle_clone.borrow_mut().take();
-            });
-            *throttle_id.borrow_mut() = Some(id);
-        }
+        drag_offset.set((offset_x, offset_y));
     });
 
     let window_for_end = window.clone();
-    gesture.connect_drag_end(move |gesture, _offset_x, _offset_y| {
+    let base_top_for_end = Rc::clone(&base_top);
+    let base_left_for_end = Rc::clone(&base_left);
+    gesture.connect_drag_end(move |_gesture, offset_x, offset_y| {
+        use gtk4_layer_shell::LayerShell;
+        
+        let new_top = (base_top_for_end.get() + offset_y as i32).max(0);
+        let new_left = (base_left_for_end.get() + offset_x as i32).max(0);
+        window_for_end.set_margin(gtk4_layer_shell::Edge::Top, new_top);
+        window_for_end.set_margin(gtk4_layer_shell::Edge::Left, new_left);
+
         if let Some(prev_id) = pending_save.borrow_mut().take() {
             prev_id.remove();
         }
