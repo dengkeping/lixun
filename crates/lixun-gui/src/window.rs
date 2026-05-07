@@ -1161,7 +1161,7 @@ fn install_drag_gesture(
         // monitor and window allocation, anchor Left, and seed
         // base_left with that value.
         if !window_for_begin.is_anchor(gtk4_layer_shell::Edge::Left) {
-            let alloc_width = window_for_begin.allocated_width();
+            let alloc_width = window_for_begin.width();
             let monitor_width = gtk::gdk::Display::default()
                 .and_then(|d| d.monitors().item(0).and_downcast::<gtk::gdk::Monitor>())
                 .map(|m| m.geometry().width())
@@ -1174,6 +1174,12 @@ fn install_drag_gesture(
             base_left_for_begin.set(window_for_begin.margin(gtk4_layer_shell::Edge::Left));
         }
         base_top_for_begin.set(window_for_begin.margin(gtk4_layer_shell::Edge::Top));
+
+        // Switch cursor to "grabbing" so the user gets visual
+        // feedback that the launcher is being dragged.
+        if let Some(cursor) = gtk::gdk::Cursor::from_name("grabbing", None) {
+            window_for_begin.set_cursor(Some(&cursor));
+        }
     });
 
     // Jump-on-release: don't move window during drag (eliminates jitter
@@ -1189,6 +1195,8 @@ fn install_drag_gesture(
     let base_left_for_end = Rc::clone(&base_left);
     gesture.connect_drag_end(move |_gesture, offset_x, offset_y| {
         use gtk4_layer_shell::LayerShell;
+        
+        window_for_end.set_cursor(None);
         
         let new_top = (base_top_for_end.get() + offset_y as i32).max(0);
         let new_left = (base_left_for_end.get() + offset_x as i32).max(0);
