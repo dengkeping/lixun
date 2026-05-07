@@ -1179,17 +1179,30 @@ fn install_drag_gesture(
     let window_for_update = window.clone();
     let base_top_for_update = Rc::clone(&base_top);
     let base_left_for_update = Rc::clone(&base_left);
-    let last_applied: Rc<Cell<(i32, i32)>> = Rc::new(Cell::new((i32::MIN, i32::MIN)));
+    // Coalesce drag_update calls to one set_margin per GTK main-loop
+    // tick. GestureDrag fires faster than the compositor's frame rate;
+    // each set_margin triggers a layer_surface configure/commit
+    // roundtrip that KWin animates with subtle smoothing, producing
+    // visible jitter. Storing the latest target in `pending` and
+    // applying it from a single idle callback batches all updates
+    // within one frame into one commit.
+    let pending: Rc<Cell<Option<(i32, i32)>>> = Rc::new(Cell::new(None));
     gesture.connect_drag_update(move |_gesture, offset_x, offset_y| {
-        use gtk4_layer_shell::LayerShell;
         let new_top = (base_top_for_update.get() + offset_y as i32).max(0);
         let new_left = (base_left_for_update.get() + offset_x as i32).max(0);
-        if last_applied.get() == (new_top, new_left) {
-            return;
+        let was_idle = pending.get().is_none();
+        pending.set(Some((new_top, new_left)));
+        if was_idle {
+            let window_clone = window_for_update.clone();
+            let pending_clone = Rc::clone(&pending);
+            glib::idle_add_local_once(move || {
+                use gtk4_layer_shell::LayerShell;
+                if let Some((top, left)) = pending_clone.take() {
+                    window_clone.set_margin(gtk4_layer_shell::Edge::Top, top);
+                    window_clone.set_margin(gtk4_layer_shell::Edge::Left, left);
+                }
+            });
         }
-        last_applied.set((new_top, new_left));
-        window_for_update.set_margin(gtk4_layer_shell::Edge::Top, new_top);
-        window_for_update.set_margin(gtk4_layer_shell::Edge::Left, new_left);
     });
 
     let window_for_end = window.clone();
