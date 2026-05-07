@@ -560,6 +560,8 @@ fn build_window_skeleton(
 ) -> Result<()> {
     let window = gtk::ApplicationWindow::builder()
         .application(app)
+        .title("Lixun Preview")
+        .icon_name("lixun-logo-light")
         .decorated(true)
         .default_width(DEFAULT_WIDTH)
         .default_height(DEFAULT_HEIGHT)
