@@ -1179,29 +1179,30 @@ fn install_drag_gesture(
     let window_for_update = window.clone();
     let base_top_for_update = Rc::clone(&base_top);
     let base_left_for_update = Rc::clone(&base_left);
-    // Coalesce drag_update calls to one set_margin per GTK main-loop
-    // tick. GestureDrag fires faster than the compositor's frame rate;
-    // each set_margin triggers a layer_surface configure/commit
-    // roundtrip that KWin animates with subtle smoothing, producing
-    // visible jitter. Storing the latest target in `pending` and
-    // applying it from a single idle callback batches all updates
-    // within one frame into one commit.
+    // Throttle drag_update to ~16ms (60fps) to match compositor frame
+    // rate. GestureDrag fires much faster; each set_margin triggers a
+    // layer_surface configure/commit that KWin animates, producing
+    // jitter. Store latest target and apply from a throttled timeout.
     let pending: Rc<Cell<Option<(i32, i32)>>> = Rc::new(Cell::new(None));
+    let throttle_id: Rc<std::cell::RefCell<Option<glib::SourceId>>> =
+        Rc::new(std::cell::RefCell::new(None));
     gesture.connect_drag_update(move |_gesture, offset_x, offset_y| {
         let new_top = (base_top_for_update.get() + offset_y as i32).max(0);
         let new_left = (base_left_for_update.get() + offset_x as i32).max(0);
-        let was_idle = pending.get().is_none();
         pending.set(Some((new_top, new_left)));
-        if was_idle {
+        if throttle_id.borrow().is_none() {
             let window_clone = window_for_update.clone();
             let pending_clone = Rc::clone(&pending);
-            glib::idle_add_local_once(move || {
+            let throttle_clone = Rc::clone(&throttle_id);
+            let id = glib::timeout_add_local_once(std::time::Duration::from_millis(16), move || {
                 use gtk4_layer_shell::LayerShell;
                 if let Some((top, left)) = pending_clone.take() {
                     window_clone.set_margin(gtk4_layer_shell::Edge::Top, top);
                     window_clone.set_margin(gtk4_layer_shell::Edge::Left, left);
                 }
+                throttle_clone.borrow_mut().take();
             });
+            *throttle_id.borrow_mut() = Some(id);
         }
     });
 
