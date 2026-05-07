@@ -168,6 +168,12 @@ pub enum PreviewEvent {
     /// no longer visible; the process is still warm waiting for
     /// the next `ShowOrUpdate` or for the idle timer to fire.
     Closed { epoch: u64 },
+    /// The user successfully launched the previewed hit (Enter
+    /// inside preview, or "Open" button). The preview process
+    /// hides itself and returns to idle; the daemon should hide
+    /// the launcher and clear its session — the user has finished
+    /// the search, not just dismissed the preview.
+    Launched { epoch: u64 },
     /// Plugin build/update failed. The window may still be
     /// visible with the previous content; the daemon logs and
     /// keeps the process running.
@@ -476,6 +482,8 @@ mod tests {
             .unwrap();
         peer.encode(PreviewEvent::Closed { epoch: 9 }, &mut buf)
             .unwrap();
+        peer.encode(PreviewEvent::Launched { epoch: 10 }, &mut buf)
+            .unwrap();
         peer.encode(
             PreviewEvent::Error {
                 epoch: 11,
@@ -492,6 +500,10 @@ mod tests {
         match codec.decode(&mut buf).unwrap().unwrap() {
             PreviewEvent::Closed { epoch } => assert_eq!(epoch, 9),
             other => panic!("expected Closed, got {:?}", other),
+        }
+        match codec.decode(&mut buf).unwrap().unwrap() {
+            PreviewEvent::Launched { epoch } => assert_eq!(epoch, 10),
+            other => panic!("expected Launched, got {:?}", other),
         }
         match codec.decode(&mut buf).unwrap().unwrap() {
             PreviewEvent::Error { epoch, msg } => {

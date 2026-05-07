@@ -212,6 +212,14 @@ impl LauncherController {
     /// launcher), with a silent background refresh catching the
     /// results up to any index changes that happened in between.
     pub(crate) fn show(&self) -> bool {
+        // Already visible: nothing to restore. Avoids snapshot consumption
+        // when the daemon dispatches Show after a preview close while the
+        // launcher stayed visible (Phase 1 xdg-toplevel preview UX).
+        // Without this guard, take() drains cached_session and a stale
+        // empty snapshot wipes the live results.
+        if self.window.is_visible() {
+            return true;
+        }
         self.recompute_monitor();
 
         let snapshot = self.cached_session.borrow_mut().take();
@@ -1047,13 +1055,19 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
             tracing::info!("gui: spurious leave during show transition, ignored");
             return;
         }
+        // While the preview window is open, the compositor will hand
+        // keyboard focus to it (the preview is now a regular
+        // xdg-toplevel, not a layer-shell surface, so it can take
+        // focus). That LEAVE event is expected and benign — the
+        // launcher must stay visible so the user can keep navigating
+        // results and see the preview update live. Preview dismissal
+        // is driven exclusively by explicit user input handled in
+        // keymap.rs (Space / Escape) and by the preview window's own
+        // close controllers (X button, launch action). Auto-closing
+        // here would defeat the "launcher + preview side-by-side"
+        // workflow.
         if controller_for_leave.preview_mode_active() {
-            tracing::info!(
-                "gui: focus_ctrl LEAVE in preview mode → hide preview + launcher"
-            );
-            crate::ipc::send_preview_hide_request();
-            controller_for_leave.set_preview_mode_active(false);
-            controller_for_leave.hide();
+            tracing::info!("gui: focus_ctrl LEAVE in preview mode → ignored (preview drives dismissal)");
             return;
         }
         tracing::info!("gui: focus_ctrl LEAVE → controller.hide()");

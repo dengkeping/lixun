@@ -54,13 +54,19 @@ impl GuiControl {
     pub async fn dispatch(self: &Arc<Self>, cmd: GuiCommand) -> anyhow::Result<GuiResponse> {
         let mut state = self.state.lock().await;
 
-        if !self.socket_responds().await {
+        let socket_alive = self.socket_responds().await;
+        if !socket_alive {
             if let Some(pid) = state.pid.take() {
                 tracing::warn!("gui_control: socket unresponsive for pid={}, SIGTERM", pid);
                 terminate(pid);
             }
         } else if state.pid.is_none() {
+            // Socket responds but we have no pid record (daemon restart
+            // adopting an already-running lixun-gui). Send the command
+            // directly without re-spawning; we just don't track the pid.
             tracing::info!("gui_control: adopting running lixun-gui via existing socket");
+            drop(state);
+            return send_command(cmd, COMMAND_TIMEOUT).await;
         }
 
         if state.pid.is_none() {

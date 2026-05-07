@@ -622,6 +622,31 @@ impl PreviewSpawner {
                             );
                         }
                     }
+                    PreviewEvent::Launched { epoch } => {
+                        tracing::debug!(
+                            "preview_spawn: pid={} Launched epoch={}",
+                            pid,
+                            epoch
+                        );
+                        if let Err(e) = gui_control.dispatch(GuiCommand::Hide).await {
+                            tracing::warn!(
+                                "preview_spawn: dispatch Hide after Launched failed: {}",
+                                e
+                            );
+                        }
+                        if let Err(e) = gui_control.dispatch(GuiCommand::ClearSession).await {
+                            tracing::warn!(
+                                "preview_spawn: dispatch ClearSession after Launched failed: {}",
+                                e
+                            );
+                        }
+                        if let Err(e) = gui_control.dispatch(GuiCommand::ExitPreviewMode).await {
+                            tracing::warn!(
+                                "preview_spawn: dispatch ExitPreviewMode after Launched failed: {}",
+                                e
+                            );
+                        }
+                    }
                     PreviewEvent::Error { epoch, msg } => {
                         tracing::warn!(
                             "preview_spawn: pid={} plugin error epoch={} msg={}",

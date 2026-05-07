@@ -560,17 +560,12 @@ fn build_window_skeleton(
 ) -> Result<()> {
     let window = gtk::ApplicationWindow::builder()
         .application(app)
-        .decorated(false)
+        .decorated(true)
         .default_width(DEFAULT_WIDTH)
         .default_height(DEFAULT_HEIGHT)
-        .resizable(false)
+        .resizable(true)
         .build();
     window.set_widget_name("lixun-preview-root");
-    // Mirror the old `KeyboardMode::None` intent: keep the preview
-    // keyboard-passive so the launcher entry continues to receive
-    // every key, and the existing IPC-driven Hide/Close path stays
-    // the only way to dismiss the preview.
-    window.set_can_focus(false);
 
     install_user_css(display);
 
@@ -751,7 +746,7 @@ fn run_plugin_launch(
                 hit.id.0
             );
             let epoch = state.current_epoch.get();
-            let _ = outbound_tx.send_blocking(PreviewEvent::Closed { epoch });
+            let _ = outbound_tx.send_blocking(PreviewEvent::Launched { epoch });
             if let Some(window) = state.window.borrow().as_ref() {
                 window.set_visible(false);
             }
@@ -838,11 +833,12 @@ fn install_close_controllers(
     let app_for_key = app.clone();
     let state_for_key = Rc::clone(state);
     let outbound_for_key = outbound_tx.clone();
+    let outbound_for_keyclose = outbound_tx.clone();
     key.connect_key_pressed(move |_, keyval, _keycode, _state| {
         let sym = keyval.name().map(|g| g.to_string()).unwrap_or_default();
         match sym.as_str() {
             "Escape" | "space" => {
-                close_via_keyboard(&state_for_key, &app_for_key);
+                close_via_keyboard(&state_for_key, &app_for_key, &outbound_for_keyclose);
                 glib::Propagation::Stop
             }
             "Return" | "KP_Enter" => {
@@ -865,10 +861,10 @@ fn install_close_controllers(
                             &outbound_for_key,
                         );
                     } else {
-                        close_via_keyboard(&state_for_key, &app_for_key);
+                        close_via_keyboard(&state_for_key, &app_for_key, &outbound_for_keyclose);
                     }
                 } else {
-                    close_via_keyboard(&state_for_key, &app_for_key);
+                    close_via_keyboard(&state_for_key, &app_for_key, &outbound_for_keyclose);
                 }
                 glib::Propagation::Stop
             }
@@ -876,6 +872,27 @@ fn install_close_controllers(
         }
     });
     window.add_controller(key);
+
+    // Window-manager close (titlebar X, Alt+F4, compositor close).
+    // Now that the preview is a decorated xdg-toplevel, the user can
+    // dismiss it via the system close button. We must tell the daemon
+    // so it exits preview mode in the launcher; otherwise the launcher
+    // stays in preview_mode_active and re-opens the preview on every
+    // arrow-key navigation. We hide+idle (mirroring close_via_keyboard)
+    // and return Stop to keep the warm process alive for the next
+    // ShowOrUpdate.
+    let state_for_close = Rc::clone(state);
+    let app_for_close = app.clone();
+    let outbound_for_close = outbound_tx.clone();
+    window.connect_close_request(move |_| {
+        let epoch = state_for_close.current_epoch.get();
+        let _ = outbound_for_close.send_blocking(PreviewEvent::Closed { epoch });
+        if let Some(window) = state_for_close.window.borrow().as_ref() {
+            window.set_visible(false);
+        }
+        schedule_idle(&state_for_close, &app_for_close);
+        glib::Propagation::Stop
+    });
 }
 
 /// Hide window + start idle timer for Escape/Space keyboard close.
@@ -885,7 +902,13 @@ fn install_close_controllers(
 /// daemon catches up via that path. Enter/KP_Enter, by contrast,
 /// goes through `run_plugin_launch` which DOES send Closed, because
 /// a launched hit is a real user decision the daemon must record.
-fn close_via_keyboard(state: &Rc<PreviewState>, app: &gtk::Application) {
+fn close_via_keyboard(
+    state: &Rc<PreviewState>,
+    app: &gtk::Application,
+    outbound_tx: &async_channel::Sender<PreviewEvent>,
+) {
+    let epoch = state.current_epoch.get();
+    let _ = outbound_tx.send_blocking(PreviewEvent::Closed { epoch });
     if let Some(window) = state.window.borrow().as_ref() {
         window.set_visible(false);
     }
