@@ -14,8 +14,14 @@ gtk = { package = "gtk4", version = "0.11", features = ["v4_16"] }
 poppler-rs = "0.26"
 cairo-rs = "0.22"
 gdk = { package = "gdk4", version = "0.11" }
+graphene = { package = "graphene-rs", version = "0.22" }
 glib = "0.22"
 gio = "0.22"
+async-channel = "2"
+lru = "0.12"
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }
 
 [lib]
 name = "lixun_preview_pdf"

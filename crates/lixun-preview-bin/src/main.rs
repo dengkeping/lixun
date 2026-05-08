@@ -35,9 +35,7 @@ use gtk::gio::ApplicationFlags;
 use gtk::glib;
 use gtk::prelude::*;
 use lixun_core::Hit;
-use lixun_ipc::preview::{
-    PreviewCommand, PreviewEvent, read_frame_sync, write_frame_sync,
-};
+use lixun_ipc::preview::{PreviewCommand, PreviewEvent, read_frame_sync, write_frame_sync};
 use lixun_preview::{
     PreviewPlugin, PreviewPluginCfg, SizingPreference, UPDATE_UNSUPPORTED, install_user_css,
     select_plugin,
@@ -102,7 +100,13 @@ struct PreviewState {
     current_plugin: RefCell<Option<Rc<dyn PreviewPlugin>>>,
     current_hit: RefCell<Option<Hit>>,
     current_widget: RefCell<Option<gtk::Widget>>,
+    /// True when `current_widget` is mounted directly into `vbox`
+    /// (plugin returned `SizingPreference::OwnsScroll`); false when
+    /// it lives inside `content_scroll`. Drives the cleanup branch
+    /// on the next mount so we never leave an orphan widget behind.
+    current_widget_owns_scroll: Cell<bool>,
     window: RefCell<Option<gtk::ApplicationWindow>>,
+    vbox: RefCell<Option<gtk::Box>>,
     header_box: RefCell<Option<gtk::Box>>,
     content_scroll: RefCell<Option<gtk::ScrolledWindow>>,
     /// Active 60s self-quit timer. Replaced (after cancellation) on
@@ -190,14 +194,9 @@ fn main() -> Result<()> {
             glib::spawn_future_local(async move {
                 while let Ok(msg) = inbound_rx.recv().await {
                     match msg {
-                        InboundMsg::Cmd(cmd) => handle_command(
-                            cmd,
-                            &app,
-                            &state,
-                            &outbound_tx,
-                            &preview_cfg,
-                            &gui_cfg,
-                        ),
+                        InboundMsg::Cmd(cmd) => {
+                            handle_command(cmd, &app, &state, &outbound_tx, &preview_cfg, &gui_cfg)
+                        }
                         InboundMsg::DaemonGone => {
                             tracing::info!("preview: daemon disconnected, quitting");
                             app.quit();
@@ -471,8 +470,7 @@ fn show_or_update(
         .as_deref()
         .is_some_and(|id| id == plugin_id);
 
-    let needs_rebuild = if same_plugin
-        && let Some(widget) = state.current_widget.borrow().as_ref()
+    let needs_rebuild = if same_plugin && let Some(widget) = state.current_widget.borrow().as_ref()
     {
         match plugin.update(hit, widget) {
             Ok(()) => false,
@@ -509,9 +507,35 @@ fn show_or_update(
                 err_label.upcast::<gtk::Widget>()
             }
         };
-        if let Some(scroll) = state.content_scroll.borrow().as_ref() {
+
+        // Detach the previously-mounted widget from whichever
+        // container owns it. Mirrors the mount branch below: an
+        // OwnsScroll widget sits directly in vbox; everything else
+        // sits inside content_scroll. Without this cleanup a plugin
+        // switch from OwnsScroll → FixedCap (or vice versa) would
+        // leak the old widget into vbox alongside the new one.
+        let prev_owns_scroll = state.current_widget_owns_scroll.get();
+        if let Some(prev_widget) = state.current_widget.borrow_mut().take() {
+            if prev_owns_scroll {
+                if let Some(vbox) = state.vbox.borrow().as_ref() {
+                    vbox.remove(&prev_widget);
+                }
+            } else if let Some(scroll) = state.content_scroll.borrow().as_ref() {
+                scroll.set_child(gtk::Widget::NONE);
+            }
+        }
+
+        let owns_scroll = matches!(plugin.sizing(), SizingPreference::OwnsScroll);
+        if owns_scroll {
+            if let Some(vbox) = state.vbox.borrow().as_ref() {
+                new_widget.set_hexpand(true);
+                new_widget.set_vexpand(true);
+                vbox.append(&new_widget);
+            }
+        } else if let Some(scroll) = state.content_scroll.borrow().as_ref() {
             scroll.set_child(Some(&new_widget));
         }
+        state.current_widget_owns_scroll.set(owns_scroll);
         *state.current_widget.borrow_mut() = Some(new_widget);
         *state.current_plugin_id.borrow_mut() = Some(plugin_id.clone());
         *state.current_plugin.borrow_mut() = Some(Rc::clone(&plugin));
@@ -544,7 +568,7 @@ fn show_or_update(
 /// as `PreviewCommand::SetParent`, and the preview imports it and
 /// calls `set_parent_of` so the compositor stacks the preview as a
 /// child of the launcher. See Phase 1 in
-/// `.workspace-local/plans/preview-rich-quicklook.md`.
+/// the rich-quicklook design notes for Phase 1.
 ///
 /// Keyboard focus: under layer-shell we used `KeyboardMode::None` to
 /// keep the preview keyboard-passive. xdg-toplevel has no equivalent
@@ -589,6 +613,7 @@ fn build_window_skeleton(
 
     *state.header_box.borrow_mut() = Some(header_box);
     *state.content_scroll.borrow_mut() = Some(content_scroll);
+    *state.vbox.borrow_mut() = Some(vbox);
     *state.window.borrow_mut() = Some(window);
     Ok(())
 }
@@ -598,8 +623,12 @@ fn try_apply_pending_parent(state: &Rc<PreviewState>, window: &gtk::ApplicationW
         Some(h) => h,
         None => return,
     };
-    let Some(gdk_surface) = window.surface() else { return };
-    let Some(wl_surface) = wayland_xdg_foreign::wl_surface_of(&gdk_surface) else { return };
+    let Some(gdk_surface) = window.surface() else {
+        return;
+    };
+    let Some(wl_surface) = wayland_xdg_foreign::wl_surface_of(&gdk_surface) else {
+        return;
+    };
     let mut importer = state.wayland_importer.borrow_mut();
     if importer.is_none() {
         match wayland_xdg_foreign::WaylandImporter::new(&gdk_surface) {
@@ -651,6 +680,7 @@ fn apply_sizing(state: &Rc<PreviewState>, sizing: SizingPreference, w_max: i32, 
     match sizing {
         SizingPreference::FixedCap => {
             window.set_default_size(w_max, h_max);
+            scroll.set_visible(true);
             scroll.set_vexpand(true);
             scroll.set_hexpand(true);
             scroll.set_propagate_natural_width(false);
@@ -658,12 +688,21 @@ fn apply_sizing(state: &Rc<PreviewState>, sizing: SizingPreference, w_max: i32, 
         }
         SizingPreference::FitToContent => {
             window.set_default_size(MIN_WIDTH, MIN_HEIGHT);
+            scroll.set_visible(true);
             scroll.set_vexpand(false);
             scroll.set_hexpand(false);
             scroll.set_max_content_width(w_max);
             scroll.set_max_content_height(h_max);
             scroll.set_propagate_natural_width(true);
             scroll.set_propagate_natural_height(true);
+        }
+        SizingPreference::OwnsScroll => {
+            // Plugin's widget contains its own scroll container plus
+            // any non-scrolling chrome. Hide the host's outer scroll
+            // so its container does not also scroll the chrome out
+            // of view, and let the widget itself fill the cap.
+            window.set_default_size(w_max, h_max);
+            scroll.set_visible(false);
         }
     }
 }
@@ -775,10 +814,7 @@ fn run_plugin_launch(
 /// 2. Pointer-position fallback for direct invocation without a
 ///    daemon (manual debug runs).
 /// 3. First monitor.
-fn pick_monitor(
-    display: &gtk::gdk::Display,
-    requested: Option<&str>,
-) -> Option<gtk::gdk::Monitor> {
+fn pick_monitor(display: &gtk::gdk::Display, requested: Option<&str>) -> Option<gtk::gdk::Monitor> {
     if let Some(name) = requested
         && !name.is_empty()
     {

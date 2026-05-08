@@ -5452,16 +5452,20 @@ name = "lixun-preview-pdf"
 version = "0.6.0"
 dependencies = [
  "anyhow",
+ "async-channel",
  "cairo-rs",
  "gdk4",
  "gio",
  "glib",
+ "graphene-rs",
  "gtk4",
  "inventory",
  "lixun-core",
  "lixun-preview",
+ "lru 0.12.5",
  "poppler-rs",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

@@ -63,10 +63,21 @@ impl<'a> PreviewPluginCfg<'a> {
 ///   `preview_max_*_px`), independently of content. Use for
 ///   media-like plugins (image, pdf, video, office) where the
 ///   content's natural size is either huge or ill-defined.
+///
+/// - `OwnsScroll`: the plugin's widget manages its own scrolling
+///   AND its own non-scrolling chrome (toolbars, action bars,
+///   status strips). The host MUST NOT wrap the widget in an
+///   outer `ScrolledWindow`; doing so would scroll the chrome
+///   out of view together with the content. The host mounts the
+///   widget directly into the window's vbox, sized to the
+///   configured cap (same dimensions as `FixedCap`). Use for
+///   plugins whose content widget is a composite of a fixed
+///   header/toolbar plus a scrollable body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SizingPreference {
     FitToContent,
     FixedCap,
+    OwnsScroll,
 }
 
 /// A format plugin that renders a preview widget for a hit AND
