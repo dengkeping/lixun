@@ -18,8 +18,7 @@ use gtk4_layer_shell::{Edge, LayerShell};
 use lixun_core::Category;
 
 use crate::factory::{
-    add_css_class, clear_cached_hits, create_list_factory, update_results,
-    with_cached_hits,
+    add_css_class, clear_cached_hits, create_list_factory, update_results, with_cached_hits,
 };
 use crate::ipc::{IpcClient, fetch_claimed_prefixes, start_ipc_thread};
 use crate::status::StatusBar;
@@ -223,7 +222,11 @@ impl LauncherController {
         self.recompute_monitor();
 
         let snapshot = self.cached_session.borrow_mut().take();
-        tracing::info!("gui: show() snapshot_present={} entry_text_before={:?}", snapshot.is_some(), self.entry.text().to_string());
+        tracing::info!(
+            "gui: show() snapshot_present={} entry_text_before={:?}",
+            snapshot.is_some(),
+            self.entry.text().to_string()
+        );
         if let Some(snapshot) = snapshot {
             // If the live UI already matches the snapshot (same query
             // and the model is non-empty), the previous hide() left
@@ -240,7 +243,11 @@ impl LauncherController {
             if model_populated && live_query == snapshot.query {
                 tracing::info!("gui: show() reusing live state, skipping restore_session");
             } else {
-                tracing::info!("gui: show() restoring snapshot query={:?} hits={}", snapshot.query, snapshot.hits.len());
+                tracing::info!(
+                    "gui: show() restoring snapshot query={:?} hits={}",
+                    snapshot.query,
+                    snapshot.hits.len()
+                );
                 self.restore_session(&snapshot);
             }
         }
@@ -249,7 +256,10 @@ impl LauncherController {
         self.window.add_css_class("lixun-showing");
         self.window.set_visible(true);
         self.entry.grab_focus();
-        tracing::info!("gui: show() called entry.grab_focus(); entry has_focus={}", self.entry.has_focus());
+        tracing::info!(
+            "gui: show() called entry.grab_focus(); entry has_focus={}",
+            self.entry.has_focus()
+        );
         self.entry.set_position(-1);
         self.just_showed_until
             .set(Instant::now() + Duration::from_millis(JUST_SHOWED_GUARD_MS));
@@ -624,9 +634,7 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
         .and_then(|d| d.monitors().item(0).and_downcast::<gtk::gdk::Monitor>())
         .and_then(|m| m.connector())
         .map(|gs| gs.to_string());
-    if let Some(pos) =
-        crate::launcher_position::load(connector_for_load.as_deref())
-    {
+    if let Some(pos) = crate::launcher_position::load(connector_for_load.as_deref()) {
         window.set_anchor(Edge::Left, true);
         window.set_margin(Edge::Top, pos.top);
         window.set_margin(Edge::Left, pos.left);
@@ -690,7 +698,7 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
         .build();
     entry.set_widget_name("lixun-entry");
     add_css_class(&entry, "lixun-entry");
-    
+
     let icon_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../packaging/icons/lixun-logo-light.svg");
     let icon_file = gtk::gio::File::for_path(&icon_path);
@@ -698,10 +706,10 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
         entry.set_icon_from_paintable(gtk::EntryIconPosition::Primary, Some(&icon));
         entry.set_icon_activatable(gtk::EntryIconPosition::Primary, true);
     }
-    
+
     let semantic_enabled = daemon_config.plugin_sections.contains_key("semantic");
     let ocr_enabled = daemon_config.ocr.enabled;
-    
+
     let entry_for_menu = entry.clone();
     let gesture = gtk::GestureClick::new();
     gesture.set_button(3);
@@ -709,25 +717,21 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
         if x < 60.0 {
             let menu = gtk::PopoverMenu::from_model(None::<&gtk::gio::MenuModel>);
             let menu_model = gtk::gio::Menu::new();
-            
+
             menu_model.append(Some("Relaunch Daemon"), Some("app.relaunch"));
-            
+
             let semantic_label = if semantic_enabled {
                 "🟢 Semantic Search"
             } else {
                 "🔴 Semantic Search"
             };
             menu_model.append(Some(semantic_label), Some("app.toggle-semantic"));
-            
-            let ocr_label = if ocr_enabled {
-                "🟢 OCR"
-            } else {
-                "🔴 OCR"
-            };
+
+            let ocr_label = if ocr_enabled { "🟢 OCR" } else { "🔴 OCR" };
             menu_model.append(Some(ocr_label), Some("app.toggle-ocr"));
-            
+
             menu_model.append(Some("Open Config"), Some("app.open-config"));
-            
+
             menu.set_menu_model(Some(&menu_model));
             menu.set_parent(&entry_for_menu);
             let rect = gtk::gdk::Rectangle::new(0, entry_for_menu.height(), 1, 1);
@@ -736,7 +740,7 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
         }
     });
     entry.add_controller(gesture);
-    
+
     vbox.append(&entry);
 
     let current_category: CategoryFilter = std::rc::Rc::new(std::cell::Cell::new(None));
@@ -837,8 +841,7 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
         std::rc::Rc::new(std::cell::RefCell::new(None));
     let loading_timer: std::rc::Rc<std::cell::RefCell<Option<glib::SourceId>>> =
         std::rc::Rc::new(std::cell::RefCell::new(None));
-    let claimed_prefixes: std::rc::Rc<Vec<String>> =
-        std::rc::Rc::new(fetch_claimed_prefixes());
+    let claimed_prefixes: std::rc::Rc<Vec<String>> = std::rc::Rc::new(fetch_claimed_prefixes());
     tracing::info!("gui: fetched claimed_prefixes={:?}", claimed_prefixes);
     let last_query: std::rc::Rc<std::cell::RefCell<String>> =
         std::rc::Rc::new(std::cell::RefCell::new(String::new()));
@@ -939,7 +942,7 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
     let relaunch_action = gio::SimpleAction::new("relaunch", None);
     relaunch_action.connect_activate(move |_, _| {
         let _ = std::process::Command::new("systemctl")
-            .args(&["--user", "restart", "lixund.service"])
+            .args(["--user", "restart", "lixund.service"])
             .spawn();
     });
     app.add_action(&relaunch_action);
@@ -950,22 +953,22 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
         let config_path = dirs::config_dir()
             .unwrap_or_else(|| std::path::PathBuf::from("~/.config"))
             .join("lixun/config.toml");
-        
-        if let Ok(content) = std::fs::read_to_string(&config_path) {
-            if let Ok(mut doc) = content.parse::<toml_edit::DocumentMut>() {
-                if semantic_current {
-                    doc.remove("semantic");
-                } else {
-                    let mut table = toml_edit::Table::new();
-                    table.insert("enabled", toml_edit::value(true));
-                    doc.insert("semantic", toml_edit::Item::Table(table));
-                }
-                let _ = std::fs::write(&config_path, doc.to_string());
+
+        if let Ok(content) = std::fs::read_to_string(&config_path)
+            && let Ok(mut doc) = content.parse::<toml_edit::DocumentMut>()
+        {
+            if semantic_current {
+                doc.remove("semantic");
+            } else {
+                let mut table = toml_edit::Table::new();
+                table.insert("enabled", toml_edit::value(true));
+                doc.insert("semantic", toml_edit::Item::Table(table));
             }
+            let _ = std::fs::write(&config_path, doc.to_string());
         }
-        
+
         let _ = std::process::Command::new("systemctl")
-            .args(&["--user", "restart", "lixund.service"])
+            .args(["--user", "restart", "lixund.service"])
             .spawn();
     });
     app.add_action(&toggle_semantic_action);
@@ -976,22 +979,22 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
         let config_path = dirs::config_dir()
             .unwrap_or_else(|| std::path::PathBuf::from("~/.config"))
             .join("lixun/config.toml");
-        
-        if let Ok(content) = std::fs::read_to_string(&config_path) {
-            if let Ok(mut doc) = content.parse::<toml_edit::DocumentMut>() {
-                if let Some(ocr_table) = doc.get_mut("ocr").and_then(|v| v.as_table_mut()) {
-                    ocr_table.insert("enabled", toml_edit::value(!ocr_current));
-                } else {
-                    let mut table = toml_edit::Table::new();
-                    table.insert("enabled", toml_edit::value(!ocr_current));
-                    doc.insert("ocr", toml_edit::Item::Table(table));
-                }
-                let _ = std::fs::write(&config_path, doc.to_string());
+
+        if let Ok(content) = std::fs::read_to_string(&config_path)
+            && let Ok(mut doc) = content.parse::<toml_edit::DocumentMut>()
+        {
+            if let Some(ocr_table) = doc.get_mut("ocr").and_then(|v| v.as_table_mut()) {
+                ocr_table.insert("enabled", toml_edit::value(!ocr_current));
+            } else {
+                let mut table = toml_edit::Table::new();
+                table.insert("enabled", toml_edit::value(!ocr_current));
+                doc.insert("ocr", toml_edit::Item::Table(table));
             }
+            let _ = std::fs::write(&config_path, doc.to_string());
         }
-        
+
         let _ = std::process::Command::new("systemctl")
-            .args(&["--user", "restart", "lixund.service"])
+            .args(["--user", "restart", "lixund.service"])
             .spawn();
     });
     app.add_action(&toggle_ocr_action);
@@ -1083,7 +1086,9 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
         // here would defeat the "launcher + preview side-by-side"
         // workflow.
         if controller_for_leave.preview_mode_active() {
-            tracing::info!("gui: focus_ctrl LEAVE in preview mode → ignored (preview drives dismissal)");
+            tracing::info!(
+                "gui: focus_ctrl LEAVE in preview mode → ignored (preview drives dismissal)"
+            );
             return;
         }
         tracing::info!("gui: focus_ctrl LEAVE → controller.hide()");
@@ -1142,15 +1147,14 @@ fn install_drag_gesture(
     let base_left_for_begin = Rc::clone(&base_left);
     let drag_accepted_for_begin = Rc::clone(&drag_accepted);
     gesture.connect_drag_begin(move |gesture, x, y| {
-        if let Some(target) = window_for_begin.pick(x, y, gtk::PickFlags::DEFAULT) {
-            if target == entry_for_begin.clone().upcast::<gtk::Widget>()
+        if let Some(target) = window_for_begin.pick(x, y, gtk::PickFlags::DEFAULT)
+            && (target == entry_for_begin.clone().upcast::<gtk::Widget>()
                 || target.is_ancestor(&entry_for_begin)
                 || target == scrolled_for_begin.clone().upcast::<gtk::Widget>()
-                || target.is_ancestor(&scrolled_for_begin)
-            {
-                gesture.set_state(gtk::EventSequenceState::Denied);
-                return;
-            }
+                || target.is_ancestor(&scrolled_for_begin))
+        {
+            gesture.set_state(gtk::EventSequenceState::Denied);
+            return;
         }
 
         use gtk4_layer_shell::LayerShell;
@@ -1207,9 +1211,9 @@ fn install_drag_gesture(
             return;
         }
         use gtk4_layer_shell::LayerShell;
-        
+
         window_for_end.set_cursor(None);
-        
+
         let new_top = (base_top_for_end.get() + offset_y as i32).max(0);
         let new_left = (base_left_for_end.get() + offset_x as i32).max(0);
         window_for_end.set_margin(gtk4_layer_shell::Edge::Top, new_top);
@@ -1221,19 +1225,20 @@ fn install_drag_gesture(
 
         let window_clone = window_for_end.clone();
         let pending_clone = Rc::clone(&pending_save);
-        let source_id = glib::timeout_add_local_once(std::time::Duration::from_millis(250), move || {
-            use gtk4_layer_shell::LayerShell;
-            let top = window_clone.margin(gtk4_layer_shell::Edge::Top);
-            let left = window_clone.margin(gtk4_layer_shell::Edge::Left);
+        let source_id =
+            glib::timeout_add_local_once(std::time::Duration::from_millis(250), move || {
+                use gtk4_layer_shell::LayerShell;
+                let top = window_clone.margin(gtk4_layer_shell::Edge::Top);
+                let left = window_clone.margin(gtk4_layer_shell::Edge::Left);
 
-            let connector = gtk::gdk::Display::default()
-                .and_then(|d| d.monitors().item(0).and_downcast::<gtk::gdk::Monitor>())
-                .and_then(|m| m.connector())
-                .map(|gs| gs.to_string());
+                let connector = gtk::gdk::Display::default()
+                    .and_then(|d| d.monitors().item(0).and_downcast::<gtk::gdk::Monitor>())
+                    .and_then(|m| m.connector())
+                    .map(|gs| gs.to_string());
 
-            crate::launcher_position::save(connector.as_deref(), top, left);
-            pending_clone.borrow_mut().take();
-        });
+                crate::launcher_position::save(connector.as_deref(), top, left);
+                pending_clone.borrow_mut().take();
+            });
         *pending_save.borrow_mut() = Some(source_id);
 
         drag_accepted_for_end.set(false);
@@ -1288,27 +1293,51 @@ fn install_response_handler(
     glib::spawn_future_local(async move {
         while let Ok(msg) = event_rx.recv().await {
             match msg {
-                crate::ipc::IpcMessage::SearchChunk { epoch, phase, hits, calculation, top_hit, claimed } => {
+                crate::ipc::IpcMessage::SearchChunk {
+                    epoch,
+                    phase,
+                    hits,
+                    calculation,
+                    top_hit,
+                    claimed,
+                } => {
                     let current_session_epoch = session_epoch.load(Ordering::SeqCst);
                     if epoch < current_session_epoch {
-                        tracing::debug!("gui: dropping stale chunk epoch={} < session_epoch={}", epoch, current_session_epoch);
+                        tracing::debug!(
+                            "gui: dropping stale chunk epoch={} < session_epoch={}",
+                            epoch,
+                            current_session_epoch
+                        );
                         continue;
                     }
 
                     if epoch > last_epoch.get() {
-                        tracing::debug!("gui: new epoch {} > {}, clearing pending", epoch, last_epoch.get());
+                        tracing::debug!(
+                            "gui: new epoch {} > {}, clearing pending",
+                            epoch,
+                            last_epoch.get()
+                        );
                         pending_hits.borrow_mut().clear();
                         last_epoch.set(epoch);
                     }
 
                     match phase {
                         lixun_ipc::Phase::Initial => {
-                            tracing::debug!("gui: buffering Initial chunk epoch={} hits={}", epoch, hits.len());
+                            tracing::debug!(
+                                "gui: buffering Initial chunk epoch={} hits={}",
+                                epoch,
+                                hits.len()
+                            );
                             *pending_hits.borrow_mut() = hits;
                             searching_indicator.set(true);
                         }
                         lixun_ipc::Phase::Final => {
-                            tracing::debug!("gui: rendering Final chunk epoch={} hits={} claimed={}", epoch, hits.len(), claimed);
+                            tracing::debug!(
+                                "gui: rendering Final chunk epoch={} hits={} claimed={}",
+                                epoch,
+                                hits.len(),
+                                claimed
+                            );
                             if let Some(id) = loading_timer.borrow_mut().take() {
                                 id.remove();
                             }
@@ -1347,7 +1376,9 @@ fn install_response_handler(
                                         (0..selection.n_items()).find(|&i| {
                                             selection
                                                 .item(i)
-                                                .and_then(|o| o.downcast::<gtk::StringObject>().ok())
+                                                .and_then(|o| {
+                                                    o.downcast::<gtk::StringObject>().ok()
+                                                })
                                                 .map(|s| s.string() == want)
                                                 .unwrap_or(false)
                                         })
@@ -1531,7 +1562,11 @@ fn install_entry_handler(
         let id = glib::timeout_add_local_once(Duration::from_millis(80), move || {
             *last_q.borrow_mut() = q.clone();
             let epoch_snapshot = epoch.load(Ordering::SeqCst);
-            tracing::debug!("gui: debounce fired, sending search query={:?} epoch={}", q, epoch_snapshot);
+            tracing::debug!(
+                "gui: debounce fired, sending search query={:?} epoch={}",
+                q,
+                epoch_snapshot
+            );
             // Skip "Searching…" spinner for queries claimed by an
             // instant plugin (shell `>`, calculator `=`). These
             // respond in <10ms so the spinner would only flash.

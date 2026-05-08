@@ -38,7 +38,7 @@ use gdk4_wayland::prelude::WaylandSurfaceExtManual;
 use gtk::prelude::*;
 use std::cell::RefCell;
 use std::rc::Rc;
-use wayland_client::globals::{registry_queue_init, GlobalList, GlobalListContents};
+use wayland_client::globals::{GlobalList, GlobalListContents, registry_queue_init};
 use wayland_client::protocol::wl_compositor::WlCompositor;
 use wayland_client::protocol::wl_region::WlRegion;
 use wayland_client::protocol::wl_registry::WlRegistry;
@@ -122,7 +122,9 @@ impl BlurAttachment {
         let Ok(wayland_display) = display.downcast::<gdk4_wayland::WaylandDisplay>() else {
             return Ok(None);
         };
-        let Ok(wayland_surface) = gdk_surface.clone().downcast::<gdk4_wayland::WaylandSurface>()
+        let Ok(wayland_surface) = gdk_surface
+            .clone()
+            .downcast::<gdk4_wayland::WaylandSurface>()
         else {
             return Ok(None);
         };

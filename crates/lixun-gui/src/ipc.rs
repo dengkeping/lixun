@@ -46,7 +46,12 @@ pub(crate) fn start_ipc_thread(
 
     std::thread::spawn(move || {
         while let Ok((query, limit, epoch_at_send)) = rx.recv() {
-            tracing::debug!("ipc: received search request query={:?} limit={} epoch={}", query, limit, epoch_at_send);
+            tracing::debug!(
+                "ipc: received search request query={:?} limit={} epoch={}",
+                query,
+                limit,
+                epoch_at_send
+            );
 
             let sock = socket_path();
             let req = Request::Search {
@@ -80,7 +85,10 @@ pub(crate) fn start_ipc_thread(
                 tracing::error!("Failed to send search request: {}", e);
                 continue;
             }
-            tracing::debug!("ipc: request written ({} bytes), entering read loop", buf.len());
+            tracing::debug!(
+                "ipc: request written ({} bytes), entering read loop",
+                buf.len()
+            );
 
             if let Err(e) = stream.set_read_timeout(Some(Duration::from_secs(3))) {
                 tracing::error!("Failed to set read timeout: {}", e);
@@ -99,7 +107,10 @@ pub(crate) fn start_ipc_thread(
                 let mut header = [0u8; 4];
                 match stream.read_exact(&mut header) {
                     Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::TimedOut =>
+                    {
                         tracing::debug!("ipc: read timeout, treating as Final");
                         let _ = event_tx.send_blocking(IpcMessage::SearchChunk {
                             epoch: epoch_at_send,
@@ -160,7 +171,12 @@ pub(crate) fn start_ipc_thread(
                         }
 
                         let is_final = matches!(phase, Phase::Final);
-                        tracing::debug!("ipc: chunk received epoch={} phase={:?} hits={}", resp_epoch, phase, hits.len());
+                        tracing::debug!(
+                            "ipc: chunk received epoch={} phase={:?} hits={}",
+                            resp_epoch,
+                            phase,
+                            hits.len()
+                        );
                         let _ = event_tx.send_blocking(IpcMessage::SearchChunk {
                             epoch: resp_epoch,
                             phase,
@@ -433,7 +449,12 @@ mod tests {
         let bytes = serde_json::to_vec(&resp).unwrap();
         let roundtrip: Response = serde_json::from_slice(&bytes).unwrap();
         match roundtrip {
-            Response::SearchChunk { epoch, phase, top_hit, .. } => {
+            Response::SearchChunk {
+                epoch,
+                phase,
+                top_hit,
+                ..
+            } => {
                 assert_eq!(epoch, 42);
                 assert_eq!(phase, Phase::Initial);
                 assert_eq!(top_hit.as_ref().map(|d| d.0.as_str()), Some("app:firefox"));

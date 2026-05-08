@@ -111,20 +111,20 @@ fn dispatch_action(action: &Action) -> Result<()> {
             desktop_file,
             working_dir,
         } => {
-        if !terminal {
-            if let Some(id) = desktop_id.as_deref()
-                && let Some(app) = DesktopAppInfo::new(id)
-            {
-                app.launch(&[], None::<&gio::AppLaunchContext>)?;
-                return Ok(());
+            if !terminal {
+                if let Some(id) = desktop_id.as_deref()
+                    && let Some(app) = DesktopAppInfo::new(id)
+                {
+                    app.launch(&[], None::<&gio::AppLaunchContext>)?;
+                    return Ok(());
+                }
+                if let Some(path) = desktop_file.as_ref()
+                    && let Some(app) = DesktopAppInfo::from_filename(path)
+                {
+                    app.launch(&[], None::<&gio::AppLaunchContext>)?;
+                    return Ok(());
+                }
             }
-            if let Some(path) = desktop_file.as_ref()
-                && let Some(app) = DesktopAppInfo::from_filename(path)
-            {
-                app.launch(&[], None::<&gio::AppLaunchContext>)?;
-                return Ok(());
-            }
-        }
 
             if *terminal {
                 let spawn = terminal_spawn();

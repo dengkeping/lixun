@@ -9,7 +9,9 @@ use gtk::prelude::*;
 use lixun_core::Action;
 use lixun_daemon::config::Keybindings;
 
-use crate::actions::{copy_to_clipboard, execute_action, execute_secondary_action, run_and_capture};
+use crate::actions::{
+    copy_to_clipboard, execute_action, execute_secondary_action, run_and_capture,
+};
 use crate::factory::{cached_hit_by_id, synthetic_history_hits, update_results, with_cached_hits};
 use crate::ipc::{
     IpcClient, current_monitor_connector, dispatch_click_pair, request_search_history,
@@ -191,7 +193,9 @@ pub(crate) fn install_keyboard_handler(
             let printable = is_printable_key(key, state);
             tracing::info!(
                 "gui: window key_controller fired key={:?} entry_focus={} printable={}",
-                key.name(), entry_focus, printable
+                key.name(),
+                entry_focus,
+                printable
             );
             // Hard rule: printable unmodified keys belong to the focused
             // Entry. Forward them before any accel dispatch can swallow
@@ -393,9 +397,8 @@ pub(crate) fn install_keyboard_handler(
             {
                 let mut should_hide = true;
                 let query_at_click = entry.text().to_string();
-                let is_secondary = accel_matches(&keybindings.secondary_action, key, state)
-                    || shift
-                    || ctrl;
+                let is_secondary =
+                    accel_matches(&keybindings.secondary_action, key, state) || shift || ctrl;
                 selected_hit_in(&selection, &filter_model, |hit| {
                     if let Action::ReplaceQuery { q } = &hit.action {
                         entry.set_text(q);
@@ -409,18 +412,20 @@ pub(crate) fn install_keyboard_handler(
                     // stdout, and replace the query text. Used by
                     // shell plugin to pipe command output into the
                     // launcher instead of opening a terminal.
-                    if is_secondary {
-                        if let Some(sec) = &hit.secondary_action
-                            && let Action::ExecCapture { cmdline, working_dir } = sec.as_ref()
-                        {
-                            if let Some(output) = run_and_capture(cmdline, working_dir.as_deref()) {
-                                entry.set_text(output.trim_end());
-                                entry.set_position(-1);
-                                entry.grab_focus();
-                            }
-                            should_hide = false;
-                            return;
+                    if is_secondary
+                        && let Some(sec) = &hit.secondary_action
+                        && let Action::ExecCapture {
+                            cmdline,
+                            working_dir,
+                        } = sec.as_ref()
+                    {
+                        if let Some(output) = run_and_capture(cmdline, working_dir.as_deref()) {
+                            entry.set_text(output.trim_end());
+                            entry.set_position(-1);
+                            entry.grab_focus();
                         }
+                        should_hide = false;
+                        return;
                     }
                     dispatch_click_pair(&hit.id.0, &query_at_click);
                     let result = if is_secondary {

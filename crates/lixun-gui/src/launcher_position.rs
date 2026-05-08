@@ -89,9 +89,7 @@ pub fn save(connector: Option<&str>, top: i32, left: i32) {
     if !gui.contains_key("position") {
         gui.insert("position", toml_edit::Item::Table(toml_edit::Table::new()));
     }
-    let position = gui
-        .get_mut("position")
-        .and_then(|v| v.as_table_mut());
+    let position = gui.get_mut("position").and_then(|v| v.as_table_mut());
     let Some(position) = position else {
         tracing::warn!("launcher_position: [gui.position] is not a table");
         return;
