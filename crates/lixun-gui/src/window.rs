@@ -1133,12 +1133,14 @@ fn install_drag_gesture(
     let base_left = Rc::new(Cell::new(0i32));
     let pending_save: Rc<std::cell::RefCell<Option<glib::SourceId>>> =
         Rc::new(std::cell::RefCell::new(None));
+    let drag_accepted: Rc<Cell<bool>> = Rc::new(Cell::new(false));
 
     let entry_for_begin = entry.clone();
     let scrolled_for_begin = scrolled.clone();
     let window_for_begin = window.clone();
     let base_top_for_begin = Rc::clone(&base_top);
     let base_left_for_begin = Rc::clone(&base_left);
+    let drag_accepted_for_begin = Rc::clone(&drag_accepted);
     gesture.connect_drag_begin(move |gesture, x, y| {
         if let Some(target) = window_for_begin.pick(x, y, gtk::PickFlags::DEFAULT) {
             if target == entry_for_begin.clone().upcast::<gtk::Widget>()
@@ -1180,20 +1182,30 @@ fn install_drag_gesture(
         if let Some(cursor) = gtk::gdk::Cursor::from_name("grabbing", None) {
             window_for_begin.set_cursor(Some(&cursor));
         }
+
+        drag_accepted_for_begin.set(true);
     });
 
     // Jump-on-release: don't move window during drag (eliminates jitter
     // and lag on high-refresh monitors). Just track offset; apply once
     // on drag_end. Standard pattern for Wayland layer-shell drag.
     let drag_offset: Rc<Cell<(f64, f64)>> = Rc::new(Cell::new((0.0, 0.0)));
+    let drag_accepted_for_update = Rc::clone(&drag_accepted);
     gesture.connect_drag_update(move |_gesture, offset_x, offset_y| {
+        if !drag_accepted_for_update.get() {
+            return;
+        }
         drag_offset.set((offset_x, offset_y));
     });
 
     let window_for_end = window.clone();
     let base_top_for_end = Rc::clone(&base_top);
     let base_left_for_end = Rc::clone(&base_left);
+    let drag_accepted_for_end = Rc::clone(&drag_accepted);
     gesture.connect_drag_end(move |_gesture, offset_x, offset_y| {
+        if !drag_accepted_for_end.get() {
+            return;
+        }
         use gtk4_layer_shell::LayerShell;
         
         window_for_end.set_cursor(None);
@@ -1223,6 +1235,8 @@ fn install_drag_gesture(
             pending_clone.borrow_mut().take();
         });
         *pending_save.borrow_mut() = Some(source_id);
+
+        drag_accepted_for_end.set(false);
     });
 
     window.add_controller(gesture);
