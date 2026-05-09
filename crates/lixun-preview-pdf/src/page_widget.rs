@@ -7,11 +7,10 @@
 //! document page at the right document-space rect; GTK handles
 //! clipping and hit-testing natively.
 //!
-//! Cache miss fallback chain matches round-3 behaviour: exact
-//! bucket → `get_best_cached` nearest-bucket fallback (stretched by
-//! `snapshot.append_texture`) → grey placeholder. The miss path
-//! also submits a render job for the exact bucket so the visible
-//! frame eventually sharpens.
+//! Snapshot layer order (PR2b):
+//!   1. page texture (cached or grey placeholder)
+//!   2. selection overlay (Papers-style `selected_region`,
+//!      accent @ 40 %)
 //!
 //! Q1 invariant: cairo never crosses the GTK boundary. Worker
 //! produces `gdk::MemoryTexture`; this widget only ever calls
@@ -24,7 +23,9 @@ use gtk::glib;
 use gtk::prelude::*;
 use gtk::subclass::prelude::*;
 
+use crate::canvas::PdfCanvas;
 use crate::document_session::{BASE_DPI, DocumentSession, POINTS_PER_INCH, zoom_bucket_q4};
+use crate::selection::selection_rect_for_page;
 use crate::worker::RenderJob;
 
 mod imp {
@@ -94,9 +95,6 @@ impl PdfPageWidget {
         self.imp().zoom.get()
     }
 
-    /// Atomic page+zoom binding update: single `queue_resize` plus
-    /// `queue_draw` keeps GTK from observing an intermediate state
-    /// where page is new but zoom is stale.
     pub fn update_state(&self, page: u32, zoom: f64) {
         self.imp().page_index.set(page);
         self.imp().zoom.set(zoom);
@@ -104,10 +102,6 @@ impl PdfPageWidget {
         self.queue_draw();
     }
 
-    /// Called by [`PdfCanvas::on_render_result`] when a worker
-    /// result lands for this widget's page+bucket. Triggers a
-    /// repaint so the next frame picks up the freshly cached
-    /// texture from the shared session.
     pub fn on_texture_ready(&self, page: u32, _bucket: u32) {
         if page == self.imp().page_index.get() {
             self.queue_draw();
@@ -151,10 +145,7 @@ impl PdfPageWidget {
                 h
             );
             snapshot.append_texture(&cached.texture, &rect);
-            return;
-        }
-
-        if let Some(fallback) = session.get_best_cached(page, bucket) {
+        } else if let Some(fallback) = session.get_best_cached(page, bucket) {
             tracing::info!(
                 "page_widget snapshot: page={} bucket={} FALLBACK painted",
                 page,
@@ -171,6 +162,8 @@ impl PdfPageWidget {
             snapshot.append_color(&color, &rect);
         }
 
+        self.snapshot_selection_overlay(snapshot, &session, page, zoom);
+
         tracing::info!(
             "page_widget snapshot: page={} bucket={} submit_visible epoch={}",
             page,
@@ -182,6 +175,80 @@ impl PdfPageWidget {
             zoom_bucket: bucket,
             epoch: session.current_epoch(),
         });
+    }
+
+    fn snapshot_selection_overlay(
+        &self,
+        snapshot: &gtk::Snapshot,
+        session: &Rc<DocumentSession>,
+        page_idx: u32,
+        zoom: f64,
+    ) {
+        let Some(canvas) = self.parent().and_then(|p| p.downcast::<PdfCanvas>().ok()) else {
+            return;
+        };
+        let Some(sel) = canvas.selection() else {
+            return;
+        };
+        let Some(sz) = session.page_size(page_idx) else {
+            return;
+        };
+        let Some(mut sel_rect) =
+            selection_rect_for_page(&sel, page_idx, sz.width_pt, sz.height_pt)
+        else {
+            return;
+        };
+        let Some(page) = session.main_page(page_idx) else {
+            return;
+        };
+        let scale = (BASE_DPI / POINTS_PER_INCH) * zoom;
+        let Some(region) = page.selected_region(scale, sel.style, &mut sel_rect) else {
+            return;
+        };
+        paint_region(snapshot, &region, accent_with_alpha(self, 0.4));
+    }
+}
+
+fn accent_with_alpha(widget: &PdfPageWidget, alpha: f32) -> gdk::RGBA {
+    let c = widget.color();
+    if c.alpha() < 1e-3 {
+        gdk::RGBA::new(0.2, 0.5, 0.95, alpha)
+    } else {
+        gdk::RGBA::new(c.red(), c.green(), c.blue(), alpha)
+    }
+}
+
+/// Pathological cap: at >10_000 rectangles (every glyph distinct
+/// in cairo terms) we collapse to a single union rect to stay
+/// within GSK's render-node budget. Visual fidelity loss accepted,
+/// see plan risk #2.
+fn paint_region(snapshot: &gtk::Snapshot, region: &cairo::Region, color: gdk::RGBA) {
+    let n = region.num_rectangles();
+    if n > 10_000 {
+        tracing::warn!(
+            "selection region has {} rectangles; painting union rect instead",
+            n
+        );
+        let extents = cairo::RectangleInt::new(0, 0, 0, 0);
+        region.extents(&extents);
+        let r = graphene::Rect::new(
+            extents.x() as f32,
+            extents.y() as f32,
+            extents.width() as f32,
+            extents.height() as f32,
+        );
+        snapshot.append_color(&color, &r);
+        return;
+    }
+    for i in 0..n {
+        let cr = region.rectangle(i);
+        let r = graphene::Rect::new(
+            cr.x() as f32,
+            cr.y() as f32,
+            cr.width() as f32,
+            cr.height() as f32,
+        );
+        snapshot.append_color(&color, &r);
     }
 }
 

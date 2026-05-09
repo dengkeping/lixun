@@ -217,6 +217,10 @@ impl DocumentSession {
         self.page_sizes.borrow().get(index as usize).copied()
     }
 
+    pub fn main_page(&self, index: u32) -> Option<poppler::Page> {
+        self.document.borrow().as_ref()?.page(index as i32)
+    }
+
     pub fn current_epoch(&self) -> u64 {
         self.epoch.load(Ordering::SeqCst)
     }
