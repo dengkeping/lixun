@@ -153,6 +153,26 @@ pub fn widget_point_to_pdf_point(wx: f64, wy: f64, page_h_pt: f64, zoom: f64) ->
     PdfPoint { x: x_pt, y: y_pt }
 }
 
+/// Flip a `selection_rect_for_page` result from PDF y-up (origin
+/// bottom-left) to poppler's `_get_selected_*` y-down (origin
+/// top-left, distance from top of page).
+///
+/// poppler's API is internally inconsistent: `find_text` returns
+/// y-up rectangles, but `selected_region` and `selected_text`
+/// expect y-down input. We do the flip at the boundary so the
+/// rest of our code can stay in PDF-y-up.
+pub fn flip_rect_y_for_poppler_selection(
+    rect: &poppler::Rectangle,
+    page_h_pt: f64,
+) -> poppler::Rectangle {
+    let mut r = poppler::Rectangle::default();
+    r.set_x1(rect.x1());
+    r.set_x2(rect.x2());
+    r.set_y1(page_h_pt - rect.y2());
+    r.set_y2(page_h_pt - rect.y1());
+    r
+}
+
 /// Walk every page touched by `sel`, pull the poppler-snapped
 /// selected text for the per-page rect, and join the non-empty
 /// segments with `"\n"`. Mirrors Papers' `pps_view_get_selected_text`.
@@ -164,10 +184,11 @@ pub fn collect_selected_text(session: &DocumentSession, sel: &PdfSelection) -> S
         let Some(sz) = session.page_size(page_idx) else {
             continue;
         };
-        let Some(mut rect) = selection_rect_for_page(sel, page_idx, sz.width_pt, sz.height_pt)
+        let Some(rect_yup) = selection_rect_for_page(sel, page_idx, sz.width_pt, sz.height_pt)
         else {
             continue;
         };
+        let mut rect = flip_rect_y_for_poppler_selection(&rect_yup, sz.height_pt);
         let Some(page) = session.main_page(page_idx) else {
             continue;
         };

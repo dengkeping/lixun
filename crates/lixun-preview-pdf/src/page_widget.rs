@@ -25,7 +25,7 @@ use gtk::subclass::prelude::*;
 
 use crate::canvas::PdfCanvas;
 use crate::document_session::{BASE_DPI, DocumentSession, POINTS_PER_INCH, zoom_bucket_q4};
-use crate::selection::{pdf_rect_to_widget_rect, selection_rect_for_page};
+use crate::selection::{flip_rect_y_for_poppler_selection, pdf_rect_to_widget_rect, selection_rect_for_page};
 use crate::worker::RenderJob;
 
 mod imp {
@@ -194,11 +194,12 @@ impl PdfPageWidget {
         let Some(sz) = session.page_size(page_idx) else {
             return;
         };
-        let Some(mut sel_rect) =
+        let Some(sel_rect_yup) =
             selection_rect_for_page(&sel, page_idx, sz.width_pt, sz.height_pt)
         else {
             return;
         };
+        let mut sel_rect = flip_rect_y_for_poppler_selection(&sel_rect_yup, sz.height_pt);
         let Some(page) = session.main_page(page_idx) else {
             return;
         };

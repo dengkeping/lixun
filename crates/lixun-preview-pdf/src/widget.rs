@@ -306,10 +306,6 @@ fn wire_selection_gestures(canvas: &PdfCanvas) {
                 return;
             };
             let hit = canvas.hit_test_page(x, y);
-            tracing::info!(
-                "selection drag begin: widget=({:.1},{:.1}) hit={:?}",
-                x, y, hit
-            );
             let Some(anchor) = hit else {
                 *anchor_cell.borrow_mut() = None;
                 return;
@@ -339,10 +335,6 @@ fn wire_selection_gestures(canvas: &PdfCanvas) {
             let wx = sx + dx;
             let wy = sy + dy;
             let hit = canvas.hit_test_page(wx, wy);
-            tracing::info!(
-                "selection drag update: start=({:.1},{:.1}) d=({:.1},{:.1}) widget=({:.1},{:.1}) hit={:?}",
-                sx, sy, dx, dy, wx, wy, hit
-            );
             if let Some(active) = hit {
                 canvas.update_selection_active(active);
             }
