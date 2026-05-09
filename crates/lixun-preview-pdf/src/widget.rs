@@ -25,6 +25,7 @@ use gtk::subclass::prelude::*;
 
 use crate::canvas::{MAX_ZOOM, MIN_ZOOM, PdfCanvas};
 use crate::document_session::DocumentSession;
+use crate::selection::{PagePoint, PdfSelection};
 use crate::worker::RenderResult;
 
 mod imp {
@@ -99,6 +100,7 @@ impl PdfView {
 
         wire_render_pump(&canvas, rx);
         wire_gestures(&canvas, &scroll);
+        wire_selection_gestures(&canvas);
         wire_buttons(&canvas, &zoom_in, &zoom_out);
         wire_page_tracking(&canvas, &scroll, &page_label, &session);
 
@@ -270,6 +272,60 @@ fn wire_buttons(canvas: &PdfCanvas, zoom_in: &gtk::Button, zoom_out: &gtk::Butto
     }
 }
 
+/// Left-drag on the canvas drives text selection. Claims the
+/// gesture on `drag_begin` so the middle-drag pan handler on the
+/// parent ScrolledWindow does not steal it.
+fn wire_selection_gestures(canvas: &PdfCanvas) {
+    let drag = gtk::GestureDrag::builder().button(1).build();
+    let anchor_cell: Rc<RefCell<Option<PagePoint>>> = Rc::new(RefCell::new(None));
+    {
+        let canvas_weak = canvas.downgrade();
+        let anchor_cell = Rc::clone(&anchor_cell);
+        drag.connect_drag_begin(move |g, x, y| {
+            let Some(canvas) = canvas_weak.upgrade() else {
+                return;
+            };
+            let Some(anchor) = canvas.hit_test_page(x, y) else {
+                *anchor_cell.borrow_mut() = None;
+                return;
+            };
+            g.set_state(gtk::EventSequenceState::Claimed);
+            *anchor_cell.borrow_mut() = Some(anchor);
+            canvas.set_selection(Some(PdfSelection {
+                anchor,
+                active: anchor,
+                style: poppler::SelectionStyle::Glyph,
+            }));
+        });
+    }
+    {
+        let canvas_weak = canvas.downgrade();
+        let anchor_cell = Rc::clone(&anchor_cell);
+        drag.connect_drag_update(move |g, dx, dy| {
+            let Some(canvas) = canvas_weak.upgrade() else {
+                return;
+            };
+            if anchor_cell.borrow().is_none() {
+                return;
+            }
+            let Some((sx, sy)) = g.start_point() else {
+                return;
+            };
+            let wx = sx + dx;
+            let wy = sy + dy;
+            if let Some(active) = canvas.hit_test_page(wx, wy) {
+                canvas.update_selection_active(active);
+            }
+        });
+    }
+    {
+        let anchor_cell = Rc::clone(&anchor_cell);
+        drag.connect_drag_end(move |_g, _dx, _dy| {
+            *anchor_cell.borrow_mut() = None;
+        });
+    }
+    canvas.add_controller(drag);
+}
 fn wire_page_tracking(
     canvas: &PdfCanvas,
     scroll: &gtk::ScrolledWindow,
