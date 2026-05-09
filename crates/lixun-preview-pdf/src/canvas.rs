@@ -1,19 +1,10 @@
 //! `PdfCanvas` — `gtk::Scrollable` container of [`PdfPageWidget`]
 //! children, one per PDF page (Papers `PpsView` pattern).
 //!
-//! Why a container instead of a single drawing widget: GTK manages
-//! per-page allocation, clipping, and (eventually) hit-testing
-//! natively when each page is its own widget. Round-5's single-
-//! snapshot approach worked but couldn't host per-page selection
-//! widgets later in PR2b. The container shape mirrors GNOME
-//! Papers' `libview/pps-view.c` layout so the same code shape can
-//! grow into selection / search overlays without another rewrite.
-//!
-//! `gtk::Scrollable` interface (round-5) stays: the canvas owns
-//! its own `hadjustment` / `vadjustment`, configures
-//! `upper = max(allocated, intrinsic)` on every `size_allocate`,
-//! and rebuilds child positions whenever an adjustment value
-//! changes (so the visible page slides with `vadj.value`).
+//! `gtk::Scrollable` wiring (`set_*adjustment_inner` +
+//! `ScrollableImpl` + ParamSpec list) lives in the sibling
+//! [`canvas_scrollable`] submodule so this file stays under 500
+//! lines once selection state + hit-testing are added.
 //!
 //! Q1 invariant: cairo never crosses the GTK boundary. Children
 //! paint via `snapshot.append_texture`; the worker stays the only
@@ -28,6 +19,7 @@ use gtk::subclass::prelude::*;
 
 use crate::document_session::{BASE_DPI, DocumentSession, PAGE_GAP_PT, POINTS_PER_INCH};
 use crate::page_widget::PdfPageWidget;
+use crate::selection::{PagePoint, PdfSelection, widget_point_to_pdf_point};
 use crate::worker::{RenderOutcome, RenderResult};
 
 pub const MIN_ZOOM: f64 = 0.25;
@@ -48,6 +40,7 @@ mod imp {
         pub vscroll_policy: Cell<gtk::ScrollablePolicy>,
         pub hadj_signal: RefCell<Option<glib::SignalHandlerId>>,
         pub vadj_signal: RefCell<Option<glib::SignalHandlerId>>,
+        pub selection: RefCell<Option<PdfSelection>>,
     }
 
     impl Default for PdfCanvas {
@@ -63,6 +56,7 @@ mod imp {
                 vscroll_policy: Cell::new(gtk::ScrollablePolicy::Minimum),
                 hadj_signal: RefCell::new(None),
                 vadj_signal: RefCell::new(None),
+                selection: RefCell::new(None),
             }
         }
     }
@@ -78,14 +72,7 @@ mod imp {
     impl ObjectImpl for PdfCanvas {
         fn properties() -> &'static [glib::ParamSpec] {
             static PROPS: OnceLock<Vec<glib::ParamSpec>> = OnceLock::new();
-            PROPS.get_or_init(|| {
-                vec![
-                    glib::ParamSpecOverride::for_interface::<gtk::Scrollable>("hadjustment"),
-                    glib::ParamSpecOverride::for_interface::<gtk::Scrollable>("vadjustment"),
-                    glib::ParamSpecOverride::for_interface::<gtk::Scrollable>("hscroll-policy"),
-                    glib::ParamSpecOverride::for_interface::<gtk::Scrollable>("vscroll-policy"),
-                ]
-            })
+            PROPS.get_or_init(super::scrollable::scrollable_param_specs)
         }
 
         fn set_property(&self, _id: usize, value: &glib::Value, pspec: &glib::ParamSpec) {
@@ -137,9 +124,10 @@ mod imp {
             self.obj().allocate_children(width, height);
         }
     }
-
-    impl ScrollableImpl for PdfCanvas {}
 }
+
+#[path = "canvas_scrollable.rs"]
+mod scrollable;
 
 glib::wrapper! {
     pub struct PdfCanvas(ObjectSubclass<imp::PdfCanvas>)
@@ -158,6 +146,7 @@ impl PdfCanvas {
         *self.imp().session.borrow_mut() = Some(session);
         self.imp().zoom.set(1.0);
         self.imp().current_page.set(0);
+        *self.imp().selection.borrow_mut() = None;
         self.rebuild_page_widgets();
         self.queue_resize();
     }
@@ -185,6 +174,65 @@ impl PdfCanvas {
 
     pub fn set_current_page(&self, p: u32) {
         self.imp().current_page.set(p);
+    }
+
+    pub fn selection(&self) -> Option<PdfSelection> {
+        self.imp().selection.borrow().clone()
+    }
+
+    pub fn set_selection(&self, sel: Option<PdfSelection>) {
+        *self.imp().selection.borrow_mut() = sel;
+        for child in self.imp().pages.borrow().iter() {
+            child.queue_draw();
+        }
+    }
+
+    pub fn clear_selection(&self) {
+        if self.imp().selection.borrow().is_some() {
+            *self.imp().selection.borrow_mut() = None;
+            for child in self.imp().pages.borrow().iter() {
+                child.queue_draw();
+            }
+        }
+    }
+
+    pub fn update_selection_active(&self, new_active: PagePoint) {
+        let mut sel_ref = self.imp().selection.borrow_mut();
+        if let Some(sel) = sel_ref.as_mut() {
+            sel.active = new_active;
+        } else {
+            return;
+        }
+        drop(sel_ref);
+        for child in self.imp().pages.borrow().iter() {
+            child.queue_draw();
+        }
+    }
+
+    /// Map a widget-space pointer to `(page, pdf_point)`. Returns
+    /// `None` in gaps between pages or before first allocation.
+    pub fn hit_test_page(&self, wx: f64, wy: f64) -> Option<PagePoint> {
+        let session = self.session()?;
+        let zoom = self.zoom();
+        for child in self.imp().pages.borrow().iter() {
+            let bounds = child.compute_bounds(self)?;
+            let bx = bounds.x() as f64;
+            let by = bounds.y() as f64;
+            let bw = bounds.width() as f64;
+            let bh = bounds.height() as f64;
+            if wx >= bx && wx < bx + bw && wy >= by && wy < by + bh {
+                let local_x = wx - bx;
+                let local_y = wy - by;
+                let page_idx = child.page_index();
+                let sz = session.page_size(page_idx)?;
+                let pdf = widget_point_to_pdf_point(local_x, local_y, sz.height_pt, zoom);
+                return Some(PagePoint {
+                    page: page_idx,
+                    point: pdf,
+                });
+            }
+        }
+        None
     }
 
     pub fn on_render_result(&self, result: RenderResult) {
@@ -236,16 +284,6 @@ impl PdfCanvas {
         }
     }
 
-    /// Papers' max-visible-intersection-area rule
-    /// (`pps-view.c:656-711`). Walks the live `pages` Vec and asks
-    /// each child for its allocation rect, intersects with the
-    /// `[vadj.value, vadj.value + viewport_h]` band, picks the
-    /// child with the largest visible area. Falls back to
-    /// `(vadj_value, viewport_h)` doc-coord math (the round-3
-    /// nearest-center rule) if children are not yet allocated —
-    /// this matters for the very first frame after `replace_path`
-    /// when the page-tracking handler may fire before
-    /// `allocate_children` has run.
     pub fn recompute_current_page(&self, vadj_value: f64, viewport_h: f64) {
         let pages = self.imp().pages.borrow();
         if !pages.is_empty() && pages.iter().any(|p| p.height() > 0) {
@@ -297,9 +335,6 @@ impl PdfCanvas {
         self.set_current_page(best.0);
     }
 
-    /// Tear down old page children and create one [`PdfPageWidget`]
-    /// per document page. Called on `set_session` and after
-    /// `replace_path` (host triggers via `set_session` again).
     pub fn rebuild_page_widgets(&self) {
         for child in self.imp().pages.borrow_mut().drain(..) {
             child.unparent();
@@ -316,17 +351,6 @@ impl PdfCanvas {
             new_children.push(pw);
         }
         *self.imp().pages.borrow_mut() = new_children;
-        // Force allocation immediately. Without this, when the
-        // canvas's own allocation didn't change between the old
-        // and new document (same host window size), GTK doesn't
-        // re-call `size_allocate` on the canvas, so the new
-        // children stay at 0×0 and snapshot a blank widget. This
-        // is the bug behind the "white page after switching to a
-        // new PDF" report. We pair `queue_resize` (request a fresh
-        // measure pass for the new intrinsic) with an explicit
-        // `allocate_children` call against the current allocation
-        // so the new children get a non-zero rect on the very
-        // next frame.
         self.queue_resize();
         self.reconfigure_adjustments(self.width(), self.height());
         self.allocate_children(self.width(), self.height());
@@ -360,11 +384,7 @@ impl PdfCanvas {
         )
     }
 
-    /// Configure `upper = max(allocated, intrinsic)` on both
-    /// adjustments — load-bearing for wheel and middle-drag scroll
-    /// range. Without this, the ScrolledWindow has no idea the
-    /// canvas wants to be larger than its allocation.
-    fn reconfigure_adjustments(&self, width: i32, height: i32) {
+    pub(crate) fn reconfigure_adjustments(&self, width: i32, height: i32) {
         let (intrinsic_w, intrinsic_h) = self.intrinsic_size();
         if let Some(hadj) = self.imp().hadjustment.borrow().as_ref() {
             let upper = (width as f64).max(intrinsic_w as f64);
@@ -390,10 +410,6 @@ impl PdfCanvas {
         }
     }
 
-    /// Allocate every page child at its document-space rect minus
-    /// the current scroll offset. GTK clips children that fall
-    /// outside the canvas's allocation; we don't need explicit
-    /// culling.
     fn allocate_children(&self, width: i32, _height: i32) {
         let Some(session) = self.session() else {
             return;
@@ -436,48 +452,6 @@ impl PdfCanvas {
             child.allocate(w, h, -1, Some(transform));
             y_pt += sz.height_pt + PAGE_GAP_PT;
         }
-    }
-
-    fn set_hadjustment_inner(&self, adj: Option<gtk::Adjustment>) {
-        let imp = self.imp();
-        if let Some(old_id) = imp.hadj_signal.borrow_mut().take()
-            && let Some(old_adj) = imp.hadjustment.borrow().as_ref()
-        {
-            old_adj.disconnect(old_id);
-        }
-        if let Some(ref a) = adj {
-            let weak = self.downgrade();
-            let id = a.connect_value_changed(move |_| {
-                if let Some(this) = weak.upgrade() {
-                    this.queue_allocate();
-                }
-            });
-            *imp.hadj_signal.borrow_mut() = Some(id);
-        }
-        *imp.hadjustment.borrow_mut() = adj;
-        let (w, h) = (self.width(), self.height());
-        self.reconfigure_adjustments(w, h);
-    }
-
-    fn set_vadjustment_inner(&self, adj: Option<gtk::Adjustment>) {
-        let imp = self.imp();
-        if let Some(old_id) = imp.vadj_signal.borrow_mut().take()
-            && let Some(old_adj) = imp.vadjustment.borrow().as_ref()
-        {
-            old_adj.disconnect(old_id);
-        }
-        if let Some(ref a) = adj {
-            let weak = self.downgrade();
-            let id = a.connect_value_changed(move |_| {
-                if let Some(this) = weak.upgrade() {
-                    this.queue_allocate();
-                }
-            });
-            *imp.vadj_signal.borrow_mut() = Some(id);
-        }
-        *imp.vadjustment.borrow_mut() = adj;
-        let (w, h) = (self.width(), self.height());
-        self.reconfigure_adjustments(w, h);
     }
 }
 
