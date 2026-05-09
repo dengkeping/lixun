@@ -25,7 +25,7 @@ use gtk::subclass::prelude::*;
 
 use crate::canvas::PdfCanvas;
 use crate::document_session::{BASE_DPI, DocumentSession, POINTS_PER_INCH, zoom_bucket_q4};
-use crate::selection::selection_rect_for_page;
+use crate::selection::{pdf_rect_to_widget_rect, selection_rect_for_page};
 use crate::worker::RenderJob;
 
 mod imp {
@@ -162,6 +162,7 @@ impl PdfPageWidget {
             snapshot.append_color(&color, &rect);
         }
 
+        self.snapshot_search_overlay(snapshot, &session, page, zoom);
         self.snapshot_selection_overlay(snapshot, &session, page, zoom);
 
         tracing::info!(
@@ -206,6 +207,37 @@ impl PdfPageWidget {
             return;
         };
         paint_region(snapshot, &region, accent_with_alpha(self, 0.4));
+    }
+
+    fn snapshot_search_overlay(
+        &self,
+        snapshot: &gtk::Snapshot,
+        session: &Rc<DocumentSession>,
+        page_idx: u32,
+        zoom: f64,
+    ) {
+        let Some(canvas) = self.parent().and_then(|p| p.downcast::<PdfCanvas>().ok()) else {
+            return;
+        };
+        let Some(sz) = session.page_size(page_idx) else {
+            return;
+        };
+        let matches = canvas.search_results_for_page(page_idx);
+        if matches.is_empty() {
+            return;
+        }
+        let current = canvas.current_match();
+        let accent_bg = accent_with_alpha(self, 0.3);
+        let accent_fg = accent_with_alpha(self, 0.6);
+        for (idx, rect) in matches.iter().enumerate() {
+            let is_current = current
+                .as_ref()
+                .map(|c| c.page_idx == page_idx && c.match_idx_in_page == idx)
+                .unwrap_or(false);
+            let color = if is_current { accent_fg } else { accent_bg };
+            let wr = pdf_rect_to_widget_rect(rect, sz.height_pt, zoom);
+            snapshot.append_color(&color, &wr);
+        }
     }
 }
 
