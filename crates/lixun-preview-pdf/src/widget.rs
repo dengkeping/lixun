@@ -77,6 +77,15 @@ impl PdfView {
         view.set_hexpand(true);
         view.set_vexpand(true);
         view.set_overflow(gtk::Overflow::Hidden);
+        // Make the view itself focusable so our key controllers (Ctrl+F,
+        // Ctrl+C, Escape) receive events even when no descendant holds
+        // focus. Without this, a freshly-mapped PdfView with no focused
+        // child drops all key events before our controllers see them.
+        view.set_focusable(true);
+        view.set_focus_on_click(false);
+        view.connect_map(|v| {
+            v.grab_focus();
+        });
 
         let (tx, rx) = async_channel::unbounded::<RenderResult>();
         let session = DocumentSession::open(path, tx)?;
@@ -340,6 +349,7 @@ fn wire_selection_gestures(canvas: &PdfCanvas) {
 
 fn wire_clipboard_key(view: &PdfView, canvas: &PdfCanvas, session: &Rc<DocumentSession>) {
     let key = gtk::EventControllerKey::new();
+    key.set_propagation_phase(gtk::PropagationPhase::Capture);
     let canvas_weak = canvas.downgrade();
     let session = Rc::clone(session);
     key.connect_key_pressed(move |_ctl, keyval, _code, state| {

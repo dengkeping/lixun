@@ -267,6 +267,7 @@ fn scroll_to_match(
 
 fn wire_search_keys(view: &PdfView, canvas: &PdfCanvas, bar: &PdfSearchBar) {
     let key = gtk::EventControllerKey::new();
+    key.set_propagation_phase(gtk::PropagationPhase::Capture);
     let canvas_weak = canvas.downgrade();
     let bar_weak = bar.downgrade();
     key.connect_key_pressed(move |_c, keyval, _code, state| {
