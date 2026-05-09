@@ -19,6 +19,7 @@ use gtk::subclass::prelude::*;
 
 use crate::document_session::{BASE_DPI, DocumentSession, PAGE_GAP_PT, POINTS_PER_INCH};
 use crate::page_widget::PdfPageWidget;
+use crate::search::{SearchMatchRef, SearchResults};
 use crate::selection::{PagePoint, PdfSelection, widget_point_to_pdf_point};
 use crate::worker::{RenderOutcome, RenderResult};
 
@@ -41,6 +42,8 @@ mod imp {
         pub hadj_signal: RefCell<Option<glib::SignalHandlerId>>,
         pub vadj_signal: RefCell<Option<glib::SignalHandlerId>>,
         pub selection: RefCell<Option<PdfSelection>>,
+        pub search_results: RefCell<SearchResults>,
+        pub current_match: Cell<Option<SearchMatchRef>>,
     }
 
     impl Default for PdfCanvas {
@@ -57,6 +60,8 @@ mod imp {
                 hadj_signal: RefCell::new(None),
                 vadj_signal: RefCell::new(None),
                 selection: RefCell::new(None),
+                search_results: RefCell::new(SearchResults::new()),
+                current_match: Cell::new(None),
             }
         }
     }
@@ -129,6 +134,9 @@ mod imp {
 #[path = "canvas_scrollable.rs"]
 mod scrollable;
 
+#[path = "canvas_search.rs"]
+mod search_accessors;
+
 glib::wrapper! {
     pub struct PdfCanvas(ObjectSubclass<imp::PdfCanvas>)
         @extends gtk::Widget,
@@ -147,6 +155,8 @@ impl PdfCanvas {
         self.imp().zoom.set(1.0);
         self.imp().current_page.set(0);
         *self.imp().selection.borrow_mut() = None;
+        self.imp().search_results.borrow_mut().clear();
+        self.imp().current_match.set(None);
         self.rebuild_page_widgets();
         self.queue_resize();
     }
@@ -244,40 +254,21 @@ impl PdfCanvas {
         let cur = session.current_epoch();
         if result.epoch != cur {
             tracing::info!(
-                "canvas on_render_result: STALE drop page={} bucket={} result_epoch={} session_epoch={}",
-                page,
-                bucket,
-                result.epoch,
-                cur
+                "canvas on_render_result STALE: page={} bucket={} result_epoch={} session_epoch={}",
+                page, bucket, result.epoch, cur
             );
             session.clear_pending(page, bucket);
             return;
         }
-        tracing::info!(
-            "canvas on_render_result: KEEP page={} bucket={} epoch={}",
-            page,
-            bucket,
-            result.epoch
-        );
+        tracing::info!("canvas on_render_result KEEP: page={} bucket={} epoch={}", page, bucket, result.epoch);
         session.clear_pending(page, bucket);
-        let RenderOutcome::Ok {
-            texture,
-            width,
-            height,
-            bytes,
-        } = result.outcome
-        else {
+        let RenderOutcome::Ok { texture, width, height, bytes } = result.outcome else {
             return;
         };
         session.insert_cached(
             page,
             bucket,
-            crate::document_session::CachedTexture {
-                texture,
-                width,
-                height,
-                bytes,
-            },
+            crate::document_session::CachedTexture { texture, width, height, bytes },
         );
         if let Some(child) = self.imp().pages.borrow().get(page as usize) {
             child.on_texture_ready(page, bucket);
@@ -291,14 +282,10 @@ impl PdfCanvas {
             let viewport_bot = vadj_value + viewport_h;
             let mut best: (u32, f64) = (0, -1.0);
             for child in pages.iter() {
-                let Some(bounds) = child.compute_bounds(self) else {
-                    continue;
-                };
+                let Some(bounds) = child.compute_bounds(self) else { continue };
                 let child_top = bounds.y() as f64 + vadj_value;
                 let child_bot = child_top + bounds.height() as f64;
-                let inter_top = child_top.max(viewport_top);
-                let inter_bot = child_bot.min(viewport_bot);
-                let inter = (inter_bot - inter_top).max(0.0);
+                let inter = (child_bot.min(viewport_bot) - child_top.max(viewport_top)).max(0.0);
                 if inter > best.1 {
                     best = (child.page_index(), inter);
                 }
@@ -308,9 +295,7 @@ impl PdfCanvas {
                 return;
             }
         }
-        let Some(session) = self.session() else {
-            return;
-        };
+        let Some(session) = self.session() else { return };
         let zoom = self.zoom();
         let scale = (BASE_DPI / POINTS_PER_INCH) * zoom;
         let n = session.n_pages();
@@ -321,11 +306,8 @@ impl PdfCanvas {
         let mut y_pt: f64 = 0.0;
         let mut best: (u32, f64) = (0, f64::INFINITY);
         for i in 0..n {
-            let Some(sz) = session.page_size(i) else {
-                continue;
-            };
-            let page_top_px = y_pt * scale;
-            let page_center_px = page_top_px + sz.height_pt * scale * 0.5;
+            let Some(sz) = session.page_size(i) else { continue };
+            let page_center_px = y_pt * scale + sz.height_pt * scale * 0.5;
             let dist = (page_center_px - viewport_center).abs();
             if dist < best.1 {
                 best = (i, dist);

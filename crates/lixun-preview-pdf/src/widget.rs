@@ -4,16 +4,15 @@
 //! ```text
 //! PdfView (gtk::Box vertical)
 //! ├── PdfToolbar (gtk::ActionBar) — page label + ± zoom buttons
+//! ├── PdfSearchBar (hidden by default, toggled via Ctrl+F)
 //! └── PdfScroll  (gtk::ScrolledWindow, kinetic OFF — Q3)
 //!     └── PdfCanvas (custom gtk::Widget subclass — see canvas.rs)
 //! ```
 //!
 //! `PdfView::replace_path` is the entry point used by
 //! `PreviewPlugin::update`: bumps the session epoch, reopens all
-//! three Documents (main + 2 workers), clears the texture cache,
-//! resets the viewport to top.
-//!
-//! TODO PR2c: outline sidebar and `PreviewCapabilities` extension.
+//! three Documents (main + 2 workers + search worker), clears the
+//! texture cache, resets the viewport to top, clears search state.
 
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -25,8 +24,15 @@ use gtk::subclass::prelude::*;
 
 use crate::canvas::{MAX_ZOOM, MIN_ZOOM, PdfCanvas};
 use crate::document_session::DocumentSession;
+use crate::search::{SearchQueryState, SearchWorker};
+use crate::search_bar::PdfSearchBar;
 use crate::selection::{PagePoint, PdfSelection, collect_selected_text};
 use crate::worker::RenderResult;
+
+pub struct SearchState {
+    pub query: SearchQueryState,
+    pub worker: Option<SearchWorker>,
+}
 
 mod imp {
     use super::*;
@@ -36,6 +42,8 @@ mod imp {
         pub canvas: RefCell<Option<PdfCanvas>>,
         pub scroll: RefCell<Option<gtk::ScrolledWindow>>,
         pub page_label: RefCell<Option<gtk::Label>>,
+        pub search_bar: RefCell<Option<PdfSearchBar>>,
+        pub search_state: RefCell<Option<Rc<RefCell<SearchState>>>>,
         pub session: RefCell<Option<Rc<DocumentSession>>>,
     }
 
@@ -50,6 +58,9 @@ mod imp {
     impl WidgetImpl for PdfView {}
     impl BoxImpl for PdfView {}
 }
+
+#[path = "widget_search.rs"]
+mod search_ui;
 
 glib::wrapper! {
     pub struct PdfView(ObjectSubclass<imp::PdfView>)
@@ -79,6 +90,8 @@ impl PdfView {
         toolbar.pack_start(&zoom_in);
         toolbar.set_center_widget(Some(&page_label));
 
+        let search_bar = PdfSearchBar::new();
+
         let scroll = gtk::ScrolledWindow::new();
         scroll.set_kinetic_scrolling(false);
         scroll.set_hexpand(true);
@@ -91,25 +104,30 @@ impl PdfView {
         scroll.set_child(Some(&canvas));
 
         view.append(&toolbar);
+        view.append(&search_bar);
         view.append(&scroll);
 
         *view.imp().canvas.borrow_mut() = Some(canvas.clone());
         *view.imp().scroll.borrow_mut() = Some(scroll.clone());
         *view.imp().page_label.borrow_mut() = Some(page_label.clone());
+        *view.imp().search_bar.borrow_mut() = Some(search_bar.clone());
         *view.imp().session.borrow_mut() = Some(Rc::clone(&session));
+
+        let state = Rc::new(RefCell::new(search_ui::default_state()));
+        *view.imp().search_state.borrow_mut() = Some(Rc::clone(&state));
 
         wire_render_pump(&canvas, rx);
         wire_gestures(&canvas, &scroll);
         wire_selection_gestures(&canvas);
-        wire_clipboard_keys(&view, &canvas, &session);
+        wire_clipboard_key(&view, &canvas, &session);
         wire_buttons(&canvas, &zoom_in, &zoom_out);
         wire_page_tracking(&canvas, &scroll, &page_label, &session);
+        search_ui::wire_search(&view, &scroll, &canvas, &search_bar, state, &session);
 
         Ok(view)
     }
 
     pub fn replace_path(&self, new_path: PathBuf) -> anyhow::Result<()> {
-        tracing::info!("PdfView replace_path: enter path={:?}", new_path);
         let session = self
             .imp()
             .session
@@ -121,21 +139,10 @@ impl PdfView {
         if let Some(canvas) = self.imp().canvas.borrow().as_ref() {
             canvas.set_zoom(1.0);
             canvas.set_current_page(0);
+            canvas.clear_selection();
             canvas.rebuild_page_widgets();
             canvas.queue_resize();
             canvas.queue_draw();
-            // Defer a second resize+redraw to the next idle tick.
-            // `update()` runs while the preview window may still be
-            // hidden (host calls `set_visible(true)` AFTER plugin
-            // update). At update-time `canvas.width()` is 0 and the
-            // synchronous `allocate_children` inside
-            // `rebuild_page_widgets` produces 0-sized child rects.
-            // GTK does not always re-allocate the canvas after the
-            // window becomes visible if the canvas's outer
-            // allocation is unchanged, leaving page children at
-            // 0x0 and the preview frozen on a white page until the
-            // next user input. Forcing a fresh resize cycle once
-            // the window has been presented unsticks the layout.
             let canvas_weak = canvas.downgrade();
             glib::idle_add_local_once(move || {
                 if let Some(c) = canvas_weak.upgrade() {
@@ -151,7 +158,13 @@ impl PdfView {
         if let Some(label) = self.imp().page_label.borrow().as_ref() {
             label.set_text(&format!("1 / {}", session.n_pages().max(1)));
         }
-        tracing::info!("PdfView replace_path: exit");
+        if let (Some(canvas), Some(bar), Some(state)) = (
+            self.imp().canvas.borrow().as_ref(),
+            self.imp().search_bar.borrow().as_ref(),
+            self.imp().search_state.borrow().as_ref(),
+        ) {
+            search_ui::reset_for_path(canvas, bar, state, &session);
+        }
         Ok(())
     }
 }
@@ -273,9 +286,6 @@ fn wire_buttons(canvas: &PdfCanvas, zoom_in: &gtk::Button, zoom_out: &gtk::Butto
     }
 }
 
-/// Left-drag on the canvas drives text selection. Claims the
-/// gesture on `drag_begin` so the middle-drag pan handler on the
-/// parent ScrolledWindow does not steal it.
 fn wire_selection_gestures(canvas: &PdfCanvas) {
     let drag = gtk::GestureDrag::builder().button(1).build();
     let anchor_cell: Rc<RefCell<Option<PagePoint>>> = Rc::new(RefCell::new(None));
@@ -328,9 +338,7 @@ fn wire_selection_gestures(canvas: &PdfCanvas) {
     canvas.add_controller(drag);
 }
 
-/// Ctrl+C copies the currently selected text to the system
-/// clipboard. Escape with no active search clears the selection.
-fn wire_clipboard_keys(view: &PdfView, canvas: &PdfCanvas, session: &Rc<DocumentSession>) {
+fn wire_clipboard_key(view: &PdfView, canvas: &PdfCanvas, session: &Rc<DocumentSession>) {
     let key = gtk::EventControllerKey::new();
     let canvas_weak = canvas.downgrade();
     let session = Rc::clone(session);
@@ -352,14 +360,11 @@ fn wire_clipboard_keys(view: &PdfView, canvas: &PdfCanvas, session: &Rc<Document
             }
             return glib::Propagation::Stop;
         }
-        if keyval == gdk::Key::Escape && canvas.selection().is_some() {
-            canvas.clear_selection();
-            return glib::Propagation::Stop;
-        }
         glib::Propagation::Proceed
     });
     view.add_controller(key);
 }
+
 fn wire_page_tracking(
     canvas: &PdfCanvas,
     scroll: &gtk::ScrolledWindow,
@@ -387,14 +392,6 @@ fn wire_page_tracking(
         let cur = canvas.current_page();
         let n = session.n_pages().max(1);
         let text = format!("{} / {}", cur + 1, n);
-        tracing::info!(
-            "page tracking: vadj={} viewport_h={} → page={} n={} label='{}'",
-            v,
-            viewport_h,
-            cur,
-            n,
-            text
-        );
         label.set_text(&text);
     });
 }
