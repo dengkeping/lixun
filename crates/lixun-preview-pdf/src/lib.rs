@@ -16,6 +16,7 @@ mod canvas;
 mod document_session;
 mod page_widget;
 pub mod search;
+mod search_bar;
 pub mod selection;
 mod widget;
 mod worker;
