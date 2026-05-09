@@ -385,6 +385,22 @@ pub(crate) fn send_preview_request(hit: &Hit, monitor: Option<String>) {
     }
 }
 
+pub(crate) fn send_launcher_geometry(monitor: String, x: i32, y: i32, w: i32, h: i32) {
+    let sock = socket_path();
+    let req = Request::LauncherGeometry { monitor, x, y, w, h };
+    let Ok(json) = serde_json::to_vec(&req) else {
+        return;
+    };
+    let total_len = (2 + json.len()) as u32;
+    let mut buf = Vec::with_capacity(4 + 2 + json.len());
+    buf.extend_from_slice(&total_len.to_be_bytes());
+    buf.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
+    buf.extend_from_slice(&json);
+    if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&sock) {
+        let _ = stream.write_all(&buf);
+    }
+}
+
 pub(crate) fn send_preview_hide_request() {
     let sock = socket_path();
     let req = Request::PreviewHide;

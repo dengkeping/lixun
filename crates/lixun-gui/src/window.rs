@@ -255,6 +255,12 @@ impl LauncherController {
         self.window.remove_css_class("lixun-hiding");
         self.window.add_css_class("lixun-showing");
         self.window.set_visible(true);
+        {
+            let w = self.window.clone();
+            glib::idle_add_local_once(move || {
+                report_launcher_geometry(&w);
+            });
+        }
         self.entry.grab_focus();
         tracing::info!(
             "gui: show() called entry.grab_focus(); entry has_focus={}",
@@ -1237,6 +1243,7 @@ fn install_drag_gesture(
                     .map(|gs| gs.to_string());
 
                 crate::launcher_position::save(connector.as_deref(), top, left);
+                report_launcher_geometry(&window_clone);
                 pending_clone.borrow_mut().take();
             });
         *pending_save.borrow_mut() = Some(source_id);
@@ -1245,6 +1252,55 @@ fn install_drag_gesture(
     });
 
     window.add_controller(gesture);
+}
+
+/// Read launcher rect (monitor-local logical pixels) and send to daemon.
+///
+/// Used to inform preview-bin where the launcher sits so it can ask the
+/// daemon to unmap us when the preview window's rect overlaps ours on
+/// the same monitor (layer-shell Overlay always paints above any
+/// xdg-toplevel, so visual stacking can't solve this).
+///
+/// When the Left edge isn't anchored (default centered launcher), we
+/// compute the centered x ourselves from monitor geometry so the rect
+/// we report matches the surface the compositor actually places.
+pub(crate) fn report_launcher_geometry(window: &gtk::ApplicationWindow) {
+    use gtk4_layer_shell::LayerShell;
+    let display = match gtk::gdk::Display::default() {
+        Some(d) => d,
+        None => return,
+    };
+    let monitor = match display
+        .monitors()
+        .item(0)
+        .and_downcast::<gtk::gdk::Monitor>()
+    {
+        Some(m) => m,
+        None => return,
+    };
+    let connector = match monitor.connector() {
+        Some(s) => s.to_string(),
+        None => return,
+    };
+    let top = window.margin(gtk4_layer_shell::Edge::Top);
+    let mut w = window.width();
+    let mut h = window.height();
+    if w <= 0 {
+        w = window.default_width();
+    }
+    if h <= 0 {
+        h = window.default_height();
+    }
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    let x = if window.is_anchor(gtk4_layer_shell::Edge::Left) {
+        window.margin(gtk4_layer_shell::Edge::Left)
+    } else {
+        let mon_w = monitor.geometry().width();
+        ((mon_w - w) / 2).max(0)
+    };
+    crate::ipc::send_launcher_geometry(connector, x, top, w, h);
 }
 
 fn install_reset_position_shortcut(window: &gtk::ApplicationWindow) {
@@ -1264,6 +1320,12 @@ fn install_reset_position_shortcut(window: &gtk::ApplicationWindow) {
             window_for_reset.set_anchor(gtk4_layer_shell::Edge::Left, false);
             window_for_reset.set_margin(gtk4_layer_shell::Edge::Top, DEFAULT_TOP_MARGIN);
             window_for_reset.set_margin(gtk4_layer_shell::Edge::Left, 0);
+            {
+                let w = window_for_reset.clone();
+                glib::idle_add_local_once(move || {
+                    report_launcher_geometry(&w);
+                });
+            }
             return glib::signal::Propagation::Stop;
         }
         glib::signal::Propagation::Proceed

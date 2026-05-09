@@ -102,6 +102,12 @@ enum PreviewLifecycle {
         /// `ShowOrUpdate` so the import resolves before the
         /// preview window is presented.
         latest_parent_handle: Option<String>,
+        /// Latest-wins buffer for the launcher's on-screen
+        /// geometry (monitor connector + rect). Replayed as
+        /// `PreviewCommand::LauncherGeometry` after the buffered
+        /// `ShowOrUpdate` so the preview can compute overlap with
+        /// the launcher and request its hide on first paint.
+        latest_launcher_geometry: Option<(String, i32, i32, i32, i32)>,
     },
     Ready {
         pid: u32,
@@ -195,6 +201,7 @@ impl PreviewSpawner {
                     socket_path: socket_path.clone(),
                     latest_desired: Some((epoch, hit, monitor)),
                     latest_parent_handle: None,
+                    latest_launcher_geometry: None,
                 };
                 // Supervisor task owns the socket, reader and
                 // writer lifetimes; it locks `state` to promote
@@ -325,6 +332,37 @@ impl PreviewSpawner {
                 if cmd_tx.send(PreviewCommand::ClearParent).is_err() {
                     tracing::warn!(
                         "preview_spawn: writer channel closed during clear_parent"
+                    );
+                    *state = PreviewLifecycle::Dead;
+                }
+            }
+        }
+    }
+
+    pub async fn set_launcher_geometry(
+        &self,
+        monitor: String,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+    ) {
+        let mut state = self.state.lock().await;
+        match &mut *state {
+            PreviewLifecycle::Dead => {}
+            PreviewLifecycle::Starting {
+                latest_launcher_geometry,
+                ..
+            } => {
+                *latest_launcher_geometry = Some((monitor, x, y, w, h));
+            }
+            PreviewLifecycle::Ready { cmd_tx, .. } => {
+                if cmd_tx
+                    .send(PreviewCommand::LauncherGeometry { monitor, x, y, w, h })
+                    .is_err()
+                {
+                    tracing::warn!(
+                        "preview_spawn: writer channel closed during set_launcher_geometry"
                     );
                     *state = PreviewLifecycle::Dead;
                 }
@@ -545,13 +583,14 @@ impl PreviewSpawner {
                                 break;
                             }
                             let old = std::mem::replace(&mut *s, PreviewLifecycle::Dead);
-                            let (latest, parent) = match old {
+                            let (latest, parent, launcher_geom) = match old {
                                 PreviewLifecycle::Starting {
                                     latest_desired,
                                     latest_parent_handle,
+                                    latest_launcher_geometry,
                                     ..
-                                } => (latest_desired, latest_parent_handle),
-                                _ => (None, None),
+                                } => (latest_desired, latest_parent_handle, latest_launcher_geometry),
+                                _ => (None, None, None),
                             };
                             *s = PreviewLifecycle::Ready {
                                 pid,
@@ -559,14 +598,14 @@ impl PreviewSpawner {
                                 cmd_tx: cmd_tx.clone(),
                                 last_used: tokio::time::Instant::now(),
                             };
-                            (latest, parent)
+                            (latest, parent, launcher_geom)
                         };
                         tracing::info!(
                             "preview_spawn: Ready from preview pid={} (wire pid={})",
                             pid,
                             preview_pid
                         );
-                        let (buffered, parent_handle) = buffered;
+                        let (buffered, parent_handle, launcher_geom) = buffered;
                         if let Some(handle) = parent_handle
                             && cmd_tx
                                 .send(PreviewCommand::SetParent { handle })
@@ -587,6 +626,18 @@ impl PreviewSpawner {
                             if cmd_tx.send(cmd).is_err() {
                                 tracing::warn!(
                                     "preview_spawn: pid={} writer gone before buffered send",
+                                    pid
+                                );
+                                break;
+                            }
+                        }
+                        if let Some((monitor, x, y, w, h)) = launcher_geom {
+                            if cmd_tx
+                                .send(PreviewCommand::LauncherGeometry { monitor, x, y, w, h })
+                                .is_err()
+                            {
+                                tracing::warn!(
+                                    "preview_spawn: pid={} writer gone before buffered LauncherGeometry",
                                     pid
                                 );
                                 break;
@@ -660,6 +711,21 @@ impl PreviewSpawner {
                             "preview_spawn: pid={} parent lost; awaiting next SetParent",
                             pid
                         );
+                    }
+                    PreviewEvent::SetLauncherVisible { visible } => {
+                        let cmd = if visible {
+                            GuiCommand::Show
+                        } else {
+                            GuiCommand::Hide
+                        };
+                        if let Err(e) = gui_control.dispatch(cmd).await {
+                            tracing::warn!(
+                                "preview_spawn: pid={} SetLauncherVisible({}) dispatch failed: {}",
+                                pid,
+                                visible,
+                                e
+                            );
+                        }
                     }
                 }
             }

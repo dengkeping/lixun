@@ -132,6 +132,9 @@ struct PreviewState {
     /// relationship. Lazy-initialized on first SetParent receipt once
     /// the window surface is realized. Cleared on ClearParent.
     wayland_importer: RefCell<Option<wayland_xdg_foreign::WaylandImporter>>,
+    launcher_monitor: RefCell<Option<String>>,
+    launcher_rect: Cell<Option<(i32, i32, i32, i32)>>,
+    launcher_hidden_by_us: Cell<bool>,
 }
 
 fn main() -> Result<()> {
@@ -377,6 +380,10 @@ fn handle_command(
             if let Some(window) = state.window.borrow().as_ref() {
                 window.set_visible(false);
             }
+            if state.launcher_hidden_by_us.get() {
+                let _ = outbound_tx.send_blocking(PreviewEvent::SetLauncherVisible { visible: true });
+                state.launcher_hidden_by_us.set(false);
+            }
             let _ = outbound_tx.send_blocking(PreviewEvent::Closed { epoch });
             schedule_idle(state, app);
         }
@@ -394,6 +401,10 @@ fn handle_command(
             cancel_idle(state);
             if let Some(window) = state.window.borrow().as_ref() {
                 window.set_visible(false);
+            }
+            if state.launcher_hidden_by_us.get() {
+                let _ = outbound_tx.send_blocking(PreviewEvent::SetLauncherVisible { visible: true });
+                state.launcher_hidden_by_us.set(false);
             }
             let _ = outbound_tx.send_blocking(PreviewEvent::Closed { epoch });
             schedule_idle(state, app);
@@ -413,6 +424,13 @@ fn handle_command(
             state.parent_handle.replace(None);
             if let Some(imp) = state.wayland_importer.borrow_mut().as_mut() {
                 imp.clear();
+            }
+        }
+        PreviewCommand::LauncherGeometry { monitor, x, y, w, h } => {
+            state.launcher_monitor.replace(Some(monitor));
+            state.launcher_rect.set(Some((x, y, w, h)));
+            if let Some(window) = state.window.borrow().as_ref() {
+                check_overlap_and_hide_launcher(state, window, outbound_tx);
             }
         }
     }
@@ -547,6 +565,7 @@ fn show_or_update(
         window.set_visible(true);
         window.present();
         try_apply_pending_parent(state, window);
+        check_overlap_and_hide_launcher(state, window, outbound_tx);
     }
 
     tracing::info!(
@@ -644,6 +663,60 @@ fn try_apply_pending_parent(state: &Rc<PreviewState>, window: &gtk::ApplicationW
         if let Err(e) = imp.import(&handle, &wl_surface) {
             tracing::warn!("preview: xdg-foreign import failed: {}", e);
         }
+    }
+}
+
+fn check_overlap_and_hide_launcher(
+    state: &Rc<PreviewState>,
+    window: &gtk::ApplicationWindow,
+    outbound_tx: &async_channel::Sender<PreviewEvent>,
+) {
+    let launcher_monitor = state.launcher_monitor.borrow();
+    let Some(launcher_mon) = launcher_monitor.as_ref() else {
+        return;
+    };
+    let Some((_lx, _ly, lw, lh)) = state.launcher_rect.get() else {
+        return;
+    };
+
+    let display = gtk::gdk::Display::default().expect("no default display");
+    let monitors = display.monitors();
+    let mut preview_monitor_connector: Option<String> = None;
+    for i in 0..monitors.n_items() {
+        if let Some(mon) = monitors.item(i).and_downcast::<gtk::gdk::Monitor>() {
+            if window.surface().is_some() {
+                let geom = mon.geometry();
+                if geom.contains_point(geom.width() / 2, geom.height() / 2) {
+                    preview_monitor_connector = mon.connector().map(|s| s.to_string());
+                    break;
+                }
+            }
+        }
+    }
+
+    let Some(preview_mon) = preview_monitor_connector else {
+        return;
+    };
+
+    if preview_mon != *launcher_mon {
+        if state.launcher_hidden_by_us.get() {
+            let _ = outbound_tx.send_blocking(PreviewEvent::SetLauncherVisible { visible: true });
+            state.launcher_hidden_by_us.set(false);
+        }
+        return;
+    }
+
+    let pw = window.width();
+    let ph = window.height();
+
+    let overlaps = pw > 0 && ph > 0 && lw > 0 && lh > 0;
+
+    if overlaps && !state.launcher_hidden_by_us.get() {
+        let _ = outbound_tx.send_blocking(PreviewEvent::SetLauncherVisible { visible: false });
+        state.launcher_hidden_by_us.set(true);
+    } else if !overlaps && state.launcher_hidden_by_us.get() {
+        let _ = outbound_tx.send_blocking(PreviewEvent::SetLauncherVisible { visible: true });
+        state.launcher_hidden_by_us.set(false);
     }
 }
 

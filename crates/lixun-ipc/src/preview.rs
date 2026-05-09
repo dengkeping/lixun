@@ -150,6 +150,28 @@ pub enum PreviewCommand {
     /// destroyed parent via `zxdg_imported_v2.destroy` and emits
     /// [`PreviewEvent::ParentLost`].
     ClearParent,
+    /// Inform the preview process of the launcher's current
+    /// on-screen geometry (monitor + monitor-local rect). The
+    /// preview uses this to decide whether its own window rect on
+    /// the same monitor overlaps the launcher, and if so to emit
+    /// [`PreviewEvent::LauncherHideRequest`] so the daemon tells
+    /// the launcher to unmap for the duration of the preview
+    /// session.
+    ///
+    /// Sent by the daemon on every `ShowOrUpdate` (so a freshly
+    /// spawned preview always has a rect) and whenever the GUI
+    /// reports a new rect via `Request::LauncherGeometry`. The
+    /// preview treats a missing rect (daemon never received one)
+    /// as "no overlap possible" and leaves the launcher visible.
+    /// To toggle visibility the preview sends
+    /// `PreviewEvent::SetLauncherVisible` back to the daemon.
+    LauncherGeometry {
+        monitor: String,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+    },
 }
 
 /// Preview → daemon. Spawn handshake, completion notifications,
@@ -186,6 +208,21 @@ pub enum PreviewEvent {
     /// the daemon clears its cached handle so the next launcher
     /// session re-exports a fresh one.
     ParentLost,
+    /// Preview asks the daemon to show/hide the launcher. Sent
+    /// when the preview detects its own window rect overlaps the
+    /// launcher rect on the same monitor (`visible=false`) and
+    /// again on close/hide to restore it (`visible=true`).
+    ///
+    /// The daemon forwards this as `GuiCommand::Show` /
+    /// `GuiCommand::Hide` to the launcher process. Idempotent:
+    /// the GUI treats redundant transitions as no-ops.
+    ///
+    /// Exists because wlr-layer-shell `Overlay` unconditionally
+    /// stacks above every xdg-toplevel; the preview cannot rise
+    /// visually above the launcher while both are mapped, so the
+    /// remedy is to unmap the launcher for the duration of an
+    /// overlapping preview session.
+    SetLauncherVisible { visible: bool },
 }
 
 /// Length-prefixed JSON codec parameterised by what each side

@@ -152,6 +152,37 @@ pub enum Request {
     /// so a subsequent re-export (with a new handle string) starts
     /// from a clean slate.
     PreviewClearParent,
+    /// Report the launcher's current on-screen geometry so the
+    /// preview process can decide whether to ask for the launcher
+    /// to be hidden. Sent by the GUI whenever the launcher window
+    /// is realised, resized, moved, or switches monitor. The
+    /// daemon caches the latest value and forwards it to the warm
+    /// preview process via
+    /// [`PreviewCommand::LauncherGeometry`][preview-cmd], both on
+    /// `ShowOrUpdate` (so a freshly-spawned preview always has a
+    /// rect to compare against) and on every subsequent update.
+    ///
+    /// Coordinates are logical pixels in the coordinate space of
+    /// the launcher's current monitor (not screen-global — Wayland
+    /// clients never see a global space). The preview-side overlap
+    /// test only makes sense when both windows are on the same
+    /// monitor, which the `monitor` field lets the preview verify.
+    ///
+    /// [preview-cmd]: crate::preview::PreviewCommand::LauncherGeometry
+    LauncherGeometry {
+        /// Connector name of the launcher's monitor
+        /// (`"eDP-1"`, `"DP-2"`, …).
+        monitor: String,
+        /// Launcher surface origin in monitor-local logical
+        /// pixels. With the layer-shell setup this is the
+        /// `margin_left` / `margin_top` pair the GUI uses on the
+        /// Edge::Top + Edge::Left anchor.
+        x: i32,
+        y: i32,
+        /// Launcher surface size in logical pixels.
+        w: i32,
+        h: i32,
+    },
     /// Ask the daemon for the flattened CLI manifest contributed by
     /// every registered plugin. The host CLI uses this once at startup
     /// to synthesize subcommands without learning any plugin name at
