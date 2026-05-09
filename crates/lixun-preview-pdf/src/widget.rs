@@ -25,7 +25,7 @@ use gtk::subclass::prelude::*;
 
 use crate::canvas::{MAX_ZOOM, MIN_ZOOM, PdfCanvas};
 use crate::document_session::DocumentSession;
-use crate::selection::{PagePoint, PdfSelection};
+use crate::selection::{PagePoint, PdfSelection, collect_selected_text};
 use crate::worker::RenderResult;
 
 mod imp {
@@ -101,6 +101,7 @@ impl PdfView {
         wire_render_pump(&canvas, rx);
         wire_gestures(&canvas, &scroll);
         wire_selection_gestures(&canvas);
+        wire_clipboard_keys(&view, &canvas, &session);
         wire_buttons(&canvas, &zoom_in, &zoom_out);
         wire_page_tracking(&canvas, &scroll, &page_label, &session);
 
@@ -325,6 +326,39 @@ fn wire_selection_gestures(canvas: &PdfCanvas) {
         });
     }
     canvas.add_controller(drag);
+}
+
+/// Ctrl+C copies the currently selected text to the system
+/// clipboard. Escape with no active search clears the selection.
+fn wire_clipboard_keys(view: &PdfView, canvas: &PdfCanvas, session: &Rc<DocumentSession>) {
+    let key = gtk::EventControllerKey::new();
+    let canvas_weak = canvas.downgrade();
+    let session = Rc::clone(session);
+    key.connect_key_pressed(move |_ctl, keyval, _code, state| {
+        let Some(canvas) = canvas_weak.upgrade() else {
+            return glib::Propagation::Proceed;
+        };
+        let ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
+        if ctrl && (keyval == gdk::Key::c || keyval == gdk::Key::C) {
+            let Some(sel) = canvas.selection() else {
+                return glib::Propagation::Proceed;
+            };
+            let text = collect_selected_text(&session, &sel);
+            if text.is_empty() {
+                return glib::Propagation::Stop;
+            }
+            if let Some(display) = gdk::Display::default() {
+                display.clipboard().set_text(&text);
+            }
+            return glib::Propagation::Stop;
+        }
+        if keyval == gdk::Key::Escape && canvas.selection().is_some() {
+            canvas.clear_selection();
+            return glib::Propagation::Stop;
+        }
+        glib::Propagation::Proceed
+    });
+    view.add_controller(key);
 }
 fn wire_page_tracking(
     canvas: &PdfCanvas,

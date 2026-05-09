@@ -16,6 +16,8 @@
 
 use poppler::SelectionStyle;
 
+use crate::document_session::DocumentSession;
+
 /// A point in PDF document space (points, y-up).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PdfPoint {
@@ -149,6 +151,40 @@ pub fn widget_point_to_pdf_point(wx: f64, wy: f64, page_h_pt: f64, zoom: f64) ->
     let x_pt = wx / scale;
     let y_pt = page_h_pt - (wy / scale);
     PdfPoint { x: x_pt, y: y_pt }
+}
+
+/// Walk every page touched by `sel`, pull the poppler-snapped
+/// selected text for the per-page rect, and join the non-empty
+/// segments with `"\n"`. Mirrors Papers' `pps_view_get_selected_text`.
+pub fn collect_selected_text(session: &DocumentSession, sel: &PdfSelection) -> String {
+    let (start, end) = normalized_selection(sel);
+    let mut out = String::new();
+    let mut first = true;
+    for page_idx in start.page..=end.page {
+        let Some(sz) = session.page_size(page_idx) else {
+            continue;
+        };
+        let Some(mut rect) = selection_rect_for_page(sel, page_idx, sz.width_pt, sz.height_pt)
+        else {
+            continue;
+        };
+        let Some(page) = session.main_page(page_idx) else {
+            continue;
+        };
+        let Some(text) = page.selected_text(sel.style, &mut rect) else {
+            continue;
+        };
+        let s = text.to_string();
+        if s.is_empty() {
+            continue;
+        }
+        if !first {
+            out.push('\n');
+        }
+        out.push_str(&s);
+        first = false;
+    }
+    out
 }
 
 #[cfg(test)]
