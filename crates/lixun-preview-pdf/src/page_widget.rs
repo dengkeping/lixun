@@ -241,13 +241,15 @@ impl PdfPageWidget {
     }
 }
 
-fn accent_with_alpha(widget: &PdfPageWidget, alpha: f32) -> gdk::RGBA {
-    let c = widget.color();
-    if c.alpha() < 1e-3 {
-        gdk::RGBA::new(0.2, 0.5, 0.95, alpha)
-    } else {
-        gdk::RGBA::new(c.red(), c.green(), c.blue(), alpha)
-    }
+/// Selection / search highlight base colour.
+///
+/// `widget.color()` returns the foreground text colour. In dark
+/// themes that is near-white, which on a white PDF page blends
+/// down to nothing visible. Use a fixed accent (Adwaita blue
+/// `#3584e4`) so the highlight is legible on every theme + page
+/// background combination. Alpha is the caller's job.
+fn accent_with_alpha(_widget: &PdfPageWidget, alpha: f32) -> gdk::RGBA {
+    gdk::RGBA::new(0.208, 0.518, 0.894, alpha)
 }
 
 /// Pathological cap: at >10_000 rectangles (every glyph distinct
