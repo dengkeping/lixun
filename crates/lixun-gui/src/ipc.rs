@@ -386,9 +386,14 @@ pub(crate) fn send_preview_request(hit: &Hit, monitor: Option<String>) {
 }
 
 pub(crate) fn send_launcher_geometry(monitor: String, x: i32, y: i32, w: i32, h: i32) {
+    tracing::debug!(
+        "gui: send_launcher_geometry monitor={} x={} y={} w={} h={}",
+        monitor, x, y, w, h
+    );
     let sock = socket_path();
     let req = Request::LauncherGeometry { monitor, x, y, w, h };
     let Ok(json) = serde_json::to_vec(&req) else {
+        tracing::warn!("gui: failed to serialize LauncherGeometry");
         return;
     };
     let total_len = (2 + json.len()) as u32;
@@ -397,7 +402,11 @@ pub(crate) fn send_launcher_geometry(monitor: String, x: i32, y: i32, w: i32, h:
     buf.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
     buf.extend_from_slice(&json);
     if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&sock) {
-        let _ = stream.write_all(&buf);
+        if stream.write_all(&buf).is_err() {
+            tracing::warn!("gui: failed to write LauncherGeometry to daemon socket");
+        }
+    } else {
+        tracing::warn!("gui: failed to connect to daemon socket for LauncherGeometry");
     }
 }
 

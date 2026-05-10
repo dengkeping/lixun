@@ -257,7 +257,7 @@ impl LauncherController {
         self.window.set_visible(true);
         {
             let w = self.window.clone();
-            glib::idle_add_local_once(move || {
+            glib::timeout_add_local_once(std::time::Duration::from_millis(100), move || {
                 report_launcher_geometry(&w);
             });
         }
@@ -1265,10 +1265,14 @@ fn install_drag_gesture(
 /// compute the centered x ourselves from monitor geometry so the rect
 /// we report matches the surface the compositor actually places.
 pub(crate) fn report_launcher_geometry(window: &gtk::ApplicationWindow) {
+    tracing::debug!("gui: report_launcher_geometry called");
     use gtk4_layer_shell::LayerShell;
     let display = match gtk::gdk::Display::default() {
         Some(d) => d,
-        None => return,
+        None => {
+            tracing::debug!("gui: report_launcher_geometry: no display");
+            return;
+        }
     };
     let monitor = match display
         .monitors()
@@ -1276,22 +1280,31 @@ pub(crate) fn report_launcher_geometry(window: &gtk::ApplicationWindow) {
         .and_downcast::<gtk::gdk::Monitor>()
     {
         Some(m) => m,
-        None => return,
+        None => {
+            tracing::debug!("gui: report_launcher_geometry: no monitor");
+            return;
+        }
     };
     let connector = match monitor.connector() {
         Some(s) => s.to_string(),
-        None => return,
+        None => {
+            tracing::debug!("gui: report_launcher_geometry: no connector");
+            return;
+        }
     };
     let top = window.margin(gtk4_layer_shell::Edge::Top);
     let mut w = window.width();
     let mut h = window.height();
+    tracing::debug!("gui: report_launcher_geometry: initial w={} h={}", w, h);
     if w <= 0 {
         w = window.default_width();
     }
     if h <= 0 {
         h = window.default_height();
     }
+    tracing::debug!("gui: report_launcher_geometry: final w={} h={}", w, h);
     if w <= 0 || h <= 0 {
+        tracing::debug!("gui: report_launcher_geometry: zero size, skipping");
         return;
     }
     let x = if window.is_anchor(gtk4_layer_shell::Edge::Left) {
@@ -1300,6 +1313,7 @@ pub(crate) fn report_launcher_geometry(window: &gtk::ApplicationWindow) {
         let mon_w = monitor.geometry().width();
         ((mon_w - w) / 2).max(0)
     };
+    tracing::debug!("gui: report_launcher_geometry: sending connector={} x={} top={} w={} h={}", connector, x, top, w, h);
     crate::ipc::send_launcher_geometry(connector, x, top, w, h);
 }
 

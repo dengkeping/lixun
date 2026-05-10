@@ -317,6 +317,7 @@ fn spawn_socket_workers(
             loop {
                 match read_frame_sync::<_, PreviewCommand>(&mut r) {
                     Ok(cmd) => {
+                        tracing::debug!("preview: read_frame_sync received command: {:?}", cmd);
                         if inbound_tx.send_blocking(InboundMsg::Cmd(cmd)).is_err() {
                             break;
                         }
@@ -427,10 +428,16 @@ fn handle_command(
             }
         }
         PreviewCommand::LauncherGeometry { monitor, x, y, w, h } => {
+            tracing::debug!(
+                "preview: received LauncherGeometry monitor={} x={} y={} w={} h={}",
+                monitor, x, y, w, h
+            );
             state.launcher_monitor.replace(Some(monitor));
             state.launcher_rect.set(Some((x, y, w, h)));
             if let Some(window) = state.window.borrow().as_ref() {
                 check_overlap_and_hide_launcher(state, window, outbound_tx);
+            } else {
+                tracing::debug!("preview: LauncherGeometry received but window not yet created");
             }
         }
     }
@@ -565,7 +572,14 @@ fn show_or_update(
         window.set_visible(true);
         window.present();
         try_apply_pending_parent(state, window);
-        check_overlap_and_hide_launcher(state, window, outbound_tx);
+        {
+            let state_clone = state.clone();
+            let window_clone = window.clone();
+            let outbound_clone = outbound_tx.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(100), move || {
+                check_overlap_and_hide_launcher(&state_clone, &window_clone, &outbound_clone);
+            });
+        }
     }
 
     tracing::info!(
@@ -673,27 +687,44 @@ fn check_overlap_and_hide_launcher(
 ) {
     let launcher_monitor = state.launcher_monitor.borrow();
     let Some(launcher_mon) = launcher_monitor.as_ref() else {
+        tracing::debug!("check_overlap: no launcher monitor");
         return;
     };
-    let Some((_lx, _ly, lw, lh)) = state.launcher_rect.get() else {
+    let Some((lx, ly, lw, lh)) = state.launcher_rect.get() else {
+        tracing::debug!("check_overlap: no launcher rect");
         return;
     };
 
     let display = gtk::gdk::Display::default().expect("no default display");
     let surface = match window.surface() {
         Some(s) => s,
-        None => return,
+        None => {
+            tracing::debug!("check_overlap: no preview surface");
+            return;
+        }
     };
     let monitor = match display.monitor_at_surface(&surface) {
         Some(m) => m,
-        None => return,
+        None => {
+            tracing::debug!("check_overlap: no monitor for preview surface");
+            return;
+        }
     };
     let preview_mon = match monitor.connector() {
         Some(c) => c.to_string(),
-        None => return,
+        None => {
+            tracing::debug!("check_overlap: no connector for preview monitor");
+            return;
+        }
     };
 
+    tracing::debug!(
+        "check_overlap: launcher_mon={} preview_mon={} launcher=({},{},{}x{})",
+        launcher_mon, preview_mon, lx, ly, lw, lh
+    );
+
     if preview_mon != *launcher_mon {
+        tracing::debug!("check_overlap: different monitors, restoring launcher if hidden");
         if state.launcher_hidden_by_us.get() {
             let _ = outbound_tx.send_blocking(PreviewEvent::SetLauncherVisible { visible: true });
             state.launcher_hidden_by_us.set(false);
@@ -701,15 +732,36 @@ fn check_overlap_and_hide_launcher(
         return;
     }
 
-    let pw = window.width();
-    let ph = window.height();
+    use gtk::prelude::*;
+    let alloc = window.allocation();
+    let px = alloc.x();
+    let py = alloc.y();
+    let pw = alloc.width();
+    let ph = alloc.height();
 
-    let overlaps = pw > 0 && ph > 0 && lw > 0 && lh > 0;
+    tracing::debug!(
+        "check_overlap: same monitor, preview allocation=({},{},{}x{})",
+        px, py, pw, ph
+    );
+
+    if pw <= 0 || ph <= 0 || lw <= 0 || lh <= 0 {
+        tracing::debug!("check_overlap: zero size, skipping");
+        return;
+    }
+
+    let overlaps = !(px + pw <= lx || lx + lw <= px || py + ph <= ly || ly + lh <= py);
+
+    tracing::debug!(
+        "check_overlap: overlaps={} hidden_by_us={}",
+        overlaps, state.launcher_hidden_by_us.get()
+    );
 
     if overlaps && !state.launcher_hidden_by_us.get() {
+        tracing::info!("check_overlap: hiding launcher (overlap detected)");
         let _ = outbound_tx.send_blocking(PreviewEvent::SetLauncherVisible { visible: false });
         state.launcher_hidden_by_us.set(true);
     } else if !overlaps && state.launcher_hidden_by_us.get() {
+        tracing::info!("check_overlap: restoring launcher (no overlap)");
         let _ = outbound_tx.send_blocking(PreviewEvent::SetLauncherVisible { visible: true });
         state.launcher_hidden_by_us.set(false);
     }
@@ -992,6 +1044,10 @@ fn install_close_controllers(
     let outbound_for_close = outbound_tx.clone();
     window.connect_close_request(move |_| {
         let epoch = state_for_close.current_epoch.get();
+        if state_for_close.launcher_hidden_by_us.get() {
+            let _ = outbound_for_close.send_blocking(PreviewEvent::SetLauncherVisible { visible: true });
+            state_for_close.launcher_hidden_by_us.set(false);
+        }
         let _ = outbound_for_close.send_blocking(PreviewEvent::Closed { epoch });
         if let Some(window) = state_for_close.window.borrow().as_ref() {
             window.set_visible(false);
@@ -1014,6 +1070,10 @@ fn close_via_keyboard(
     outbound_tx: &async_channel::Sender<PreviewEvent>,
 ) {
     let epoch = state.current_epoch.get();
+    if state.launcher_hidden_by_us.get() {
+        let _ = outbound_tx.send_blocking(PreviewEvent::SetLauncherVisible { visible: true });
+        state.launcher_hidden_by_us.set(false);
+    }
     let _ = outbound_tx.send_blocking(PreviewEvent::Closed { epoch });
     if let Some(window) = state.window.borrow().as_ref() {
         window.set_visible(false);

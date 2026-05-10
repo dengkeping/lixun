@@ -159,6 +159,10 @@ pub struct PreviewSpawner {
     /// and wall-clock nanoseconds to avoid collisions on fast
     /// restart cycles.
     spawn_counter: AtomicU64,
+    /// Latest launcher geometry from GUI. Cached independently
+    /// of preview lifecycle so it survives Dead→Starting→Ready
+    /// transitions. Replayed on every cold start.
+    cached_launcher_geometry: Arc<Mutex<Option<(String, i32, i32, i32, i32)>>>,
 }
 
 impl PreviewSpawner {
@@ -168,6 +172,7 @@ impl PreviewSpawner {
             gui_control,
             epoch: AtomicU64::new(0),
             spawn_counter: AtomicU64::new(0),
+            cached_launcher_geometry: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -196,12 +201,13 @@ impl PreviewSpawner {
                     .spawn_preview_process()
                     .await
                     .context("cold-start lixun-preview")?;
+                let cached_geom = self.cached_launcher_geometry.lock().await.clone();
                 *state = PreviewLifecycle::Starting {
                     pid,
                     socket_path: socket_path.clone(),
                     latest_desired: Some((epoch, hit, monitor)),
                     latest_parent_handle: None,
-                    latest_launcher_geometry: None,
+                    latest_launcher_geometry: cached_geom,
                 };
                 // Supervisor task owns the socket, reader and
                 // writer lifetimes; it locks `state` to promote
@@ -347,16 +353,28 @@ impl PreviewSpawner {
         w: i32,
         h: i32,
     ) {
+        *self.cached_launcher_geometry.lock().await = Some((monitor.clone(), x, y, w, h));
+        
         let mut state = self.state.lock().await;
         match &mut *state {
-            PreviewLifecycle::Dead => {}
+            PreviewLifecycle::Dead => {
+                tracing::debug!(
+                    "preview_spawn: set_launcher_geometry while Dead, cached for next spawn"
+                );
+            }
             PreviewLifecycle::Starting {
                 latest_launcher_geometry,
                 ..
             } => {
+                tracing::debug!(
+                    "preview_spawn: set_launcher_geometry while Starting, buffering"
+                );
                 *latest_launcher_geometry = Some((monitor, x, y, w, h));
             }
             PreviewLifecycle::Ready { cmd_tx, .. } => {
+                tracing::debug!(
+                    "preview_spawn: set_launcher_geometry sending to Ready preview"
+                );
                 if cmd_tx
                     .send(PreviewCommand::LauncherGeometry { monitor, x, y, w, h })
                     .is_err()
@@ -632,6 +650,10 @@ impl PreviewSpawner {
                             }
                         }
                         if let Some((monitor, x, y, w, h)) = launcher_geom {
+                            tracing::debug!(
+                                "preview_spawn: pid={} draining buffered LauncherGeometry monitor={} x={} y={} w={} h={}",
+                                pid, monitor, x, y, w, h
+                            );
                             if cmd_tx
                                 .send(PreviewCommand::LauncherGeometry { monitor, x, y, w, h })
                                 .is_err()
@@ -642,6 +664,11 @@ impl PreviewSpawner {
                                 );
                                 break;
                             }
+                        } else {
+                            tracing::debug!(
+                                "preview_spawn: pid={} no buffered LauncherGeometry to drain",
+                                pid
+                            );
                         }
                     }
                     PreviewEvent::Closed { epoch } => {
@@ -713,17 +740,33 @@ impl PreviewSpawner {
                         );
                     }
                     PreviewEvent::SetLauncherVisible { visible } => {
+                        tracing::debug!(
+                            "preview_spawn: pid={} SetLauncherVisible visible={}",
+                            pid,
+                            visible
+                        );
                         let cmd = if visible {
                             GuiCommand::Show
                         } else {
                             GuiCommand::Hide
                         };
+                        tracing::debug!(
+                            "preview_spawn: pid={} dispatching {:?} to GUI",
+                            pid,
+                            cmd
+                        );
                         if let Err(e) = gui_control.dispatch(cmd).await {
                             tracing::warn!(
                                 "preview_spawn: pid={} SetLauncherVisible({}) dispatch failed: {}",
                                 pid,
                                 visible,
                                 e
+                            );
+                        } else {
+                            tracing::debug!(
+                                "preview_spawn: pid={} dispatch {:?} succeeded",
+                                pid,
+                                cmd
                             );
                         }
                     }

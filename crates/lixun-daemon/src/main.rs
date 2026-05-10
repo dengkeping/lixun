@@ -1480,6 +1480,10 @@ async fn handle_client(
                 }
             }
             Request::LauncherGeometry { monitor, x, y, w, h } => {
+                tracing::debug!(
+                    "daemon: received LauncherGeometry monitor={} x={} y={} w={} h={}",
+                    monitor, x, y, w, h
+                );
                 preview_spawner.set_launcher_geometry(monitor, x, y, w, h).await;
                 if write_tx.send(Response::Ok).await.is_err() {
                     break;
