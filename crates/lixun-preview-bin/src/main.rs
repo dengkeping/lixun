@@ -680,22 +680,17 @@ fn check_overlap_and_hide_launcher(
     };
 
     let display = gtk::gdk::Display::default().expect("no default display");
-    let monitors = display.monitors();
-    let mut preview_monitor_connector: Option<String> = None;
-    for i in 0..monitors.n_items() {
-        if let Some(mon) = monitors.item(i).and_downcast::<gtk::gdk::Monitor>() {
-            if window.surface().is_some() {
-                let geom = mon.geometry();
-                if geom.contains_point(geom.width() / 2, geom.height() / 2) {
-                    preview_monitor_connector = mon.connector().map(|s| s.to_string());
-                    break;
-                }
-            }
-        }
-    }
-
-    let Some(preview_mon) = preview_monitor_connector else {
-        return;
+    let surface = match window.surface() {
+        Some(s) => s,
+        None => return,
+    };
+    let monitor = match display.monitor_at_surface(&surface) {
+        Some(m) => m,
+        None => return,
+    };
+    let preview_mon = match monitor.connector() {
+        Some(c) => c.to_string(),
+        None => return,
     };
 
     if preview_mon != *launcher_mon {
