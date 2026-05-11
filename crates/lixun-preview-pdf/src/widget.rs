@@ -14,7 +14,7 @@
 //! three Documents (main + 2 workers + search worker), clears the
 //! texture cache, resets the viewport to top, clears search state.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -22,7 +22,7 @@ use gtk::glib;
 use gtk::prelude::*;
 use gtk::subclass::prelude::*;
 
-use crate::canvas::{MAX_ZOOM, MIN_ZOOM, PdfCanvas, zoomed_in, zoomed_out};
+use crate::canvas::{MAX_ZOOM, MIN_ZOOM, PdfCanvas, fit_to_page, fit_to_width, zoomed_in, zoomed_out};
 use crate::document_session::DocumentSession;
 use crate::search::{SearchQueryState, SearchWorker};
 use crate::search_bar::PdfSearchBar;
@@ -45,6 +45,7 @@ mod imp {
         pub search_bar: RefCell<Option<PdfSearchBar>>,
         pub search_state: RefCell<Option<Rc<RefCell<SearchState>>>>,
         pub session: RefCell<Option<Rc<DocumentSession>>>,
+        pub max_page_size: Cell<(f64, f64)>,
     }
 
     #[glib::object_subclass]
@@ -90,13 +91,36 @@ impl PdfView {
         let (tx, rx) = async_channel::unbounded::<RenderResult>();
         let session = DocumentSession::open(path, tx)?;
 
+        // Compute document-wide max page size once and cache it.
+        let max_page_size = Rc::new(Cell::new((0.0_f64, 0.0_f64)));
+        {
+            let n = session.n_pages();
+            let mut max_w = 0.0_f64;
+            let mut max_h = 0.0_f64;
+            for i in 0..n {
+                if let Some(size) = session.page_size(i) {
+                    if size.width_pt > max_w {
+                        max_w = size.width_pt;
+                    }
+                    if size.height_pt > max_h {
+                        max_h = size.height_pt;
+                    }
+                }
+            }
+            max_page_size.set((max_w, max_h));
+        }
+
         let toolbar = gtk::ActionBar::new();
         toolbar.add_css_class("lixun-preview-pdf-toolbar");
         let zoom_out = gtk::Button::from_icon_name("zoom-out-symbolic");
         let zoom_in = gtk::Button::from_icon_name("zoom-in-symbolic");
+        let fit_width_btn = gtk::Button::from_icon_name("zoom-fit-width-symbolic");
+        let fit_page_btn = gtk::Button::from_icon_name("zoom-fit-best-symbolic");
         let page_label = gtk::Label::new(Some(&format!("1 / {}", session.n_pages().max(1))));
         toolbar.pack_start(&zoom_out);
         toolbar.pack_start(&zoom_in);
+        toolbar.pack_start(&fit_width_btn);
+        toolbar.pack_start(&fit_page_btn);
         toolbar.set_center_widget(Some(&page_label));
 
         let search_bar = PdfSearchBar::new();
@@ -121,6 +145,7 @@ impl PdfView {
         *view.imp().page_label.borrow_mut() = Some(page_label.clone());
         *view.imp().search_bar.borrow_mut() = Some(search_bar.clone());
         *view.imp().session.borrow_mut() = Some(Rc::clone(&session));
+        view.imp().max_page_size.set(max_page_size.get());
 
         let state = Rc::new(RefCell::new(search_ui::default_state()));
         *view.imp().search_state.borrow_mut() = Some(Rc::clone(&state));
@@ -129,7 +154,15 @@ impl PdfView {
         wire_gestures(&canvas, &scroll);
         wire_selection_gestures(&canvas);
         wire_clipboard_key(&view, &canvas, &session);
-        wire_buttons(&canvas, &zoom_in, &zoom_out);
+        wire_buttons(
+            &canvas,
+            &zoom_in,
+            &zoom_out,
+            &fit_width_btn,
+            &fit_page_btn,
+            &scroll,
+            Rc::clone(&max_page_size),
+        );
         wire_page_tracking(&canvas, &scroll, &page_label, &session);
         search_ui::wire_search(&view, &scroll, &canvas, &search_bar, state, &session);
 
@@ -144,6 +177,24 @@ impl PdfView {
             .clone()
             .ok_or_else(|| anyhow::anyhow!("PdfView has no session"))?;
         session.replace_path(new_path)?;
+
+        // Recompute cached max page size for the new document.
+        {
+            let n = session.n_pages();
+            let mut max_w = 0.0_f64;
+            let mut max_h = 0.0_f64;
+            for i in 0..n {
+                if let Some(size) = session.page_size(i) {
+                    if size.width_pt > max_w {
+                        max_w = size.width_pt;
+                    }
+                    if size.height_pt > max_h {
+                        max_h = size.height_pt;
+                    }
+                }
+            }
+            self.imp().max_page_size.set((max_w, max_h));
+        }
 
         if let Some(canvas) = self.imp().canvas.borrow().as_ref() {
             canvas.set_zoom(1.0);
@@ -274,7 +325,15 @@ fn wire_gestures(canvas: &PdfCanvas, scroll: &gtk::ScrolledWindow) {
     canvas.add_controller(scroll_ctrl);
 }
 
-fn wire_buttons(canvas: &PdfCanvas, zoom_in: &gtk::Button, zoom_out: &gtk::Button) {
+fn wire_buttons(
+    canvas: &PdfCanvas,
+    zoom_in: &gtk::Button,
+    zoom_out: &gtk::Button,
+    fit_width_btn: &gtk::Button,
+    fit_page_btn: &gtk::Button,
+    scroll: &gtk::ScrolledWindow,
+    max_page_size: Rc<Cell<(f64, f64)>>,
+) {
     {
         let canvas_weak = canvas.downgrade();
         zoom_in.connect_clicked(move |_| {
@@ -289,6 +348,47 @@ fn wire_buttons(canvas: &PdfCanvas, zoom_in: &gtk::Button, zoom_out: &gtk::Butto
             if let Some(c) = canvas_weak.upgrade() {
                 c.set_zoom(zoomed_out(c.zoom()));
             }
+        });
+    }
+    {
+        let canvas_weak = canvas.downgrade();
+        let scroll_weak = scroll.downgrade();
+        let max_page_size = Rc::clone(&max_page_size);
+        fit_width_btn.connect_clicked(move |_| {
+            let Some(canvas) = canvas_weak.upgrade() else {
+                return;
+            };
+            let Some(scroll) = scroll_weak.upgrade() else {
+                return;
+            };
+            let (max_w, _) = max_page_size.get();
+            if max_w <= 0.0 {
+                return;
+            }
+            let viewport_w = scroll.hadjustment().page_size();
+            let zoom = fit_to_width(max_w, viewport_w);
+            canvas.set_zoom(zoom);
+        });
+    }
+    {
+        let canvas_weak = canvas.downgrade();
+        let scroll_weak = scroll.downgrade();
+        let max_page_size = Rc::clone(&max_page_size);
+        fit_page_btn.connect_clicked(move |_| {
+            let Some(canvas) = canvas_weak.upgrade() else {
+                return;
+            };
+            let Some(scroll) = scroll_weak.upgrade() else {
+                return;
+            };
+            let (max_w, max_h) = max_page_size.get();
+            if max_w <= 0.0 || max_h <= 0.0 {
+                return;
+            }
+            let viewport_w = scroll.hadjustment().page_size();
+            let viewport_h = scroll.vadjustment().page_size();
+            let zoom = fit_to_page((max_w, max_h), (viewport_w, viewport_h));
+            canvas.set_zoom(zoom);
         });
     }
 }
