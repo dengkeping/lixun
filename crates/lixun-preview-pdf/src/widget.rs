@@ -165,6 +165,7 @@ impl PdfView {
         wire_selection_gestures(&canvas);
         wire_clipboard_key(&view, &canvas, &session);
         wire_page_keys(&view, &canvas, &scroll);
+        wire_zoom_keys(&view, &canvas);
         wire_buttons(
             &canvas,
             &zoom_in,
@@ -514,6 +515,36 @@ fn wire_page_keys(view: &PdfView, canvas: &PdfCanvas, scroll: &gtk::ScrolledWind
             gdk::Key::Page_Up => {
                 let prev = canvas.current_page().saturating_sub(1);
                 canvas.scroll_to_page(&scroll, prev);
+                glib::Propagation::Stop
+            }
+            _ => glib::Propagation::Proceed,
+        }
+    });
+    view.add_controller(key);
+}
+
+fn wire_zoom_keys(view: &PdfView, canvas: &PdfCanvas) {
+    let key = gtk::EventControllerKey::new();
+    key.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let canvas_weak = canvas.downgrade();
+    key.connect_key_pressed(move |_ctl, keyval, _code, state| {
+        let Some(canvas) = canvas_weak.upgrade() else {
+            return glib::Propagation::Proceed;
+        };
+        if !state.contains(gdk::ModifierType::CONTROL_MASK) {
+            return glib::Propagation::Proceed;
+        }
+        match keyval {
+            gdk::Key::equal | gdk::Key::plus => {
+                canvas.set_zoom(zoomed_in(canvas.zoom()));
+                glib::Propagation::Stop
+            }
+            gdk::Key::minus | gdk::Key::underscore => {
+                canvas.set_zoom(zoomed_out(canvas.zoom()));
+                glib::Propagation::Stop
+            }
+            gdk::Key::_0 => {
+                canvas.set_zoom(1.0);
                 glib::Propagation::Stop
             }
             _ => glib::Propagation::Proceed,
