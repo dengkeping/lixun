@@ -1417,7 +1417,27 @@ fn install_response_handler(
                             if let Some(id) = loading_timer.borrow_mut().take() {
                                 id.remove();
                             }
-                            let all_hits = hits;
+                            let all_hits = if hits.is_empty() {
+                                let pending = pending_hits.borrow().clone();
+                                if !pending.is_empty() {
+                                    tracing::debug!(
+                                        "gui: Final empty, falling back to {} buffered Initial hits",
+                                        pending.len()
+                                    );
+                                }
+                                pending
+                            } else {
+                                hits
+                            };
+                            for (i, h) in all_hits.iter().enumerate().take(10) {
+                                tracing::debug!(
+                                    "gui: final hit[{}] id={} title={:?} score={:.4}",
+                                    i,
+                                    h.id.0,
+                                    h.title,
+                                    h.score
+                                );
+                            }
                             pending_hits.borrow_mut().clear();
 
                             let preserve_doc_id = user_selected_override.get();
