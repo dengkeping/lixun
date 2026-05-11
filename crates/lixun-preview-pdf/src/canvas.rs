@@ -25,6 +25,15 @@ use crate::worker::{RenderOutcome, RenderResult};
 
 pub const MIN_ZOOM: f64 = 0.25;
 pub const MAX_ZOOM: f64 = 16.0;
+pub(crate) const ZOOM_STEP: f64 = 1.25;
+
+pub(crate) fn zoomed_in(current: f64) -> f64 {
+    (current * ZOOM_STEP).clamp(MIN_ZOOM, MAX_ZOOM)
+}
+
+pub(crate) fn zoomed_out(current: f64) -> f64 {
+    (current / ZOOM_STEP).clamp(MIN_ZOOM, MAX_ZOOM)
+}
 
 mod imp {
     use super::*;

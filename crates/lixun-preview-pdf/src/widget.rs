@@ -22,7 +22,7 @@ use gtk::glib;
 use gtk::prelude::*;
 use gtk::subclass::prelude::*;
 
-use crate::canvas::{MAX_ZOOM, MIN_ZOOM, PdfCanvas};
+use crate::canvas::{MAX_ZOOM, MIN_ZOOM, PdfCanvas, zoomed_in, zoomed_out};
 use crate::document_session::DocumentSession;
 use crate::search::{SearchQueryState, SearchWorker};
 use crate::search_bar::PdfSearchBar;
@@ -279,8 +279,7 @@ fn wire_buttons(canvas: &PdfCanvas, zoom_in: &gtk::Button, zoom_out: &gtk::Butto
         let canvas_weak = canvas.downgrade();
         zoom_in.connect_clicked(move |_| {
             if let Some(c) = canvas_weak.upgrade() {
-                let cur = c.zoom();
-                c.set_zoom((cur * 1.25).clamp(MIN_ZOOM, MAX_ZOOM));
+                c.set_zoom(zoomed_in(c.zoom()));
             }
         });
     }
@@ -288,8 +287,7 @@ fn wire_buttons(canvas: &PdfCanvas, zoom_in: &gtk::Button, zoom_out: &gtk::Butto
         let canvas_weak = canvas.downgrade();
         zoom_out.connect_clicked(move |_| {
             if let Some(c) = canvas_weak.upgrade() {
-                let cur = c.zoom();
-                c.set_zoom((cur / 1.25).clamp(MIN_ZOOM, MAX_ZOOM));
+                c.set_zoom(zoomed_out(c.zoom()));
             }
         });
     }

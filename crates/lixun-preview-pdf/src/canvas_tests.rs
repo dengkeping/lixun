@@ -37,3 +37,37 @@ fn pdf_canvas_creates_one_child_per_page() {
         "expected one PdfPageWidget per document page (n={n}, got={count})"
     );
 }
+
+#[test]
+fn zoomed_in_clamps_at_max() {
+    assert!((zoomed_in(MAX_ZOOM) - MAX_ZOOM).abs() < f64::EPSILON);
+}
+
+#[test]
+fn zoomed_out_clamps_at_min() {
+    assert!((zoomed_out(MIN_ZOOM) - MIN_ZOOM).abs() < f64::EPSILON);
+}
+
+#[test]
+fn zoomed_in_steps_normally() {
+    let result = zoomed_in(1.0);
+    assert!((result - 1.25).abs() < f64::EPSILON);
+}
+
+#[test]
+fn zoomed_out_steps_normally() {
+    let result = zoomed_out(1.0);
+    assert!((result - 0.8).abs() < f64::EPSILON);
+}
+
+#[test]
+fn zoomed_in_clamps_near_max() {
+    let result = zoomed_in(15.0);
+    assert!((result - MAX_ZOOM).abs() < f64::EPSILON);
+}
+
+#[test]
+fn zoomed_out_clamps_near_min() {
+    let result = zoomed_out(0.3);
+    assert!((result - MIN_ZOOM).abs() < f64::EPSILON);
+}
