@@ -72,4 +72,28 @@ impl PdfCanvas {
         }
         None
     }
+
+    /// Scroll the given `ScrolledWindow` so the top of page `page_index`
+    /// is at the top of the viewport. Clamps `page_index` to `0..n_pages`.
+    ///
+    /// We take `&ScrolledWindow` as a parameter rather than storing one
+    /// because `PdfCanvas` is the child widget, not the parent — it does
+    /// not own its scroll container and should not assume one exists.
+    pub fn scroll_to_page(&self, scroll: &gtk::ScrolledWindow, page_index: u32) {
+        let Some(session) = self.session() else { return; };
+        let n_pages = session.n_pages();
+        if n_pages == 0 {
+            return;
+        }
+        let target = page_index.min(n_pages.saturating_sub(1));
+        let Some((top, _bot)) = self.page_y_range(target) else {
+            return;
+        };
+        let vadj = scroll.vadjustment();
+        let lower = vadj.lower();
+        let upper = vadj.upper();
+        let page_size = vadj.page_size();
+        let clamped = top.clamp(lower, upper - page_size);
+        vadj.set_value(clamped);
+    }
 }

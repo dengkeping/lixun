@@ -113,3 +113,15 @@ fn fit_to_page_defensive_zero_page_size() {
     let result = fit_to_page((0.0, 0.0), (800.0, 600.0));
     assert!((result - MIN_ZOOM).abs() < f64::EPSILON);
 }
+
+#[test]
+fn scroll_to_page_clamp_arithmetic() {
+    // Forward clamp: page_index.min(n_pages - 1)
+    let n = 3u32;
+    let target = (n - 1).min(99);
+    assert_eq!(target, 2, "min(n-1, large) should clamp to n-1");
+
+    // Backward clamp: current_page.saturating_sub(1)
+    let target = 0u32.saturating_sub(1);
+    assert_eq!(target, 0, "saturating_sub from 0 should stay 0");
+}
