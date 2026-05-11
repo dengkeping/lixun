@@ -35,6 +35,59 @@ pub(crate) fn zoomed_out(current: f64) -> f64 {
     (current / ZOOM_STEP).clamp(MIN_ZOOM, MAX_ZOOM)
 }
 
+pub(crate) fn fit_to_width(max_page_width_pt: f64, viewport_inner_width_px: f64) -> f64 {
+    if max_page_width_pt <= 0.0
+        || !max_page_width_pt.is_finite()
+        || viewport_inner_width_px <= 0.0
+        || !viewport_inner_width_px.is_finite()
+    {
+        // Defensive: non-sensible inputs fall back to minimum zoom rather
+        // than producing NaN, infinity, or negative values.
+        return MIN_ZOOM;
+    }
+    (viewport_inner_width_px / max_page_width_pt).clamp(MIN_ZOOM, MAX_ZOOM)
+}
+
+pub(crate) fn fit_to_page(max_page_size_pt: (f64, f64), viewport_inner_size_px: (f64, f64)) -> f64 {
+    let (page_w, page_h) = max_page_size_pt;
+    let (viewport_w, viewport_h) = viewport_inner_size_px;
+    if page_w <= 0.0
+        || !page_w.is_finite()
+        || page_h <= 0.0
+        || !page_h.is_finite()
+        || viewport_w <= 0.0
+        || !viewport_w.is_finite()
+        || viewport_h <= 0.0
+        || !viewport_h.is_finite()
+    {
+        return MIN_ZOOM;
+    }
+    let zoom_w = viewport_w / page_w;
+    let zoom_h = viewport_h / page_h;
+    zoom_w.min(zoom_h).clamp(MIN_ZOOM, MAX_ZOOM)
+}
+
+pub(crate) fn document_max_page_size(doc: &poppler::Document) -> (f64, f64) {
+    let n = doc.n_pages();
+    if n == 0 {
+        return (0.0, 0.0);
+    }
+    let mut max_w = 0.0f64;
+    let mut max_h = 0.0f64;
+    for i in 0..n {
+        if let Some(page) = doc.page(i) {
+            let (w, h) = page.size();
+            if w > max_w {
+                max_w = w;
+            }
+            if h > max_h {
+                max_h = h;
+            }
+        }
+    }
+    (max_w, max_h)
+}
+
 mod imp {
     use super::*;
     use std::sync::OnceLock;

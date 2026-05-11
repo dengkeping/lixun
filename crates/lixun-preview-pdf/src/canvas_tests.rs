@@ -71,3 +71,45 @@ fn zoomed_out_clamps_near_min() {
     let result = zoomed_out(0.3);
     assert!((result - MIN_ZOOM).abs() < f64::EPSILON);
 }
+
+#[test]
+fn fit_to_width_normal() {
+    let result = fit_to_width(600.0, 800.0);
+    assert!((result - 1.333_333_333_333_333_3).abs() < 1e-6);
+}
+
+#[test]
+fn fit_to_page_normal() {
+    let result = fit_to_page((600.0, 800.0), (800.0, 600.0));
+    assert!((result - 0.75).abs() < f64::EPSILON);
+}
+
+#[test]
+fn fit_to_width_clamps_upper() {
+    let result = fit_to_width(600.0, 100_000.0);
+    assert!((result - MAX_ZOOM).abs() < f64::EPSILON);
+}
+
+#[test]
+fn fit_to_page_clamps_lower() {
+    let result = fit_to_page((600.0, 800.0), (10.0, 10.0));
+    assert!((result - MIN_ZOOM).abs() < f64::EPSILON);
+}
+
+#[test]
+fn fit_to_width_defensive_zero_page_width() {
+    let result = fit_to_width(0.0, 800.0);
+    assert!((result - MIN_ZOOM).abs() < f64::EPSILON);
+}
+
+#[test]
+fn fit_to_width_defensive_nan_viewport() {
+    let result = fit_to_width(600.0, f64::NAN);
+    assert!((result - MIN_ZOOM).abs() < f64::EPSILON);
+}
+
+#[test]
+fn fit_to_page_defensive_zero_page_size() {
+    let result = fit_to_page((0.0, 0.0), (800.0, 600.0));
+    assert!((result - MIN_ZOOM).abs() < f64::EPSILON);
+}
