@@ -42,6 +42,7 @@ mod imp {
         pub canvas: RefCell<Option<PdfCanvas>>,
         pub scroll: RefCell<Option<gtk::ScrolledWindow>>,
         pub page_label: RefCell<Option<gtk::Label>>,
+        pub page_entry: RefCell<Option<gtk::Entry>>,
         pub search_bar: RefCell<Option<PdfSearchBar>>,
         pub search_state: RefCell<Option<Rc<RefCell<SearchState>>>>,
         pub session: RefCell<Option<Rc<DocumentSession>>>,
@@ -116,12 +117,20 @@ impl PdfView {
         let zoom_in = gtk::Button::from_icon_name("zoom-in-symbolic");
         let fit_width_btn = gtk::Button::from_icon_name("zoom-fit-width-symbolic");
         let fit_page_btn = gtk::Button::from_icon_name("zoom-fit-best-symbolic");
-        let page_label = gtk::Label::new(Some(&format!("1 / {}", session.n_pages().max(1))));
+        let page_entry = gtk::Entry::new();
+        page_entry.set_text("1");
+        page_entry.set_max_width_chars(4);
+        page_entry.set_width_chars(4);
+        gtk::prelude::EntryExt::set_alignment(&page_entry, 0.5);
+        let page_label = gtk::Label::new(Some(&format!(" / {}", session.n_pages().max(1))));
+        let page_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        page_box.append(&page_entry);
+        page_box.append(&page_label);
         toolbar.pack_start(&zoom_out);
         toolbar.pack_start(&zoom_in);
         toolbar.pack_start(&fit_width_btn);
         toolbar.pack_start(&fit_page_btn);
-        toolbar.set_center_widget(Some(&page_label));
+        toolbar.set_center_widget(Some(&page_box));
 
         let search_bar = PdfSearchBar::new();
 
@@ -143,6 +152,7 @@ impl PdfView {
         *view.imp().canvas.borrow_mut() = Some(canvas.clone());
         *view.imp().scroll.borrow_mut() = Some(scroll.clone());
         *view.imp().page_label.borrow_mut() = Some(page_label.clone());
+        *view.imp().page_entry.borrow_mut() = Some(page_entry.clone());
         *view.imp().search_bar.borrow_mut() = Some(search_bar.clone());
         *view.imp().session.borrow_mut() = Some(Rc::clone(&session));
         view.imp().max_page_size.set(max_page_size.get());
@@ -164,7 +174,8 @@ impl PdfView {
             &scroll,
             Rc::clone(&max_page_size),
         );
-        wire_page_tracking(&canvas, &scroll, &page_label, &session);
+        wire_page_tracking(&canvas, &scroll, &page_entry, &session);
+        wire_page_entry(&view, &canvas, &scroll, &page_entry, &session);
         search_ui::wire_search(&view, &scroll, &canvas, &search_bar, state, &session);
 
         Ok(view)
@@ -217,7 +228,10 @@ impl PdfView {
             scroll.hadjustment().set_value(0.0);
         }
         if let Some(label) = self.imp().page_label.borrow().as_ref() {
-            label.set_text(&format!("1 / {}", session.n_pages().max(1)));
+            label.set_text(&format!(" / {}", session.n_pages().max(1)));
+        }
+        if let Some(entry) = self.imp().page_entry.borrow().as_ref() {
+            entry.set_text("1");
         }
         if let (Some(canvas), Some(bar), Some(state)) = (
             self.imp().canvas.borrow().as_ref(),
@@ -508,24 +522,82 @@ fn wire_page_keys(view: &PdfView, canvas: &PdfCanvas, scroll: &gtk::ScrolledWind
     view.add_controller(key);
 }
 
+fn wire_page_entry(
+    view: &PdfView,
+    canvas: &PdfCanvas,
+    scroll: &gtk::ScrolledWindow,
+    page_entry: &gtk::Entry,
+    session: &Rc<DocumentSession>,
+) {
+    let activate_canvas_weak = canvas.downgrade();
+    let activate_scroll_weak = scroll.downgrade();
+    let activate_view_weak = view.downgrade();
+    let activate_session = Rc::clone(session);
+    page_entry.connect_activate(move |entry| {
+        let Some(canvas) = activate_canvas_weak.upgrade() else {
+            return;
+        };
+        let Some(scroll) = activate_scroll_weak.upgrade() else {
+            return;
+        };
+        let n_pages = activate_session.n_pages() as usize;
+        let text = entry.text();
+        let Some(target_1) = parse_page_input(text.as_str(), n_pages) else {
+            return;
+        };
+        let target_0 = (target_1.saturating_sub(1)) as u32;
+        canvas.scroll_to_page(&scroll, target_0);
+        entry.set_text(&format!("{}", target_1));
+        if let Some(view) = activate_view_weak.upgrade() {
+            view.grab_focus();
+        }
+    });
+
+    let esc_canvas_weak = canvas.downgrade();
+    let esc_entry_weak = page_entry.downgrade();
+    let esc_view_weak = view.downgrade();
+    let key = gtk::EventControllerKey::new();
+    key.set_propagation_phase(gtk::PropagationPhase::Capture);
+    key.connect_key_pressed(move |_, keyval, _keycode, _state| {
+        if keyval != gdk::Key::Escape {
+            return glib::Propagation::Proceed;
+        }
+        let Some(entry) = esc_entry_weak.upgrade() else {
+            return glib::Propagation::Proceed;
+        };
+        let cur = esc_canvas_weak
+            .upgrade()
+            .map(|c| c.current_page())
+            .unwrap_or(0);
+        entry.set_text(&format!("{}", cur + 1));
+        if let Some(view) = esc_view_weak.upgrade() {
+            view.grab_focus();
+        }
+        glib::Propagation::Stop
+    });
+    page_entry.add_controller(key);
+}
+
 fn wire_page_tracking(
     canvas: &PdfCanvas,
     scroll: &gtk::ScrolledWindow,
-    page_label: &gtk::Label,
-    session: &Rc<DocumentSession>,
+    page_entry: &gtk::Entry,
+    _session: &Rc<DocumentSession>,
 ) {
     let vadj = scroll.vadjustment();
     let canvas_weak = canvas.downgrade();
-    let label_weak = page_label.downgrade();
+    let entry_weak = page_entry.downgrade();
     let scroll_weak = scroll.downgrade();
-    let session = Rc::clone(session);
     vadj.connect_value_changed(move |adj| {
         let Some(canvas) = canvas_weak.upgrade() else {
             return;
         };
-        let Some(label) = label_weak.upgrade() else {
+        let Some(entry) = entry_weak.upgrade() else {
             return;
         };
+        if entry.has_focus() {
+            return;
+        }
         let viewport_h = scroll_weak
             .upgrade()
             .map(|s| s.height() as f64)
@@ -533,9 +605,7 @@ fn wire_page_tracking(
         let v = adj.value();
         canvas.recompute_current_page(v, viewport_h);
         let cur = canvas.current_page();
-        let n = session.n_pages().max(1);
-        let text = format!("{} / {}", cur + 1, n);
-        label.set_text(&text);
+        entry.set_text(&format!("{}", cur + 1));
     });
 }
 
