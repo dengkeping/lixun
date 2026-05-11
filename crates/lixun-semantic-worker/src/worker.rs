@@ -68,6 +68,7 @@ pub fn spawn_worker(
         pending_images: Vec::new(),
         pending_deletes: Vec::new(),
         last_flush: Instant::now(),
+        flush_count: 0,
     };
 
     let join = std::thread::Builder::new()
@@ -92,6 +93,7 @@ struct WorkerThread {
     pending_images: Vec<UpsertedDoc>,
     pending_deletes: Vec<String>,
     last_flush: Instant,
+    flush_count: u64,
 }
 
 enum Channel {
@@ -132,12 +134,14 @@ impl WorkerThread {
                         self.flush_text();
                         self.flush_images();
                         self.flush_deletes();
+                        self.maybe_compact();
                     }
                 }
                 Ok(None) => {
                     self.flush_text();
                     self.flush_images();
                     self.flush_deletes();
+                    self.maybe_compact();
                     tracing::info!("semantic embed worker: channel closed, exiting");
                     return;
                 }
@@ -145,6 +149,7 @@ impl WorkerThread {
                     self.flush_text();
                     self.flush_images();
                     self.flush_deletes();
+                    self.maybe_compact();
                 }
             }
         }
@@ -175,6 +180,29 @@ impl WorkerThread {
                 self.pending_deletes.push(doc_id);
                 Ok(())
             }
+        }
+    }
+
+    fn maybe_compact(&mut self) {
+        self.flush_count = self.flush_count.wrapping_add(1);
+        if self.flush_count % 50 != 0 {
+            return;
+        }
+        let store = self.store.clone();
+        let res = self.runtime.block_on(async move {
+            store.compact_if_stale(32).await
+        });
+        match res {
+            Ok(true) => tracing::info!(
+                "semantic embed worker: compaction ran (flush_count={})",
+                self.flush_count
+            ),
+            Ok(false) => tracing::debug!(
+                "semantic embed worker: compaction skipped, fragments below threshold"
+            ),
+            Err(e) => tracing::warn!(
+                "semantic embed worker: compaction failed: {e:#}"
+            ),
         }
     }
 
