@@ -459,3 +459,64 @@ fn apply_zoom_centered(
         vadj.set_value(v);
     });
 }
+
+/// Parse a raw page-number string into a 1-indexed page number.
+///
+/// Returns `None` for empty, non-numeric, or negative input, or when
+/// `n_pages == 0`.  Zero is silently clamped to `1`; values greater
+/// than `n_pages` are silently clamped to `n_pages`.
+pub(crate) fn parse_page_input(raw: &str, n_pages: usize) -> Option<usize> {
+    if n_pages == 0 {
+        return None;
+    }
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let parsed = trimmed.parse::<usize>().ok()?;
+    if parsed == 0 {
+        Some(1)
+    } else if parsed > n_pages {
+        Some(n_pages)
+    } else {
+        Some(parsed)
+    }
+}
+
+#[cfg(test)]
+mod parse_page_input_tests {
+    use super::parse_page_input;
+
+    #[test]
+    fn acceptance_criteria() {
+        let cases: Vec<(&str, usize, Option<usize>)> = vec![
+            ("", 10, None),
+            ("abc", 10, None),
+            ("0", 10, Some(1)),
+            ("5", 10, Some(5)),
+            ("999", 10, Some(10)),
+            ("  7  ", 10, Some(7)),
+            ("-3", 10, None),
+        ];
+        for (raw, n_pages, expected) in cases {
+            assert_eq!(
+                parse_page_input(raw, n_pages),
+                expected,
+                "input={:?}, n_pages={}",
+                raw,
+                n_pages
+            );
+        }
+    }
+
+    #[test]
+    fn edge_cases() {
+        assert_eq!(parse_page_input("0", 0), None, "n_pages=0 should yield None");
+        assert_eq!(parse_page_input("1", 0), None, "n_pages=0 should yield None");
+        assert_eq!(
+            parse_page_input("1.5", 10),
+            None,
+            "decimal input should be rejected"
+        );
+    }
+}
