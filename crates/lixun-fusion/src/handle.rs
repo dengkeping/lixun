@@ -247,7 +247,27 @@ impl HybridSearchHandle {
         let mut out: Vec<(lixun_core::Hit, lixun_core::ScoreBreakdown)> =
             Vec::with_capacity(target_limit);
 
-        for (doc_id, _rrf_score) in fused.into_iter().take(target_limit) {
+        for (doc_id, rrf_score) in fused.into_iter().take(target_limit) {
+            let in_bm25 = bm25_by_id.contains_key(&doc_id);
+            let in_text_ann = text_hits.iter().any(|h| h.doc_id == doc_id);
+            let in_image_ann = image_hits.iter().any(|h| h.doc_id == doc_id);
+            let source = match (in_bm25, in_text_ann, in_image_ann) {
+                (true, true, true) => "BM25+TEXT_ANN+IMAGE_ANN",
+                (true, true, false) => "BM25+TEXT_ANN",
+                (true, false, true) => "BM25+IMAGE_ANN",
+                (true, false, false) => "BM25",
+                (false, true, true) => "TEXT_ANN+IMAGE_ANN",
+                (false, true, false) => "TEXT_ANN",
+                (false, false, true) => "IMAGE_ANN",
+                (false, false, false) => "HYDRATE",
+            };
+            tracing::debug!(
+                target: "lixun_fusion",
+                "fusion: hit doc_id={} source={} rrf_score={:.4}",
+                doc_id,
+                source,
+                rrf_score
+            );
             let (mut hit, mut bd) = if let Some(pair) = bm25_by_id.get(&doc_id) {
                 pair.clone()
             } else if let Some((hit, bd)) = self.inner.hydrate_doc(&doc_id).await? {
