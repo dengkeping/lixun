@@ -25,7 +25,8 @@ mod worker;
 use gtk::prelude::*;
 use lixun_core::{Action, Hit};
 use lixun_preview::{
-    PreviewPlugin, PreviewPluginCfg, PreviewPluginEntry, SizingPreference, UPDATE_UNSUPPORTED,
+    PreviewCapabilities, PreviewPlugin, PreviewPluginCfg, PreviewPluginEntry, SizingPreference,
+    UPDATE_UNSUPPORTED,
 };
 
 pub use widget::PdfView;
@@ -57,6 +58,15 @@ impl PreviewPlugin for PdfPreview {
 
     fn sizing(&self) -> SizingPreference {
         SizingPreference::OwnsScroll
+    }
+
+    fn capabilities(&self) -> PreviewCapabilities {
+        PreviewCapabilities {
+            text_selection: true,
+            text_search: true,
+            paginated: true,
+            zoomable: true,
+        }
     }
 
     fn build(&self, hit: &Hit, _cfg: &PreviewPluginCfg<'_>) -> anyhow::Result<gtk::Widget> {

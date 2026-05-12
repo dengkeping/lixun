@@ -80,6 +80,33 @@ pub enum SizingPreference {
     OwnsScroll,
 }
 
+/// Capabilities a `PreviewPlugin` declares to the host.
+///
+/// The host reads these abstractly to decide whether to show
+/// capability-bound UI (search bar, zoom controls, page indicator,
+/// selection toolbar) — NEVER by branching on `plugin.id()`.
+/// Plugins that lack a capability simply leave it `false`; the host
+/// hides the corresponding control.
+///
+/// Each field is independently overridable so a plugin can ship
+/// partial support (e.g. text but no search) without lying about
+/// the rest.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PreviewCapabilities {
+    /// User can select text inside the preview widget. Implies
+    /// Ctrl+C copies the selection to the clipboard.
+    pub text_selection: bool,
+    /// Plugin exposes a text-search workflow (find bar, next/prev
+    /// match navigation).
+    pub text_search: bool,
+    /// Content is laid out as discrete pages and the plugin exposes
+    /// per-page navigation (next/prev page, jump-to-page).
+    pub paginated: bool,
+    /// User can zoom in/out and the plugin re-renders at the new
+    /// scale (i.e. zoom is content-aware, not just CSS transform).
+    pub zoomable: bool,
+}
+
 /// A format plugin that renders a preview widget for a hit AND
 /// owns the launch semantics for hits in its domain.
 ///
@@ -110,6 +137,15 @@ pub trait PreviewPlugin: Send + Sync + 'static {
     /// like plugins should return `FitToContent`.
     fn sizing(&self) -> SizingPreference {
         SizingPreference::FixedCap
+    }
+
+    /// Declared capability flags; see `PreviewCapabilities`.
+    ///
+    /// Default returns all-false. Plugins override to advertise
+    /// features they support. The host reads these abstractly and
+    /// MUST NOT branch on plugin id (AGENTS.md §1 hard-modularity).
+    fn capabilities(&self) -> PreviewCapabilities {
+        PreviewCapabilities::default()
     }
 
     fn build(&self, hit: &Hit, cfg: &PreviewPluginCfg<'_>) -> anyhow::Result<gtk::Widget>;
