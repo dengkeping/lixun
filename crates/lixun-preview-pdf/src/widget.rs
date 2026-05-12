@@ -179,6 +179,8 @@ impl PdfView {
         wire_page_entry(&view, &canvas, &scroll, &page_entry, &session);
         search_ui::wire_search(&view, &scroll, &canvas, &search_bar, state, &session);
 
+        schedule_auto_exit(&view);
+
         Ok(view)
     }
 
@@ -242,6 +244,30 @@ impl PdfView {
             search_ui::reset_for_path(canvas, bar, state, &session);
         }
         Ok(())
+    }
+}
+
+/// Debug-only auto-exit knob. When `LIXUN_PDF_AUTOEXIT_MS` is set to a
+/// u64 millisecond count, the preview widget's hosting window closes
+/// after that delay so `/usr/bin/time -v` can capture peak RSS. Unset
+/// or unparseable values are no-ops; production path is unaffected.
+fn schedule_auto_exit(view: &PdfView) {
+    if let Some(ms) = std::env::var("LIXUN_PDF_AUTOEXIT_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        tracing::info!(target = "lixun-preview-pdf", "auto-exit scheduled in {} ms", ms);
+        let view_weak = view.downgrade();
+        glib::timeout_add_local_once(std::time::Duration::from_millis(ms), move || {
+            let Some(view) = view_weak.upgrade() else {
+                return;
+            };
+            if let Some(window) = view.root().and_downcast::<gtk::Window>() {
+                window.close();
+            } else {
+                tracing::warn!(target = "lixun-preview-pdf", "auto-exit: could not resolve hosting window");
+            }
+        });
     }
 }
 

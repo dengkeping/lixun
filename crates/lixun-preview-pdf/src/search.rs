@@ -17,11 +17,9 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::rc::Rc;
 
-use poppler::{Document, FindFlags};
-
-use crate::document_session::path_to_file_uri;
+use crate::document_session::DocumentSession;
 
 /// Per-page hits keyed by page index. `BTreeMap` so iteration is
 /// document order; `Vec<Rectangle>` preserves the per-page order
@@ -173,140 +171,24 @@ pub struct PageSearchResult {
     pub done_for_page: bool,
 }
 
-enum SearchMsg {
-    ReplacePath(PathBuf),
-    Start {
-        query: String,
-        generation: u64,
-        n_pages: u32,
-    },
-}
-
 pub struct SearchWorker {
-    tx: mpsc::Sender<SearchMsg>,
+    session: Rc<DocumentSession>,
+    result_tx: async_channel::Sender<PageSearchResult>,
 }
 
 impl SearchWorker {
-    pub fn spawn(
-        path: PathBuf,
+    pub fn new(
+        session: Rc<DocumentSession>,
         result_tx: async_channel::Sender<PageSearchResult>,
-    ) -> anyhow::Result<Self> {
-        let (tx, rx) = mpsc::channel::<SearchMsg>();
-        std::thread::Builder::new()
-            .name("pdf-search-worker".to_string())
-            .spawn(move || worker_loop(path, rx, result_tx))
-            .map_err(|e| anyhow::anyhow!("spawn search worker: {}", e))?;
-        Ok(Self { tx })
+    ) -> Self {
+        Self { session, result_tx }
     }
 
-    pub fn replace_path(&self, path: PathBuf) {
-        let _ = self.tx.send(SearchMsg::ReplacePath(path));
-    }
+    pub fn replace_path(&self, _path: PathBuf) {}
 
     pub fn start(&self, query: String, generation: u64, n_pages: u32) {
-        let _ = self.tx.send(SearchMsg::Start {
-            query,
-            generation,
-            n_pages,
-        });
-    }
-}
-
-fn worker_loop(
-    initial_path: PathBuf,
-    rx: mpsc::Receiver<SearchMsg>,
-    result_tx: async_channel::Sender<PageSearchResult>,
-) {
-    let mut document: Option<Document> = open_doc(&initial_path);
-    let mut current_generation: u64 = 0;
-
-    while let Ok(msg) = rx.recv() {
-        match msg {
-            SearchMsg::ReplacePath(p) => {
-                document = open_doc(&p);
-                current_generation = current_generation.saturating_add(1);
-            }
-            SearchMsg::Start {
-                query,
-                generation,
-                n_pages,
-            } => {
-                current_generation = generation;
-                let Some(doc) = document.as_ref() else {
-                    continue;
-                };
-                if query.is_empty() {
-                    continue;
-                }
-                if !scan(
-                    doc,
-                    &query,
-                    generation,
-                    n_pages,
-                    &result_tx,
-                    &rx,
-                    &mut current_generation,
-                ) {
-                    tracing::debug!("search worker: scan generation={} aborted", generation);
-                }
-            }
-        }
-    }
-    tracing::debug!("pdf search worker exited");
-}
-
-fn scan(
-    doc: &Document,
-    query: &str,
-    generation: u64,
-    n_pages: u32,
-    result_tx: &async_channel::Sender<PageSearchResult>,
-    rx: &mpsc::Receiver<SearchMsg>,
-    current_generation: &mut u64,
-) -> bool {
-    for page_idx in 0..n_pages {
-        if let Ok(msg) = rx.try_recv() {
-            match msg {
-                SearchMsg::ReplacePath(_) => return false,
-                SearchMsg::Start { generation: g, .. } => {
-                    if g != generation {
-                        *current_generation = g;
-                        return false;
-                    }
-                }
-            }
-        }
-        if *current_generation != generation {
-            return false;
-        }
-        let Some(page) = doc.page(page_idx as i32) else {
-            continue;
-        };
-        let rects = page.find_text_with_options(query, FindFlags::empty());
-        let _ = result_tx.send_blocking(PageSearchResult {
-            generation,
-            page_idx,
-            rects,
-            done_for_page: true,
-        });
-    }
-    true
-}
-
-fn open_doc(path: &std::path::Path) -> Option<Document> {
-    let uri = match path_to_file_uri(path) {
-        Ok(u) => u,
-        Err(e) => {
-            tracing::warn!("search worker uri for {:?}: {}", path, e);
-            return None;
-        }
-    };
-    match Document::from_file(&uri, None) {
-        Ok(d) => Some(d),
-        Err(e) => {
-            tracing::warn!("search worker open {:?}: {:?}", path, e);
-            None
-        }
+        self.session
+            .start_search(generation, query, n_pages, self.result_tx.clone());
     }
 }
 

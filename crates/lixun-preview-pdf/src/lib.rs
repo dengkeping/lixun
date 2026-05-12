@@ -15,6 +15,7 @@
 mod canvas;
 mod document_session;
 mod page_widget;
+mod poppler_host;
 pub mod search;
 mod search_bar;
 pub mod selection;

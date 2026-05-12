@@ -26,13 +26,7 @@ pub(super) fn wire_search(
     session: &Rc<DocumentSession>,
 ) {
     let (tx, rx) = async_channel::unbounded::<PageSearchResult>();
-    let worker = match SearchWorker::spawn(session.path(), tx) {
-        Ok(w) => w,
-        Err(e) => {
-            tracing::warn!("search worker spawn failed: {}", e);
-            return;
-        }
-    };
+    let worker = SearchWorker::new(Rc::clone(session), tx);
     state.borrow_mut().worker = Some(worker);
 
     wire_result_pump(canvas, bar, Rc::clone(&state), rx);

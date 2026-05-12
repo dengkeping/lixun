@@ -72,8 +72,24 @@ struct Args {
     /// `$XDG_RUNTIME_DIR/lixun-preview-{pid}.sock`) and passes it
     /// here. The preview process owns the socket file: it binds it,
     /// chmods it 0600, and is responsible for unlinking it on exit.
+    ///
+    /// Mutually exclusive with `--standalone-file`.
+    #[arg(long, required_unless_present = "standalone_file", conflicts_with = "standalone_file")]
+    socket_path: Option<PathBuf>,
+
+    /// Debug-only: open the given file directly, bypassing the daemon
+    /// IPC layer entirely. Synthesises a generic `Hit` from the path
+    /// and runs the normal `ShowOrUpdate` dispatch (plugin selection
+    /// via `match_score`, host mounts whatever widget the matching
+    /// plugin returns). Used for profiling under tools like
+    /// `heaptrack` or `valgrind massif` where the daemon-mediated
+    /// path would obscure allocations.
+    ///
+    /// The flag is plugin-agnostic — the host does not branch on
+    /// file type; the matching `PreviewPlugin` is resolved via the
+    /// same machinery used for daemon-dispatched hits.
     #[arg(long)]
-    socket_path: PathBuf,
+    standalone_file: Option<PathBuf>,
 }
 
 /// Marker the reader thread sends to the GTK side when the daemon
@@ -151,21 +167,35 @@ fn main() -> Result<()> {
     let preview_cfg = Rc::new(daemon_cfg.preview);
     let gui_cfg = Rc::new(daemon_cfg.gui);
 
-    let listener = bind_listener(&args.socket_path)?;
-    tracing::info!(
-        "preview: listening on {:?} pid={}",
-        args.socket_path,
-        std::process::id()
-    );
+    let standalone_file = args.standalone_file.clone();
+    let socket_path_opt = args.socket_path.clone();
 
     let (inbound_tx, inbound_rx) = async_channel::unbounded::<InboundMsg>();
     let (outbound_tx, outbound_rx) = async_channel::unbounded::<PreviewEvent>();
 
-    spawn_socket_workers(listener, inbound_tx, outbound_rx);
+    if let Some(ref path) = standalone_file {
+        tracing::info!(
+            "preview: standalone mode, file={:?} pid={}",
+            path,
+            std::process::id()
+        );
+        spawn_outbound_drain(outbound_rx);
+        push_standalone_command(&inbound_tx, path.clone());
+    } else {
+        let socket_path = socket_path_opt
+            .as_ref()
+            .expect("clap guarantees socket_path or standalone_file");
+        let listener = bind_listener(socket_path)?;
+        tracing::info!(
+            "preview: listening on {:?} pid={}",
+            socket_path,
+            std::process::id()
+        );
+        spawn_socket_workers(listener, inbound_tx.clone(), outbound_rx);
+    }
 
     let app = gtk::Application::new(Some(APP_ID), ApplicationFlags::NON_UNIQUE);
     let state = Rc::new(PreviewState::default());
-    let socket_path = args.socket_path.clone();
 
     {
         let state = Rc::clone(&state);
@@ -213,13 +243,72 @@ fn main() -> Result<()> {
 
     let exit_code = app.run_with_args::<&str>(&[]);
 
-    let _ = std::fs::remove_file(&socket_path);
+    if let Some(ref path) = socket_path_opt {
+        let _ = std::fs::remove_file(path);
+    }
 
     let code: i32 = exit_code.into();
     if code != 0 {
         std::process::exit(code);
     }
     Ok(())
+}
+
+fn spawn_outbound_drain(rx: async_channel::Receiver<PreviewEvent>) {
+    std::thread::Builder::new()
+        .name("standalone-event-drain".into())
+        .spawn(move || while rx.recv_blocking().is_ok() {})
+        .expect("spawn standalone event drain");
+}
+
+fn push_standalone_command(tx: &async_channel::Sender<InboundMsg>, path: PathBuf) {
+    use lixun_core::{Action, Category, DocId, Hit};
+
+    let title = path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned());
+    let mime = mime_guess_from_path(&path);
+
+    let hit = Hit {
+        id: DocId("standalone".into()),
+        category: Category::File,
+        title,
+        subtitle: String::new(),
+        icon_name: None,
+        kind_label: mime.clone(),
+        score: 100.0,
+        action: Action::OpenFile { path },
+        extract_fail: false,
+        sender: None,
+        recipients: None,
+        body: None,
+        secondary_action: None,
+        source_instance: String::new(),
+        row_menu: Default::default(),
+        mime,
+    };
+
+    let _ = tx.send_blocking(InboundMsg::Cmd(PreviewCommand::ShowOrUpdate {
+        epoch: 1,
+        hit: Box::new(hit),
+        monitor: None,
+    }));
+}
+
+fn mime_guess_from_path(path: &std::path::Path) -> Option<String> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    Some(match ext.as_str() {
+        "pdf" => "application/pdf",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "txt" | "md" | "log" => "text/plain",
+        "html" | "htm" => "text/html",
+        _ => return None,
+    }.into())
 }
 
 /// Bind the per-process Unix socket. The path was passed by the

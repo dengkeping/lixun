@@ -35,6 +35,13 @@ mod imp {
         pub page_index: Cell<u32>,
         pub zoom: Cell<f64>,
         pub session: RefCell<Option<Rc<DocumentSession>>>,
+        /// `true` while this widget has been marked visible since the
+        /// last `release_texture` call. Lets the canvas's allocation
+        /// pass call `release_texture` unconditionally on off-screen
+        /// pages without paying for a `queue_draw` on every layout —
+        /// only the in→out transition actually invalidates the GTK
+        /// render-node cache.
+        pub previously_visible: Cell<bool>,
     }
 
     impl Default for PdfPageWidget {
@@ -43,6 +50,7 @@ mod imp {
                 page_index: Cell::new(0),
                 zoom: Cell::new(1.0),
                 session: RefCell::new(None),
+                previously_visible: Cell::new(false),
             }
         }
     }
@@ -108,6 +116,33 @@ impl PdfPageWidget {
         }
     }
 
+    /// Mark this widget as having been laid out inside the canvas's
+    /// visible-band on the current allocation pass. Sets the
+    /// `previously_visible` flag so a subsequent `release_texture`
+    /// (when this page scrolls out of band) actually invalidates the
+    /// GTK render-node cache. Pages that have never been visible —
+    /// or have already been released — short-circuit `release_texture`
+    /// to a no-op.
+    pub fn mark_visible(&self) {
+        self.imp().previously_visible.set(true);
+    }
+
+    /// Invalidate the GTK render-node cache so any `gdk::Paintable`
+    /// reference GTK is holding to the last-snapshotted page texture
+    /// is dropped — letting the session-evicted `glib::Bytes` finally
+    /// be freed.
+    ///
+    /// Idempotent: the first call after `mark_visible` performs the
+    /// `queue_draw`, every subsequent call is a no-op until the page
+    /// re-enters the visible band. This avoids the
+    /// "off-screen widget queue_draws on every layout pass" amplifier
+    /// that was visible in tracing before T9.
+    pub fn release_texture(&self) {
+        if self.imp().previously_visible.replace(false) {
+            self.queue_draw();
+        }
+    }
+
     fn intrinsic_size(&self) -> (i32, i32) {
         let Some(session) = self.imp().session.borrow().clone() else {
             return (0, 0);
@@ -127,8 +162,67 @@ impl PdfPageWidget {
             return;
         };
         let page = self.imp().page_index.get();
-        let zoom = self.imp().zoom.get();
-        let bucket = zoom_bucket_q4(zoom);
+        let user_zoom = self.imp().zoom.get();
+        // Viewport-derived cap: never render at higher resolution than the
+        // pixel grid we'll actually paint to. The destination rectangle
+        // below still uses `user_zoom`, so the user sees their requested
+        // zoom; this cap only bounds the *texture bucket* we request from
+        // the session/worker cache.
+        //
+        // We walk up the widget tree to find the nearest ancestor
+        // `gtk::ScrolledWindow`: its allocation width is the actual
+        // viewport the user sees through. `self.width()` is the page
+        // child's own allocation, which always equals the page's full
+        // rendered width (no clipping) and therefore made the cap a
+        // no-op for the regression scenario.
+        //
+        // `scale_factor()` is the HiDPI multiplier (1 on @1x, 2 on @2x).
+        let device_scale = self.scale_factor() as f64;
+        let viewport_width_logical = {
+            let mut viewport = 0i32;
+            let mut walker: Option<gtk::Widget> = self.parent();
+            while let Some(w) = walker {
+                if let Some(sw) = w.downcast_ref::<gtk::ScrolledWindow>() {
+                    viewport = sw.width();
+                    break;
+                }
+                walker = w.parent();
+            }
+            // Fall back to the widget's own width when no ScrolledWindow
+            // is in the ancestry (e.g. headless unit tests). At least it
+            // matches the pre-T9 behaviour.
+            if viewport <= 0 { self.width() } else { viewport }
+        };
+        let viewport_width_px = (viewport_width_logical as f64).max(0.0) * device_scale;
+        let effective_zoom = if let Some(sz) = session.page_size(page) {
+            let page_width_px_at_zoom_1 = sz.width_pt * BASE_DPI / POINTS_PER_INCH;
+            if page_width_px_at_zoom_1 > 0.0 && viewport_width_px > 0.0 {
+                let viewport_zoom_cap =
+                    (viewport_width_px / page_width_px_at_zoom_1).max(0.25);
+                let clamped = user_zoom.min(viewport_zoom_cap).max(0.25);
+                tracing::trace!(
+                    target = "lixun-preview-pdf",
+                    page,
+                    user_zoom,
+                    viewport_zoom_cap,
+                    effective_zoom = clamped,
+                    "viewport-clamped zoom"
+                );
+                clamped
+            } else {
+                user_zoom
+            }
+        } else {
+            user_zoom
+        };
+        // Canonicalize once: every cache-boundary call site below
+        // (`get_cached`, `get_best_cached`, `submit_visible`) routes
+        // through `canonical_bucket_for_page` internally, but doing it
+        // here too means the single `bucket` variable we pass to all
+        // three is already the storage key — no risk of a future edit
+        // splitting the value and reintroducing the cache-miss storm
+        // that was the primary T9 bug.
+        let bucket = session.canonical_bucket_for_page(page, zoom_bucket_q4(effective_zoom));
         let w = self.width() as f32;
         let h = self.height() as f32;
         if w <= 0.0 || h <= 0.0 {
@@ -162,8 +256,8 @@ impl PdfPageWidget {
             snapshot.append_color(&color, &rect);
         }
 
-        self.snapshot_search_overlay(snapshot, &session, page, zoom);
-        self.snapshot_selection_overlay(snapshot, &session, page, zoom);
+        self.snapshot_search_overlay(snapshot, &session, page, user_zoom);
+        self.snapshot_selection_overlay(snapshot, &session, page, user_zoom);
 
         tracing::info!(
             "page_widget snapshot: page={} bucket={} submit_visible epoch={}",
