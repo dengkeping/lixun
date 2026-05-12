@@ -67,27 +67,6 @@ pub(crate) fn fit_to_page(max_page_size_pt: (f64, f64), viewport_inner_size_px: 
     zoom_w.min(zoom_h).clamp(MIN_ZOOM, MAX_ZOOM)
 }
 
-pub(crate) fn document_max_page_size(doc: &poppler::Document) -> (f64, f64) {
-    let n = doc.n_pages();
-    if n == 0 {
-        return (0.0, 0.0);
-    }
-    let mut max_w = 0.0f64;
-    let mut max_h = 0.0f64;
-    for i in 0..n {
-        if let Some(page) = doc.page(i) {
-            let (w, h) = page.size();
-            if w > max_w {
-                max_w = w;
-            }
-            if h > max_h {
-                max_h = h;
-            }
-        }
-    }
-    (max_w, max_h)
-}
-
 mod imp {
     use super::*;
     use std::sync::OnceLock;
