@@ -1,7 +1,8 @@
 //! Single-threaded `poppler::Document` owner — `PopplerHost`.
 //!
-//! See `.workspace-local/plans/pdf-preview-document-collapse.md` and
-//! `.workspace-local/notepads/pdf-preview-document-collapse/decisions.md` (Shape C).
+//! Shape C: a single dedicated thread owns the only Document instance;
+//! all callers (main thread, render-result drain, search code) talk to
+//! that thread via typed commands sent over an `mpsc::Sender`.
 //!
 //! `poppler::Document` is `!Send`. Instead of cloning the Document across
 //! main / visible-render / prefetch-render / search threads, this module

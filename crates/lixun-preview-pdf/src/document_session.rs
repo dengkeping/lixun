@@ -147,8 +147,7 @@ pub struct DocumentSession {
     pending: RefCell<HashSet<(u32, u32)>>,
     /// Single dedicated thread that owns the worker-side
     /// `poppler::Document`. Replaces the previous two-worker fan-out
-    /// (visible + prefetch each owning a Document). See
-    /// `.workspace-local/plans/pdf-preview-document-collapse.md`.
+    /// (visible + prefetch each owning a Document).
     host: PopplerHost,
 }
 
