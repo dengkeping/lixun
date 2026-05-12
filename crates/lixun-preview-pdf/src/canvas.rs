@@ -454,7 +454,7 @@ impl PdfCanvas {
         }
     }
 
-    fn allocate_children(&self, width: i32, _height: i32) {
+    fn allocate_children(&self, width: i32, height: i32) {
         let Some(session) = self.session() else {
             return;
         };
@@ -478,6 +478,9 @@ impl PdfCanvas {
         let centerline = (width as f64 * 0.5).max(intrinsic_w * 0.5);
 
         let pages = self.imp().pages.borrow();
+        let viewport_h = height.max(0) as f64;
+        let mut first_visible: Option<usize> = None;
+        let mut last_visible: Option<usize> = None;
         let mut y_pt: f64 = 0.0;
         for (i, child) in pages.iter().enumerate() {
             let Some(sz) = session.page_size(i as u32) else {
@@ -494,7 +497,53 @@ impl PdfCanvas {
             let transform = gtk::gsk::Transform::new()
                 .translate(&graphene::Point::new(x_widget as f32, y_widget as f32));
             child.allocate(w, h, -1, Some(transform));
+            let top = y_widget as f64;
+            let bottom = top + h as f64;
+            if bottom > 0.0 && top < viewport_h {
+                first_visible.get_or_insert(i);
+                last_visible = Some(i);
+            }
             y_pt += sz.height_pt + PAGE_GAP_PT;
+        }
+
+        // Off-screen page widgets must be hidden from GTK's snapshot pipeline.
+        //
+        // GTK invokes `snapshot()` on every allocated, `child_visible=true` child
+        // on every redraw tick. The PDF canvas allocates ALL N pages (so the
+        // scrollbar geometry is correct), so without explicit visibility gating
+        // every page widget — including pages 200+ that the user has never
+        // scrolled near — would have `do_snapshot` fire on every paint. That
+        // snapshot calls `session.submit_visible(...)`, which (on a cache miss)
+        // enqueues a render → poppler `doc.page(idx)` → `Catalog::cachePageTree`
+        // populates → ~3-4 MB per page held in the host's `poppler::Document`.
+        // For a 314-page datasheet that path materialised ~880 MB of poppler
+        // page-tree cache on startup before the user did anything.
+        //
+        // `release_texture()` alone is insufficient: it frees the cached pixel
+        // buffer, but the next snapshot tick on the off-screen widget submits
+        // a fresh render request and the Catalog repopulates immediately. We
+        // also have to stop GTK from calling `snapshot()` on the widget in the
+        // first place, which is exactly what `set_child_visible(false)` does.
+        if let (Some(first), Some(last)) = (first_visible, last_visible) {
+            let keep_lo = first.saturating_sub(1);
+            let keep_hi = last.saturating_add(1);
+            for (i, child) in pages.iter().enumerate() {
+                if i < keep_lo || i > keep_hi {
+                    child.release_texture();
+                    child.set_child_visible(false);
+                } else {
+                    child.set_child_visible(true);
+                    if i >= first && i <= last {
+                        child.mark_visible();
+                    }
+                }
+            }
+        } else {
+            // No viewport intersection (page_size hadn't resolved yet, etc.) —
+            // hide everything off-screen so we don't snapshot the whole document.
+            for child in pages.iter() {
+                child.set_child_visible(false);
+            }
         }
     }
 }
