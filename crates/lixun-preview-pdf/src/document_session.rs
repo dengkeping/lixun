@@ -401,15 +401,30 @@ impl DocumentSession {
         }
     }
 
-    /// Submit a render job to the host thread (visible-page slot).
-    /// Host drops jobs whose epoch < its `current_epoch`. Per-key
-    /// dedup: a duplicate `(page, bucket)` while one is in flight
-    /// is a no-op, preventing the "snapshot resubmits while the
-    /// result is still rendering" feedback loop.
+    /// Submit a render job to worker A (visible). Worker drops
+    /// jobs whose epoch < its `current_epoch`. Per-key dedup: a
+    /// duplicate `(page, bucket)` while one is in flight is a
+    /// no-op, preventing the "snapshot resubmits while the result
+    /// is still rendering" feedback loop.
+    ///
+    /// Also short-circuits when the exact `(page, bucket)` is
+    /// already cached. GTK fires `do_snapshot` on every redraw
+    /// (frame ticks, window damage, hover) and the page widget
+    /// unconditionally calls `submit_visible` from `do_snapshot`.
+    /// Without this cache check the host thread sees a steady
+    /// drumbeat of `Cmd::Render` jobs even at idle — re-rendering
+    /// pages whose texture is already on the GPU, bumping
+    /// `last_activity` on every poll tick, and preventing the
+    /// `PopplerHost` idle-drop cooldown from ever firing. Use
+    /// `LruCache::peek` (NOT `get`) so a steady-state visible page
+    /// does not get artificially promoted to MRU every redraw.
     pub fn submit_visible(&self, job: RenderJob) {
         let mut job = job;
         job.zoom_bucket = self.canonical_bucket_for_page(job.page_index, job.zoom_bucket);
         let key = (job.page_index, job.zoom_bucket);
+        if self.cache.borrow().peek(&key).is_some() {
+            return;
+        }
         if !self.pending.borrow_mut().insert(key) {
             return;
         }
@@ -428,6 +443,12 @@ impl DocumentSession {
     pub fn submit_prefetch(&self, job: RenderJob) {
         let mut job = job;
         job.zoom_bucket = self.canonical_bucket_for_page(job.page_index, job.zoom_bucket);
+
+        // Cache short-circuit (see `submit_visible` for rationale).
+        // `peek` to avoid LRU promotion of off-screen prefetch.
+        if self.cache.borrow().peek(&(job.page_index, job.zoom_bucket)).is_some() {
+            return;
+        }
 
         // Estimate prospective texture bytes and gate before
         // claiming the dedup slot — if we'd reject anyway, leave
@@ -606,6 +627,50 @@ mod tests {
             s.pending.borrow().len(),
             1,
             "after clear_pending, the same key can be submitted again"
+        );
+    }
+
+    #[test]
+    fn submit_visible_short_circuits_when_cached() {
+        // Regression: GTK fires `do_snapshot` continuously (frame
+        // ticks, window damage); page widget calls `submit_visible`
+        // from `do_snapshot`. Without the cache short-circuit the
+        // host thread receives a steady stream of `Cmd::Render`
+        // jobs at idle, bumping `last_activity` and preventing the
+        // `PopplerHost` idle-drop cooldown from ever firing — the
+        // exact failure mode that left idle RSS at 1.2 GB on the
+        // 314-page IC datasheet despite T7 landing.
+        gtk::init().ok();
+        let s = fresh_session();
+        let bucket = s.canonical_bucket_for_page(0, 4);
+        s.insert_cached(0, bucket, make_texture(2, 2));
+        assert!(s.pending.borrow().is_empty());
+        s.submit_visible(RenderJob {
+            page_index: 0,
+            zoom_bucket: 4,
+            epoch: 1,
+        });
+        assert!(
+            s.pending.borrow().is_empty(),
+            "cache hit must short-circuit submit; pending must stay empty"
+        );
+    }
+
+    #[test]
+    fn submit_prefetch_short_circuits_when_cached() {
+        gtk::init().ok();
+        let s = fresh_session();
+        let bucket = s.canonical_bucket_for_page(0, 4);
+        s.insert_cached(0, bucket, make_texture(2, 2));
+        assert!(s.pending.borrow().is_empty());
+        s.submit_prefetch(RenderJob {
+            page_index: 0,
+            zoom_bucket: 4,
+            epoch: 1,
+        });
+        assert!(
+            s.pending.borrow().is_empty(),
+            "cache hit must short-circuit prefetch; pending must stay empty"
         );
     }
 
