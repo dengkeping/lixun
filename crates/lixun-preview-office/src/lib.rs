@@ -476,6 +476,8 @@ mod tests {
     use super::*;
     use lixun_core::paths::canonical_fs_doc_id;
     use lixun_core::{Category, DocId};
+    use std::ffi::OsString;
+    use std::time::Duration;
 
     fn file_hit(path: impl Into<PathBuf>) -> Hit {
         let path = path.into();
@@ -607,5 +609,105 @@ mod tests {
         let found = find_output_in(&dir, "pdf");
         std::fs::remove_dir_all(&dir).ok();
         assert!(found.is_none());
+    }
+
+    #[test]
+    fn build_soffice_argv_targets_pdf_format() {
+        let outdir = Path::new("/out");
+        let src = Path::new("/src.docx");
+        let argv = build_soffice_argv("pdf", outdir, src);
+        assert!(argv.contains(&OsString::from("--headless")));
+        let pos = argv.iter().position(|a| a == "--convert-to").unwrap();
+        assert_eq!(argv[pos + 1], OsString::from("pdf"));
+        let out_pos = argv.iter().position(|a| a == "--outdir").unwrap();
+        assert_eq!(argv[out_pos + 1], OsString::from("/out"));
+        assert_eq!(argv.last(), Some(&OsString::from("/src.docx")));
+    }
+
+    #[test]
+    fn build_soffice_argv_format_is_pluggable() {
+        let outdir = Path::new("/out");
+        let src = Path::new("/src.docx");
+        let argv = build_soffice_argv("png", outdir, src);
+        let pos = argv.iter().position(|a| a == "--convert-to").unwrap();
+        assert_eq!(argv[pos + 1], OsString::from("png"));
+    }
+
+    #[test]
+    fn cache_file_path_uses_pdf_extension() {
+        let p = cache_file_path(Path::new("/cache/office"), "abcdef", "pdf");
+        let s = p.to_string_lossy();
+        assert!(s.ends_with("/office/abcdef.pdf"), "got {}", s);
+        assert!(s.starts_with("/cache/office/"), "got {}", s);
+    }
+
+    #[test]
+    fn cache_file_path_extension_is_pluggable() {
+        let p = cache_file_path(Path::new("/cache/office"), "abcdef", "png");
+        assert!(p.to_string_lossy().ends_with("/office/abcdef.png"));
+    }
+
+    #[test]
+    fn office_build_path_passes_pdf_extension_to_cache_file_path() {
+        let src = include_str!("lib.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap();
+        assert!(prod.contains(r#"cache_file_path(&cache_dir, &cache_key, "pdf")"#));
+        assert!(!prod.contains(r#"cache_file_path(&cache_dir, &cache_key, "png")"#));
+    }
+
+    #[test]
+    fn office_conversion_thread_passes_pdf_format_to_soffice() {
+        let src = include_str!("lib.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap();
+        assert!(prod.contains(r#"build_soffice_argv("pdf", "#));
+        assert!(prod.contains(r#"find_output_in(&outdir, "pdf")"#));
+    }
+
+    #[test]
+    fn conversion_timeout_is_thirty_seconds() {
+        assert_eq!(CONVERSION_TIMEOUT, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn convert_outcome_ok_carries_path() {
+        let p = PathBuf::from("/tmp/x.pdf");
+        let outcome = ConvertOutcome::Ok(p);
+        match outcome {
+            ConvertOutcome::Ok(path) => {
+                assert_eq!(path.extension().and_then(|e| e.to_str()), Some("pdf"));
+            }
+            _ => panic!("expected Ok variant"),
+        }
+    }
+
+    #[test]
+    fn convert_outcome_err_carries_reason() {
+        let outcome = ConvertOutcome::Err("timeout".into());
+        match outcome {
+            ConvertOutcome::Err(reason) => assert_eq!(reason, "timeout"),
+            _ => panic!("expected Err variant"),
+        }
+    }
+
+    #[test]
+    fn find_output_in_ignores_other_extensions() {
+        let dir =
+            std::env::temp_dir().join(format!("lixun-office-ignore-ext-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("x.png"), b"").unwrap();
+        std::fs::write(dir.join("y.txt"), b"").unwrap();
+        let found = find_output_in(&dir, "pdf");
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn strong_extensions_includes_all_office_formats() {
+        let mut actual = STRONG_EXTENSIONS.to_vec();
+        actual.sort();
+        let expected: Vec<&str> = vec![
+            "doc", "docx", "odp", "ods", "odt", "ppt", "pptx", "rtf", "xls", "xlsx",
+        ];
+        assert_eq!(actual, expected);
     }
 }
