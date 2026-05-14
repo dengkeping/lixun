@@ -13,6 +13,40 @@
 //! `PreviewPlugin::update`: bumps the session epoch, reopens all
 //! three Documents (main + 2 workers + search worker), clears the
 //! texture cache, resets the viewport to top, clears search state.
+//!
+//! ## Cross-plugin reuse contract
+//!
+//! `PdfView` is re-exported at the crate root (`pub use
+//! widget::PdfView`) so any peer preview plugin whose source format
+//! can be converted to PDF on disk may embed the same rich viewer
+//! without duplicating the rendering pipeline. The reuse surface is
+//! exactly two methods — see [`PdfView::new`] and
+//! [`PdfView::replace_path`].
+//!
+//! Importing this crate as a plain `path` dependency is enough; it
+//! does NOT cause the PDF `PreviewPlugin` to register a second time.
+//! `inventory::submit!` for `PdfPreview` runs once per linked binary
+//! regardless of how many other crates pull in this library, and the
+//! widget itself is independent of plugin discovery.
+//!
+//! Reusing plugins are expected to:
+//!
+//! 1. Convert their source document to a cached PDF on disk (own
+//!    crate's responsibility — no PDF-side coupling).
+//! 2. Call `PdfView::new(cached_pdf_path)` from `build()`, returning
+//!    the widget as `gtk::Widget`.
+//! 3. In their own `PreviewPlugin::update` implementation, downcast
+//!    the existing widget to `&PdfView` and call
+//!    `replace_path(new_cached_pdf_path)` for in-place arrow-key
+//!    scrubbing between hits.
+//!
+//! Reusing plugins SHOULD advertise the matching subset of
+//! [`lixun_preview::PreviewCapabilities`] — `text_selection`,
+//! `text_search`, `paginated`, `zoomable` — and
+//! [`lixun_preview::SizingPreference::OwnsScroll`], mirroring the
+//! native PDF plugin's declared surface. This is purely a capability
+//! contract; the host reads it abstractly and never branches on the
+//! consuming plugin's id.
 
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
@@ -71,6 +105,20 @@ glib::wrapper! {
 }
 
 impl PdfView {
+    /// Construct a rich PDF view rooted at `path`.
+    ///
+    /// `path` must point to a readable PDF file on disk. The
+    /// constructor opens the document on the calling (main) thread,
+    /// spawns its render/search worker threads, builds the toolbar +
+    /// search bar + canvas tree, and wires every gesture/keyboard
+    /// controller. Returns the constructed widget; errors surface
+    /// poppler open failures (encrypted, malformed, missing).
+    ///
+    /// Reusable by any peer preview plugin that produces a PDF on
+    /// disk (see crate-level "Cross-plugin reuse contract"). The
+    /// constructor takes only a `PathBuf` and exposes no
+    /// plugin-specific state, so call sites in foreign crates need
+    /// nothing from this crate beyond the public re-export.
     pub fn new(path: PathBuf) -> anyhow::Result<Self> {
         let view: Self = glib::Object::builder()
             .property("orientation", gtk::Orientation::Vertical)
@@ -184,6 +232,26 @@ impl PdfView {
         Ok(view)
     }
 
+    /// Reload the view in place against `new_path`.
+    ///
+    /// Bumps the session epoch (invalidating in-flight render jobs),
+    /// reopens all three poppler `Document` handles (main + 2 render
+    /// workers + 1 search worker), clears the texture cache, resets
+    /// zoom to 1.0, scrolls to the top of page 1, clears any active
+    /// text selection, and resets the search bar to its idle state.
+    ///
+    /// This is the primary path for arrow-key scrubbing in the
+    /// launcher: peer plugins implementing
+    /// [`lixun_preview::PreviewPlugin::update`] should downcast the
+    /// existing widget to `&PdfView` and call `replace_path` with
+    /// the new cached PDF path. Returns `Err` if the underlying
+    /// document fails to open (encrypted, malformed, missing);
+    /// callers should bubble that up to the host, which falls back
+    /// to `build()`.
+    ///
+    /// Target wall time is one frame (~16 ms) so that rapid hit
+    /// changes feel instant; heavy rasterisation is offloaded to
+    /// worker threads and resolved asynchronously.
     pub fn replace_path(&self, new_path: PathBuf) -> anyhow::Result<()> {
         let session = self
             .imp()

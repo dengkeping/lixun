@@ -2,12 +2,31 @@
 //!
 //! Covers docx/xlsx/pptx/odt/ods/odp/doc/xls/ppt/rtf. LibreOffice
 //! in headless mode is the conversion engine — we pay the 1–15 s
-//! first-page-to-PNG cost, cache the result, and then reuse the
-//! cached PNG on every subsequent preview.
+//! document-to-PDF cost, cache the resulting PDF, and then reuse
+//! the cached PDF on every subsequent preview. All pages of the
+//! source document are preserved in the PDF; rendering is handed
+//! off to the shared PDF preview surface (see `lixun-preview-pdf`).
+//!
+//! # Render delegation
+//!
+//! The office plugin owns conversion and caching; rendering is
+//! delegated to `PdfView` from `lixun-preview-pdf`. The two plugins
+//! do not share state — the office plugin instantiates `PdfView`
+//! directly via its public constructor, with no dependency on PDF
+//! plugin registration. The `inventory::submit!` block at the
+//! bottom of this file registers `OfficePreview` once; importing
+//! `lixun-preview-pdf` does not duplicate the PDF plugin
+//! registration because `inventory` deduplicates by entry, not by
+//! crate.
+//!
+//! AGENTS.md hard-modularity invariant: this crate is the sole
+//! place that names `.docx`/`.xlsx`/`soffice`/`libreoffice`. The
+//! host binary, daemon, GUI, and `lixun-preview` trait remain
+//! unaware of office-specific identifiers.
 //!
 //! # Why this plugin is the async case
 //!
-//! `soffice --headless --convert-to png` takes seconds, not
+//! `soffice --headless --convert-to pdf` takes seconds, not
 //! milliseconds. The plan's G2.8 Decision 6 forbids blocking the
 //! GTK main thread in `build()` for >50 ms. This plugin is the
 //! first tier-2 plugin that has to honour the placeholder +
@@ -16,12 +35,13 @@
 //! 1. `build()` returns a `gtk::Box` with a spinner + "converting…"
 //!    label immediately.
 //! 2. A background thread (`std::thread::spawn`) runs the soffice
-//!    command with a 15 s wall-clock timeout. On success it writes
-//!    the PNG to the cache.
+//!    command with a 30 s wall-clock timeout (raised from 15 s to
+//!    accommodate larger multi-page documents). On success it
+//!    writes the PDF to the cache.
 //! 3. The thread pushes the result onto an `async_channel`.
 //! 4. A `glib::MainContext::spawn_future_local` task awaits the
-//!    channel, then swaps the placeholder for a `gtk::Picture`
-//!    pointing at the PNG (or an error label on failure).
+//!    channel, then swaps the placeholder for the rich PDF view
+//!    pointing at the cached PDF (or an error label on failure).
 //!
 //! The `async_channel` + `spawn_future_local` combination is the
 //! gtk4-rs 0.9+ replacement for the removed
@@ -31,16 +51,21 @@
 //! # Cache
 //!
 //! Key: SHA-256(`path_bytes || "\0" || mtime_nanos`) hex, stored
-//! as `<cache_dir>/office/<key>.png` where cache_dir comes from
+//! as `<cache_dir>/office/<key>.pdf` where cache_dir comes from
 //! the shared `PreviewConfig.cache_dir`. Hit rate is high for the
 //! typical "open the same slide deck three times" UX.
-//!
-//! # Multi-page
-//!
-//! `soffice --convert-to png` emits only page 1. The plan flags
-//! this as a documented v1 limitation; do not fight LibreOffice
-//! over it here.
 
+// ---------------------------------------------------------------------------
+// Cache migration policy
+// ---------------------------------------------------------------------------
+// `<key>.pdf` is the authoritative cache path. Any old `<key>.png` entries
+// left over from the previous PNG-based pipeline are ignored on read and are
+// not actively migrated. There is no automatic cache cleanup (TTL or size
+// cap) in this plugin; stale .png files remain until the user clears the
+// cache directory manually or a system-wide cleanup policy removes them.
+// ---------------------------------------------------------------------------
+
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc;
@@ -50,10 +75,14 @@ use async_channel::{Receiver, Sender};
 use gtk::glib;
 use gtk::prelude::*;
 use lixun_core::{Action, Hit};
-use lixun_preview::{PreviewPlugin, PreviewPluginCfg, PreviewPluginEntry};
+use lixun_preview::{
+    PreviewCapabilities, PreviewPlugin, PreviewPluginCfg, PreviewPluginEntry, SizingPreference,
+    UPDATE_UNSUPPORTED,
+};
+use lixun_preview_pdf::PdfView;
 use sha2::{Digest, Sha256};
 
-const CONVERT_TIMEOUT: Duration = Duration::from_secs(15);
+const CONVERSION_TIMEOUT: Duration = Duration::from_secs(30);
 
 const STRONG_EXTENSIONS: &[&str] = &[
     "docx", "xlsx", "pptx", "odt", "ods", "odp", "doc", "xls", "ppt", "rtf",
@@ -81,6 +110,19 @@ impl PreviewPlugin for OfficePreview {
         0
     }
 
+    fn sizing(&self) -> SizingPreference {
+        SizingPreference::OwnsScroll
+    }
+
+    fn capabilities(&self) -> PreviewCapabilities {
+        PreviewCapabilities {
+            text_selection: true,
+            text_search: true,
+            paginated: true,
+            zoomable: true,
+        }
+    }
+
     fn build(&self, hit: &Hit, _cfg: &PreviewPluginCfg<'_>) -> anyhow::Result<gtk::Widget> {
         let path = match &hit.action {
             Action::OpenFile { path } | Action::ShowInFileManager { path } => path.clone(),
@@ -97,7 +139,7 @@ impl PreviewPlugin for OfficePreview {
 
         let cache_dir = office_cache_dir();
         let cache_key = compute_cache_key(&path);
-        let cache_file = cache_dir.join(format!("{}.png", cache_key));
+        let cache_file = cache_file_path(&cache_dir, &cache_key, "pdf");
 
         let stack = gtk::Stack::new();
         stack.set_hexpand(true);
@@ -116,8 +158,8 @@ impl PreviewPlugin for OfficePreview {
                 cache_key,
                 cache_file
             );
-            let picture = build_picture(&cache_file);
-            stack.add_named(&picture, Some("rendered"));
+            let rendered = build_pdf_view(&cache_file);
+            stack.add_named(&rendered, Some("rendered"));
             stack.set_visible_child_name("rendered");
             return Ok(stack.upcast());
         }
@@ -143,11 +185,16 @@ impl PreviewPlugin for OfficePreview {
                 return;
             };
             match outcome {
-                ConvertOutcome::Ok(png_path) => {
-                    let picture = build_picture(&png_path);
-                    stack.add_named(&picture, Some("rendered"));
+                ConvertOutcome::Ok(pdf_path) => {
+                    // pdf_path is the cached .pdf produced by `run_soffice_convert`;
+                    // hand it to the shared rich PDF viewer for rendering.
+                    let rendered = build_pdf_view(&pdf_path);
+                    stack.add_named(&rendered, Some("rendered"));
                     stack.set_visible_child_name("rendered");
                 }
+                // Error placeholder mapping: every ConvertOutcome::Err becomes an
+                // error_widget labelled "conversion failed: <reason>". This is the
+                // sole translation point from backend failure to UI placeholder.
                 ConvertOutcome::Err(reason) => {
                     let err = error_widget(&format!("conversion failed: {}", reason));
                     stack.add_named(&err, Some("error"));
@@ -157,6 +204,35 @@ impl PreviewPlugin for OfficePreview {
         });
 
         Ok(stack.upcast())
+    }
+
+    fn update(&self, hit: &Hit, widget: &gtk::Widget) -> anyhow::Result<()> {
+        let source_path = match &hit.action {
+            Action::OpenFile { path } | Action::ShowInFileManager { path } => path.clone(),
+            _ => anyhow::bail!(UPDATE_UNSUPPORTED),
+        };
+
+        // update() only handles cache hits; cache misses force the host to call
+        // build() again so the async conversion + spinner pipeline runs from
+        // scratch. We deliberately do not trigger a new conversion here.
+        let cache_dir = office_cache_dir();
+        let cache_key = compute_cache_key(&source_path);
+        let pdf_path = cache_file_path(&cache_dir, &cache_key, "pdf");
+        if !pdf_path.exists() {
+            anyhow::bail!(UPDATE_UNSUPPORTED);
+        }
+
+        let stack = widget
+            .downcast_ref::<gtk::Stack>()
+            .ok_or_else(|| anyhow::anyhow!(UPDATE_UNSUPPORTED))?;
+        let rendered = stack
+            .child_by_name("rendered")
+            .ok_or_else(|| anyhow::anyhow!(UPDATE_UNSUPPORTED))?;
+        let view = rendered
+            .downcast_ref::<PdfView>()
+            .ok_or_else(|| anyhow::anyhow!(UPDATE_UNSUPPORTED))?;
+        view.replace_path(pdf_path)?;
+        Ok(())
     }
 }
 
@@ -184,25 +260,17 @@ fn build_placeholder() -> gtk::Widget {
     vbox.upcast()
 }
 
-fn build_picture(png_path: &Path) -> gtk::Widget {
-    match gdk::Texture::from_filename(png_path) {
-        Ok(texture) => {
-            let picture = gtk::Picture::for_paintable(&texture);
-            picture.set_content_fit(gtk::ContentFit::Contain);
-            picture.set_can_shrink(true);
-            picture.set_hexpand(true);
-            picture.set_vexpand(true);
-
-            let scroll = gtk::ScrolledWindow::new();
-            scroll.set_child(Some(&picture));
-            scroll.set_hscrollbar_policy(gtk::PolicyType::Automatic);
-            scroll.set_vscrollbar_policy(gtk::PolicyType::Automatic);
-            scroll.upcast()
+fn build_pdf_view(pdf_path: &Path) -> gtk::Widget {
+    match PdfView::new(pdf_path.to_path_buf()) {
+        Ok(view) => view.upcast(),
+        Err(e) => {
+            tracing::warn!(
+                "office: PdfView::new failed for cached pdf {:?}: {}",
+                pdf_path,
+                e
+            );
+            error_widget(&format!("conversion failed: {}", e))
         }
-        Err(e) => error_widget(&format!(
-            "rendered PNG at {:?} failed to load: {}",
-            png_path, e
-        )),
     }
 }
 
@@ -216,6 +284,54 @@ fn error_widget(msg: &str) -> gtk::Widget {
     label.set_margin_end(24);
     label.add_css_class("lixun-preview-office-error");
     label.upcast()
+}
+
+/// Pure helper: build the argv for `soffice --headless --convert-to <fmt>`.
+/// `format` is passed as a parameter so callers can pick the output
+/// (currently `"pdf"`; the previous PNG-based pipeline passed `"png"`).
+fn build_soffice_argv(format: &str, outdir: &Path, src: &Path) -> Vec<OsString> {
+    vec![
+        OsString::from("--headless"),
+        OsString::from("--nologo"),
+        OsString::from("--nolockcheck"),
+        OsString::from("--norestore"),
+        OsString::from("--convert-to"),
+        OsString::from(format),
+        OsString::from("--outdir"),
+        outdir.as_os_str().to_os_string(),
+        src.as_os_str().to_os_string(),
+    ]
+}
+
+/// Pure helper: SHA-256 hex of (`path_bytes`, `mtime_ns`).
+fn compute_cache_key_raw(path_bytes: &[u8], mtime_ns: u128) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(path_bytes);
+    hasher.update(b"\0");
+    hasher.update(mtime_ns.to_be_bytes());
+    hex_encode(&hasher.finalize())
+}
+
+/// Pure helper: compose the on-disk cache path.
+/// `ext` is passed as a parameter so T4 can pass "pdf".
+fn cache_file_path(cache_dir: &Path, key: &str, ext: &str) -> PathBuf {
+    cache_dir.join(format!("{}.{}", key, ext))
+}
+
+/// Pure helper: scan `dir` for a file with the requested extension.
+fn find_output_in(dir: &Path, expected_ext: &str) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case(expected_ext))
+        {
+            return Some(path);
+        }
+    }
+    None
 }
 
 fn run_soffice_convert(bin: &Path, src: &Path, dest: &Path) -> ConvertOutcome {
@@ -233,16 +349,9 @@ fn run_soffice_convert(bin: &Path, src: &Path, dest: &Path) -> ConvertOutcome {
 
     let src_abs = std::fs::canonicalize(src).unwrap_or_else(|_| src.to_path_buf());
 
+    let args = build_soffice_argv("pdf", &outdir, &src_abs);
     let mut child = match Command::new(bin)
-        .arg("--headless")
-        .arg("--nologo")
-        .arg("--nolockcheck")
-        .arg("--norestore")
-        .arg("--convert-to")
-        .arg("png")
-        .arg("--outdir")
-        .arg(&outdir)
-        .arg(&src_abs)
+        .args(&args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -258,14 +367,14 @@ fn run_soffice_convert(bin: &Path, src: &Path, dest: &Path) -> ConvertOutcome {
         let _ = done_tx.send(status);
     });
 
-    let exit_status = match done_rx.recv_timeout(CONVERT_TIMEOUT) {
+    let exit_status = match done_rx.recv_timeout(CONVERSION_TIMEOUT) {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => return ConvertOutcome::Err(format!("wait soffice: {}", e)),
         Err(_) => {
             kill_pid(pid);
             return ConvertOutcome::Err(format!(
                 "soffice exceeded {}s timeout — killed pid={}",
-                CONVERT_TIMEOUT.as_secs(),
+                CONVERSION_TIMEOUT.as_secs(),
                 pid
             ));
         }
@@ -275,11 +384,11 @@ fn run_soffice_convert(bin: &Path, src: &Path, dest: &Path) -> ConvertOutcome {
         return ConvertOutcome::Err(format!("soffice exited {:?}", exit_status.code()));
     }
 
-    let produced = match find_png_in(&outdir) {
+    let produced = match find_output_in(&outdir, "pdf") {
         Some(p) => p,
         None => {
             return ConvertOutcome::Err(format!(
-                "soffice succeeded but produced no .png in {:?}",
+                "soffice succeeded but produced no .pdf in {:?}",
                 outdir
             ));
         }
@@ -295,21 +404,6 @@ fn run_soffice_convert(bin: &Path, src: &Path, dest: &Path) -> ConvertOutcome {
 
     let _ = std::fs::remove_dir_all(&outdir);
     ConvertOutcome::Ok(dest.to_path_buf())
-}
-
-fn find_png_in(dir: &Path) -> Option<PathBuf> {
-    let entries = std::fs::read_dir(dir).ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| e.eq_ignore_ascii_case("png"))
-        {
-            return Some(path);
-        }
-    }
-    None
 }
 
 fn tempdir_sibling(parent: &Path) -> std::io::Result<PathBuf> {
@@ -340,17 +434,13 @@ fn office_cache_dir() -> PathBuf {
 }
 
 fn compute_cache_key(path: &Path) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(path.to_string_lossy().as_bytes());
-    hasher.update(b"\0");
     let mtime_nanos = std::fs::metadata(path)
         .and_then(|m| m.modified())
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    hasher.update(mtime_nanos.to_be_bytes());
-    hex_encode(&hasher.finalize())
+    compute_cache_key_raw(path.to_string_lossy().as_bytes(), mtime_nanos)
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -408,6 +498,7 @@ mod tests {
             secondary_action: None,
             source_instance: String::new(),
             row_menu: lixun_core::RowMenuDef::empty(),
+            mime: None,
         }
     }
 
@@ -459,6 +550,7 @@ mod tests {
             secondary_action: None,
             source_instance: String::new(),
             row_menu: lixun_core::RowMenuDef::empty(),
+            mime: None,
         };
         assert_eq!(OfficePreview.match_score(&hit), 0);
     }
@@ -497,22 +589,22 @@ mod tests {
     }
 
     #[test]
-    fn find_png_in_scans_directory() {
+    fn find_pdf_in_scans_directory() {
         let dir = std::env::temp_dir().join(format!("lixun-office-find-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("x.txt"), b"").unwrap();
-        std::fs::write(dir.join("result.png"), b"\x89PNG").unwrap();
-        let found = find_png_in(&dir);
+        std::fs::write(dir.join("result.pdf"), b"%PDF-1.4\n").unwrap();
+        let found = find_output_in(&dir, "pdf");
         std::fs::remove_dir_all(&dir).ok();
-        let found = found.expect("find_png_in must return a path");
-        assert!(found.to_string_lossy().ends_with("result.png"));
+        let found = found.expect("find_output_in must return a path");
+        assert!(found.to_string_lossy().ends_with("result.pdf"));
     }
 
     #[test]
-    fn find_png_in_empty_returns_none() {
+    fn find_pdf_in_empty_returns_none() {
         let dir = std::env::temp_dir().join(format!("lixun-office-empty-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let found = find_png_in(&dir);
+        let found = find_output_in(&dir, "pdf");
         std::fs::remove_dir_all(&dir).ok();
         assert!(found.is_none());
     }

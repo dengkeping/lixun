@@ -5435,7 +5435,6 @@ dependencies = [
  "anyhow",
  "async-channel",
  "dirs 5.0.1",
- "gdk4",
  "gio",
  "glib",
  "gtk4",
@@ -5443,6 +5442,7 @@ dependencies = [
  "libc",
  "lixun-core",
  "lixun-preview",
+ "lixun-preview-pdf",
  "sha2",
  "tracing",
 ]

@@ -29,6 +29,15 @@ use lixun_preview::{
     UPDATE_UNSUPPORTED,
 };
 
+/// Rich PDF view widget, re-exported for peer preview plugins.
+///
+/// Peer plugins whose source format can be converted to a PDF on
+/// disk embed this widget directly to avoid duplicating the
+/// render/search/zoom pipeline. See the [`widget`] module docs for
+/// the cross-plugin reuse contract. Depending on this crate does
+/// not double-register the PDF `PreviewPlugin` — `inventory::submit!`
+/// runs once per linked binary regardless of how many crates
+/// import `PdfView`.
 pub use widget::PdfView;
 
 pub struct PdfPreview;
