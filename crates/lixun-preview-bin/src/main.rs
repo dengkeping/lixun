@@ -822,11 +822,17 @@ fn check_overlap_and_hide_launcher(
     }
 
     use gtk::prelude::*;
-    let alloc = window.allocation();
-    let px = alloc.x();
-    let py = alloc.y();
-    let pw = alloc.width();
-    let ph = alloc.height();
+    let bounds = match window.compute_bounds(window) {
+        Some(b) => b,
+        None => {
+            tracing::debug!("check_overlap: compute_bounds returned None, skipping");
+            return;
+        }
+    };
+    let px = bounds.x() as i32;
+    let py = bounds.y() as i32;
+    let pw = bounds.width() as i32;
+    let ph = bounds.height() as i32;
 
     tracing::debug!(
         "check_overlap: same monitor, preview allocation=({},{},{}x{})",
