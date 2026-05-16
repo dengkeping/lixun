@@ -60,7 +60,8 @@ use crate::canvas::{MAX_ZOOM, MIN_ZOOM, PdfCanvas, fit_to_page, fit_to_width, zo
 use crate::document_session::DocumentSession;
 use crate::search::{SearchQueryState, SearchWorker};
 use crate::search_bar::PdfSearchBar;
-use crate::selection::{PagePoint, PdfSelection, collect_selected_text};
+use crate::region_image::render_region_image;
+use crate::selection::{PagePoint, PdfSelection, PdfSelectionMode, collect_selected_text};
 use crate::worker::RenderResult;
 
 pub struct SearchState {
@@ -174,10 +175,26 @@ impl PdfView {
         let page_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         page_box.append(&page_entry);
         page_box.append(&page_label);
+        let region_select_btn = gtk::ToggleButton::new();
+        if let Some(display) = gdk::Display::default() {
+            crate::icons::ensure_registered(&display);
+        }
+        region_select_btn.set_icon_name(crate::icons::marquee_icon_name());
+        region_select_btn.set_tooltip_text(Some(
+            "Image region select (drag to capture, Shift inverts mode)",
+        ));
+        let region_mode_default: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        {
+            let region_mode_default = Rc::clone(&region_mode_default);
+            region_select_btn.connect_toggled(move |b| {
+                region_mode_default.set(b.is_active());
+            });
+        }
         toolbar.pack_start(&zoom_out);
         toolbar.pack_start(&zoom_in);
         toolbar.pack_start(&fit_width_btn);
         toolbar.pack_start(&fit_page_btn);
+        toolbar.pack_start(&region_select_btn);
         toolbar.set_center_widget(Some(&page_box));
 
         let search_bar = PdfSearchBar::new();
@@ -210,7 +227,7 @@ impl PdfView {
 
         wire_render_pump(&canvas, rx);
         wire_gestures(&canvas, &scroll);
-        wire_selection_gestures(&canvas);
+        wire_selection_gestures(&canvas, Rc::clone(&region_mode_default));
         wire_clipboard_key(&view, &canvas, &session);
         wire_page_keys(&view, &canvas, &scroll);
         wire_zoom_keys(&view, &canvas);
@@ -503,12 +520,13 @@ fn wire_buttons(
     }
 }
 
-fn wire_selection_gestures(canvas: &PdfCanvas) {
+fn wire_selection_gestures(canvas: &PdfCanvas, region_mode_default: Rc<Cell<bool>>) {
     let drag = gtk::GestureDrag::builder().button(1).build();
     let anchor_cell: Rc<RefCell<Option<PagePoint>>> = Rc::new(RefCell::new(None));
     {
         let canvas_weak = canvas.downgrade();
         let anchor_cell = Rc::clone(&anchor_cell);
+        let region_mode_default = Rc::clone(&region_mode_default);
         drag.connect_drag_begin(move |g, x, y| {
             let Some(canvas) = canvas_weak.upgrade() else {
                 return;
@@ -520,10 +538,24 @@ fn wire_selection_gestures(canvas: &PdfCanvas) {
             };
             g.set_state(gtk::EventSequenceState::Claimed);
             *anchor_cell.borrow_mut() = Some(anchor);
+            let shift = g
+                .current_event()
+                .map(|e| e.modifier_state().contains(gdk::ModifierType::SHIFT_MASK))
+                .unwrap_or(false);
+            // Toolbar toggle picks the default mode; Shift inverts it
+            // so users can flip momentarily either way.
+            let want_region = region_mode_default.get() ^ shift;
+            let mode = if want_region {
+                PdfSelectionMode::Region
+            } else {
+                PdfSelectionMode::Text {
+                    style: poppler::SelectionStyle::Glyph,
+                }
+            };
             canvas.set_selection(Some(PdfSelection {
                 anchor,
                 active: anchor,
-                style: poppler::SelectionStyle::Glyph,
+                mode,
             }));
         });
     }
@@ -544,6 +576,20 @@ fn wire_selection_gestures(canvas: &PdfCanvas) {
             let wy = sy + dy;
             let hit = canvas.hit_test_page(wx, wy);
             if let Some(active) = hit {
+                // Region selection is single-page: ignore drags
+                // that wander off the anchor page so the rectangle
+                // stays bounded.
+                let region_mode = matches!(
+                    canvas.selection().map(|s| s.mode),
+                    Some(PdfSelectionMode::Region)
+                );
+                if region_mode {
+                    if let Some(anchor) = *anchor_cell.borrow() {
+                        if active.page != anchor.page {
+                            return;
+                        }
+                    }
+                }
                 canvas.update_selection_active(active);
             }
         });
@@ -571,14 +617,27 @@ fn wire_clipboard_key(view: &PdfView, canvas: &PdfCanvas, session: &Rc<DocumentS
             let Some(sel) = canvas.selection() else {
                 return glib::Propagation::Proceed;
             };
-            let text = collect_selected_text(&session, &sel);
-            if text.is_empty() {
-                return glib::Propagation::Stop;
+            match sel.mode {
+                PdfSelectionMode::Region => {
+                    let zoom = canvas.zoom();
+                    if let Some(tex) = render_region_image(&session, &sel, zoom) {
+                        if let Some(display) = gdk::Display::default() {
+                            display.clipboard().set_texture(&tex);
+                        }
+                    }
+                    return glib::Propagation::Stop;
+                }
+                PdfSelectionMode::Text { .. } => {
+                    let text = collect_selected_text(&session, &sel);
+                    if text.is_empty() {
+                        return glib::Propagation::Stop;
+                    }
+                    if let Some(display) = gdk::Display::default() {
+                        display.clipboard().set_text(&text);
+                    }
+                    return glib::Propagation::Stop;
+                }
             }
-            if let Some(display) = gdk::Display::default() {
-                display.clipboard().set_text(&text);
-            }
-            return glib::Propagation::Stop;
         }
         glib::Propagation::Proceed
     });

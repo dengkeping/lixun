@@ -32,6 +32,17 @@ pub struct PagePoint {
     pub point: PdfPoint,
 }
 
+/// What kind of selection the user is making.
+///
+/// `Text` uses poppler's glyph snapping and supports multi-page
+/// spans. `Region` is a single-page axis-aligned rectangle in PDF
+/// point space, used to extract a pixel image of part of the page.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PdfSelectionMode {
+    Text { style: SelectionStyle },
+    Region,
+}
+
 /// Selection state: anchor is the drag-start point, active follows
 /// the pointer. Both are stored in document space so zoom changes
 /// do not stretch the selection.
@@ -39,7 +50,7 @@ pub struct PagePoint {
 pub struct PdfSelection {
     pub anchor: PagePoint,
     pub active: PagePoint,
-    pub style: SelectionStyle,
+    pub mode: PdfSelectionMode,
 }
 
 /// Normalize a selection to `(start, end)` in reading order.
@@ -177,6 +188,10 @@ pub fn flip_rect_y_for_poppler_selection(
 /// selected text for the per-page rect, and join the non-empty
 /// segments with `"\n"`. Mirrors Papers' `pps_view_get_selected_text`.
 pub fn collect_selected_text(session: &DocumentSession, sel: &PdfSelection) -> String {
+    let style = match sel.mode {
+        PdfSelectionMode::Text { style } => style,
+        PdfSelectionMode::Region => return String::new(),
+    };
     let (start, end) = normalized_selection(sel);
     let mut out = String::new();
     let mut first = true;
@@ -192,7 +207,7 @@ pub fn collect_selected_text(session: &DocumentSession, sel: &PdfSelection) -> S
         let Some(page) = session.main_page(page_idx) else {
             continue;
         };
-        let Some(text) = page.selected_text(sel.style, &mut rect) else {
+        let Some(text) = page.selected_text(style, &mut rect) else {
             continue;
         };
         let s = text.to_string();
@@ -223,7 +238,9 @@ mod tests {
         PdfSelection {
             anchor: a,
             active: b,
-            style: SelectionStyle::Glyph,
+            mode: PdfSelectionMode::Text {
+                style: SelectionStyle::Glyph,
+            },
         }
     }
 

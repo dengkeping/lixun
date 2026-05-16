@@ -14,8 +14,10 @@
 
 mod canvas;
 mod document_session;
+mod icons;
 mod page_widget;
 mod poppler_host;
+mod region_image;
 pub mod search;
 mod search_bar;
 pub mod selection;

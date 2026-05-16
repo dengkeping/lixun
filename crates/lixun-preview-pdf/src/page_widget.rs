@@ -25,7 +25,10 @@ use gtk::subclass::prelude::*;
 
 use crate::canvas::PdfCanvas;
 use crate::document_session::{BASE_DPI, DocumentSession, POINTS_PER_INCH, zoom_bucket_q4};
-use crate::selection::{flip_rect_y_for_poppler_selection, pdf_rect_to_widget_rect, selection_rect_for_page};
+use crate::selection::{
+    PdfSelectionMode, flip_rect_y_for_poppler_selection, pdf_rect_to_widget_rect,
+    selection_rect_for_page,
+};
 use crate::worker::RenderJob;
 
 mod imp {
@@ -288,20 +291,70 @@ impl PdfPageWidget {
         let Some(sz) = session.page_size(page_idx) else {
             return;
         };
-        let Some(sel_rect_yup) =
-            selection_rect_for_page(&sel, page_idx, sz.width_pt, sz.height_pt)
-        else {
-            return;
-        };
-        let mut sel_rect = flip_rect_y_for_poppler_selection(&sel_rect_yup, sz.height_pt);
-        let Some(page) = session.main_page(page_idx) else {
-            return;
-        };
-        let scale = (BASE_DPI / POINTS_PER_INCH) * zoom;
-        let Some(region) = page.selected_region(scale, sel.style, &mut sel_rect) else {
-            return;
-        };
-        paint_region(snapshot, &region, accent_with_alpha(self, 0.4));
+        match sel.mode {
+            PdfSelectionMode::Text { style } => {
+                let Some(sel_rect_yup) =
+                    selection_rect_for_page(&sel, page_idx, sz.width_pt, sz.height_pt)
+                else {
+                    return;
+                };
+                let mut sel_rect =
+                    flip_rect_y_for_poppler_selection(&sel_rect_yup, sz.height_pt);
+                let Some(page) = session.main_page(page_idx) else {
+                    return;
+                };
+                let scale = (BASE_DPI / POINTS_PER_INCH) * zoom;
+                let Some(region) = page.selected_region(scale, style, &mut sel_rect) else {
+                    return;
+                };
+                paint_region(snapshot, &region, accent_with_alpha(self, 0.4));
+            }
+            PdfSelectionMode::Region => {
+                // Region selection is single-page: only paint on
+                // the anchor page.
+                if sel.anchor.page != page_idx {
+                    return;
+                }
+                let x_lo = sel.anchor.point.x.min(sel.active.point.x).max(0.0);
+                let x_hi = sel
+                    .anchor
+                    .point
+                    .x
+                    .max(sel.active.point.x)
+                    .min(sz.width_pt);
+                let y_lo = sel.anchor.point.y.min(sel.active.point.y).max(0.0);
+                let y_hi = sel
+                    .anchor
+                    .point
+                    .y
+                    .max(sel.active.point.y)
+                    .min(sz.height_pt);
+                if x_hi - x_lo < 0.5 || y_hi - y_lo < 0.5 {
+                    return;
+                }
+                let mut rect = poppler::Rectangle::default();
+                rect.set_x1(x_lo);
+                rect.set_x2(x_hi);
+                rect.set_y1(y_lo);
+                rect.set_y2(y_hi);
+                let wr = pdf_rect_to_widget_rect(&rect, sz.height_pt, zoom);
+                let fill = accent_with_alpha(self, 0.25);
+                let border = accent_with_alpha(self, 0.9);
+                snapshot.append_color(&fill, &wr);
+                // 1-pixel border using four thin filled rects.
+                let x = wr.x();
+                let y = wr.y();
+                let w = wr.width();
+                let h = wr.height();
+                let t: f32 = 1.0;
+                snapshot.append_color(&border, &gtk::graphene::Rect::new(x, y, w, t));
+                snapshot
+                    .append_color(&border, &gtk::graphene::Rect::new(x, y + h - t, w, t));
+                snapshot.append_color(&border, &gtk::graphene::Rect::new(x, y, t, h));
+                snapshot
+                    .append_color(&border, &gtk::graphene::Rect::new(x + w - t, y, t, h));
+            }
+        }
     }
 
     fn snapshot_search_overlay(

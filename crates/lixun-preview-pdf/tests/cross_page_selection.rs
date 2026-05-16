@@ -7,7 +7,8 @@
 //! but inlined here because `DocumentSession` is crate-private.
 
 use lixun_preview_pdf::selection::{
-    PagePoint, PdfPoint, PdfSelection, flip_rect_y_for_poppler_selection, selection_rect_for_page,
+    PagePoint, PdfPoint, PdfSelection, PdfSelectionMode, flip_rect_y_for_poppler_selection,
+    selection_rect_for_page,
 };
 use poppler::{Document, SelectionStyle};
 use std::path::PathBuf;
@@ -69,7 +70,7 @@ fn cross_page_selection_collects_text_from_all_three_pages() {
         anchor: PagePoint { page: 0, point: PdfPoint { x: 0.0, y: h0 } },
         // active: bottom-right of page 2 (PDF y-up: y=0 == bottom)
         active: PagePoint { page: 2, point: PdfPoint { x: w2.max(w0), y: 0.0 } },
-        style: SelectionStyle::Glyph,
+        mode: PdfSelectionMode::Text { style: SelectionStyle::Glyph },
     };
 
     let text = collect_text(&doc, &sel);
@@ -85,7 +86,7 @@ fn cross_page_selection_middle_page_is_full_page() {
     let sel = PdfSelection {
         anchor: PagePoint { page: 0, point: PdfPoint { x: 10.0, y: 20.0 } },
         active: PagePoint { page: 2, point: PdfPoint { x: 30.0, y: 40.0 } },
-        style: SelectionStyle::Glyph,
+        mode: PdfSelectionMode::Text { style: SelectionStyle::Glyph },
     };
     let r = selection_rect_for_page(&sel, 1, 612.0, 792.0).expect("rect for middle page");
     assert_eq!(r.x1(), 0.0);
