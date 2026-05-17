@@ -18,6 +18,16 @@
 //!      and forward matching events to an mpsc channel.
 //!   6. If the signal stream ends, re-subscribe without recreating the
 //!      session (so Plasma does not create another entry).
+//!
+//! Login-race resilience: at user login, the systemd unit orders against
+//! `xdg-desktop-portal.service` (the frontend), but on KDE the
+//! `GlobalShortcuts` interface is exported by `xdg-desktop-portal-kde`,
+//! which is D-Bus-activated lazily. The frontend can answer Registry
+//! calls before the KDE backend has exported GlobalShortcuts, so a
+//! one-shot `CreateSession` reliably loses the race during cold login
+//! and the shortcut never registers. We therefore retry session
+//! establishment with bounded exponential backoff. The persistent token
+//! keeps KDE from accumulating ghost entries across retries.
 
 use anyhow::{Context, Result};
 use futures::StreamExt;
@@ -37,20 +47,7 @@ const SHORTCUT_ID: &str = "toggle";
 const RESUBSCRIBE_MIN_BACKOFF: Duration = Duration::from_secs(2);
 const RESUBSCRIBE_MAX_BACKOFF: Duration = Duration::from_secs(60);
 
-pub async fn spawn_global_toggle_listener(
-    preferred_trigger: String,
-    state_dir: PathBuf,
-) -> Result<mpsc::Receiver<()>> {
-    let (tx, rx) = mpsc::channel(16);
-    tokio::spawn(async move {
-        if let Err(e) = setup_and_run(preferred_trigger, state_dir, tx).await {
-            tracing::warn!("hotkeys: listener failed: {}", e);
-        }
-    });
-    Ok(rx)
-}
-
-async fn setup_and_run(
+pub(super) async fn run(
     preferred_trigger: String,
     state_dir: PathBuf,
     tx: mpsc::Sender<()>,
@@ -67,18 +64,76 @@ async fn setup_and_run(
     )
     .await?;
 
-    let session_handle = create_session(&conn, &token).await?;
+    let session_handle = create_session_with_retry(&conn, &token).await?;
     tracing::info!(
         "hotkeys: session established at {} (token {})",
         session_handle.as_str(),
         token
     );
 
-    bind_shortcut(&conn, &session_handle, &preferred_trigger).await?;
+    bind_shortcut_with_retry(&conn, &session_handle, &preferred_trigger).await?;
     tracing::info!("hotkeys: shortcut '{}' bound", preferred_trigger);
+
+    super::hyprland_bind::try_register(&preferred_trigger).await;
 
     supervisor_loop(conn, session_handle, tx).await;
     Ok(())
+}
+
+async fn create_session_with_retry(
+    conn: &Connection,
+    token: &str,
+) -> Result<OwnedObjectPath> {
+    let mut backoff = RESUBSCRIBE_MIN_BACKOFF;
+    loop {
+        match create_session(conn, token).await {
+            Ok(handle) => return Ok(handle),
+            Err(e) if is_portal_unready(&e) => {
+                tracing::warn!(
+                    "hotkeys: portal backend not ready ({}); retry in {:?}",
+                    e,
+                    backoff
+                );
+                tokio::time::sleep(backoff).await;
+                backoff = std::cmp::min(backoff.saturating_mul(2), RESUBSCRIBE_MAX_BACKOFF);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+async fn bind_shortcut_with_retry(
+    conn: &Connection,
+    session_handle: &OwnedObjectPath,
+    preferred_trigger: &str,
+) -> Result<()> {
+    let mut backoff = RESUBSCRIBE_MIN_BACKOFF;
+    loop {
+        match bind_shortcut(conn, session_handle, preferred_trigger).await {
+            Ok(()) => return Ok(()),
+            Err(e) if is_portal_unready(&e) => {
+                tracing::warn!(
+                    "hotkeys: BindShortcuts not ready ({}); retry in {:?}",
+                    e,
+                    backoff
+                );
+                tokio::time::sleep(backoff).await;
+                backoff = std::cmp::min(backoff.saturating_mul(2), RESUBSCRIBE_MAX_BACKOFF);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+fn is_portal_unready(err: &anyhow::Error) -> bool {
+    let msg = format!("{:#}", err).to_lowercase();
+    msg.contains("unknownmethod")
+        || msg.contains("serviceunknown")
+        || msg.contains("nameownerlost")
+        || msg.contains("noreply")
+        || msg.contains("disconnected")
+        || msg.contains("no such interface")
+        || msg.contains("not provided by any .service")
 }
 
 fn token_path(state_dir: &Path) -> PathBuf {
@@ -166,8 +221,17 @@ async fn bind_shortcut(
 
     let parent_window = "";
 
+    let unique = conn
+        .unique_name()
+        .context("session bus connection has no unique name")?
+        .to_string();
+    let request_path = predict_request_path(&unique, &handle_token)?;
+    let request_proxy =
+        zbus::Proxy::new(conn, PORTAL_SERVICE, request_path.clone(), IFACE_REQUEST).await?;
+    let mut stream = request_proxy.receive_signal("Response").await?;
+
     let proxy = zbus::Proxy::new(conn, PORTAL_SERVICE, PORTAL_PATH, IFACE_GLOBAL_SHORTCUTS).await?;
-    let request_path: OwnedObjectPath = proxy
+    let actual_path: OwnedObjectPath = proxy
         .call(
             "BindShortcuts",
             &(session_handle, shortcuts, parent_window, &options),
@@ -175,8 +239,33 @@ async fn bind_shortcut(
         .await
         .context("BindShortcuts call")?;
 
-    let _ = await_request_response(conn, &request_path, &handle_token).await?;
+    let _ = if actual_path.as_str() != request_path.as_str() {
+        await_request_response(conn, &actual_path).await?
+    } else {
+        await_response_stream(&mut stream).await?
+    };
     Ok(())
+}
+
+/// Predict the Request object path the portal will use for a method call with
+/// the given `handle_token`, following the spec at
+/// <https://flatpak.github.io/xdg-desktop-portal/docs/request.html>.
+///
+/// The predictable form is
+/// `/org/freedesktop/portal/desktop/request/SENDER/HANDLE_TOKEN` where
+/// `SENDER` is the caller's unique bus name with the leading `:` stripped
+/// and `.` replaced by `_`. Subscribing to the Response signal at the
+/// predicted path BEFORE issuing the method call closes a race where the
+/// portal answers fast enough (common on hyprland/wlroots backends) that a
+/// post-call subscription misses the signal entirely.
+fn predict_request_path(unique_name: &str, handle_token: &str) -> Result<OwnedObjectPath> {
+    let sender = unique_name
+        .strip_prefix(':')
+        .unwrap_or(unique_name)
+        .replace('.', "_");
+    let raw = format!("/org/freedesktop/portal/desktop/request/{sender}/{handle_token}");
+    let path = ObjectPath::try_from(raw.as_str()).context("predicted request path invalid")?;
+    Ok(path.into())
 }
 
 async fn portal_request(
@@ -185,19 +274,40 @@ async fn portal_request(
     body: &HashMap<&str, Value<'_>>,
     handle_token: &str,
 ) -> Result<HashMap<String, OwnedValue>> {
+    // Subscribe BEFORE issuing the call to avoid losing the Response signal
+    // when the portal answers synchronously.
+    let unique = conn
+        .unique_name()
+        .context("session bus connection has no unique name")?
+        .to_string();
+    let request_path = predict_request_path(&unique, handle_token)?;
+    let request_proxy =
+        zbus::Proxy::new(conn, PORTAL_SERVICE, request_path.clone(), IFACE_REQUEST).await?;
+    let mut stream = request_proxy.receive_signal("Response").await?;
+
     let proxy = zbus::Proxy::new(conn, PORTAL_SERVICE, PORTAL_PATH, IFACE_GLOBAL_SHORTCUTS).await?;
-    let request_path: OwnedObjectPath = proxy.call(method, body).await?;
-    await_request_response(conn, &request_path, handle_token).await
+    let actual_path: OwnedObjectPath = proxy.call(method, body).await?;
+    if actual_path.as_str() != request_path.as_str() {
+        // Spec violation by the portal; fall back to the path it returned.
+        return await_request_response(conn, &actual_path).await;
+    }
+
+    await_response_stream(&mut stream).await
 }
 
 async fn await_request_response(
     conn: &Connection,
     request_path: &OwnedObjectPath,
-    _handle_token: &str,
 ) -> Result<HashMap<String, OwnedValue>> {
     let request_proxy =
         zbus::Proxy::new(conn, PORTAL_SERVICE, request_path.as_str(), IFACE_REQUEST).await?;
     let mut stream = request_proxy.receive_signal("Response").await?;
+    await_response_stream(&mut stream).await
+}
+
+async fn await_response_stream(
+    stream: &mut zbus::proxy::SignalStream<'_>,
+) -> Result<HashMap<String, OwnedValue>> {
     let Some(msg) = stream.next().await else {
         anyhow::bail!("Response stream closed without a message");
     };
