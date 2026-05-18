@@ -115,8 +115,6 @@ pub(crate) struct SessionSnapshot {
     pub(crate) scroll_position: f64,
 }
 
-const EMBEDDED_STYLESHEET: &str = include_str!("../style.css");
-
 pub(crate) const DEFAULT_TOP_MARGIN: i32 = 140;
 
 /// Transition latch duration. `connect_leave` fires spuriously during the
@@ -612,6 +610,12 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
     window.set_widget_name("lixun-root");
 
     window.init_layer_shell();
+    // Stable layer-shell namespace so compositors can target the
+    // launcher surface with layer rules (e.g. Hyprland
+    //   layerrule = blur, ^(lixun-gui)$
+    // ). Must be set after init_layer_shell and before the surface
+    // is realized; gtk4-layer-shell 0.8 takes Option<&str>.
+    window.set_namespace(Some("lixun-gui"));
     // Overlay keeps the launcher above ordinary toplevels; the preview
     // xdg-toplevel still renders above per compositor stacking rules,
     // and fcitx5 popups resolve above by the standard above-overlay rule.
@@ -649,7 +653,7 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
     }
     add_css_class(&window, "lixun-window");
 
-    crate::kde_blur::attach(&window, daemon_config.gui.blur);
+    let blur = crate::kde_blur::BlurController::new(&window, daemon_config.gui.blur);
 
     let display = gtk::gdk::Display::default().unwrap();
 
@@ -683,14 +687,105 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
         gui_max_content_height = daemon_config.gui.max_height_px;
     }
 
-    let provider = gtk::CssProvider::new();
-    provider.load_from_string(EMBEDDED_STYLESHEET);
-    gtk::style_context_add_provider_for_display(
+    let style_manager = crate::style_manager::StyleManager::install(
         &display,
-        &provider,
-        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        daemon_config.gui.theme.as_deref(),
     );
-    lixun_preview::install_user_css(&display);
+
+    // Spawn the live-reload pipeline: a notify watcher posts
+    // ConfigChanged / UserCssChanged / ThemeCssChanged events to a
+    // glib-friendly async_channel. The pump below reapplies the
+    // appropriate provider (or toggles the blur controller) on the
+    // GTK main thread. When the active theme path changes the
+    // watcher is rebuilt so the new theme directory is observed.
+    let config_path = dirs::config_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+        .join("lixun/config.toml");
+    let (style_tx, style_rx) = async_channel::unbounded::<crate::style_watcher::StyleEvent>();
+    let initial_theme_css = style_manager
+        .resolver
+        .active_css_path(daemon_config.gui.theme.as_deref());
+    let initial_watcher = crate::style_watcher::spawn(
+        config_path.clone(),
+        style_manager.resolver.user_override(),
+        initial_theme_css.clone(),
+        style_tx.clone(),
+    );
+    match initial_watcher {
+        Ok(watcher) => {
+            let mut current_theme_css = initial_theme_css;
+            let mut current_watcher = watcher;
+            let style_manager = style_manager;
+            let blur = blur;
+            let style_tx_pump = style_tx.clone();
+            let config_path_pump = config_path.clone();
+            glib::MainContext::default().spawn_local(async move {
+                while let Ok(event) = style_rx.recv().await {
+                    use crate::style_watcher::StyleEvent;
+                    match event {
+                        StyleEvent::ConfigChanged => {
+                            match lixun_daemon::config::Config::load() {
+                                Ok(cfg) => {
+                                    let theme = cfg.gui.theme.as_deref();
+                                    style_manager.apply_theme(theme);
+                                    blur.set_enabled(cfg.gui.blur);
+                                    let new_theme_css =
+                                        style_manager.resolver.active_css_path(theme);
+                                    if new_theme_css != current_theme_css {
+                                        match crate::style_watcher::spawn(
+                                            config_path_pump.clone(),
+                                            style_manager.resolver.user_override(),
+                                            new_theme_css.clone(),
+                                            style_tx_pump.clone(),
+                                        ) {
+                                            Ok(w) => {
+                                                current_watcher = w;
+                                                current_theme_css = new_theme_css;
+                                            }
+                                            Err(e) => tracing::warn!(
+                                                error = %e,
+                                                "failed to rebuild style watcher after theme change",
+                                            ),
+                                        }
+                                    }
+                                }
+                                Err(e) => tracing::warn!(
+                                    error = %e,
+                                    "failed to reload config after change",
+                                ),
+                            }
+                        }
+                        StyleEvent::ThemeCssChanged => {
+                            // Reload the active theme by re-resolving from current config.
+                            if let Ok(cfg) = lixun_daemon::config::Config::load() {
+                                style_manager.apply_theme(cfg.gui.theme.as_deref());
+                            }
+                        }
+                        StyleEvent::UserCssChanged => {
+                            style_manager.reload_user_css();
+                        }
+                    }
+                }
+                // Receiver closed: drop the watcher explicitly so the
+                // backing notify thread tears down before this task ends.
+                drop(current_watcher);
+            });
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to start style watcher; live reload disabled");
+            // Without a watcher the StyleManager and BlurController still
+            // need to stay alive for the lifetime of the window. Leak them
+            // into the application's MainContext by holding them in a
+            // never-completing task.
+            let style_manager = style_manager;
+            let blur = blur;
+            glib::MainContext::default().spawn_local(async move {
+                std::future::pending::<()>().await;
+                drop(style_manager);
+                drop(blur);
+            });
+        }
+    }
 
     let vbox = gtk::Box::new(gtk::Orientation::Vertical, 6);
     vbox.set_margin_start(16);

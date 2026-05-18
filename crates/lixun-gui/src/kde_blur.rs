@@ -52,47 +52,134 @@ use wayland_protocols_plasma::blur::client::org_kde_kwin_blur_manager::OrgKdeKwi
 /// compositor doesn't blur outside the visible rounded body.
 const WINDOW_BORDER_RADIUS: i32 = 14;
 
-/// Wire compositor blur to a window. Returns silently on non-Wayland
-/// or non-KDE sessions; the caller never needs to branch on session type.
-///
-/// Hooks `GdkSurface::layout` to re-attach blur on every resize (including
-/// the initial 1×1 placeholder → real size transition), and `connect_hide`
-/// to clean up when the window is hidden.
-pub fn attach(window: &gtk::ApplicationWindow, enabled: bool) {
-    if !enabled {
-        return;
-    }
-    let state: Rc<RefCell<Option<BlurAttachment>>> = Rc::new(RefCell::new(None));
+/// CSS class added to `.lixun-window` when blur is disabled so the
+/// stylesheet can compensate with a heavier background fill. This is
+/// the WM-agnostic half of the toggle: on compositors that don't
+/// implement `org_kde_kwin_blur_manager` (Hyprland, sway, niri, GNOME)
+/// the protocol attach is a no-op, but the class still toggles, so
+/// the panel always reflects the user's preference visually.
+const NO_BLUR_CLASS: &str = "lixun-no-blur";
 
-    let state_layout = Rc::clone(&state);
-    window.connect_realize(move |w| {
-        let Some(gdk_surface) = w.surface() else {
-            return;
-        };
-        let state_inner = Rc::clone(&state_layout);
-        gdk_surface.connect_layout(move |surface, width, height| {
-            if width <= 1 || height <= 1 {
+/// Runtime controller for KDE compositor blur.
+///
+/// Owns the window-side state needed to toggle blur on and off after
+/// the window has been realised. Created with the initial enabled
+/// state from config and driven later by [`Self::set_enabled`] from
+/// the style watcher.
+///
+/// On non-KDE compositors the protocol attach silently no-ops (see
+/// the module docstring). The CSS class toggle still runs, so theme
+/// authors can style the panel for a no-blur compositor by targeting
+/// `.lixun-window.lixun-no-blur`.
+pub struct BlurController {
+    state: Rc<RefCell<ControllerState>>,
+    window: gtk::ApplicationWindow,
+}
+
+struct ControllerState {
+    enabled: bool,
+    attachment: Option<BlurAttachment>,
+}
+
+impl BlurController {
+    /// Build a controller for `window` and wire up the realise/hide
+    /// hooks. The compositor attach happens lazily on the first
+    /// `GdkSurface::layout` after realise, gated on the current
+    /// `enabled` flag.
+    pub fn new(window: &gtk::ApplicationWindow, initial_enabled: bool) -> Self {
+        let state = Rc::new(RefCell::new(ControllerState {
+            enabled: initial_enabled,
+            attachment: None,
+        }));
+
+        apply_no_blur_class(window, !initial_enabled);
+
+        let state_layout = Rc::clone(&state);
+        window.connect_realize(move |w| {
+            let Some(gdk_surface) = w.surface() else {
                 return;
-            }
-            match BlurAttachment::create(surface, width, height) {
-                Ok(Some(att)) => {
-                    tracing::debug!("KDE blur enabled: {width}×{height} (layout)");
-                    *state_inner.borrow_mut() = Some(att);
+            };
+            let state_inner = Rc::clone(&state_layout);
+            gdk_surface.connect_layout(move |surface, width, height| {
+                if width <= 1 || height <= 1 {
+                    return;
                 }
-                Ok(None) => {}
-                Err(e) => {
-                    tracing::warn!("KDE blur attach failed: {e:#}");
+                let mut st = state_inner.borrow_mut();
+                if !st.enabled {
+                    return;
                 }
+                match BlurAttachment::create(surface, width, height) {
+                    Ok(Some(att)) => {
+                        tracing::debug!("KDE blur enabled: {width}×{height} (layout)");
+                        st.attachment = Some(att);
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!("KDE blur attach failed: {e:#}");
+                    }
+                }
+            });
+        });
+
+        let state_hide = Rc::clone(&state);
+        window.connect_hide(move |_| {
+            if let Some(att) = state_hide.borrow_mut().attachment.take() {
+                att.detach();
             }
         });
-    });
 
-    let state_hide = Rc::clone(&state);
-    window.connect_hide(move |_| {
-        if let Some(att) = state_hide.borrow_mut().take() {
-            att.detach();
+        Self {
+            state,
+            window: window.clone(),
         }
-    });
+    }
+
+    /// Switch blur on or off at runtime. When turning off, drops the
+    /// current compositor attachment (which calls `unset` on the blur
+    /// manager) and adds the `lixun-no-blur` CSS class. When turning
+    /// on, removes the class and asks GTK to redraw — the next
+    /// `GdkSurface::layout` will re-attach the protocol. If the window
+    /// has not been realised yet, the toggle simply records the new
+    /// flag and the realise path picks it up.
+    pub fn set_enabled(&self, enabled: bool) {
+        let mut st = self.state.borrow_mut();
+        if st.enabled == enabled {
+            return;
+        }
+        st.enabled = enabled;
+        if !enabled {
+            if let Some(att) = st.attachment.take() {
+                att.detach();
+            }
+        }
+        drop(st);
+
+        apply_no_blur_class(&self.window, !enabled);
+
+        if enabled {
+            if let Some(surface) = self.window.surface() {
+                let (w, h) = (surface.width(), surface.height());
+                if w > 1 && h > 1 {
+                    match BlurAttachment::create(&surface, w, h) {
+                        Ok(Some(att)) => {
+                            tracing::debug!("KDE blur re-enabled: {w}×{h}");
+                            self.state.borrow_mut().attachment = Some(att);
+                        }
+                        Ok(None) => {}
+                        Err(e) => tracing::warn!("KDE blur re-attach failed: {e:#}"),
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn apply_no_blur_class(window: &gtk::ApplicationWindow, no_blur: bool) {
+    if no_blur {
+        window.add_css_class(NO_BLUR_CLASS);
+    } else {
+        window.remove_css_class(NO_BLUR_CLASS);
+    }
 }
 
 struct BlurAttachment {
