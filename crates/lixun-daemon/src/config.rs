@@ -110,6 +110,7 @@ struct GuiToml {
     preview_max_width_px: Option<i32>,
     preview_max_height_px: Option<i32>,
     blur: Option<bool>,
+    theme: Option<String>,
 }
 
 /// Text-extraction cache configuration. Shared by every extractor
@@ -410,6 +411,11 @@ pub struct GuiConfig {
     pub preview_max_width_px: i32,
     pub preview_max_height_px: i32,
     pub blur: bool,
+    /// Active theme. Looked up as `${config_dir}/lixun/themes/<name>/style.css`.
+    /// When `None` the GUI falls back to the built-in stylesheet embedded at
+    /// compile time from `crates/lixun-gui/style.css` (plus the optional
+    /// user-wide override at `${config_dir}/lixun/style.css`).
+    pub theme: Option<String>,
 }
 
 impl Default for GuiConfig {
@@ -424,6 +430,7 @@ impl Default for GuiConfig {
             preview_max_width_px: 2000,
             preview_max_height_px: 1400,
             blur: true,
+            theme: None,
         }
     }
 }
@@ -653,6 +660,14 @@ impl Config {
             }
             if let Some(v) = gui.blur {
                 cfg.gui.blur = v;
+            }
+            if let Some(theme) = gui.theme {
+                let trimmed = theme.trim();
+                cfg.gui.theme = if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                };
             }
         }
         if let Some(impact_toml) = parsed.impact {
@@ -1155,5 +1170,35 @@ follow_battery = false
         assert_eq!(observed.daemon_nice, 10);
         assert!(observed.daemon_sched_idle);
         assert_eq!(observed.ocr_worker_interval.as_secs(), 30);
+    }
+
+    #[test]
+    fn gui_theme_parses_non_empty_string() {
+        let cfg = Config::from_toml_str("[gui]\ntheme = \"midnight\"\n").unwrap();
+        assert_eq!(cfg.gui.theme.as_deref(), Some("midnight"));
+    }
+
+    #[test]
+    fn gui_theme_empty_string_becomes_none() {
+        let cfg = Config::from_toml_str("[gui]\ntheme = \"\"\n").unwrap();
+        assert!(cfg.gui.theme.is_none());
+    }
+
+    #[test]
+    fn gui_theme_whitespace_only_becomes_none() {
+        let cfg = Config::from_toml_str("[gui]\ntheme = \"   \"\n").unwrap();
+        assert!(cfg.gui.theme.is_none());
+    }
+
+    #[test]
+    fn gui_theme_absent_defaults_to_none() {
+        let cfg = Config::from_toml_str("").unwrap();
+        assert!(cfg.gui.theme.is_none());
+    }
+
+    #[test]
+    fn gui_theme_is_trimmed() {
+        let cfg = Config::from_toml_str("[gui]\ntheme = \"  midnight  \"\n").unwrap();
+        assert_eq!(cfg.gui.theme.as_deref(), Some("midnight"));
     }
 }

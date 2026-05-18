@@ -290,3 +290,16 @@ popover.menu modelbutton:hover {
 .lixun-hiding {
     animation: lixun-fade-slide-out 120ms ease-in;
 }
+
+/* When compositor blur is unavailable or disabled, raise the panel's
+   background opacity so the glass tint stays legible against arbitrary
+   wallpapers. The lixun-no-blur class is toggled by BlurController on
+   every set_enabled call, giving WM-agnostic visual feedback whether
+   or not the org_kde_kwin_blur protocol succeeded. */
+.lixun-window.lixun-no-blur {
+    background:
+        linear-gradient(180deg,
+            rgba(255, 255, 255, 0.035) 0%,
+            rgba(255, 255, 255, 0.0)  50%),
+        rgba(28, 28, 32, 0.92);
+}

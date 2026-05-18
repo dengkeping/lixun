@@ -17,6 +17,9 @@ mod keymap;
 mod launcher_position;
 mod reaper;
 mod status;
+mod style_manager;
+mod style_watcher;
+mod theme;
 mod window;
 
 pub fn run() -> Result<()> {
