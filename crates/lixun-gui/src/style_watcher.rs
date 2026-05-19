@@ -1,10 +1,12 @@
 //! Filesystem watcher that drives live theme reloads.
 //!
-//! Watches three paths and emits a coalesced [`StyleEvent`] when any
+//! Watches four paths and emits a coalesced [`StyleEvent`] when any
 //! of them changes:
 //!
 //! * `config.toml` — config-driven theme switch or blur toggle
 //! * `${config_dir}/lixun/style.css` — user-wide CSS override
+//! * `Config::gui.matugen.colors_path` (default
+//!   `${config_dir}/lixun/colors.css`) — matugen-generated palette
 //! * `${config_dir}/lixun/themes/<active>/style.css` — active theme
 //!
 //! The watcher debounces inotify events with a 80 ms window because
@@ -40,6 +42,9 @@ pub enum StyleEvent {
     ConfigChanged,
     /// `${config_dir}/lixun/style.css` was modified or created.
     UserCssChanged,
+    /// The matugen-generated palette file was modified or created.
+    /// Caller reloads the colours layer of the style stack.
+    ColorsCssChanged,
     /// The active theme's `style.css` was modified. Carries no path
     /// because the active theme is owned by the caller; if the theme
     /// selection itself changed the caller will see a
@@ -53,8 +58,11 @@ pub enum StyleEvent {
 /// `config_path` is the absolute path to `config.toml`.
 /// `user_css` is `${config_dir}/lixun/style.css` (need not exist —
 /// the watcher tolerates absent files and starts emitting events as
-/// soon as they appear). `active_theme_css` is `Some(path)` when a
-/// theme is selected and its `style.css` exists, or `None` otherwise.
+/// soon as they appear).
+/// `colors_css` is the matugen palette path (need not exist; same
+/// tolerance as `user_css`).
+/// `active_theme_css` is `Some(path)` when a theme is selected and
+/// its `style.css` exists, or `None` otherwise.
 /// `tx` is the sender side of an `async_channel` whose receiver lives
 /// on the GTK main thread.
 ///
@@ -63,6 +71,7 @@ pub enum StyleEvent {
 pub fn spawn(
     config_path: PathBuf,
     user_css: PathBuf,
+    colors_css: PathBuf,
     active_theme_css: Option<PathBuf>,
     tx: async_channel::Sender<StyleEvent>,
 ) -> notify::Result<RecommendedWatcher> {
@@ -70,6 +79,7 @@ pub fn spawn(
 
     let config_path_clone = config_path.clone();
     let user_css_clone = user_css.clone();
+    let colors_css_clone = colors_css.clone();
     let theme_css_clone = active_theme_css.clone();
 
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
@@ -88,6 +98,7 @@ pub fn spawn(
                 path,
                 &config_path_clone,
                 &user_css_clone,
+                &colors_css_clone,
                 theme_css_clone.as_deref(),
             ) {
                 let _ = raw_tx.send(hit);
@@ -110,11 +121,19 @@ pub fn spawn(
     // parent when canonicalisation fails (e.g. the file does not yet
     // exist), so first-creation still works for greenfield setups.
     let mut watched_parents: Vec<PathBuf> = Vec::new();
-    for path in [Some(&config_path), Some(&user_css), active_theme_css.as_ref()]
-        .into_iter()
-        .flatten()
+    for path in [
+        Some(&config_path),
+        Some(&user_css),
+        Some(&colors_css),
+        active_theme_css.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
     {
-        let canonical_parent = path.canonicalize().ok().and_then(|p| p.parent().map(PathBuf::from));
+        let canonical_parent = path
+            .canonicalize()
+            .ok()
+            .and_then(|p| p.parent().map(PathBuf::from));
         let lexical_parent = path.parent().map(PathBuf::from);
         for parent in canonical_parent.into_iter().chain(lexical_parent) {
             if watched_parents.iter().any(|p| p == &parent) {
@@ -143,6 +162,7 @@ pub fn spawn(
 enum RawHit {
     Config,
     UserCss,
+    ColorsCss,
     ThemeCss,
 }
 
@@ -150,6 +170,7 @@ fn classify(
     path: &Path,
     config_path: &Path,
     user_css: &Path,
+    colors_css: &Path,
     theme_css: Option<&Path>,
 ) -> Option<RawHit> {
     if paths_equivalent(path, config_path) {
@@ -157,6 +178,9 @@ fn classify(
     }
     if paths_equivalent(path, user_css) {
         return Some(RawHit::UserCss);
+    }
+    if paths_equivalent(path, colors_css) {
+        return Some(RawHit::ColorsCss);
     }
     if let Some(theme) = theme_css {
         if paths_equivalent(path, theme) {
@@ -187,6 +211,7 @@ fn debounce_loop(rx: mpsc::Receiver<RawHit>, tx: async_channel::Sender<StyleEven
     let debounce = Duration::from_millis(DEBOUNCE_MS);
     let mut pending_config = false;
     let mut pending_user = false;
+    let mut pending_colors = false;
     let mut pending_theme = false;
     let mut last_seen: Option<Instant> = None;
 
@@ -199,19 +224,37 @@ fn debounce_loop(rx: mpsc::Receiver<RawHit>, tx: async_channel::Sender<StyleEven
             Some(stamp) => {
                 let elapsed = stamp.elapsed();
                 if elapsed >= debounce {
-                    flush(&mut pending_config, &mut pending_user, &mut pending_theme, &tx);
+                    flush(
+                        &mut pending_config,
+                        &mut pending_user,
+                        &mut pending_colors,
+                        &mut pending_theme,
+                        &tx,
+                    );
                     last_seen = None;
                     continue;
                 }
                 match rx.recv_timeout(debounce - elapsed) {
                     Ok(h) => h,
                     Err(mpsc::RecvTimeoutError::Timeout) => {
-                        flush(&mut pending_config, &mut pending_user, &mut pending_theme, &tx);
+                        flush(
+                            &mut pending_config,
+                            &mut pending_user,
+                            &mut pending_colors,
+                            &mut pending_theme,
+                            &tx,
+                        );
                         last_seen = None;
                         continue;
                     }
                     Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        flush(&mut pending_config, &mut pending_user, &mut pending_theme, &tx);
+                        flush(
+                            &mut pending_config,
+                            &mut pending_user,
+                            &mut pending_colors,
+                            &mut pending_theme,
+                            &tx,
+                        );
                         return;
                     }
                 }
@@ -221,6 +264,7 @@ fn debounce_loop(rx: mpsc::Receiver<RawHit>, tx: async_channel::Sender<StyleEven
         match hit {
             RawHit::Config => pending_config = true,
             RawHit::UserCss => pending_user = true,
+            RawHit::ColorsCss => pending_colors = true,
             RawHit::ThemeCss => pending_theme = true,
         }
         last_seen = Some(Instant::now());
@@ -230,16 +274,27 @@ fn debounce_loop(rx: mpsc::Receiver<RawHit>, tx: async_channel::Sender<StyleEven
 fn flush(
     config: &mut bool,
     user: &mut bool,
+    colors: &mut bool,
     theme: &mut bool,
     tx: &async_channel::Sender<StyleEvent>,
 ) {
     // ConfigChanged is dispatched first because the caller reacts to
     // it by reloading the whole config (which may switch the active
-    // theme path); flushing the CSS events after lets the caller
-    // rebuild the watcher with the new path without losing edits.
+    // theme path or the matugen palette path); flushing the CSS
+    // events after lets the caller rebuild the watcher with the new
+    // paths without losing edits.
+    //
+    // The relative order of the three CSS events is cosmetic — GTK
+    // resolves `var(--lixun-*)` at style computation time against the
+    // current cascade, not at provider-load time, so each provider
+    // reload is independent of the others.
     if *config {
         let _ = tx.send_blocking(StyleEvent::ConfigChanged);
         *config = false;
+    }
+    if *colors {
+        let _ = tx.send_blocking(StyleEvent::ColorsCssChanged);
+        *colors = false;
     }
     if *theme {
         let _ = tx.send_blocking(StyleEvent::ThemeCssChanged);

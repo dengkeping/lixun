@@ -37,29 +37,50 @@ with no theme applied.
 
 ## Stylesheet cascade
 
-Lixun installs three `GtkCssProvider`s at fixed priorities. Later
-layers override earlier ones, GTK's normal specificity rules apply
-within each layer.
+Lixun installs up to four `GtkCssProvider`s at fixed priorities.
+Later layers override earlier ones, GTK's normal specificity rules
+apply within each layer.
 
 | Layer | Path | GTK priority | Hot reload |
 |-------|------|--------------|------------|
 | 1. Built-in | embedded `crates/lixun-gui/style.css` | `APPLICATION` | no |
 | 2. User override | `~/.config/lixun/style.css` | `APPLICATION + 1` | yes |
 | 3. Theme | `~/.config/lixun/themes/<name>/style.css` | `APPLICATION + 2` | yes |
+| 4. Matugen colours | `~/.config/lixun/colors.css` | `APPLICATION + 3` | yes |
 
-The chosen theme wins over the user override. This matches Hyprland's
-`source =` semantics where the later source wins. The user override
-is meant for small permanent patches that should apply regardless of
-which theme is active; a theme is meant to be a complete look.
+Matugen sits on top of the stack on purpose: it is the wallpaper-derived
+palette, and the design goal is that any active theme — built-in,
+user override, or named theme — gets recoloured to match the current
+matugen run. In practice that recolouring only touches selectors that
+reference `var(--lixun-*)` tokens. Themes that paint with hard-coded
+literals opt out of palette injection naturally because matugen's
+`colors.css` declares only `--lixun-*` custom properties, never
+selectors or layout rules.
+
+Below matugen, the cascade still follows Hyprland's `source =`
+semantics: a named theme wins over the user override, which wins over
+the built-in defaults. The user override is for small permanent
+patches that should apply regardless of which theme is active; a
+theme is meant to be a complete look.
+
+Layer 4 is only registered when `matugen = true` under `[gui]`.
+The default is `false` because matugen integration is opt-in — it
+requires the user to install matugen and configure `[templates.lixun]`
+externally. When the toggle is `false` the provider is not registered
+so saving `colors.css` has no effect — see the
+[Matugen integration](#matugen-integration) section for details.
 
 ## Live reload
 
-The launcher watches three files via `inotify` with an 80 ms
+The launcher watches up to four files via `inotify` with an 80 ms
 debounce:
 
 - `~/.config/lixun/config.toml` — config change, including a theme
-  switch or blur toggle. Reapplies the theme and rebuilds the
-  watcher if the active theme path changed.
+  switch, blur toggle, or matugen settings change. Reapplies the
+  theme and rebuilds the watcher if any watched path changed.
+- `~/.config/lixun/colors.css` — matugen palette layer. Reloads the
+  colours provider in place. Watched even before the file exists so
+  matugen's first run is picked up live.
 - `~/.config/lixun/style.css` — user override layer. Reloads the
   user provider in place.
 - The active theme's `style.css`. Reloads the theme provider in
@@ -266,8 +287,198 @@ specifically so this rule can target it.
 
 When blur is disabled or unsupported, the `.lixun-window.lixun-no-blur`
 class is added so your stylesheet can paint a heavier background
-instead. The built-in theme uses `rgba(28, 28, 32, 0.92)` for that
-state.
+instead. The built-in theme uses `alpha(var(--lixun-surface), 0.92)`
+for that state.
+
+## Matugen integration
+
+[Matugen](https://github.com/InioX/matugen) is a Material You /
+base16 colour generator. Point it at a wallpaper (or a source
+colour) and it renders a full Material Design 3 palette through
+user-provided templates. Lixun ships a matugen template that emits
+GTK4 [CSS custom properties][gtk-custom-props] (`--lixun-*`);
+matugen renders it into `~/.config/lixun/colors.css`; the launcher
+loads that file at `APPLICATION + 3` — the top of the cascade — and
+picks up regenerations within the 80 ms debounce window. No restart,
+no SIGHUP. Because matugen sits above the user override and the
+active theme, any selector in any layer that uses `var(--lixun-*)`
+resolves against the matugen palette automatically.
+
+[gtk-custom-props]: https://docs.gtk.org/gtk4/css-properties.html#custom-properties
+
+> **Why custom properties instead of `@define-color`?** GTK4's
+> `@define-color` is provider-local: tokens declared inside one
+> stylesheet are invisible to selectors in another provider. The
+> matugen layer would render its `@define-color` block in vain
+> because nothing in it consumes the tokens. CSS custom properties,
+> on the other hand, cascade through the widget tree like any
+> inherited property, so `--lixun-*` declared on `window, popover`
+> in the matugen layer becomes visible to every selector in the
+> built-in, user-override, and theme layers. GTK supports custom
+> properties since 4.16 and has formally deprecated `@define-color`.
+
+### What gets coloured
+
+The built-in stylesheet consumes eleven Material You tokens, all
+prefixed with `--lixun-` to keep clear of GTK's Adwaita tokens
+(`--accent-color`, `--window-bg-color`, …):
+
+| Token | Used by |
+|-------|---------|
+| `--lixun-primary` | search caret, status-action background and border |
+| `--lixun-on-primary-container` | status-action text |
+| `--lixun-primary-container` | (reserved) |
+| `--lixun-on-primary` | (reserved) |
+| `--lixun-surface` | window and popover background |
+| `--lixun-on-surface` | titles, entry text, status-bar calc text |
+| `--lixun-on-surface-variant` | subtitles, status-bar label |
+| `--lixun-outline` | placeholder text, kind label |
+| `--lixun-outline-variant` | (reserved) |
+| `--lixun-error` | (reserved) |
+| `--lixun-on-error` | (reserved) |
+
+The matugen template emits the full 52-token Material You core set,
+so themes that want to use any of the remaining tokens
+(`--lixun-secondary*`, `--lixun-tertiary*`, all
+`--lixun-surface-container*` shades, `--lixun-inverse-*`, etc.) can
+reference them directly with `var(--lixun-<token>)` once matugen has
+populated `colors.css`. Pure glass overlays (white-alpha hairlines,
+hover backgrounds, selection backgrounds) stay hard-coded so they
+remain palette-independent.
+
+When `colors.css` is absent the built-in stylesheet's own
+`window, popover { --lixun-*: …; }` fallback block paints the
+launcher's familiar dark-glass look.
+
+### Wiring matugen to Lixun
+
+Install matugen via your package manager. Add a `[templates.lixun]`
+block to `~/.config/matugen/config.toml`:
+
+```toml
+[templates.lixun]
+input_path  = "/usr/share/lixun/matugen/lixun-colors.css.tmpl"
+output_path = "~/.config/lixun/colors.css"
+```
+
+If you run lixun from a development checkout instead of the
+packaged binary, point `input_path` at the in-tree template:
+
+```toml
+input_path = "/path/to/lixun-checkout/crates/lixun-gui/assets/matugen/lixun-colors.css.tmpl"
+```
+
+Run `matugen image /path/to/wallpaper.jpg` (or `matugen color hex
+'#4b8dff'`). The output file appears at `~/.config/lixun/colors.css`,
+the launcher's watcher fires, and the palette swaps in within 80 ms.
+
+### Configuring the lixun side
+
+Lixun reads two optional keys under `[gui]`:
+
+```toml
+[gui]
+matugen              = true                              # default: false (opt-in)
+matugen_colors_path  = "~/.config/lixun/colors.css"      # default
+```
+
+- `matugen = false` removes the matugen layer from the provider
+  stack entirely. Saving `colors.css` becomes a no-op (the watcher
+  still fires, but `reload_colors_css` short-circuits). Toggling
+  this key takes effect on the next launcher restart.
+- `matugen_colors_path` accepts a `~`-prefixed path and is re-resolved
+  when `config.toml` changes; the watcher is rebuilt to point at the
+  new location.
+
+### Writing a matugen-recolourable theme
+
+Matugen sits at layer 4 but it only declares `--lixun-*` custom
+properties on `window, popover` — it does not declare any selectors.
+Your theme keeps full control of structure (sizes, spacing, borders,
+which selectors to paint) and merely opts into the palette by
+referencing tokens through `var()`:
+
+```css
+.lixun-title  { color: var(--lixun-on-surface); }
+.lixun-window { background-color: alpha(var(--lixun-surface), 0.5); }
+.lixun-top-hit {
+    background-color: alpha(var(--lixun-primary), 0.22);
+    box-shadow: inset 2px 0 0 0 var(--lixun-primary);
+}
+```
+
+GTK resolves `var(--lixun-*)` at style computation time against the
+top-most provider that declares the property, so your theme's
+selectors win on specificity but pull their colour values from
+matugen. A theme that hard-codes literals (`color: #f0f0f4;`)
+opts out of recolouring — the literal wins on the property side
+and matugen has nothing to override.
+
+The built-in stylesheet
+([`crates/lixun-gui/style.css`](../crates/lixun-gui/style.css))
+is the reference: it pairs `var(--lixun-*)` for palette-driven
+surfaces with literal `rgba(255, 255, 255, …)` for palette-independent
+glass overlays. Copy that pattern.
+
+### A note on the user override
+
+The user override at `~/.config/lixun/style.css` is **not** a
+duplicate of the built-in stylesheet. It is for small permanent
+deltas — a one-off `padding: 4px` here, a `border-radius` tweak
+there. If you copy the entire built-in `style.css` into it
+verbatim, your copy will include the embedded fallback
+`--lixun-*` declarations and shadow matugen for any selector that
+uses `var()`. Keep the override file short and write only the rules
+you actually want to change.
+
+### Troubleshooting
+
+- **`colors.css` does not appear after running matugen** — check
+  matugen's own output. The `[templates.lixun]` block needs the
+  exact `input_path` and `output_path` shown above. Matugen's
+  `--verbose` flag prints every template it renders.
+- **`colors.css` exists but the launcher does not pick it up** —
+  confirm `matugen` under `[gui]` is `true` (or absent, which means
+  `true`). Then tail the journal:
+  ```sh
+  journalctl --user -u lixund.service -f -o cat | grep -i colors
+  ```
+  You should see `loading matugen colours from /path/to/colors.css`
+  every time the file changes.
+- **GTK parser warnings about `alpha(...)` or `var(...)`** — both
+  `alpha()` and `var()` are GTK4 features. `alpha()` landed in 4.6
+  and `var()` / custom properties landed in 4.16. Lixun requires GTK
+  4.16 or newer; older releases will fail to parse the stylesheet.
+- **Theme looks unchanged after matugen regenerates** — your active
+  theme or user override is painting fixed colour literals
+  (`color: #ff0000;`) rather than `var(--lixun-*)` references.
+  Matugen only declares custom properties; it cannot override a
+  literal that a lower layer already wrote. Convert those literals
+  to `var(--lixun-*)` references and they will resolve through the
+  palette automatically.
+- **User override looks unchanged when you wanted matugen colours
+  to shine through** — this almost always means the override is
+  painting literals (`background-color: #1c1c20;`) on selectors that
+  the built-in stylesheet paints with `var(--lixun-surface)`. The
+  override wins for those properties because it sits above the
+  built-in layer (layer 2 vs layer 1), and matugen at layer 4 only
+  declares custom properties, not selectors — so it cannot reach the
+  property the override hard-coded. Rewrite the offending rules to
+  use `var(--lixun-*)`.
+- **`colors.css` exists but selectors still show fallback colours**
+  — the `colors.css` file may have been generated against an older
+  `@define-color`-based template. Re-run
+  `matugen image /path/to/wallpaper.jpg` to regenerate it against
+  the current `--lixun-*` template.
+
+### Host-only invariant
+
+Matugen support lives entirely in `lixun-gui` (provider, watcher,
+template asset) and `lixun-daemon` (config schema). No source or
+preview plugin gains matugen-aware code, no trait crate matches on
+a colour token, no host binary names the matugen executable. The
+launcher only ever consumes a file at a configurable path; matugen
+itself is run by the user, not by lixun.
 
 ## Testing your theme
 

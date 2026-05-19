@@ -81,6 +81,9 @@ package() {
   install -Dm644 packaging/icons/app.lixun.daemon.svg \
     "$pkgdir/usr/share/icons/hicolor/scalable/apps/app.lixun.daemon.svg"
 
+  install -Dm644 crates/lixun-gui/assets/matugen/lixun-colors.css.tmpl \
+    "$pkgdir/usr/share/lixun/matugen/lixun-colors.css.tmpl"
+
   install -Dm644 LICENSE-MIT     "$pkgdir/usr/share/licenses/$pkgname/LICENSE-MIT"
   install -Dm644 LICENSE-APACHE  "$pkgdir/usr/share/licenses/$pkgname/LICENSE-APACHE"
 }

@@ -111,6 +111,16 @@ struct GuiToml {
     preview_max_height_px: Option<i32>,
     blur: Option<bool>,
     theme: Option<String>,
+    /// Matugen integration toggle. Mapped to [`GuiMatugenConfig::enabled`]
+    /// on the resolved side. Absent or missing leaves the default
+    /// (`false`) in place; matugen integration is opt-in because it
+    /// requires the user to install matugen and configure
+    /// `[templates.lixun]` externally.
+    matugen: Option<bool>,
+    /// Optional override of the path lixun watches for matugen output.
+    /// Mapped to [`GuiMatugenConfig::colors_path`]. Tilde expansion is
+    /// applied. Defaults to `${config_dir}/lixun/colors.css`.
+    matugen_colors_path: Option<String>,
 }
 
 /// Text-extraction cache configuration. Shared by every extractor
@@ -416,6 +426,42 @@ pub struct GuiConfig {
     /// compile time from `crates/lixun-gui/style.css` (plus the optional
     /// user-wide override at `${config_dir}/lixun/style.css`).
     pub theme: Option<String>,
+    pub matugen: GuiMatugenConfig,
+}
+
+/// Matugen-driven color override layer. When `enabled` is `true`
+/// the GUI registers an extra `gtk::CssProvider` at
+/// `APPLICATION + 3` — the top of the cascade — loading
+/// `colors_path` whenever it exists or is updated. The file is
+/// expected to contain `--lixun-*` custom property declarations
+/// rendered by matugen from the lixun-owned template at
+/// `/usr/share/lixun/matugen/lixun-colors.css.tmpl` (or the in-tree
+/// copy at `crates/lixun-gui/assets/matugen/lixun-colors.css.tmpl`).
+///
+/// Wire format (under `[gui]` in `config.toml`):
+/// `matugen = true|false` and `matugen_colors_path = "..."`.
+///
+/// `enabled = false` makes the layer a true no-op: the provider is
+/// never registered with GTK, the file is never loaded, and no
+/// watcher event is emitted even if the file exists.
+#[derive(Debug, Clone)]
+pub struct GuiMatugenConfig {
+    pub enabled: bool,
+    pub colors_path: PathBuf,
+}
+
+impl Default for GuiMatugenConfig {
+    fn default() -> Self {
+        // Opt-in: enabling matugen requires the user to install matugen and
+        // wire up `[templates.lixun]` in their matugen config first. Defaulting
+        // to `false` leaves the launcher visually unchanged for users who
+        // never set up the integration; setting `matugen = true` under `[gui]`
+        // in `~/.config/lixun/config.toml` activates the recolour path.
+        Self {
+            enabled: false,
+            colors_path: config_dir().join("lixun").join("colors.css"),
+        }
+    }
 }
 
 impl Default for GuiConfig {
@@ -431,6 +477,7 @@ impl Default for GuiConfig {
             preview_max_height_px: 1400,
             blur: true,
             theme: None,
+            matugen: GuiMatugenConfig::default(),
         }
     }
 }
@@ -668,6 +715,15 @@ impl Config {
                 } else {
                     Some(trimmed.to_string())
                 };
+            }
+            if let Some(v) = gui.matugen {
+                cfg.gui.matugen.enabled = v;
+            }
+            if let Some(path) = gui.matugen_colors_path {
+                let trimmed = path.trim();
+                if !trimmed.is_empty() {
+                    cfg.gui.matugen.colors_path = expand_tilde(trimmed);
+                }
             }
         }
         if let Some(impact_toml) = parsed.impact {

@@ -1,8 +1,42 @@
 /* Lixun — Spotlight-like launcher for Linux. Dark translucent theme. */
 
-/* ----- Design tokens (GTK supports @define-color; CSS custom properties
-   are only partially honored by GtkCssProvider, so we use hardcoded values
-   below but group them visually for maintainability). ----- */
+/* ----- Material You token fallbacks -----
+   GTK4 ≥ 4.16 supports the standard CSS custom-property cascade, so
+   the palette below is expressed as `--lixun-*` custom properties on
+   the root `window` and `popover` nodes, then consumed by selectors
+   via `var(--lixun-*)` (and `alpha(var(--lixun-*), fraction)` where a
+   tinted variant is needed).
+
+   These values are the embedded dark-glass defaults. When matugen is
+   active, the generated `colors.css` is loaded at the top of the
+   provider cascade (APPLICATION+3) and redeclares these same custom
+   properties with the user's Material You palette. Because CSS
+   custom properties cascade through the widget tree, those values
+   are visible to selectors in this stylesheet and in every other
+   provider on the same display -- this is precisely why we DO NOT
+   use @define-color, which is provider-local and would leave the
+   matugen layer silently inert.
+
+   Token names are `--lixun-`-prefixed to avoid colliding with
+   libadwaita's `--accent-color`, `--window-bg-color`, ... custom
+   properties that newer GTK4 distributions ship by default.
+
+   Only tokens actually consumed by this stylesheet are defined here;
+   the full Material You surface (52 tokens) lives in the matugen
+   template at `assets/matugen/lixun-colors.css.tmpl`. */
+window, popover {
+    --lixun-primary:               #4b8dff;
+    --lixun-on-primary:            #ffffff;
+    --lixun-primary-container:     #2a4d8f;
+    --lixun-on-primary-container:  #d6e3ff;
+    --lixun-surface:               #1c1c20;
+    --lixun-on-surface:            #f0f0f4;
+    --lixun-on-surface-variant:    #a8a8b2;
+    --lixun-outline:               #7b7b86;
+    --lixun-outline-variant:       #4a4a55;
+    --lixun-error:                 #ff6b6b;
+    --lixun-on-error:              #ffffff;
+}
 
 /* ----- Top-level window transparency -----
    GTK4's root `window` CSS node paints a default opaque background
@@ -58,7 +92,7 @@ window.background,
         linear-gradient(180deg,
             rgba(255, 255, 255, 0.035) 0%,
             rgba(255, 255, 255, 0.0)  50%),
-        rgba(28, 28, 32, 0.50);
+        alpha(var(--lixun-surface), 0.50);
     border-radius: 14px;
     border: 0.5px solid rgba(255, 255, 255, 0.12);
     box-shadow: 0 24px 64px rgba(0, 0, 0, 0.55),
@@ -73,8 +107,8 @@ window.background,
     font-weight: 300;
     padding: 0;
     background-color: transparent;
-    color: #f0f0f4;
-    caret-color: #4b8dff;
+    color: var(--lixun-on-surface);
+    caret-color: var(--lixun-primary);
     border: none;
     border-radius: 10px;
 }
@@ -91,7 +125,7 @@ window.background,
 }
 
 .lixun-entry placeholder {
-    color: #7b7b86;
+    color: var(--lixun-outline);
 }
 
 /* ----- Results container -----
@@ -178,7 +212,7 @@ listview row:selected:hover {
 /* ----- Title / subtitle / kind ----- */
 .lixun-title {
     font-weight: 500;
-    color: #f0f0f4;
+    color: var(--lixun-on-surface);
     font-size: 14px;
 }
 
@@ -192,12 +226,12 @@ listview row:selected:hover {
 }
 
 .lixun-subtitle {
-    color: #a8a8b2;
+    color: var(--lixun-on-surface-variant);
     font-size: 11px;
 }
 
 .lixun-kind {
-    color: #7b7b86;
+    color: var(--lixun-outline);
     font-size: 10px;
     font-weight: 500;
     margin-right: 4px;
@@ -212,33 +246,33 @@ listview row:selected:hover {
 }
 
 .lixun-status-label {
-    color: #a8a8b2;
+    color: var(--lixun-on-surface-variant);
     font-size: 12px;
 }
 
 .lixun-status-calc {
-    color: #f0f0f4;
+    color: var(--lixun-on-surface);
     font-size: 14px;
     font-weight: 500;
     font-family: ui-monospace, "JetBrains Mono", monospace;
 }
 
 .lixun-status-action {
-    background-color: rgba(75, 141, 255, 0.22);
-    color: #f0f0f4;
-    border: 1px solid rgba(75, 141, 255, 0.35);
+    background-color: alpha(var(--lixun-primary), 0.22);
+    color: var(--lixun-on-primary-container);
+    border: 1px solid alpha(var(--lixun-primary), 0.35);
     border-radius: 6px;
     padding: 2px 10px;
     font-size: 11px;
 }
 
 .lixun-status-action:hover {
-    background-color: rgba(75, 141, 255, 0.35);
+    background-color: alpha(var(--lixun-primary), 0.35);
 }
 
 /* ----- Context menu (popover) ----- */
 popover.menu {
-    background-color: rgba(28, 28, 32, 0.50);
+    background-color: alpha(var(--lixun-surface), 0.50);
     border-radius: 10px;
     border: 0.5px solid rgba(255, 255, 255, 0.05);
 }
@@ -301,5 +335,5 @@ popover.menu modelbutton:hover {
         linear-gradient(180deg,
             rgba(255, 255, 255, 0.035) 0%,
             rgba(255, 255, 255, 0.0)  50%),
-        rgba(28, 28, 32, 0.92);
+        alpha(var(--lixun-surface), 0.92);
 }

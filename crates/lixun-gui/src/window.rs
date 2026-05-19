@@ -690,6 +690,8 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
     let style_manager = crate::style_manager::StyleManager::install(
         &display,
         daemon_config.gui.theme.as_deref(),
+        daemon_config.gui.matugen.enabled,
+        daemon_config.gui.matugen.colors_path.clone(),
     );
 
     // Spawn the live-reload pipeline: a notify watcher posts
@@ -705,15 +707,18 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
     let initial_theme_css = style_manager
         .resolver
         .active_css_path(daemon_config.gui.theme.as_deref());
+    let initial_colors_css = daemon_config.gui.matugen.colors_path.clone();
     let initial_watcher = crate::style_watcher::spawn(
         config_path.clone(),
         style_manager.resolver.user_override(),
+        initial_colors_css.clone(),
         initial_theme_css.clone(),
         style_tx.clone(),
     );
     match initial_watcher {
         Ok(watcher) => {
             let mut current_theme_css = initial_theme_css;
+            let mut current_colors_css = initial_colors_css;
             let mut current_watcher = watcher;
             let style_manager = style_manager;
             let blur = blur;
@@ -723,37 +728,42 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
                 while let Ok(event) = style_rx.recv().await {
                     use crate::style_watcher::StyleEvent;
                     match event {
-                        StyleEvent::ConfigChanged => {
-                            match lixun_daemon::config::Config::load() {
-                                Ok(cfg) => {
-                                    let theme = cfg.gui.theme.as_deref();
-                                    style_manager.apply_theme(theme);
-                                    blur.set_enabled(cfg.gui.blur);
-                                    let new_theme_css =
-                                        style_manager.resolver.active_css_path(theme);
-                                    if new_theme_css != current_theme_css {
-                                        match crate::style_watcher::spawn(
-                                            config_path_pump.clone(),
-                                            style_manager.resolver.user_override(),
-                                            new_theme_css.clone(),
-                                            style_tx_pump.clone(),
-                                        ) {
-                                            Ok(w) => {
-                                                current_watcher = w;
-                                                current_theme_css = new_theme_css;
-                                            }
-                                            Err(e) => tracing::warn!(
-                                                error = %e,
-                                                "failed to rebuild style watcher after theme change",
-                                            ),
+                        StyleEvent::ConfigChanged => match lixun_daemon::config::Config::load() {
+                            Ok(cfg) => {
+                                let theme = cfg.gui.theme.as_deref();
+                                style_manager.apply_theme(theme);
+                                blur.set_enabled(cfg.gui.blur);
+                                let new_theme_css = style_manager.resolver.active_css_path(theme);
+                                let new_colors_css = cfg.gui.matugen.colors_path.clone();
+                                if new_theme_css != current_theme_css
+                                    || new_colors_css != current_colors_css
+                                {
+                                    match crate::style_watcher::spawn(
+                                        config_path_pump.clone(),
+                                        style_manager.resolver.user_override(),
+                                        new_colors_css.clone(),
+                                        new_theme_css.clone(),
+                                        style_tx_pump.clone(),
+                                    ) {
+                                        Ok(w) => {
+                                            current_watcher = w;
+                                            current_theme_css = new_theme_css;
+                                            current_colors_css = new_colors_css;
                                         }
+                                        Err(e) => tracing::warn!(
+                                            error = %e,
+                                            "failed to rebuild style watcher after path change",
+                                        ),
                                     }
                                 }
-                                Err(e) => tracing::warn!(
-                                    error = %e,
-                                    "failed to reload config after change",
-                                ),
                             }
+                            Err(e) => tracing::warn!(
+                                error = %e,
+                                "failed to reload config after change",
+                            ),
+                        },
+                        StyleEvent::ColorsCssChanged => {
+                            style_manager.reload_colors_css();
                         }
                         StyleEvent::ThemeCssChanged => {
                             // Reload the active theme by re-resolving from current config.
@@ -1408,7 +1418,14 @@ pub(crate) fn report_launcher_geometry(window: &gtk::ApplicationWindow) {
         let mon_w = monitor.geometry().width();
         ((mon_w - w) / 2).max(0)
     };
-    tracing::debug!("gui: report_launcher_geometry: sending connector={} x={} top={} w={} h={}", connector, x, top, w, h);
+    tracing::debug!(
+        "gui: report_launcher_geometry: sending connector={} x={} top={} w={} h={}",
+        connector,
+        x,
+        top,
+        w,
+        h
+    );
     crate::ipc::send_launcher_geometry(connector, x, top, w, h);
 }
 
