@@ -51,6 +51,40 @@ tempfile = "3"
 tempfile = "3"
 
 [features]
-default = ["image-decode"]
+# Default feature set kept intentionally minimal. Heavy or invasive
+# subsystems opt in via the named flags below so a regression in any
+# one of them can be bisected and disabled in isolation.
+default = []
+
+# image-decode (default: OFF as of W0.4)
+#   Compiles the in-process image decoder (HEIC/JXL/RAW transitive deps)
+#   into the worker. Flipped OFF in W0.4 to remove the decoder from the
+#   default build; B5 will move it permanently into the sidecar process.
+#   Rollback: cargo build -p lixun-semantic-worker --features image-decode
+#   Evidence: .workspace-local/evidence/task-b5-image-decode.log
 image-decode = ["lixun-image-decode"]
+
+# jemalloc (default: OFF)
+#   Reserved placeholder for B1. When enabled, the worker binary will
+#   link tikv-jemallocator and run jemalloc with proactive decay tuning.
+#   Empty until B1 wires the dependency and #[global_allocator].
+#   Rollback: cargo build -p lixun-semantic-worker --no-default-features
+#   Evidence: .workspace-local/evidence/task-b1-jemalloc.log
+jemalloc = []
+
+# quantized-embedders (default: OFF)
+#   Reserved placeholder for B2. When enabled, the worker selects
+#   pre-quantized embedder variants (BGE small int8, CLIP int8) instead
+#   of the FP32 weights. Empty until B2 wires the fastembed selection.
+#   Rollback: cargo build -p lixun-semantic-worker --no-default-features
+#   Evidence: .workspace-local/evidence/task-b2-quantized.log
+quantized-embedders = []
+
+# idle-eviction (default: OFF)
+#   Reserved placeholder for B4. When enabled, the worker supervisor
+#   drops loaded embedder Sessions after an idle window and lazily
+#   reloads on next demand. Empty until B4 wires the supervisor.
+#   Rollback: cargo build -p lixun-semantic-worker --no-default-features
+#   Evidence: .workspace-local/evidence/task-b4-idle-eviction.log
+idle-eviction = []
 

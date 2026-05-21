@@ -1,0 +1,65 @@
+name: feature-matrix
+
+on:
+  push:
+    branches: [main, wave-d-semantic]
+  pull_request:
+
+jobs:
+  matrix:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          # legacy-json-ipc (lixun-ipc)
+          - crate: lixun-ipc
+            flag: legacy-json-ipc
+            state: on
+          - crate: lixun-ipc
+            flag: legacy-json-ipc
+            state: off
+          # image-decode (lixun-semantic-worker)
+          - crate: lixun-semantic-worker
+            flag: image-decode
+            state: on
+          - crate: lixun-semantic-worker
+            flag: image-decode
+            state: off
+          # jemalloc (lixun-semantic-worker)
+          - crate: lixun-semantic-worker
+            flag: jemalloc
+            state: on
+          # quantized-embedders (lixun-semantic-worker)
+          - crate: lixun-semantic-worker
+            flag: quantized-embedders
+            state: on
+          # idle-eviction (lixun-semantic-worker)
+          - crate: lixun-semantic-worker
+            flag: idle-eviction
+            state: on
+          # minimum build: no default features across workspace
+          - crate: workspace
+            flag: none
+            state: off
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: feature-matrix-${{ matrix.crate }}-${{ matrix.flag }}-${{ matrix.state }}
+
+      - name: Build workspace (default features)
+        if: matrix.crate == 'workspace' && matrix.flag == 'none'
+        run: cargo build --workspace
+
+      - name: Build workspace (--no-default-features)
+        if: matrix.crate == 'workspace' && matrix.flag == 'none'
+        run: cargo build --workspace --no-default-features
+
+      - name: Build crate with flag ON
+        if: matrix.crate != 'workspace' && matrix.state == 'on'
+        run: cargo build --manifest-path crates/${{ matrix.crate }}/Cargo.toml --no-default-features --features ${{ matrix.flag }}
+
+      - name: Build crate with flag OFF
+        if: matrix.crate != 'workspace' && matrix.state == 'off'
+        run: cargo build --manifest-path crates/${{ matrix.crate }}/Cargo.toml --no-default-features

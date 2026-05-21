@@ -29,3 +29,4 @@
 
 # Throwaway spike experiments (benchmarks, PoCs) — never committed
 /spike/
+/rust_out
