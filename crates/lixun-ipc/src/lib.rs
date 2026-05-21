@@ -288,6 +288,11 @@ pub enum Response {
     PluginError(String),
     Error(String),
     ClaimedPrefixes(Vec<String>),
+    /// Sent in lieu of `SearchChunk` when an in-flight search is
+    /// preempted by a newer `Request::Search` carrying a higher
+    /// `epoch`. Best-effort: short queries may still complete and
+    /// emit a normal `SearchChunk` before the cancel signal lands.
+    Cancelled { epoch: u64 },
     /// Reply to every `Impact*` request. `applied_hot` and
     /// `requires_restart` are populated only on `ImpactSet`; both
     /// empty for `ImpactGet` / `ImpactExplain`. `persisted` is true
@@ -652,7 +657,10 @@ mod tests {
                 let c = calculation.expect("calculation present");
                 assert_eq!(c.expr, "2+2");
                 assert_eq!(c.result, "4");
-                assert_eq!(top_hit.as_ref().map(|d| d.0.as_str()), Some("fs:/tmp/demo.txt"));
+                assert_eq!(
+                    top_hit.as_ref().map(|d| d.0.as_str()),
+                    Some("fs:/tmp/demo.txt")
+                );
                 assert_eq!(explanations, vec!["test".to_string()]);
                 assert!(!claimed);
             }

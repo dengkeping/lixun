@@ -35,9 +35,9 @@ use lixun_core::{DocId, Hit};
 /// front; callers rely on this to key hero styling by "row 0 iff
 /// top_hit_index.is_some()" without scanning.
 #[derive(Debug)]
-pub(crate) struct RenderPlan {
-    pub(crate) hits: Vec<Hit>,
-    pub(crate) top_hit_index: Option<usize>,
+pub struct RenderPlan {
+    pub hits: Vec<Hit>,
+    pub top_hit_index: Option<usize>,
 }
 
 /// Compose render order from daemon's `hits` and optional
@@ -53,7 +53,7 @@ pub(crate) struct RenderPlan {
 /// - `top_hit = None`, `top_hit = Some` but not present in hits,
 ///   or `hits` is empty → leave order untouched; return
 ///   `top_hit_index = None`.
-pub(crate) fn compute_render_plan(hits: &[Hit], top_hit: Option<&DocId>) -> RenderPlan {
+pub fn compute_render_plan(hits: &[Hit], top_hit: Option<&DocId>) -> RenderPlan {
     let Some(want) = top_hit else {
         return RenderPlan {
             hits: hits.to_vec(),

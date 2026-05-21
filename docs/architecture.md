@@ -318,3 +318,7 @@ The anchor classifier code remains in the codebase (`lixun-semantic-worker/src/q
 - Cormack et al. (2009): "Reciprocal Rank Fusion outperforms Condorcet and individual rank learning methods" (SIGIR)
 - [docs/search-fusion.md](search-fusion.md) — detailed fusion algorithm walkthrough
 - [docs/wave-d-semantic.md](wave-d-semantic.md) — semantic worker setup and operations
+
+## Cancellation contract
+
+The GUI assigns a monotonically increasing `epoch` to every non-empty keystroke and stamps it onto each `Request::Search`. Empty queries do not advance the epoch. The daemon maintains an `active_search_slot` per IPC connection; when a `Search` arrives with an epoch greater than the slot, the in-flight search is preempted by cancelling its `CancellationToken` and the daemon best-effort sends `Response::Cancelled { epoch: prev_epoch }` back to the GUI. The send is best-effort because a short query may have already enqueued or completed its final `SearchChunk` before observing the cancel signal, so the GUI must tolerate either ordering. On receipt of `Cancelled`, the GUI discards any pending state for `prev_epoch` and waits for chunks belonging to the current epoch. Cancellation never propagates into source plugins; it is daemon-internal and only short-circuits the collector and reranker. The CLI is single-shot, never supersedes, and treats `Cancelled` as a no-op.

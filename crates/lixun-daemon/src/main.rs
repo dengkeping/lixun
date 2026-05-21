@@ -17,7 +17,7 @@ use lixun_sources::QueryContext;
 use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 
 mod battery;
@@ -814,6 +814,7 @@ fn collect_memory_stats() -> lixun_ipc::MemoryStats {
 
 struct SearchSlot {
     generation: u64,
+    epoch: u64,
     cancel: CancellationToken,
 }
 
@@ -851,7 +852,7 @@ async fn process_search_chunk(
     bool,
 )> {
     let now = chrono::Utc::now().timestamp();
-    
+
     let claiming_entry = if phase == lixun_fusion::Phase::Final {
         registry.instances.iter().find(|e| e.source.claims_query(q))
     } else {
@@ -861,12 +862,12 @@ async fn process_search_chunk(
     if let Some(claimer) = claiming_entry {
         hits.clear();
         breakdowns.clear();
-        
+
         let plugin = claimer.source.clone();
         let q_str = q.to_string();
         let instance_id = claimer.instance_id.clone();
         let state_dir = claimer.state_dir.clone();
-        
+
         let plugin_hits = tokio::task::spawn_blocking(move || {
             let ctx = QueryContext {
                 instance_id: &instance_id,
@@ -876,7 +877,7 @@ async fn process_search_chunk(
         })
         .await
         .unwrap_or_default();
-        
+
         if explain {
             for h in &plugin_hits {
                 breakdowns.push(lixun_core::ScoreBreakdown {
@@ -1072,18 +1073,19 @@ async fn handle_search(
             (chunk.hits.into_iter().map(|(h, _)| h).collect(), Vec::new())
         };
 
-        let (processed_hits, calculation, top_hit_id, explanations, claimed) = process_search_chunk(
-            hits,
-            breakdowns,
-            chunk.phase,
-            explain,
-            &q,
-            &frecency,
-            &query_latch,
-            &config,
-            &registry,
-        )
-        .await?;
+        let (processed_hits, calculation, top_hit_id, explanations, claimed) =
+            process_search_chunk(
+                hits,
+                breakdowns,
+                chunk.phase,
+                explain,
+                &q,
+                &frecency,
+                &query_latch,
+                &config,
+                &registry,
+            )
+            .await?;
 
         if cancel.is_cancelled() {
             return Ok(());
@@ -1190,7 +1192,8 @@ async fn handle_client(
 
     let mut frame_buf: Vec<u8> = Vec::new();
 
-    let (negotiated_version, first_req) = match read_request(&mut stream_read, &mut frame_buf).await {
+    let (negotiated_version, first_req) = match read_request(&mut stream_read, &mut frame_buf).await
+    {
         Ok(Some(pair)) => pair,
         Ok(None) => return Ok(()),
         Err(e) => return Err(e),
@@ -1253,46 +1256,56 @@ async fn handle_client(
         };
 
         match req {
-            Request::Search { q, limit, explain, epoch } => {
-                {
-                    let mut slot = conn_state.active_search_slot.lock().await;
-                    if let Some(prev) = slot.take() {
-                        prev.cancel.cancel();
-                    }
-                    let generation = conn_state
-                        .next_search_generation
-                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    let cancel = CancellationToken::new();
-                    *slot = Some(SearchSlot {
-                        generation,
-                        cancel: cancel.clone(),
-                    });
-                    drop(slot);
-
-                    let write_tx_c = write_tx.clone();
-                    let fusion_c = Arc::clone(&fusion);
-                    let frecency_c = Arc::clone(&frecency);
-                    let query_latch_c = Arc::clone(&query_latch);
-                    let config_c = Arc::clone(&config);
-                    let registry_c = Arc::clone(&registry);
-                    let active_slot_c = Arc::clone(&conn_state.active_search_slot);
-
-                    search_tasks.spawn(handle_search(
-                        generation,
-                        cancel,
-                        write_tx_c,
-                        epoch,
-                        q,
-                        limit,
-                        explain,
-                        fusion_c,
-                        frecency_c,
-                        query_latch_c,
-                        config_c,
-                        registry_c,
-                        active_slot_c,
-                    ));
+            Request::Search {
+                q,
+                limit,
+                explain,
+                epoch,
+            } => {
+                let mut slot = conn_state.active_search_slot.lock().await;
+                if let Some(prev) = slot.take() {
+                    prev.cancel.cancel();
+                    // Best-effort: short queries may still complete and emit a
+                    // SearchChunk before observing the cancel token. The GUI
+                    // tolerates a Cancelled arriving after a final chunk.
+                    let _ = write_tx
+                        .send(Response::Cancelled { epoch: prev.epoch })
+                        .await;
                 }
+                let generation = conn_state
+                    .next_search_generation
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let cancel = CancellationToken::new();
+                *slot = Some(SearchSlot {
+                    generation,
+                    epoch,
+                    cancel: cancel.clone(),
+                });
+                drop(slot);
+
+                let write_tx_c = write_tx.clone();
+                let fusion_c = Arc::clone(&fusion);
+                let frecency_c = Arc::clone(&frecency);
+                let query_latch_c = Arc::clone(&query_latch);
+                let config_c = Arc::clone(&config);
+                let registry_c = Arc::clone(&registry);
+                let active_slot_c = Arc::clone(&conn_state.active_search_slot);
+
+                search_tasks.spawn(handle_search(
+                    generation,
+                    cancel,
+                    write_tx_c,
+                    epoch,
+                    q,
+                    limit,
+                    explain,
+                    fusion_c,
+                    frecency_c,
+                    query_latch_c,
+                    config_c,
+                    registry_c,
+                    active_slot_c,
+                ));
             }
             Request::Toggle => {
                 let resp = gui_result_to_response(gui_control.dispatch(GuiCommand::Toggle).await);
@@ -1390,7 +1403,11 @@ async fn handle_client(
                     memory: Some(collect_memory_stats()),
                     reindex_in_progress: s.reindex_in_progress,
                     reindex_started: s.reindex_started,
-                    ocr: collect_ocr_stats(ocr_queue.as_deref(), &ocr_worker_stats, OCR_MAX_ATTEMPTS),
+                    ocr: collect_ocr_stats(
+                        ocr_queue.as_deref(),
+                        &ocr_worker_stats,
+                        OCR_MAX_ATTEMPTS,
+                    ),
                 };
                 if write_tx.send(resp).await.is_err() {
                     break;
@@ -1479,12 +1496,24 @@ async fn handle_client(
                     break;
                 }
             }
-            Request::LauncherGeometry { monitor, x, y, w, h } => {
+            Request::LauncherGeometry {
+                monitor,
+                x,
+                y,
+                w,
+                h,
+            } => {
                 tracing::debug!(
                     "daemon: received LauncherGeometry monitor={} x={} y={} w={} h={}",
-                    monitor, x, y, w, h
+                    monitor,
+                    x,
+                    y,
+                    w,
+                    h
                 );
-                preview_spawner.set_launcher_geometry(monitor, x, y, w, h).await;
+                preview_spawner
+                    .set_launcher_geometry(monitor, x, y, w, h)
+                    .await;
                 if write_tx.send(Response::Ok).await.is_err() {
                     break;
                 }
@@ -1544,13 +1573,18 @@ async fn handle_client(
             Request::ImpactSet { level, persist } => {
                 let old = profile_swap.load_full();
                 let new_profile = lixun_core::ImpactProfile::from_level(level, num_cpus::get());
-                let (applied_hot, requires_restart) = impact_diff_hot_cold(old.as_ref(), &new_profile);
+                let (applied_hot, requires_restart) =
+                    impact_diff_hot_cold(old.as_ref(), &new_profile);
                 sched::apply_nice_only(new_profile.daemon_nice);
                 profile_swap.store(Arc::new(new_profile.clone()));
                 let persist_outcome: Result<bool, String> = if persist {
                     match config::Config::persist_impact_level(level) {
                         Ok(path) => {
-                            tracing::info!("impact: persisted level={} to {}", level, path.display());
+                            tracing::info!(
+                                "impact: persisted level={} to {}",
+                                level,
+                                path.display()
+                            );
                             Ok(true)
                         }
                         Err(e) => {

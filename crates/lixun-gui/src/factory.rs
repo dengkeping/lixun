@@ -95,7 +95,7 @@ pub(crate) fn is_top_hit_doc(id: &str) -> bool {
 /// desired selection index themselves after this function returns,
 /// or to pin it via `set_selected(INVALID_LIST_POSITION)` if they
 /// want a blank state.
-pub(crate) fn update_results(
+pub fn update_results(
     model: &gtk::StringList,
     selection: &gtk::SingleSelection,
     hits: &[Hit],

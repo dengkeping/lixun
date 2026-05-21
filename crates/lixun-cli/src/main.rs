@@ -808,6 +808,8 @@ fn handle_response(resp: Response, ocr_only: bool) {
                 println!("{}", p);
             }
         }
+        // CLI is single-shot; supersede never happens, so this is defensive.
+        Response::Cancelled { .. } => {}
         Response::Error(msg) => {
             eprintln!("Error: {}", msg);
         }

@@ -190,6 +190,14 @@ pub(crate) fn start_ipc_thread(
                             break;
                         }
                     }
+                    Ok(Response::Cancelled { epoch: cancelled_epoch }) => {
+                        tracing::debug!(
+                            "ipc: search superseded (cancelled epoch {}, send epoch {})",
+                            cancelled_epoch,
+                            epoch_at_send
+                        );
+                        break;
+                    }
                     Ok(other) => {
                         tracing::warn!("ipc: unexpected response variant: {:?}", other);
                         break;
@@ -388,10 +396,20 @@ pub(crate) fn send_preview_request(hit: &Hit, monitor: Option<String>) {
 pub(crate) fn send_launcher_geometry(monitor: String, x: i32, y: i32, w: i32, h: i32) {
     tracing::debug!(
         "gui: send_launcher_geometry monitor={} x={} y={} w={} h={}",
-        monitor, x, y, w, h
+        monitor,
+        x,
+        y,
+        w,
+        h
     );
     let sock = socket_path();
-    let req = Request::LauncherGeometry { monitor, x, y, w, h };
+    let req = Request::LauncherGeometry {
+        monitor,
+        x,
+        y,
+        w,
+        h,
+    };
     let Ok(json) = serde_json::to_vec(&req) else {
         tracing::warn!("gui: failed to serialize LauncherGeometry");
         return;

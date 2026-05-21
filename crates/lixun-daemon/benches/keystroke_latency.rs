@@ -172,11 +172,74 @@ fn bench_bursty_10keystrokes_200ms(c: &mut Criterion) {
     drop(stream);
 }
 
+fn send_search(stream: &mut UnixStream, q: &str, limit: u32, epoch: u64) {
+    let req = encode_search(q, limit, epoch);
+    stream.write_all(&req).expect("bench: write_all to daemon socket");
+    stream.flush().expect("bench: flush daemon socket");
+}
+
+fn drain_until_final_or_cancelled(stream: &mut UnixStream, target_epoch: u64) -> Duration {
+    let start = Instant::now();
+    loop {
+        let Some(resp) = read_response(stream) else {
+            break;
+        };
+        if let Some(c) = resp.get("SearchChunk") {
+            let phase_final = c.get("phase").map(|p| p == "Final").unwrap_or(false);
+            let ep = c.get("epoch").and_then(|v| v.as_u64()).unwrap_or(0);
+            if phase_final && ep == target_epoch {
+                break;
+            }
+        } else if resp.get("Cancelled").is_some() {
+            continue;
+        }
+    }
+    start.elapsed()
+}
+
+fn bench_bursty_with_cancel(c: &mut Criterion) {
+    let mut group = c.benchmark_group("bursty-with-cancel");
+    group.sample_size(20);
+    group.measurement_time(Duration::from_secs(30));
+
+    let mut stream = connect_system_daemon();
+
+    for i in 0..10u64 {
+        let _ = search_roundtrip(&mut stream, "rep", 30, i);
+    }
+
+    group.bench_function("bursty-with-cancel", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            let queries: Vec<String> = (1..=11).map(|i| "a".repeat(i)).collect();
+            let inter_keystroke = Duration::from_millis(50);
+
+            for _ in 0..iters {
+                let burst_start = Instant::now();
+                for (i, q) in queries.iter().enumerate().take(10) {
+                    let epoch = (i + 1) as u64;
+                    send_search(&mut stream, q, 30, epoch);
+                    std::thread::sleep(inter_keystroke);
+                }
+                send_search(&mut stream, &queries[10], 30, 11);
+                let _ = drain_until_final_or_cancelled(&mut stream, 11);
+                total += burst_start.elapsed();
+                black_box(&queries);
+            }
+            total
+        });
+    });
+
+    group.finish();
+    drop(stream);
+}
+
 criterion_group!(
     benches,
     bench_cold_3char,
     bench_warm_3char,
     bench_warm_30char,
-    bench_bursty_10keystrokes_200ms
+    bench_bursty_10keystrokes_200ms,
+    bench_bursty_with_cancel
 );
 criterion_main!(benches);

@@ -22,6 +22,9 @@ mod style_watcher;
 mod theme;
 mod window;
 
+pub use factory::update_results;
+pub use window::{compute_render_plan, RenderPlan};
+
 pub fn run() -> Result<()> {
     // RUST_LOG wins; fall back to lixun_gui=info only when env is unset/empty so
     // operators can still raise the level for diagnosis without recompiling.
