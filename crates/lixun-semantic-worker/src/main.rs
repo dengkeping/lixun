@@ -9,14 +9,7 @@
 
 #![allow(dead_code)]
 
-mod ann;
-mod config;
-mod embedder;
-mod ipc_doc_store;
-mod journal;
-mod query_router;
-mod store;
-mod worker;
+
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -32,14 +25,14 @@ use tracing_subscriber::EnvFilter;
 use lixun_mutation::AnnHandle;
 use lixun_semantic_proto::{Cmd, ErrorCode, Msg, PROTOCOL_VERSION, WorkerCodec};
 
-use crate::ann::LanceDbAnnHandle;
-use crate::config::SemanticConfig;
-use crate::embedder::{load_clip_text_embedder, load_image_embedder, load_text_embedder};
-use crate::ipc_doc_store::IpcDocStore;
-use crate::journal::BackfillJournal;
-use crate::query_router::QueryRouter;
-use crate::store::VectorStore;
-use crate::worker::{EmbedJob, spawn_worker, start_backfill};
+use lixun_semantic_worker::ann::LanceDbAnnHandle;
+use lixun_semantic_worker::config::SemanticConfig;
+use lixun_semantic_worker::embedder::{load_clip_text_embedder, load_image_embedder, load_text_embedder};
+use lixun_semantic_worker::ipc_doc_store::IpcDocStore;
+use lixun_semantic_worker::journal::BackfillJournal;
+use lixun_semantic_worker::query_router::QueryRouter;
+use lixun_semantic_worker::store::VectorStore;
+use lixun_semantic_worker::worker::{EmbedJob, spawn_worker, start_backfill};
 
 const REPLY_QUEUE_CAPACITY: usize = 256;
 

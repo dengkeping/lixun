@@ -4,10 +4,15 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Semantic-search sidecar worker spawned by lixund."
+autobenches = false
 
 [[bin]]
 name = "lixun-semantic-worker"
 path = "src/main.rs"
+
+[[bin]]
+name = "memory-states-harness"
+path = "benches/memory_states.rs"
 
 [dependencies]
 lixun-core = { path = "../lixun-core" }
@@ -36,8 +41,11 @@ anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 clap = { workspace = true }
+image = { workspace = true }
+libc = "0.2"
 rusqlite = { workspace = true }
 dirs = "5"
+tempfile = "3"
 
 [dev-dependencies]
 tempfile = "3"
