@@ -942,6 +942,7 @@ mod tests {
             socket_path: PathBuf::from("/tmp/lixun-preview-1234.sock"),
             latest_desired: Some((7, fake_hit(), Some("eDP-1".into()))),
             latest_parent_handle: Some("export-handle-xyz".into()),
+            latest_launcher_geometry: None,
         };
         assert_eq!(s.pid(), Some(1234));
         assert_eq!(

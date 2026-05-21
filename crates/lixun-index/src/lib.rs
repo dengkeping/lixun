@@ -4,13 +4,15 @@ pub mod normalize;
 pub mod plugin_schema;
 pub mod scoring;
 pub mod tokenizer;
+mod warmer;
 
 use anyhow::Result;
 use chrono::Utc;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Weak};
 use tantivy::{
-    DocAddress, Index, IndexWriter, Searcher, TantivyDocument, Term,
+    DocAddress, Index, IndexReader, IndexWriter, ReloadPolicy, Searcher, TantivyDocument, Term,
     collector::{DocSetCollector, TopDocs},
     directory::MmapDirectory,
     doc,
@@ -20,6 +22,9 @@ use tantivy::{
     },
     tokenizer::TokenStream,
 };
+
+use tantivy::Warmer;
+use warmer::FastFieldWarmer;
 
 pub use plugin_schema::CompiledPluginSchema;
 pub use tantivy::{IndexWriter as TantivyIndexWriter, TantivyDocument as TantivyDoc};
@@ -149,6 +154,17 @@ pub struct LixunIndex {
     schema: LixunSchema,
     plugins: CompiledPluginSchema,
     ranking: RankingConfig,
+    /// Single long-lived reader. Tantivy stores the active searcher
+    /// behind `ArcSwap`, so per-request `searcher()` calls are an
+    /// atomic load — no syscalls, no thread spawn. Reloads are
+    /// driven explicitly by [`LixunIndex::reload`] from the indexer
+    /// post-commit hook.
+    reader: IndexReader,
+    /// Owning handle keeping the fast-field warmer alive for the
+    /// lifetime of the index. The reader holds only a `Weak` to it
+    /// (Tantivy 0.26 contract), so dropping this would silently
+    /// disable warming.
+    _warmer: Arc<FastFieldWarmer>,
 }
 
 impl LixunIndex {
@@ -206,15 +222,41 @@ impl LixunIndex {
 
         tokenizer::register_spotlight_tokenizer(&index);
 
+        let warmer = FastFieldWarmer::from_schema(&schema.schema);
+        let warmer_weak: Weak<dyn Warmer> = Arc::downgrade(&warmer) as Weak<dyn Warmer>;
+        let reader = index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::Manual)
+            .warmers(vec![warmer_weak])
+            .try_into()?;
+
         Ok((
             Self {
                 index,
                 schema,
                 plugins,
                 ranking,
+                reader,
+                _warmer: warmer,
             },
             needs_rebuild,
         ))
+    }
+
+    /// Borrow the cached [`IndexReader`]. Use this when you need
+    /// direct reader access (tests, batch tooling). The launcher
+    /// hot path goes through the typed read methods on
+    /// [`LixunIndex`] which already use this reader internally.
+    pub fn reader(&self) -> &IndexReader {
+        &self.reader
+    }
+
+    /// Refresh the cached reader so subsequent `searcher()` calls
+    /// see the latest committed segments. Drives the warmer for the
+    /// new generation. Called exactly once per writer commit from
+    /// the indexer's post-commit hook.
+    pub fn reload(&self) -> tantivy::Result<()> {
+        self.reader.reload()
     }
 
     /// Upsert a document (delete by id, then insert).
@@ -334,7 +376,7 @@ impl LixunIndex {
     /// by the daemon after this call; daemon fills them in before
     /// formatting the human-readable explanation string.
     pub fn search_with_breakdown(&self, query: &Query) -> Result<Vec<(Hit, ScoreBreakdown)>> {
-        let reader = self.index.reader()?;
+        let reader = &self.reader;
         let searcher = reader.searcher();
         let s = &self.schema;
         let q_norm = normalize_for_match(&query.text);
@@ -546,7 +588,7 @@ impl LixunIndex {
     /// All `id` values in the live index. O(N) over stored docs; intended for
     /// cross-checking a manifest against the index, not the search hot path.
     pub fn all_doc_ids(&self) -> Result<HashSet<String>> {
-        let reader = self.index.reader()?;
+        let reader = &self.reader;
         let searcher = reader.searcher();
         let mut out: HashSet<String> = HashSet::new();
         for (segment_ord, segment_reader) in searcher.segment_readers().iter().enumerate() {
@@ -575,7 +617,7 @@ impl LixunIndex {
     /// query to score against — the fusion layer assigns the final
     /// score from RRF before publishing.
     pub fn hydrate_doc_by_id(&self, id: &str) -> Result<Option<(Hit, ScoreBreakdown)>> {
-        let reader = self.index.reader()?;
+        let reader = &self.reader;
         let searcher = reader.searcher();
         let s = &self.schema;
         let term = Term::from_field_text(s.id, id);
@@ -689,7 +731,7 @@ impl LixunIndex {
     /// false` are dropped (they would be dropped on any re-upsert
     /// anyway, so this is consistent with `upsert`'s round-trip).
     pub fn get_doc_by_id(&self, id: &str) -> Result<Option<Document>> {
-        let reader = self.index.reader()?;
+        let reader = &self.reader;
         let searcher = reader.searcher();
         let term = Term::from_field_text(self.schema.id, id);
         let query = TermQuery::new(term, IndexRecordOption::Basic);
@@ -710,7 +752,7 @@ impl LixunIndex {
     /// not re-enqueue it. Cheaper than `get_doc_by_id` — only looks at
     /// one stored field instead of reconstructing the full `Document`.
     pub fn get_body_by_id(&self, id: &str) -> Result<Option<String>> {
-        let reader = self.index.reader()?;
+        let reader = &self.reader;
         let searcher = reader.searcher();
         let term = Term::from_field_text(self.schema.id, id);
         let query = TermQuery::new(term, IndexRecordOption::Basic);
@@ -1055,7 +1097,7 @@ mod tests {
             index.upsert(doc, &mut writer).unwrap();
         }
 
-        index.commit(&mut writer).unwrap();
+        index.commit(&mut writer).unwrap(); index.reload().unwrap();
         (tmp, index)
     }
 
@@ -1154,7 +1196,7 @@ mod tests {
         );
 
         index.upsert(&doc, &mut writer).unwrap();
-        index.commit(&mut writer).unwrap();
+        index.commit(&mut writer).unwrap(); index.reload().unwrap();
         writer.wait_merging_threads().unwrap();
 
         let mut writer = index.writer(20_000_000).unwrap();
@@ -1164,7 +1206,7 @@ mod tests {
         index
             .delete_by_id("fs:/nonexistent.txt", &mut writer)
             .unwrap();
-        index.commit(&mut writer).unwrap();
+        index.commit(&mut writer).unwrap(); index.reload().unwrap();
         writer.wait_merging_threads().unwrap();
 
         let results = index
@@ -1191,7 +1233,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        index.commit(&mut writer).unwrap();
+        index.commit(&mut writer).unwrap(); index.reload().unwrap();
         writer.wait_merging_threads().unwrap();
 
         let mut writer = index.writer(20_000_000).unwrap();
@@ -1202,7 +1244,7 @@ mod tests {
         assert!(ids.contains("fs:/tmp/a2.txt"));
 
         index.delete_by_id("fs:/tmp/a1.txt", &mut writer).unwrap();
-        index.commit(&mut writer).unwrap();
+        index.commit(&mut writer).unwrap(); index.reload().unwrap();
         writer.wait_merging_threads().unwrap();
 
         let ids = index.all_doc_ids().unwrap();
@@ -1223,7 +1265,7 @@ mod tests {
 
         index.upsert(&doc1, &mut writer).unwrap();
         index.upsert(&doc2, &mut writer).unwrap();
-        index.commit(&mut writer).unwrap();
+        index.commit(&mut writer).unwrap(); index.reload().unwrap();
 
         let results = index
             .search(&Query {
@@ -1547,7 +1589,7 @@ mod tests {
         let mut idx = LixunIndex::create_or_open(path, RankingConfig::default()).unwrap();
         let mut writer = idx.writer(20_000_000).unwrap();
         idx.upsert(&doc, &mut writer).unwrap();
-        idx.commit(&mut writer).unwrap();
+        idx.commit(&mut writer).unwrap(); idx.reload().unwrap();
         drop(idx);
 
         assert_eq!(

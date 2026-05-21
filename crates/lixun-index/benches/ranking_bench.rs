@@ -244,7 +244,7 @@ fn build_index(ranking: RankingConfig, corpus: &[Document]) -> (tempfile::TempDi
     for doc in corpus {
         index.upsert(doc, &mut writer).unwrap();
     }
-    index.commit(&mut writer).unwrap();
+    index.commit(&mut writer).unwrap(); index.reload().unwrap();
     (tmp, index)
 }
 

@@ -547,6 +547,8 @@ fn do_commit(
 ) -> Result<()> {
     let start = Instant::now();
     shared.commit(writer)?;
+    shared.reload()?;
+    tracing::debug!(target: "tantivy_reload", "reload triggered");
     *generation += 1;
     *dirty = false;
     *last_commit = Instant::now();

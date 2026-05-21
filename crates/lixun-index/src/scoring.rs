@@ -402,7 +402,7 @@ mod tests {
             index.upsert(doc, &mut writer).unwrap();
         }
 
-        index.commit(&mut writer).unwrap();
+        index.commit(&mut writer).unwrap(); index.reload().unwrap();
 
         index
             .search(&Query {
