@@ -1,0 +1,9 @@
+[tasks.bench-latency]
+description = "Run criterion bench harness for keystroke → render latency"
+command = "cargo"
+args = ["bench", "-p", "lixun-daemon", "--bench", "keystroke_latency", "--", "--save-baseline", "w0.1-baseline"]
+
+[tasks.bench-render]
+description = "Run criterion bench harness for GUI render path"
+command = "cargo"
+args = ["bench", "-p", "lixun-gui", "--bench", "render_path", "--", "--save-baseline", "w0.1-baseline"]
