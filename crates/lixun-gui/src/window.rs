@@ -1137,6 +1137,23 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
         std::rc::Rc::clone(&loading_timer),
     );
 
+    // Drain the icon-loader's ready channel on the GTK main loop.
+    // When the off-thread worker finishes loading an absolute-path
+    // texture, it emits the IconKey here; we provoke a filter
+    // re-evaluation so the ListView re-binds visible rows and
+    // picks up the freshly-cached texture without requiring the
+    // user to scroll or re-type. Same async_channel boundary as
+    // start_ipc_thread; no tokio.
+    {
+        let icon_ready_rx = crate::icons::icon_ready_rx();
+        let filter_for_icons = filter.clone();
+        glib::spawn_future_local(async move {
+            while let Ok(_key) = icon_ready_rx.recv().await {
+                filter_for_icons.changed(gtk::FilterChange::Different);
+            }
+        });
+    }
+
     install_entry_handler(
         &entry,
         ipc.clone(),
@@ -1767,7 +1784,14 @@ fn install_entry_handler(
         let pending_self = std::rc::Rc::clone(&pending_debounce);
         let epoch = Arc::clone(&session_epoch);
         let prefixes_for_debounce = std::rc::Rc::clone(&claimed_prefixes);
-        let id = glib::timeout_add_local_once(Duration::from_millis(80), move || {
+        // 30 ms keystroke debounce. A6 (8a309de) introduced
+        // cooperative cancellation in the daemon's collector, so
+        // superseded queries are aborted server-side and the GUI
+        // no longer needs the 80 ms guard that previously absorbed
+        // bursts. The 30 ms residual is a single-frame-budget
+        // safety margin so we don't fire a fresh IPC round-trip on
+        // every individual keystroke during rapid typing.
+        let id = glib::timeout_add_local_once(Duration::from_millis(30), move || {
             *last_q.borrow_mut() = q.clone();
             let epoch_snapshot = epoch.load(Ordering::SeqCst);
             tracing::debug!(

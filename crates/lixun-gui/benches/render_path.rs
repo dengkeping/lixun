@@ -29,6 +29,52 @@ fn make_hits(count: usize) -> Vec<Hit> {
         .collect()
 }
 
+/// Mix of categories with theme-resolvable icon names, exercising
+/// the A5 main-thread paintable cache: hits 0..6 each declare a
+/// distinct icon name, hits 6..30 cycle through the same set so
+/// the cache must amortise lookups across rows. Absolute-path
+/// icons are NOT used here because the bench runs without a real
+/// display in some environments; the cross-thread texture cache
+/// is still exercised by the icon-name path through `resolve_icon`
+/// which consults the main-thread paintable cache on every call.
+fn make_hits_with_icons(count: usize) -> Vec<Hit> {
+    const ICON_NAMES: &[(&str, Category)] = &[
+        ("text-x-generic", Category::File),
+        ("application-x-executable", Category::App),
+        ("mail-message", Category::Mail),
+        ("mail-attachment", Category::Attachment),
+        ("accessories-calculator", Category::Calculator),
+        ("utilities-terminal", Category::Shell),
+    ];
+    (0..count)
+        .map(|i| {
+            let (icon, category) = ICON_NAMES[i % ICON_NAMES.len()];
+            Hit {
+                id: DocId(format!("doc-icon-{i}")),
+                category,
+                title: format!("Iconified result {i}"),
+                subtitle: format!("/path/to/result-{i}"),
+                icon_name: Some(icon.to_string()),
+                kind_label: Some("File".to_string()),
+                score: (count - i) as f32,
+                action: Action::Exec {
+                    cmdline: vec!["true".to_string()],
+                    working_dir: None,
+                    terminal: false,
+                },
+                extract_fail: false,
+                sender: None,
+                recipients: None,
+                body: None,
+                secondary_action: None,
+                source_instance: "fs".to_string(),
+                row_menu: lixun_core::RowMenuDef::empty(),
+                mime: None,
+            }
+        })
+        .collect()
+}
+
 fn serialize_response(hits: &[Hit]) -> Vec<u8> {
     let chunk = lixun_ipc::Response::SearchChunk {
         epoch: 1,
@@ -88,6 +134,35 @@ fn bench_ipc_receive_to_model_insertion(c: &mut Criterion) {
                         .model(&model)
                         .build();
                     lixun_gui::update_results(&model, &selection, &plan.hits, plan.top_hit_index.and_then(|i| plan.hits.get(i)).map(|h| h.id.0.clone()));
+                    black_box(&model);
+                } else {
+                    black_box(plan);
+                }
+            }
+        });
+    });
+
+    let hits_30_icons = make_hits_with_icons(30);
+    let bytes_30_icons = serialize_response(&hits_30_icons);
+
+    group.bench_function("render-30hits-with-icons", |b| {
+        b.iter(|| {
+            let resp = deserialize_response(&bytes_30_icons);
+            if let lixun_ipc::Response::SearchChunk { hits, top_hit, .. } = resp {
+                let plan = lixun_gui::compute_render_plan(&hits, top_hit.as_ref());
+                if gtk_ready {
+                    let model = gtk::StringList::new(&[]);
+                    let selection = gtk::SingleSelection::builder()
+                        .model(&model)
+                        .build();
+                    lixun_gui::update_results(
+                        &model,
+                        &selection,
+                        &plan.hits,
+                        plan.top_hit_index
+                            .and_then(|i| plan.hits.get(i))
+                            .map(|h| h.id.0.clone()),
+                    );
                     black_box(&model);
                 } else {
                     black_box(plan);
