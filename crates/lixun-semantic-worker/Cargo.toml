@@ -47,6 +47,10 @@ rusqlite = { workspace = true }
 dirs = "5"
 tempfile = "3"
 
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { version = "0.6", optional = true }
+tikv-jemalloc-ctl = { version = "0.6", optional = true }
+
 [dev-dependencies]
 tempfile = "3"
 
@@ -64,13 +68,11 @@ default = []
 #   Evidence: .workspace-local/evidence/task-b5-image-decode.log
 image-decode = ["lixun-image-decode"]
 
-# jemalloc (default: OFF)
-#   Reserved placeholder for B1. When enabled, the worker binary will
-#   link tikv-jemallocator and run jemalloc with proactive decay tuning.
-#   Empty until B1 wires the dependency and #[global_allocator].
+# jemalloc (default: OFF until harness verifies ≥20% drop)
+#   Links tikv-jemallocator and sets proactive decay tuning.
 #   Rollback: cargo build -p lixun-semantic-worker --no-default-features
 #   Evidence: .workspace-local/evidence/task-b1-jemalloc.log
-jemalloc = []
+jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
 
 # quantized-embedders (default: OFF)
 #   Reserved placeholder for B2. When enabled, the worker selects
