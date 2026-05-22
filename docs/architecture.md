@@ -311,6 +311,29 @@ Earlier versions (commit 790d2df, reverted in 2f283f3) attempted to classify que
 
 The anchor classifier code remains in the codebase (`lixun-semantic-worker/src/query_router.rs`, `AnnHandle::classify_query` trait method) but is **unused** in the current fusion pipeline.
 
+## Build features
+
+The `lixun-semantic-worker` crate uses Cargo feature flags to control heavy or invasive subsystems. The default set is intentionally conservative but includes `image-decode` after the B5 audit confirmed it adds only ~10 MB binary (well under the 50 MB threshold).
+
+| Feature | Default | Description |
+|---------|---------|-------------|
+| `image-decode` | **ON** | In-process HEIC/JXL/RAW decoding. Adds ~10 MB binary. Disable with `--no-default-features` if you never index those formats. |
+| `jemalloc` | OFF | Links tikv-jemallocator with proactive decay tuning. Enable if the B1 harness shows ≥20% RSS drop. |
+| `quantized-embedders` | OFF | Uses int8 BGE small text embedder (~33 MB) instead of fp32 (~130 MB). MTEB loss < 1% for typical English retrieval. |
+| `idle-eviction` | OFF | Drops loaded embedder Sessions after idle timeout and lazily reloads. Compounds with jemalloc decay for faster OS reclamation. |
+
+**For operators wanting a minimal worker:**
+```sh
+cargo build --release -p lixun-semantic-worker --no-default-features
+```
+
+**For operators wanting all optimizations:**
+```sh
+cargo build --release -p lixun-semantic-worker --features "jemalloc quantized-embedders idle-eviction"
+```
+
+See `crates/lixun-semantic-worker/Cargo.toml` for the authoritative feature list and rollback commands.
+
 ## References
 
 - Apple WWDC24: "Support semantic search with Core Spotlight"

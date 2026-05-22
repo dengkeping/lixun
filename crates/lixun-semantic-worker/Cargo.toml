@@ -59,17 +59,21 @@ tikv-jemalloc-ctl = { version = "0.6", optional = true }
 tempfile = "3"
 
 [features]
-# Default feature set kept intentionally minimal. Heavy or invasive
-# subsystems opt in via the named flags below so a regression in any
-# one of them can be bisected and disabled in isolation.
-default = []
+# Default feature set. image-decode is ON by default because the B5
+# bloat audit measured +10.4 MiB .text / +17.0 MiB file size — well
+# under the 50 MiB threshold the plan set for the default-on gate.
+# Other heavy or invasive subsystems still opt in via the named flags
+# below so a regression in any one of them can be bisected and
+# disabled in isolation.
+default = ["image-decode"]
 
-# image-decode (default: OFF as of W0.4)
+# image-decode (default: ON as of B5)
 #   Compiles the in-process image decoder (HEIC/JXL/RAW transitive deps)
-#   into the worker. Flipped OFF in W0.4 to remove the decoder from the
-#   default build; B5 will move it permanently into the sidecar process.
-#   Rollback: cargo build -p lixun-semantic-worker --features image-decode
-#   Evidence: .workspace-local/evidence/task-b5-image-decode.log
+#   into the worker. Was flipped OFF in W0.4 pending a size audit;
+#   B5 measured +10.4 MiB .text / +17.0 MiB file — below threshold,
+#   so the default is restored to ON.
+#   Disable: cargo build -p lixun-semantic-worker --no-default-features
+#   Evidence: .workspace-local/evidence/task-b5-summary.md
 image-decode = ["lixun-image-decode"]
 
 # jemalloc (default: OFF until harness verifies ≥20% drop)

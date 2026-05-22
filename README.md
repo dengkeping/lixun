@@ -82,6 +82,8 @@ systemctl --user enable --now lixund.service
 cargo build --workspace --release
 
 # Semantic search worker (separate sidecar binary; ONNX Runtime, ~400 MB model cache)
+# Default build includes HEIC/JXL/RAW image decoding (~10 MB binary overhead).
+# Use --no-default-features for a minimal worker if you never index those formats.
 cargo build --release -p lixun-semantic-worker
 
 install -Dm755 target/release/lixund        /usr/local/bin/lixund
