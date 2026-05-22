@@ -230,6 +230,14 @@ async fn ensure_table(conn: &Connection, name: &str, dim: usize) -> Result<Table
     if names.iter().any(|n| n == name) {
         return conn
             .open_table(name)
+            // W0.2 baseline: worker steady-state RSS ~900 MB across all four states (see
+            // .workspace-local/evidence/baseline/worker_memory/summary.md). LanceDB 0.27 exposes
+            // index cache control as entry count (not MB); the default is 256 entries.
+            // Capping at 64 entries keeps working-set pressure low so RSS movement is
+            // observable rather than fs-cache noise. No HNSW index exists in this
+            // codebase, so the same conservative value applies to both text and image
+            // vector tables.
+            .index_cache_size(64)
             .execute()
             .await
             .with_context(|| format!("lancedb: open_table {name}"));
