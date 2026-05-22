@@ -5,4 +5,6 @@ pub mod ipc_doc_store;
 pub mod journal;
 pub mod query_router;
 pub mod store;
+#[cfg(feature = "idle-eviction")]
+pub mod supervisor;
 pub mod worker;

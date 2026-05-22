@@ -7,6 +7,8 @@ use lixun_mutation::{AnnHandle, AnnHit, Modality};
 use crate::embedder::{ClipTextEmbedder, TextEmbedder};
 use crate::query_router::QueryRouter;
 use crate::store::VectorStore;
+#[cfg(feature = "idle-eviction")]
+use crate::supervisor::EmbedderSupervisor;
 
 /// Approximate-nearest-neighbour handle backed by LanceDB. Both
 /// `store` and `text_embedder` are filled lazily by the factory
@@ -20,6 +22,8 @@ pub struct LanceDbAnnHandle {
     text_embedder: OnceLock<Arc<Mutex<TextEmbedder>>>,
     clip_text_embedder: OnceLock<Arc<Mutex<ClipTextEmbedder>>>,
     query_router: OnceLock<Arc<QueryRouter>>,
+    #[cfg(feature = "idle-eviction")]
+    supervisor: OnceLock<Arc<EmbedderSupervisor>>,
 }
 
 impl LanceDbAnnHandle {
@@ -29,7 +33,21 @@ impl LanceDbAnnHandle {
             text_embedder: OnceLock::new(),
             clip_text_embedder: OnceLock::new(),
             query_router: OnceLock::new(),
+            #[cfg(feature = "idle-eviction")]
+            supervisor: OnceLock::new(),
         }
+    }
+
+    /// Install the idle-eviction supervisor so query-side embed
+    /// dispatch goes through it instead of holding fixed `Arc<Mutex>`
+    /// handles. Only present under `idle-eviction`; the supervisor
+    /// owns lazy reload + last-used bookkeeping for each slot.
+    #[cfg(feature = "idle-eviction")]
+    pub fn install_supervisor(
+        &self,
+        supervisor: Arc<EmbedderSupervisor>,
+    ) -> Result<(), Arc<EmbedderSupervisor>> {
+        self.supervisor.set(supervisor)
     }
 
     pub fn install_store(&self, store: Arc<VectorStore>) -> Result<(), Arc<VectorStore>> {
@@ -59,9 +77,20 @@ impl LanceDbAnnHandle {
     }
 
     fn embed_query_text(&self, query: &str) -> Result<Option<Vec<f32>>> {
-        let Some(embedder) = self.text_embedder.get() else {
-            return Ok(None);
+        #[cfg(feature = "idle-eviction")]
+        let embedder = match self.supervisor.get() {
+            Some(s) => s.text()?,
+            None => match self.text_embedder.get() {
+                Some(e) => e.clone(),
+                None => return Ok(None),
+            },
         };
+        #[cfg(not(feature = "idle-eviction"))]
+        let embedder = match self.text_embedder.get() {
+            Some(e) => e.clone(),
+            None => return Ok(None),
+        };
+
         let mut guard = embedder
             .lock()
             .map_err(|_| anyhow::anyhow!("text embedder mutex poisoned"))?;
@@ -72,9 +101,20 @@ impl LanceDbAnnHandle {
     }
 
     fn embed_query_clip_text(&self, query: &str) -> Result<Option<Vec<f32>>> {
-        let Some(embedder) = self.clip_text_embedder.get() else {
-            return Ok(None);
+        #[cfg(feature = "idle-eviction")]
+        let embedder = match self.supervisor.get() {
+            Some(s) => s.clip_text()?,
+            None => match self.clip_text_embedder.get() {
+                Some(e) => e.clone(),
+                None => return Ok(None),
+            },
         };
+        #[cfg(not(feature = "idle-eviction"))]
+        let embedder = match self.clip_text_embedder.get() {
+            Some(e) => e.clone(),
+            None => return Ok(None),
+        };
+
         let mut guard = embedder
             .lock()
             .map_err(|_| anyhow::anyhow!("CLIP text embedder mutex poisoned"))?;

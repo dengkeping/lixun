@@ -46,6 +46,10 @@ libc = "0.2"
 rusqlite = { workspace = true }
 dirs = "5"
 tempfile = "3"
+# Lock-free Arc swap used by the B4 idle-eviction supervisor to
+# hot-swap embedder slots without blocking concurrent readers.
+# Pulled in only when the `idle-eviction` feature is enabled.
+arc-swap = { version = "1", optional = true }
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = { version = "0.6", optional = true }
@@ -87,11 +91,13 @@ jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
 #   Evidence: .workspace-local/evidence/task-b2-{build,build-quant,build-both,tests}.log
 quantized-embedders = []
 
-# idle-eviction (default: OFF)
-#   Reserved placeholder for B4. When enabled, the worker supervisor
-#   drops loaded embedder Sessions after an idle window and lazily
-#   reloads on next demand. Empty until B4 wires the supervisor.
+# idle-eviction (default: OFF until heaptrack proof — see B4 evidence)
+#   When enabled, the worker supervisor (src/supervisor.rs) drops
+#   loaded embedder Sessions after `idle_threshold_secs` (default 300)
+#   and lazily reloads them on next demand. Compounds with B1
+#   jemalloc decay: the OS reclaims freed ORT arenas within
+#   ~5 s of Session drop. Adds `arc-swap` for lock-free slot swap.
 #   Rollback: cargo build -p lixun-semantic-worker --no-default-features
-#   Evidence: .workspace-local/evidence/task-b4-idle-eviction.log
-idle-eviction = []
+#   Evidence: .workspace-local/evidence/task-b4-{build,build-feature,build-jemalloc,build-all,summary}.{log,md}
+idle-eviction = ["dep:arc-swap"]
 

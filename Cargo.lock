@@ -5656,6 +5656,7 @@ name = "lixun-semantic-worker"
 version = "0.6.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "arrow",
  "arrow-array",
  "arrow-schema",

@@ -25,8 +25,8 @@ use tokio::runtime::Runtime;
 
 use lixun_semantic_worker::config::SemanticConfig;
 use lixun_semantic_worker::embedder::{
-    load_clip_text_embedder, load_image_embedder, load_text_embedder,
-    ClipTextEmbedder, ImageEmbedder, TextEmbedder,
+    ClipTextEmbedder, ImageEmbedder, TextEmbedder, load_clip_text_embedder, load_image_embedder,
+    load_text_embedder,
 };
 use lixun_semantic_worker::query_router::QueryRouter;
 use lixun_semantic_worker::store::VectorStore;
@@ -80,16 +80,14 @@ fn main() -> Result<()> {
     let cfg = SemanticConfig::default();
 
     let text_embedder = Arc::new(Mutex::new(
-        load_text_embedder(&cfg.text_model, &cache_dir, 1, 1)
-            .context("loading text embedder")?,
+        load_text_embedder(&cfg.text_model, &cache_dir, 1, 1).context("loading text embedder")?,
     ));
     let image_embedder = Arc::new(Mutex::new(
         load_image_embedder(&cfg.image_model, &cache_dir, 1, 1)
             .context("loading image embedder")?,
     ));
     let clip_text_embedder = Arc::new(Mutex::new(
-        load_clip_text_embedder(&cache_dir, 1, 1)
-            .context("loading CLIP text embedder")?,
+        load_clip_text_embedder(&cache_dir, 1, 1).context("loading CLIP text embedder")?,
     ));
 
     let vectors_dir = std::env::temp_dir().join("lixun-memory-harness-vectors");
@@ -124,9 +122,7 @@ fn main() -> Result<()> {
                 &clip_text_embedder,
                 &fixture_dir,
             )?,
-            "post-vision-burst" => {
-                run_post_vision_burst(&image_embedder, &fixture_dir)?
-            }
+            "post-vision-burst" => run_post_vision_burst(&image_embedder, &fixture_dir)?,
             "active" => run_active(
                 &text_embedder,
                 &image_embedder,
@@ -153,23 +149,20 @@ fn cache_dir() -> PathBuf {
 fn create_image_fixtures(dir: &Path, count: usize) -> Result<()> {
     for i in 0..count {
         let path = dir.join(format!("fixture_{:03}.png", i));
-        let img: ImageBuffer<Rgb<u8>, Vec<u8>> =
-            ImageBuffer::from_fn(64, 64, |x, y| {
-                let ii = i as u32;
-                let r = ((x * 7 + y * 13 + ii * 31) % 256) as u8;
-                let g = ((x * 11 + y * 17 + ii * 41) % 256) as u8;
-                let b = ((x * 13 + y * 19 + ii * 47) % 256) as u8;
-                Rgb([r, g, b])
-            });
+        let img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_fn(64, 64, |x, y| {
+            let ii = i as u32;
+            let r = ((x * 7 + y * 13 + ii * 31) % 256) as u8;
+            let g = ((x * 11 + y * 17 + ii * 41) % 256) as u8;
+            let b = ((x * 13 + y * 19 + ii * 47) % 256) as u8;
+            Rgb([r, g, b])
+        });
         img.save(&path)
             .with_context(|| format!("saving fixture {}", path.display()))?;
     }
     Ok(())
 }
 
-fn build_query_router(
-    clip_text: &Arc<Mutex<ClipTextEmbedder>>,
-) -> Result<QueryRouter> {
+fn build_query_router(clip_text: &Arc<Mutex<ClipTextEmbedder>>) -> Result<QueryRouter> {
     let image_anchors = {
         let mut guard = clip_text.lock().unwrap();
         let texts: Vec<String> = QueryRouter::image_anchor_texts()
@@ -308,10 +301,7 @@ fn run_idle_after_1h(
     Ok(())
 }
 
-fn run_post_vision_burst(
-    image: &Arc<Mutex<ImageEmbedder>>,
-    fixture_dir: &Path,
-) -> Result<()> {
+fn run_post_vision_burst(image: &Arc<Mutex<ImageEmbedder>>, fixture_dir: &Path) -> Result<()> {
     let fixtures: Vec<PathBuf> = (0..50)
         .map(|i| fixture_dir.join(format!("fixture_{:03}.png", i)))
         .collect();

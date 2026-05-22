@@ -6,9 +6,12 @@ use lixun_mutation::UpsertedDoc;
 use tokio::sync::mpsc;
 
 use crate::config::SemanticConfig;
+#[cfg(not(feature = "idle-eviction"))]
 use crate::embedder::{ClipTextEmbedder, ImageEmbedder, TextEmbedder};
 use crate::journal::BackfillJournal;
 use crate::store::VectorStore;
+#[cfg(feature = "idle-eviction")]
+use crate::supervisor::EmbedderSupervisor;
 
 pub const CHANNEL_TEXT: &str = "text";
 pub const CHANNEL_IMAGE: &str = "image";
@@ -48,9 +51,10 @@ pub fn spawn_worker(
     store: Arc<VectorStore>,
     journal: Arc<Mutex<BackfillJournal>>,
     runtime: tokio::runtime::Handle,
-    text_embedder: Arc<Mutex<TextEmbedder>>,
-    image_embedder: Arc<Mutex<ImageEmbedder>>,
-    clip_text_embedder: Arc<Mutex<ClipTextEmbedder>>,
+    #[cfg(not(feature = "idle-eviction"))] text_embedder: Arc<Mutex<TextEmbedder>>,
+    #[cfg(not(feature = "idle-eviction"))] image_embedder: Arc<Mutex<ImageEmbedder>>,
+    #[cfg(not(feature = "idle-eviction"))] clip_text_embedder: Arc<Mutex<ClipTextEmbedder>>,
+    #[cfg(feature = "idle-eviction")] supervisor: Arc<EmbedderSupervisor>,
 ) -> Result<WorkerHandle> {
     let (tx, rx) = mpsc::channel::<EmbedJob>(QUEUE_CAPACITY);
 
@@ -60,9 +64,14 @@ pub fn spawn_worker(
         store,
         journal,
         runtime: runtime.clone(),
+        #[cfg(not(feature = "idle-eviction"))]
         text: text_embedder,
+        #[cfg(not(feature = "idle-eviction"))]
         image: image_embedder,
+        #[cfg(not(feature = "idle-eviction"))]
         clip_text: clip_text_embedder,
+        #[cfg(feature = "idle-eviction")]
+        supervisor,
         rx,
         pending_text: Vec::new(),
         pending_images: Vec::new(),
@@ -85,9 +94,14 @@ struct WorkerThread {
     store: Arc<VectorStore>,
     journal: Arc<Mutex<BackfillJournal>>,
     runtime: tokio::runtime::Handle,
+    #[cfg(not(feature = "idle-eviction"))]
     text: Arc<Mutex<TextEmbedder>>,
+    #[cfg(not(feature = "idle-eviction"))]
     image: Arc<Mutex<ImageEmbedder>>,
+    #[cfg(not(feature = "idle-eviction"))]
     clip_text: Arc<Mutex<ClipTextEmbedder>>,
+    #[cfg(feature = "idle-eviction")]
+    supervisor: Arc<EmbedderSupervisor>,
     rx: mpsc::Receiver<EmbedJob>,
     pending_text: Vec<UpsertedDoc>,
     pending_images: Vec<UpsertedDoc>,
@@ -189,9 +203,9 @@ impl WorkerThread {
             return;
         }
         let store = self.store.clone();
-        let res = self.runtime.block_on(async move {
-            store.compact_if_stale(32).await
-        });
+        let res = self
+            .runtime
+            .block_on(async move { store.compact_if_stale(32).await });
         match res {
             Ok(true) => tracing::info!(
                 "semantic embed worker: compaction ran (flush_count={})",
@@ -200,9 +214,7 @@ impl WorkerThread {
             Ok(false) => tracing::debug!(
                 "semantic embed worker: compaction skipped, fragments below threshold"
             ),
-            Err(e) => tracing::warn!(
-                "semantic embed worker: compaction failed: {e:#}"
-            ),
+            Err(e) => tracing::warn!("semantic embed worker: compaction failed: {e:#}"),
         }
     }
 
@@ -248,7 +260,18 @@ impl WorkerThread {
             .map(|d| compose_text_input(&d.doc_id, d.body.as_deref()))
             .collect();
 
-        let vectors = match self.text.lock() {
+        #[cfg(feature = "idle-eviction")]
+        let text_handle = match self.supervisor.text() {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!("semantic embed worker: supervisor text lazy-load failed: {e:#}");
+                return;
+            }
+        };
+        #[cfg(not(feature = "idle-eviction"))]
+        let text_handle = self.text.clone();
+
+        let vectors = match text_handle.lock() {
             Ok(mut t) => match t.embed(texts) {
                 Ok(v) => v,
                 Err(e) => {
@@ -338,13 +361,14 @@ impl WorkerThread {
         let original_count = original_paths.len();
 
         #[cfg(feature = "image-decode")]
-        let (paths_for_embed, _temp_files) = match lixun_image_decode::prepare_batch(&original_paths) {
-            Ok(result) => result,
-            Err(e) => {
-                tracing::warn!("image pre-decode failed, skipping batch: {:#}", e);
-                return;
-            }
-        };
+        let (paths_for_embed, _temp_files) =
+            match lixun_image_decode::prepare_batch(&original_paths) {
+                Ok(result) => result,
+                Err(e) => {
+                    tracing::warn!("image pre-decode failed, skipping batch: {:#}", e);
+                    return;
+                }
+            };
 
         #[cfg(not(feature = "image-decode"))]
         let paths_for_embed = original_paths;
@@ -359,11 +383,25 @@ impl WorkerThread {
         }
 
         if paths_for_embed.is_empty() {
-            tracing::warn!("image batch: all {} files skipped after pre-decode", original_count);
+            tracing::warn!(
+                "image batch: all {} files skipped after pre-decode",
+                original_count
+            );
             return;
         }
 
-        let vectors = match self.image.lock() {
+        #[cfg(feature = "idle-eviction")]
+        let image_handle = match self.supervisor.image() {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!("semantic embed worker: supervisor image lazy-load failed: {e:#}");
+                return;
+            }
+        };
+        #[cfg(not(feature = "idle-eviction"))]
+        let image_handle = self.image.clone();
+
+        let vectors = match image_handle.lock() {
             Ok(mut img) => match img.embed(paths_for_embed) {
                 Ok(v) => v,
                 Err(e) => {

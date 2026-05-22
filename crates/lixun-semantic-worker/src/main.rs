@@ -29,7 +29,9 @@ use lixun_semantic_proto::{Cmd, ErrorCode, Msg, PROTOCOL_VERSION, WorkerCodec};
 
 use lixun_semantic_worker::ann::LanceDbAnnHandle;
 use lixun_semantic_worker::config::SemanticConfig;
-use lixun_semantic_worker::embedder::{load_clip_text_embedder, load_image_embedder, load_text_embedder};
+use lixun_semantic_worker::embedder::{
+    load_clip_text_embedder, load_image_embedder, load_text_embedder,
+};
 use lixun_semantic_worker::ipc_doc_store::IpcDocStore;
 use lixun_semantic_worker::journal::BackfillJournal;
 use lixun_semantic_worker::query_router::QueryRouter;
@@ -164,8 +166,29 @@ async fn main() -> Result<()> {
         load_clip_text_embedder(&cache_dir, 1, 1).context("loading CLIP text embedder")?;
     let text_dim = text_embedder.dim();
     let image_dim = image_embedder.dim();
+
+    #[cfg(feature = "idle-eviction")]
+    let supervisor = {
+        use lixun_semantic_worker::supervisor::{EmbedderSupervisor, EvictionConfig};
+        let sup = Arc::new(EmbedderSupervisor::from_config(
+            cache_dir.clone(),
+            cfg.text_model.clone(),
+            cfg.image_model.clone(),
+            1,
+            1,
+            text_embedder,
+            image_embedder,
+            clip_text_embedder,
+        ));
+        sup.clone().spawn_eviction_task(EvictionConfig::default());
+        sup
+    };
+
+    #[cfg(not(feature = "idle-eviction"))]
     let text_embedder = Arc::new(Mutex::new(text_embedder));
+    #[cfg(not(feature = "idle-eviction"))]
     let image_embedder = Arc::new(Mutex::new(image_embedder));
+    #[cfg(not(feature = "idle-eviction"))]
     let clip_text_embedder = Arc::new(Mutex::new(clip_text_embedder));
 
     let vectors_dir = data_root.join("vectors");
@@ -188,23 +211,52 @@ async fn main() -> Result<()> {
         store.clone(),
         journal.clone(),
         runtime,
+        #[cfg(not(feature = "idle-eviction"))]
         text_embedder.clone(),
+        #[cfg(not(feature = "idle-eviction"))]
         image_embedder.clone(),
+        #[cfg(not(feature = "idle-eviction"))]
         clip_text_embedder.clone(),
+        #[cfg(feature = "idle-eviction")]
+        supervisor.clone(),
     )
     .context("spawning embed worker thread")?;
     let embed_tx = worker_handle.sender();
 
     let ann = Arc::new(LanceDbAnnHandle::new());
     let _ = ann.install_store(store.clone());
+    #[cfg(not(feature = "idle-eviction"))]
     let _ = ann.install_text_embedder(text_embedder.clone());
+    #[cfg(not(feature = "idle-eviction"))]
     let _ = ann.install_clip_text_embedder(clip_text_embedder.clone());
+    #[cfg(feature = "idle-eviction")]
+    let _ = ann.install_supervisor(supervisor.clone());
 
     let ann_for_router = ann.clone();
+    #[cfg(not(feature = "idle-eviction"))]
     let clip_for_router = clip_text_embedder.clone();
+    #[cfg(feature = "idle-eviction")]
+    let clip_for_router = supervisor.clone();
     tokio::spawn(async move {
         tracing::info!("embedding query router anchors...");
+        #[cfg(feature = "idle-eviction")]
+        let resolve_clip = || match clip_for_router.clip_text() {
+            Ok(h) => Some(h),
+            Err(e) => {
+                tracing::error!("failed to obtain CLIP text embedder via supervisor: {e:#}");
+                None
+            }
+        };
+
         let image_anchor_embeddings: Vec<Vec<f32>> = {
+            #[cfg(feature = "idle-eviction")]
+            let handle = match resolve_clip() {
+                Some(h) => h,
+                None => return,
+            };
+            #[cfg(feature = "idle-eviction")]
+            let mut embedder = handle.lock().unwrap();
+            #[cfg(not(feature = "idle-eviction"))]
             let mut embedder = clip_for_router.lock().unwrap();
             let texts: Vec<String> = QueryRouter::image_anchor_texts()
                 .iter()
@@ -219,6 +271,14 @@ async fn main() -> Result<()> {
             }
         };
         let text_anchor_embeddings: Vec<Vec<f32>> = {
+            #[cfg(feature = "idle-eviction")]
+            let handle = match resolve_clip() {
+                Some(h) => h,
+                None => return,
+            };
+            #[cfg(feature = "idle-eviction")]
+            let mut embedder = handle.lock().unwrap();
+            #[cfg(not(feature = "idle-eviction"))]
             let mut embedder = clip_for_router.lock().unwrap();
             let texts: Vec<String> = QueryRouter::text_anchor_texts()
                 .iter()
