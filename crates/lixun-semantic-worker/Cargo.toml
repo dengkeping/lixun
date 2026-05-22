@@ -75,11 +75,16 @@ image-decode = ["lixun-image-decode"]
 jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
 
 # quantized-embedders (default: OFF)
-#   Reserved placeholder for B2. When enabled, the worker selects
-#   pre-quantized embedder variants (BGE small int8, CLIP int8) instead
-#   of the FP32 weights. Empty until B2 wires the fastembed selection.
+#   When enabled, the worker selects the statically-quantized int8
+#   variant of the BGE small text embedder
+#   (EmbeddingModel::BGESmallENV15Q, ~33 MB) instead of the fp32
+#   weights (~130 MB) with published MTEB loss < 1% for typical
+#   English retrieval. The CLIP image and CLIP text sides stay on
+#   fp32 because fastembed 5.13.3 does not ship pre-quantized
+#   variants of either ClipVitB32 enum; that gap is tracked in
+#   .workspace-local/notepads/launcher-perf-and-semantic-memory/decisions.md.
 #   Rollback: cargo build -p lixun-semantic-worker --no-default-features
-#   Evidence: .workspace-local/evidence/task-b2-quantized.log
+#   Evidence: .workspace-local/evidence/task-b2-{build,build-quant,build-both,tests}.log
 quantized-embedders = []
 
 # idle-eviction (default: OFF)

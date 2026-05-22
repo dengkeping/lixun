@@ -140,7 +140,37 @@ impl ClipTextEmbedder {
 
 fn resolve_text_model(name: &str) -> Result<(EmbeddingModel, usize)> {
     match name {
-        "bge-small-en-v1.5" => Ok((EmbeddingModel::BGESmallENV15, 384)),
+        // BAAI bge-small-en-v1.5. Output dimension stays 384 in both
+        // the FP32 and statically-quantized branches, so on-disk
+        // LanceDB tables and the ANN store are bit-compatible across a
+        // feature flip. The `quantized-embedders` cargo feature picks
+        // between two pre-converted ONNX weight files at compile
+        // time:
+        //
+        // - OFF: `EmbeddingModel::BGESmallENV15` — fp32 weights,
+        //   ~130 MB on disk, baseline MTEB scores.
+        // - ON:  `EmbeddingModel::BGESmallENV15Q` — int8-quantized
+        //   weights, ~33 MB on disk (~4× weight reduction). Published
+        //   MTEB loss vs fp32 is < 1% for typical English retrieval
+        //   tasks per the BGE int8 release notes; this matches the
+        //   acceptance window the plan calls out before B2 may flip
+        //   to default-on.
+        //
+        // Runtime quality is otherwise identical: tokenizer, max
+        // sequence length, normalization, and the post-processing
+        // path in `TextEmbedding::embed` are unchanged.
+        "bge-small-en-v1.5" => {
+            #[cfg(feature = "quantized-embedders")]
+            {
+                Ok((EmbeddingModel::BGESmallENV15Q, 384))
+            }
+            #[cfg(not(feature = "quantized-embedders"))]
+            {
+                Ok((EmbeddingModel::BGESmallENV15, 384))
+            }
+        }
+        // BAAI bge-m3 has no statically-quantized variant in fastembed
+        // 5.13.3, so this arm is the same in both feature states.
         "bge-m3" => Ok((EmbeddingModel::BGEM3, 1024)),
         other => anyhow::bail!(
             "semantic.text_model='{other}' not supported in v1 \
@@ -151,6 +181,17 @@ fn resolve_text_model(name: &str) -> Result<(EmbeddingModel, usize)> {
 
 fn resolve_image_model(name: &str) -> Result<(ImageEmbeddingModel, usize)> {
     match name {
+        // CLIP ViT-B/32 vision encoder. fastembed 5.13.3 does NOT ship
+        // a statically pre-quantized variant of either
+        // `ImageEmbeddingModel::ClipVitB32` or
+        // `EmbeddingModel::ClipVitB32` (the matching text tower), so
+        // there is no `ClipVitB32Q` to switch to when the
+        // `quantized-embedders` feature is on. The image and CLIP-text
+        // sides therefore stay on fp32 (~150 MB per branch) regardless
+        // of the feature state; B2 only quantizes the BGE text path
+        // and the CLIP int8 gap is tracked in
+        // `.workspace-local/notepads/launcher-perf-and-semantic-memory/decisions.md`
+        // under "B2 partial: only BGE int8 available".
         "clip-vit-b-32" => Ok((ImageEmbeddingModel::ClipVitB32, 512)),
         other => anyhow::bail!(
             "semantic.image_model='{other}' not supported in v1 \
