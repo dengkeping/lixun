@@ -9,6 +9,7 @@ lixun-core = { path = "../lixun-core" }
 lixun-mutation = { path = "../lixun-mutation" }
 serde.workspace = true
 serde_json.workspace = true
+postcard = { version = "1", features = ["use-std"] }
 tokio.workspace = true
 tokio-util = { workspace = true, features = ["codec"] }
 bytes.workspace = true

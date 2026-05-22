@@ -15,7 +15,151 @@ use lixun_core::{Hit, ImpactProfile, SystemImpact};
 pub mod gui;
 pub mod preview;
 
-pub const PROTOCOL_VERSION: u16 = 4;
+/// JSON wire format introduced in v4. Kept as the rollback path
+/// behind the `legacy-json-ipc` feature.
+pub const PROTOCOL_VERSION_LEGACY: u16 = 4;
+/// Postcard binary wire format introduced in v5.
+pub const PROTOCOL_VERSION_BINARY: u16 = 5;
+
+/// The protocol version this build emits on the wire. Decode paths
+/// still accept both [`PROTOCOL_VERSION_LEGACY`] and
+/// [`PROTOCOL_VERSION_BINARY`] regardless of which codec is compiled
+/// in, so a rolling upgrade between daemon and launcher does not
+/// require a coordinated restart.
+#[cfg(feature = "legacy-json-ipc")]
+pub const PROTOCOL_VERSION: u16 = PROTOCOL_VERSION_LEGACY;
+#[cfg(not(feature = "legacy-json-ipc"))]
+pub const PROTOCOL_VERSION: u16 = PROTOCOL_VERSION_BINARY;
+
+/// Error returned by [`encode_request`] / [`encode_response`].
+#[derive(Debug)]
+pub enum EncodeError {
+    Json(serde_json::Error),
+    Postcard(postcard::Error),
+}
+
+impl std::fmt::Display for EncodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EncodeError::Json(e) => write!(f, "json encode error: {}", e),
+            EncodeError::Postcard(e) => write!(f, "postcard encode error: {}", e),
+        }
+    }
+}
+
+impl std::error::Error for EncodeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            EncodeError::Json(e) => Some(e),
+            EncodeError::Postcard(e) => Some(e),
+        }
+    }
+}
+
+impl From<serde_json::Error> for EncodeError {
+    fn from(e: serde_json::Error) -> Self {
+        EncodeError::Json(e)
+    }
+}
+
+impl From<postcard::Error> for EncodeError {
+    fn from(e: postcard::Error) -> Self {
+        EncodeError::Postcard(e)
+    }
+}
+
+/// Error returned by [`decode_request`] / [`decode_response`].
+#[derive(Debug)]
+pub enum DecodeError {
+    Json(serde_json::Error),
+    Postcard(postcard::Error),
+    UnsupportedVersion(u16),
+}
+
+impl std::fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DecodeError::Json(e) => write!(f, "json decode error: {}", e),
+            DecodeError::Postcard(e) => write!(f, "postcard decode error: {}", e),
+            DecodeError::UnsupportedVersion(v) => {
+                write!(f, "unsupported protocol version: {}", v)
+            }
+        }
+    }
+}
+
+impl std::error::Error for DecodeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            DecodeError::Json(e) => Some(e),
+            DecodeError::Postcard(e) => Some(e),
+            DecodeError::UnsupportedVersion(_) => None,
+        }
+    }
+}
+
+impl From<serde_json::Error> for DecodeError {
+    fn from(e: serde_json::Error) -> Self {
+        DecodeError::Json(e)
+    }
+}
+
+impl From<postcard::Error> for DecodeError {
+    fn from(e: postcard::Error) -> Self {
+        DecodeError::Postcard(e)
+    }
+}
+
+/// Encode a request using the codec selected at compile time. Returns
+/// the wire-protocol version that callers must write into the framing
+/// header alongside the payload.
+pub fn encode_request(req: &Request) -> Result<(u16, Vec<u8>), EncodeError> {
+    #[cfg(feature = "legacy-json-ipc")]
+    {
+        let bytes = serde_json::to_vec(req)?;
+        Ok((PROTOCOL_VERSION_LEGACY, bytes))
+    }
+    #[cfg(not(feature = "legacy-json-ipc"))]
+    {
+        let bytes = postcard::to_allocvec(req)?;
+        Ok((PROTOCOL_VERSION_BINARY, bytes))
+    }
+}
+
+/// Encode a response using the codec selected at compile time. See
+/// [`encode_request`].
+pub fn encode_response(resp: &Response) -> Result<(u16, Vec<u8>), EncodeError> {
+    #[cfg(feature = "legacy-json-ipc")]
+    {
+        let bytes = serde_json::to_vec(resp)?;
+        Ok((PROTOCOL_VERSION_LEGACY, bytes))
+    }
+    #[cfg(not(feature = "legacy-json-ipc"))]
+    {
+        let bytes = postcard::to_allocvec(resp)?;
+        Ok((PROTOCOL_VERSION_BINARY, bytes))
+    }
+}
+
+/// Decode a request frame. Branches on the runtime `version` from the
+/// framing header so a build can still accept frames from a peer that
+/// hasn't upgraded yet.
+pub fn decode_request(version: u16, bytes: &[u8]) -> Result<Request, DecodeError> {
+    match version {
+        PROTOCOL_VERSION_LEGACY => Ok(serde_json::from_slice(bytes)?),
+        PROTOCOL_VERSION_BINARY => Ok(postcard::from_bytes(bytes)?),
+        other => Err(DecodeError::UnsupportedVersion(other)),
+    }
+}
+
+/// Decode a response frame. See [`decode_request`].
+pub fn decode_response(version: u16, bytes: &[u8]) -> Result<Response, DecodeError> {
+    match version {
+        PROTOCOL_VERSION_LEGACY => Ok(serde_json::from_slice(bytes)?),
+        PROTOCOL_VERSION_BINARY => Ok(postcard::from_bytes(bytes)?),
+        other => Err(DecodeError::UnsupportedVersion(other)),
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WatcherStats {

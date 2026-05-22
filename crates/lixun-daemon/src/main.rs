@@ -11,7 +11,8 @@ use chrono::Utc;
 use futures::StreamExt;
 use lixun_ipc::gui::{GuiCommand, GuiResponse};
 use lixun_ipc::{
-    ImpactProfileWire, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, Request, Response, socket_path,
+    ImpactProfileWire, PROTOCOL_VERSION_BINARY, PROTOCOL_VERSION_LEGACY, Request, Response,
+    socket_path,
 };
 use lixun_sources::QueryContext;
 use std::os::unix::io::AsRawFd;
@@ -1124,15 +1125,15 @@ async fn handle_search(
 async fn writer_task(
     mut stream_write: tokio::io::WriteHalf<tokio::net::UnixStream>,
     mut rx: mpsc::Receiver<Response>,
-    negotiated_version: u16,
+    _negotiated_version: u16,
 ) -> anyhow::Result<()> {
     while let Some(resp) = rx.recv().await {
-        let json = serde_json::to_vec(&resp)?;
-        let total_len = (2 + json.len()) as u32;
+        let (version, payload) = lixun_ipc::encode_response(&resp)?;
+        let total_len = (2 + payload.len()) as u32;
         let mut out = BytesMut::with_capacity(4 + total_len as usize);
         out.put_u32(total_len);
-        out.put_u16(negotiated_version);
-        out.put_slice(&json);
+        out.put_u16(version);
+        out.put_slice(&payload);
         stream_write.write_all(&out).await?;
     }
     Ok(())
@@ -1156,18 +1157,18 @@ async fn read_request(
     let mut ver_buf = [0u8; 2];
     stream_read.read_exact(&mut ver_buf).await?;
     let version = u16::from_be_bytes(ver_buf);
-    if !(MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&version) {
+    if !(PROTOCOL_VERSION_LEGACY..=PROTOCOL_VERSION_BINARY).contains(&version) {
         anyhow::bail!(
             "unsupported protocol version: got {}, supported {}..={}",
             version,
-            MIN_PROTOCOL_VERSION,
-            PROTOCOL_VERSION
+            PROTOCOL_VERSION_LEGACY,
+            PROTOCOL_VERSION_BINARY
         );
     }
     frame_buf.clear();
     frame_buf.resize(frame_len - 2, 0);
     stream_read.read_exact(frame_buf).await?;
-    let parsed: Request = serde_json::from_slice(frame_buf)?;
+    let parsed = lixun_ipc::decode_request(version, frame_buf)?;
     Ok(Some((version, parsed)))
 }
 

@@ -12,7 +12,7 @@ use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use lixun_core::{Calculation, DocId, Hit};
-use lixun_ipc::{PROTOCOL_VERSION, Phase, Request, Response, socket_path};
+use lixun_ipc::{Phase, Request, Response, socket_path};
 
 #[derive(Debug, Clone)]
 pub(crate) enum IpcMessage {
@@ -60,18 +60,18 @@ pub(crate) fn start_ipc_thread(
                 explain: false,
                 epoch: epoch_at_send,
             };
-            let json = match serde_json::to_vec(&req) {
-                Ok(j) => j,
+            let (version, payload) = match lixun_ipc::encode_request(&req) {
+                Ok(p) => p,
                 Err(e) => {
                     tracing::error!("Failed to serialize search request: {}", e);
                     continue;
                 }
             };
-            let total_len = (2 + json.len()) as u32;
-            let mut buf = Vec::with_capacity(4 + 2 + json.len());
+            let total_len = (2 + payload.len()) as u32;
+            let mut buf = Vec::with_capacity(4 + 2 + payload.len());
             buf.extend_from_slice(&total_len.to_be_bytes());
-            buf.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
-            buf.extend_from_slice(&json);
+            buf.extend_from_slice(&version.to_be_bytes());
+            buf.extend_from_slice(&payload);
 
             let mut stream = match std::os::unix::net::UnixStream::connect(&sock) {
                 Ok(s) => s,
@@ -132,18 +132,19 @@ pub(crate) fn start_ipc_thread(
                     tracing::error!("Response frame too short");
                     break;
                 }
-                let mut _version = [0u8; 2];
-                if let Err(e) = stream.read_exact(&mut _version) {
+                let mut version_buf = [0u8; 2];
+                if let Err(e) = stream.read_exact(&mut version_buf) {
                     tracing::error!("Failed to read response version: {}", e);
                     break;
                 }
+                let resp_version = u16::from_be_bytes(version_buf);
                 let mut resp_buf = vec![0u8; resp_len - 2];
                 if let Err(e) = stream.read_exact(&mut resp_buf) {
                     tracing::error!("Failed to read response body: {}", e);
                     break;
                 }
 
-                match serde_json::from_slice::<Response>(&resp_buf) {
+                match lixun_ipc::decode_response(resp_version, &resp_buf) {
                     Ok(Response::SearchChunk {
                         epoch: resp_epoch,
                         phase,
@@ -218,14 +219,14 @@ pub(crate) fn start_ipc_thread(
 pub(crate) fn send_record_query(q: &str) {
     let sock = socket_path();
     let req = Request::RecordQuery { q: q.to_string() };
-    let Ok(json) = serde_json::to_vec(&req) else {
+    let Ok((version, payload)) = lixun_ipc::encode_request(&req) else {
         return;
     };
-    let total_len = (2 + json.len()) as u32;
-    let mut buf = Vec::with_capacity(4 + 2 + json.len());
+    let total_len = (2 + payload.len()) as u32;
+    let mut buf = Vec::with_capacity(4 + 2 + payload.len());
     buf.extend_from_slice(&total_len.to_be_bytes());
-    buf.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
-    buf.extend_from_slice(&json);
+    buf.extend_from_slice(&version.to_be_bytes());
+    buf.extend_from_slice(&payload);
 
     if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&sock) {
         let _ = stream.write_all(&buf);
@@ -235,14 +236,14 @@ pub(crate) fn send_record_query(q: &str) {
 pub(crate) fn request_search_history(limit: u32) -> Vec<String> {
     let sock = socket_path();
     let req = Request::SearchHistory { limit };
-    let Ok(json) = serde_json::to_vec(&req) else {
+    let Ok((version, payload)) = lixun_ipc::encode_request(&req) else {
         return Vec::new();
     };
-    let total_len = (2 + json.len()) as u32;
-    let mut buf = Vec::with_capacity(4 + 2 + json.len());
+    let total_len = (2 + payload.len()) as u32;
+    let mut buf = Vec::with_capacity(4 + 2 + payload.len());
     buf.extend_from_slice(&total_len.to_be_bytes());
-    buf.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
-    buf.extend_from_slice(&json);
+    buf.extend_from_slice(&version.to_be_bytes());
+    buf.extend_from_slice(&payload);
 
     let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&sock) else {
         return Vec::new();
@@ -259,15 +260,16 @@ pub(crate) fn request_search_history(limit: u32) -> Vec<String> {
     if resp_len < 2 {
         return Vec::new();
     }
-    let mut version = [0u8; 2];
-    if stream.read_exact(&mut version).is_err() {
+    let mut version_buf = [0u8; 2];
+    if stream.read_exact(&mut version_buf).is_err() {
         return Vec::new();
     }
+    let resp_version = u16::from_be_bytes(version_buf);
     let mut resp_buf = vec![0u8; resp_len - 2];
     if stream.read_exact(&mut resp_buf).is_err() {
         return Vec::new();
     }
-    match serde_json::from_slice::<Response>(&resp_buf) {
+    match lixun_ipc::decode_response(resp_version, &resp_buf) {
         Ok(Response::Queries(qs)) => qs,
         _ => Vec::new(),
     }
@@ -300,14 +302,14 @@ pub(crate) fn build_click_pair(doc_id: &str, query: &str) -> Vec<Request> {
 
 fn send_request_fire_and_forget(req: &Request) {
     let sock = socket_path();
-    let Ok(json) = serde_json::to_vec(req) else {
+    let Ok((version, payload)) = lixun_ipc::encode_request(req) else {
         return;
     };
-    let total_len = (2 + json.len()) as u32;
-    let mut buf = Vec::with_capacity(4 + 2 + json.len());
+    let total_len = (2 + payload.len()) as u32;
+    let mut buf = Vec::with_capacity(4 + 2 + payload.len());
     buf.extend_from_slice(&total_len.to_be_bytes());
-    buf.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
-    buf.extend_from_slice(&json);
+    buf.extend_from_slice(&version.to_be_bytes());
+    buf.extend_from_slice(&payload);
     if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&sock) {
         let _ = stream.write_all(&buf);
     }
@@ -317,14 +319,14 @@ pub(crate) fn fetch_claimed_prefixes() -> Vec<String> {
     use std::io::Read;
     let sock = socket_path();
     let req = Request::ClaimedPrefixes;
-    let Ok(json) = serde_json::to_vec(&req) else {
+    let Ok((version, payload)) = lixun_ipc::encode_request(&req) else {
         return Vec::new();
     };
-    let total_len = (2 + json.len()) as u32;
-    let mut buf = Vec::with_capacity(4 + 2 + json.len());
+    let total_len = (2 + payload.len()) as u32;
+    let mut buf = Vec::with_capacity(4 + 2 + payload.len());
     buf.extend_from_slice(&total_len.to_be_bytes());
-    buf.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
-    buf.extend_from_slice(&json);
+    buf.extend_from_slice(&version.to_be_bytes());
+    buf.extend_from_slice(&payload);
     let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&sock) else {
         return Vec::new();
     };
@@ -340,15 +342,16 @@ pub(crate) fn fetch_claimed_prefixes() -> Vec<String> {
     if resp_len < 2 {
         return Vec::new();
     }
-    let mut version = [0u8; 2];
-    if stream.read_exact(&mut version).is_err() {
+    let mut version_buf = [0u8; 2];
+    if stream.read_exact(&mut version_buf).is_err() {
         return Vec::new();
     }
+    let resp_version = u16::from_be_bytes(version_buf);
     let mut body = vec![0u8; resp_len - 2];
     if stream.read_exact(&mut body).is_err() {
         return Vec::new();
     }
-    match serde_json::from_slice::<Response>(&body) {
+    match lixun_ipc::decode_response(resp_version, &body) {
         Ok(Response::ClaimedPrefixes(p)) => p,
         _ => Vec::new(),
     }
@@ -374,14 +377,14 @@ pub(crate) fn send_preview_request(hit: &Hit, monitor: Option<String>) {
         hit: Box::new(hit.clone()),
         monitor: monitor.clone(),
     };
-    let Ok(json) = serde_json::to_vec(&req) else {
+    let Ok((version, payload)) = lixun_ipc::encode_request(&req) else {
         return;
     };
-    let total_len = (2 + json.len()) as u32;
-    let mut buf = Vec::with_capacity(4 + 2 + json.len());
+    let total_len = (2 + payload.len()) as u32;
+    let mut buf = Vec::with_capacity(4 + 2 + payload.len());
     buf.extend_from_slice(&total_len.to_be_bytes());
-    buf.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
-    buf.extend_from_slice(&json);
+    buf.extend_from_slice(&version.to_be_bytes());
+    buf.extend_from_slice(&payload);
 
     tracing::info!(
         "gui: send_preview_request hit_id={} monitor={:?}",
@@ -410,15 +413,15 @@ pub(crate) fn send_launcher_geometry(monitor: String, x: i32, y: i32, w: i32, h:
         w,
         h,
     };
-    let Ok(json) = serde_json::to_vec(&req) else {
+    let Ok((version, payload)) = lixun_ipc::encode_request(&req) else {
         tracing::warn!("gui: failed to serialize LauncherGeometry");
         return;
     };
-    let total_len = (2 + json.len()) as u32;
-    let mut buf = Vec::with_capacity(4 + 2 + json.len());
+    let total_len = (2 + payload.len()) as u32;
+    let mut buf = Vec::with_capacity(4 + 2 + payload.len());
     buf.extend_from_slice(&total_len.to_be_bytes());
-    buf.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
-    buf.extend_from_slice(&json);
+    buf.extend_from_slice(&version.to_be_bytes());
+    buf.extend_from_slice(&payload);
     if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&sock) {
         if stream.write_all(&buf).is_err() {
             tracing::warn!("gui: failed to write LauncherGeometry to daemon socket");
@@ -431,14 +434,14 @@ pub(crate) fn send_launcher_geometry(monitor: String, x: i32, y: i32, w: i32, h:
 pub(crate) fn send_preview_hide_request() {
     let sock = socket_path();
     let req = Request::PreviewHide;
-    let Ok(json) = serde_json::to_vec(&req) else {
+    let Ok((version, payload)) = lixun_ipc::encode_request(&req) else {
         return;
     };
-    let total_len = (2 + json.len()) as u32;
-    let mut buf = Vec::with_capacity(4 + 2 + json.len());
+    let total_len = (2 + payload.len()) as u32;
+    let mut buf = Vec::with_capacity(4 + 2 + payload.len());
     buf.extend_from_slice(&total_len.to_be_bytes());
-    buf.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
-    buf.extend_from_slice(&json);
+    buf.extend_from_slice(&version.to_be_bytes());
+    buf.extend_from_slice(&payload);
 
     tracing::info!("gui: send_preview_hide_request");
     if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&sock) {
