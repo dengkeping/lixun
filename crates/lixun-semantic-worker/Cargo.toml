@@ -13,6 +13,7 @@ path = "src/main.rs"
 [[bin]]
 name = "memory-states-harness"
 path = "benches/memory_states.rs"
+required-features = ["bench-harness"]
 
 [dependencies]
 lixun-core = { path = "../lixun-core" }
@@ -104,4 +105,13 @@ quantized-embedders = []
 #   Rollback: cargo build -p lixun-semantic-worker --no-default-features
 #   Evidence: .workspace-local/evidence/task-b4-{build,build-feature,build-jemalloc,build-all,summary}.{log,md}
 idle-eviction = ["dep:arc-swap"]
+
+# bench-harness (default: OFF)
+#   Gates the `memory-states-harness` binary so it is built only when
+#   explicitly requested for heaptrack profiling. Without this gate, a
+#   plain `cargo build --release` produced a 237 MB harness binary
+#   alongside `lixun-semantic-worker` in target/release/, polluting
+#   production artefacts. Build: cargo build -p lixun-semantic-worker
+#   --features bench-harness --bin memory-states-harness
+bench-harness = []
 
