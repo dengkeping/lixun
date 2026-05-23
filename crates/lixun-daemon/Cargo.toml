@@ -53,9 +53,13 @@ getrandom = "0.3"
 # jemalloc: bounds VmPeak on a long-lived daemon by aggressively returning
 # freed pages to the kernel. Glibc malloc retains arenas (~64 MiB each) and
 # inflated VmPeak to ~4.4 GiB in heaptrack profiling despite peak heap
-# consumption of only 292 MiB.
+# consumption of only 292 MiB. The companion `tikv-jemalloc-ctl` crate
+# exposes the runtime mallctl interface used to tune decay timers and
+# emit the periodic anon/resident heartbeat — mirrors the worker-side
+# B1 wiring so both binaries observe the same allocator policy.
 [target.'cfg(target_os = "linux")'.dependencies]
 tikv-jemallocator = "0.6"
+tikv-jemalloc-ctl = "0.6"
 
 [dev-dependencies]
 tempfile = "3"

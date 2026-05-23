@@ -5307,6 +5307,7 @@ dependencies = [
  "signal-hook",
  "signal-hook-tokio",
  "tempfile",
+ "tikv-jemalloc-ctl",
  "tikv-jemallocator",
  "tokio",
  "tokio-util",

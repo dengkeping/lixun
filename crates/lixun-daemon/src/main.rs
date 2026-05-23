@@ -213,6 +213,49 @@ fn try_single_instance() -> Result<std::fs::File> {
     Ok(file)
 }
 
+/// Apply proactive decay tuning to the jemalloc allocator backing the
+/// daemon. Without this, jemalloc retains freed pages for ten seconds
+/// by default; on a long-lived daemon that periodically allocates
+/// large transient buffers (zstd compressors, Tantivy merge scratch,
+/// search hit Vecs) the resident set drifts upward over time even
+/// though the application heap is small. Setting `dirty_decay_ms` and
+/// `muzzy_decay_ms` to five seconds and turning on the background
+/// purge thread tells jemalloc to return freed pages to the kernel
+/// promptly. Mirrors the worker-side B1 wiring so both binaries
+/// observe the same allocator policy; failures are downgraded to a
+/// warning so the daemon still starts on a build where one of the
+/// knobs is unsupported.
+#[cfg(target_os = "linux")]
+fn tune_jemalloc_decay() {
+    use tikv_jemalloc_ctl::raw;
+
+    // SAFETY: these mallctl keys are statically known and have the
+    // documented types (bool for the toggle, ssize_t for the decay
+    // window, u32 for the metadata_thp mode). The keys are
+    // null-terminated and stable across jemalloc 5.x.
+    unsafe {
+        if let Err(e) = raw::write(b"background_thread\0", true) {
+            tracing::warn!(target: "jemalloc", error = ?e, "mallctl background_thread failed");
+        }
+        if let Err(e) = raw::write::<libc::ssize_t>(b"arenas.dirty_decay_ms\0", 5000) {
+            tracing::warn!(target: "jemalloc", error = ?e, "mallctl arenas.dirty_decay_ms failed");
+        }
+        if let Err(e) = raw::write::<libc::ssize_t>(b"arenas.muzzy_decay_ms\0", 5000) {
+            tracing::warn!(target: "jemalloc", error = ?e, "mallctl arenas.muzzy_decay_ms failed");
+        }
+        // metadata_thp is best-effort; ignore on kernels without
+        // transparent huge pages.
+        let _ = raw::write::<u32>(b"opt.metadata_thp\0", 2 /* auto */);
+    }
+    tracing::info!(
+        target: "jemalloc",
+        "decay tuned (dirty_decay_ms=5000, muzzy_decay_ms=5000, background_thread=on)"
+    );
+}
+
+#[cfg(not(target_os = "linux"))]
+fn tune_jemalloc_decay() {}
+
 fn main() -> Result<()> {
     let env_filter = match std::env::var("RUST_LOG") {
         Ok(raw) if !raw.trim().is_empty() => tracing_subscriber::EnvFilter::new(raw),
@@ -221,6 +264,8 @@ fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
     tracing::info!("lixund starting...");
+
+    tune_jemalloc_decay();
 
     let _lock = try_single_instance()?;
 
