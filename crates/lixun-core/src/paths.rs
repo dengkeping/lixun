@@ -36,6 +36,20 @@ pub fn canonical_fs_doc_id(path: &Path) -> String {
     format!("fs:{}", canonical_fs_path_str(path))
 }
 
+/// Build a stable `fs:<abspath>` document id from a path string that
+/// is already known to be canonical.
+///
+/// Skips the [`std::fs::canonicalize`] call. Use this from hot loops
+/// where the caller has just produced the canonical string via
+/// [`canonical_fs_path_str`] and would otherwise pay a second
+/// `realpath(3)` syscall per file. The contract is the same shape as
+/// [`canonical_fs_doc_id`]: the returned string is `fs:` followed by
+/// the input. Callers that pass a non-canonical string get a
+/// non-canonical id — keep the invariant local to the call site.
+pub fn canonical_fs_doc_id_from_str(canon_path: &str) -> String {
+    format!("fs:{canon_path}")
+}
+
 /// Build the canonical absolute path string for `path`, without the
 /// `fs:` prefix.
 ///

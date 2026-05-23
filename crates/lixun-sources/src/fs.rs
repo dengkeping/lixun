@@ -5,7 +5,7 @@
 //! 2. **Content pass** (rayon pool): extracts body text in parallel.
 
 use anyhow::Result;
-use lixun_core::paths::{canonical_fs_doc_id, canonical_fs_path_str};
+use lixun_core::paths::{canonical_fs_doc_id, canonical_fs_doc_id_from_str, canonical_fs_path_str};
 use lixun_core::{Action, Category, DocId, Document, RowMenuDef, RowMenuItem, RowMenuVerb};
 use lixun_extract::ExtractorCapabilities;
 use rayon::prelude::*;
@@ -297,10 +297,15 @@ impl FsSource {
                     })
                     .unwrap_or(0);
 
+                // Canonicalise the path once and reuse the string to
+                // build the doc id. Calling canonical_fs_doc_id(path)
+                // here would issue a second realpath(3) per file in
+                // the hot incremental-scan loop — heaptrack confirmed
+                // 922k realpath calls / 76 s before this fix.
                 let path_str = canonical_fs_path_str(path);
                 current_files.insert(path_str.clone());
 
-                let doc_id = canonical_fs_doc_id(path);
+                let doc_id = canonical_fs_doc_id_from_str(&path_str);
                 let in_index = indexed_ids.contains(&doc_id);
                 if manifest.is_unchanged(&path_str, mtime) && in_index {
                     continue;
