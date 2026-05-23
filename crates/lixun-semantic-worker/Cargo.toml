@@ -59,13 +59,13 @@ tikv-jemalloc-ctl = { version = "0.6", optional = true }
 tempfile = "3"
 
 [features]
-# Default feature set. image-decode is ON by default because the B5
-# bloat audit measured +10.4 MiB .text / +17.0 MiB file size — well
-# under the 50 MiB threshold the plan set for the default-on gate.
-# Other heavy or invasive subsystems still opt in via the named flags
-# below so a regression in any one of them can be bisected and
-# disabled in isolation.
-default = ["image-decode"]
+# Default feature set. All three memory-saving subsystems
+# (jemalloc, quantized-embedders, idle-eviction) are now default-ON
+# after empirical confirmation that the default-off worker held
+# 2.75 GB anonymous heap with all three embedders eagerly resident.
+# Each can be bisected with --no-default-features --features "..."
+# if one of them regresses.
+default = ["image-decode", "jemalloc", "quantized-embedders", "idle-eviction"]
 
 # image-decode (default: ON as of B5)
 #   Compiles the in-process image decoder (HEIC/JXL/RAW transitive deps)
