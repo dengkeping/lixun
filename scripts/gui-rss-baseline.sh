@@ -255,7 +255,8 @@ run_baseline() {
 
     # ---- Assemble JSON output --------------------------------------------
     local out_dir out_file timestamp sample_count
-    out_dir=".workspace-local/evidence/baseline/gui_rss"
+    # Default writes to .workspace-local/ — override with LIXUN_EVIDENCE_DIR.
+    out_dir="${LIXUN_EVIDENCE_DIR:-.workspace-local}/evidence/baseline/gui_rss"
     mkdir -p "$out_dir"
     timestamp=$(date +%Y%m%d_%H%M%S)
     out_file="${out_dir}/${timestamp}.json"

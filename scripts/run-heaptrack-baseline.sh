@@ -31,7 +31,8 @@ if [[ ! -x "$HARNESS" ]]; then
 fi
 
 TIMESTAMP=$(date +%Y%m%dT%H%M%S)
-EVIDENCE_DIR="${PROJECT_ROOT}/.workspace-local/evidence/baseline/memory_states"
+# Default writes to .workspace-local/ — override with LIXUN_EVIDENCE_DIR.
+EVIDENCE_DIR="${LIXUN_EVIDENCE_DIR:-${PROJECT_ROOT}/.workspace-local}/evidence/baseline/memory_states"
 mkdir -p "$EVIDENCE_DIR"
 
 OUTPUT_JSONL="${EVIDENCE_DIR}/${TIMESTAMP}.jsonl"
