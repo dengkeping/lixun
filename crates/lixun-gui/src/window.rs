@@ -1224,8 +1224,7 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
     });
     window.add_controller(focus_ctrl);
 
-    install_drag_gesture(&window, &entry, &scrolled);
-    install_reset_position_shortcut(&window);
+    install_drag_gesture(&window);
 
     // In daemon-spawned (service) mode the GUI must start hidden
     // and wait for the daemon's first command. Calling show() here
@@ -1252,11 +1251,7 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
     Ok(())
 }
 
-fn install_drag_gesture(
-    window: &gtk::ApplicationWindow,
-    entry: &gtk::Entry,
-    scrolled: &gtk::ScrolledWindow,
-) {
+fn install_drag_gesture(window: &gtk::ApplicationWindow) {
     use gtk::prelude::*;
     use std::cell::Cell;
     use std::rc::Rc;
@@ -1268,18 +1263,18 @@ fn install_drag_gesture(
         Rc::new(std::cell::RefCell::new(None));
     let drag_accepted: Rc<Cell<bool>> = Rc::new(Cell::new(false));
 
-    let entry_for_begin = entry.clone();
-    let scrolled_for_begin = scrolled.clone();
     let window_for_begin = window.clone();
     let base_top_for_begin = Rc::clone(&base_top);
     let base_left_for_begin = Rc::clone(&base_left);
     let drag_accepted_for_begin = Rc::clone(&drag_accepted);
-    gesture.connect_drag_begin(move |gesture, x, y| {
-        if let Some(target) = window_for_begin.pick(x, y, gtk::PickFlags::DEFAULT)
-            && (target == entry_for_begin.clone().upcast::<gtk::Widget>()
-                || target.is_ancestor(&entry_for_begin)
-                || target == scrolled_for_begin.clone().upcast::<gtk::Widget>()
-                || target.is_ancestor(&scrolled_for_begin))
+    gesture.connect_drag_begin(move |gesture, _x, _y| {
+        // Super-hold gates the drag so plain clicks fall through to
+        // the entry, list, and chips. Without this guard, drags on
+        // the chrome between widgets would move the launcher and
+        // confuse users who expected the click to land on a widget.
+        if !gesture
+            .current_event_state()
+            .contains(gtk::gdk::ModifierType::SUPER_MASK)
         {
             gesture.set_state(gtk::EventSequenceState::Denied);
             return;
@@ -1334,13 +1329,22 @@ fn install_drag_gesture(
     let base_top_for_end = Rc::clone(&base_top);
     let base_left_for_end = Rc::clone(&base_left);
     let drag_accepted_for_end = Rc::clone(&drag_accepted);
-    gesture.connect_drag_end(move |_gesture, offset_x, offset_y| {
+    gesture.connect_drag_end(move |gesture, offset_x, offset_y| {
         if !drag_accepted_for_end.get() {
             return;
         }
         use gtk4_layer_shell::LayerShell;
 
-        window_for_end.set_cursor(None);
+        // If Super is still held when the drag ends, restore the
+        // "grab" (open hand) affordance so the user knows another
+        // drag is available. Otherwise reset to the default cursor.
+        let still_super = gesture
+            .current_event_state()
+            .contains(gtk::gdk::ModifierType::SUPER_MASK);
+        let hover_cursor = still_super
+            .then(|| gtk::gdk::Cursor::from_name("grab", None))
+            .flatten();
+        window_for_end.set_cursor(hover_cursor.as_ref());
 
         let new_top = (base_top_for_end.get() + offset_y as i32).max(0);
         let new_left = (base_left_for_end.get() + offset_x as i32).max(0);
@@ -1374,6 +1378,49 @@ fn install_drag_gesture(
     });
 
     window.add_controller(gesture);
+
+    install_super_drag_cursor(window, drag_accepted);
+}
+
+/// Track Super-key press/release so the cursor shows the "grab" (open
+/// hand) affordance whenever the modifier is held, even before the
+/// user starts dragging. Without this the affordance only appears
+/// after the GestureDrag claims the sequence — too late to discover.
+///
+/// Cursor is left alone while a drag is in progress (drag_accepted is
+/// true): connect_drag_begin/end own the cursor for that window of
+/// time.
+fn install_super_drag_cursor(
+    window: &gtk::ApplicationWindow,
+    drag_accepted: std::rc::Rc<std::cell::Cell<bool>>,
+) {
+    use gtk::prelude::*;
+
+    let key_ctrl = gtk::EventControllerKey::new();
+
+    let window_for_press = window.clone();
+    let drag_for_press = std::rc::Rc::clone(&drag_accepted);
+    key_ctrl.connect_key_pressed(move |_ctrl, key, _code, _state| {
+        if matches!(key, gtk::gdk::Key::Super_L | gtk::gdk::Key::Super_R)
+            && !drag_for_press.get()
+            && let Some(cursor) = gtk::gdk::Cursor::from_name("grab", None)
+        {
+            window_for_press.set_cursor(Some(&cursor));
+        }
+        glib::Propagation::Proceed
+    });
+
+    let window_for_release = window.clone();
+    let drag_for_release = std::rc::Rc::clone(&drag_accepted);
+    key_ctrl.connect_key_released(move |_ctrl, key, _code, _state| {
+        if matches!(key, gtk::gdk::Key::Super_L | gtk::gdk::Key::Super_R)
+            && !drag_for_release.get()
+        {
+            window_for_release.set_cursor(None);
+        }
+    });
+
+    window.add_controller(key_ctrl);
 }
 
 /// Read launcher rect (monitor-local logical pixels) and send to daemon.
@@ -1444,36 +1491,6 @@ pub(crate) fn report_launcher_geometry(window: &gtk::ApplicationWindow) {
         h
     );
     crate::ipc::send_launcher_geometry(connector, x, top, w, h);
-}
-
-fn install_reset_position_shortcut(window: &gtk::ApplicationWindow) {
-    use gtk::prelude::*;
-    let key_ctrl = gtk::EventControllerKey::new();
-    let window_for_reset = window.clone();
-    key_ctrl.connect_key_pressed(move |_ctrl, key, _code, state| {
-        let ctrl = state.contains(gtk::gdk::ModifierType::CONTROL_MASK);
-        if ctrl && (key == gtk::gdk::Key::_0 || key == gtk::gdk::Key::KP_0) {
-            let connector = gtk::gdk::Display::default()
-                .and_then(|d| d.monitors().item(0).and_downcast::<gtk::gdk::Monitor>())
-                .and_then(|m| m.connector())
-                .map(|gs| gs.to_string());
-            crate::launcher_position::clear(connector.as_deref());
-
-            use gtk4_layer_shell::LayerShell;
-            window_for_reset.set_anchor(gtk4_layer_shell::Edge::Left, false);
-            window_for_reset.set_margin(gtk4_layer_shell::Edge::Top, DEFAULT_TOP_MARGIN);
-            window_for_reset.set_margin(gtk4_layer_shell::Edge::Left, 0);
-            {
-                let w = window_for_reset.clone();
-                glib::idle_add_local_once(move || {
-                    report_launcher_geometry(&w);
-                });
-            }
-            return glib::signal::Propagation::Stop;
-        }
-        glib::signal::Propagation::Proceed
-    });
-    window.add_controller(key_ctrl);
 }
 
 #[allow(clippy::too_many_arguments)]

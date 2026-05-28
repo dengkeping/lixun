@@ -343,6 +343,7 @@ struct KeybindingsToml {
     filter_mail: Option<String>,
     filter_attachments: Option<String>,
     global_toggle: Option<String>,
+    reset_gui_position: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -363,6 +364,7 @@ pub struct Keybindings {
     pub filter_mail: String,
     pub filter_attachments: String,
     pub global_toggle: String,
+    pub reset_gui_position: String,
 }
 
 pub struct Config {
@@ -552,12 +554,13 @@ impl Default for Keybindings {
             previous_result: "Up".into(),
             next_category: "<Ctrl>Down".into(),
             previous_category: "<Ctrl>Up".into(),
-            filter_all: "<Ctrl>0".into(),
+            filter_all: "<Ctrl>grave".into(),
             filter_apps: "<Ctrl>1".into(),
             filter_files: "<Ctrl>2".into(),
             filter_mail: "<Ctrl>3".into(),
             filter_attachments: "<Ctrl>4".into(),
             global_toggle: "Super+space".into(),
+            reset_gui_position: "<Ctrl>0".into(),
         }
     }
 }
@@ -664,6 +667,9 @@ impl Config {
             }
             if let Some(v) = bindings.global_toggle {
                 cfg.keybindings.global_toggle = v;
+            }
+            if let Some(v) = bindings.reset_gui_position {
+                cfg.keybindings.reset_gui_position = v;
             }
         }
         if let Some(preview) = parsed.preview {

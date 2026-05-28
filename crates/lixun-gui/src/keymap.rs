@@ -477,6 +477,37 @@ pub(crate) fn install_keyboard_handler(
                 // delivered to the launcher, not the preview.
                 entry.grab_focus();
                 glib::signal::Propagation::Stop
+            } else if accel_matches(&keybindings.reset_gui_position, key, state) {
+                // Clears the saved per-monitor launcher position and
+                // re-centers the window. Configurable via the
+                // `reset_gui_position` keybinding (default `<Ctrl>0`).
+                // Caveat for users picking a shifted-digit accel
+                // (`<Ctrl><Shift>0`, etc): `gtk::accelerator_parse`
+                // always returns the base keysym, but most keyboard
+                // layouts emit a different keysym for shifted digits
+                // (US: `Shift+0` → `parenright`), so such accels will
+                // silently never fire. Prefer unshifted or alpha keys.
+                use gtk4_layer_shell::LayerShell;
+                let connector = gtk::gdk::Display::default()
+                    .and_then(|d| {
+                        d.monitors().item(0).and_downcast::<gtk::gdk::Monitor>()
+                    })
+                    .and_then(|m| m.connector())
+                    .map(|gs| gs.to_string());
+                crate::launcher_position::clear(connector.as_deref());
+                window.set_anchor(gtk4_layer_shell::Edge::Left, false);
+                window.set_margin(
+                    gtk4_layer_shell::Edge::Top,
+                    crate::window::DEFAULT_TOP_MARGIN,
+                );
+                window.set_margin(gtk4_layer_shell::Edge::Left, 0);
+                {
+                    let w = window.clone();
+                    glib::idle_add_local_once(move || {
+                        crate::window::report_launcher_geometry(&w);
+                    });
+                }
+                glib::signal::Propagation::Stop
             } else if accel_matches(&keybindings.filter_all, key, state) {
                 chips.activate_index(0);
                 glib::signal::Propagation::Stop
