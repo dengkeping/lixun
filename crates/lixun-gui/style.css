@@ -337,3 +337,86 @@ popover.menu modelbutton:hover {
             rgba(255, 255, 255, 0.0)  50%),
         alpha(var(--lixun-surface), 0.92);
 }
+
+/* ===== Light mode variant =====
+   Applied by toggling `.lixun-light` on the root `window` widget when
+   the freedesktop appearance portal reports "prefer light". We cannot
+   yet rely on `@media (prefers-color-scheme: light)` because GTK only
+   gained that at-rule in 4.20 and the launcher still targets the 4.16
+   floor; once the GTK floor moves up the runtime detection in
+   `color_scheme.rs` collapses into pure CSS.
+
+   Two flips are needed:
+   * the `--lixun-*` palette swaps to a light Material You skin, and
+   * every hardcoded `rgba(255,255,255,*)` overlay (rim highlight,
+     border, inset shadow, hover backdrop, hero frame, status divider,
+     popover.menu chrome) is replaced with a `rgba(0,0,0,*)`
+     equivalent so each specular cue keeps its intended visual role on
+     a bright substrate. Drop shadows are also lightened from
+     0.55/0.40 alpha to 0.12/0.10 — heavy shadows on a light panel
+     read as muddy rather than glassy.
+
+   CSS custom properties cascade through the widget tree, so
+   declaring the tokens on `window.lixun-light` is enough to reach
+   every descendant popover via inheritance; the popover does NOT
+   need its own `.lixun-light` class. The rgba overlay overrides use
+   descendant selectors against the same root. */
+
+window.lixun-light,
+popover.lixun-light {
+    --lixun-primary:               #1e5fd0;
+    --lixun-on-primary:            #ffffff;
+    --lixun-primary-container:     #d6e3ff;
+    --lixun-on-primary-container:  #001a40;
+    --lixun-surface:               #fdfcff;
+    --lixun-on-surface:            #1a1c1e;
+    --lixun-on-surface-variant:    #44474a;
+    --lixun-outline:               #74777b;
+    --lixun-outline-variant:       #c4c6c9;
+    --lixun-error:                 #b3261e;
+    --lixun-on-error:              #ffffff;
+}
+
+.lixun-window.lixun-light {
+    background:
+        linear-gradient(180deg,
+            rgba(0, 0, 0, 0.04) 0%,
+            rgba(0, 0, 0, 0.0)  50%),
+        alpha(var(--lixun-surface), 0.50);
+    border: 0.5px solid rgba(0, 0, 0, 0.18);
+    box-shadow: 0 24px 64px rgba(0, 0, 0, 0.12),
+                0 8px  16px rgba(0, 0, 0, 0.10),
+                inset 0 1px 0 rgba(0, 0, 0, 0.04);
+}
+
+.lixun-window.lixun-light.lixun-no-blur {
+    background:
+        linear-gradient(180deg,
+            rgba(0, 0, 0, 0.04) 0%,
+            rgba(0, 0, 0, 0.0)  50%),
+        alpha(var(--lixun-surface), 0.94);
+}
+
+.lixun-light .lixun-hit:hover {
+    background-color: rgba(0, 0, 0, 0.06);
+}
+
+.lixun-light .lixun-top-hit {
+    background-color: rgba(0, 0, 0, 0.05);
+}
+
+.lixun-light .lixun-top-hit-hero {
+    background-color: rgba(0, 0, 0, 0.05);
+}
+
+.lixun-light .lixun-status {
+    border-top: 1px solid rgba(0, 0, 0, 0.08);
+}
+
+.lixun-light popover.menu {
+    border: 0.5px solid rgba(0, 0, 0, 0.08);
+}
+
+.lixun-light popover.menu modelbutton:hover {
+    background-color: rgba(0, 0, 0, 0.08);
+}

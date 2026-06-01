@@ -584,15 +584,134 @@ impl LauncherController {
     }
 
     fn recompute_monitor(&self) {
-        if let Some(display) = gtk::gdk::Display::default()
-            && let Some(seat) = display.default_seat()
-            && let Some(pointer) = seat.pointer()
-        {
-            let (surface, _, _) = pointer.surface_at_position();
-            if let Some(surface) = surface {
-                let monitor = display.monitor_at_surface(&surface);
-                self.window.set_monitor(monitor.as_ref());
+        let monitor = pick_current_monitor();
+        // Assign the surface to its output first: in layer-shell the
+        // top/left margins are interpreted relative to the monitor the
+        // surface is bound to, so the binding must happen before we
+        // apply any margin so the offsets land on the right output.
+        self.window.set_monitor(monitor.as_ref());
+        if let Some(monitor) = monitor {
+            apply_validated_placement(&self.window, &monitor);
+        }
+    }
+}
+
+/// Pick the monitor the launcher should appear on.
+///
+/// Prefers the output under the pointer (the user's active screen),
+/// then falls back to the first connected monitor. Returns `None`
+/// only when no display/monitor is available at all.
+fn pick_current_monitor() -> Option<gtk::gdk::Monitor> {
+    let display = gtk::gdk::Display::default()?;
+    if let Some(seat) = display.default_seat()
+        && let Some(pointer) = seat.pointer()
+    {
+        let (surface, _, _) = pointer.surface_at_position();
+        if let Some(surface) = surface {
+            if let Some(monitor) = display.monitor_at_surface(&surface) {
+                return Some(monitor);
             }
+        }
+    }
+    display
+        .monitors()
+        .item(0)
+        .and_downcast::<gtk::gdk::Monitor>()
+}
+
+/// Where the launcher surface should sit on a given monitor.
+enum Placement {
+    /// Pin the surface at an exact (top, left) offset (Left anchored).
+    Pinned { top: i32, left: i32 },
+    /// Drop the Left anchor and let the compositor centre the surface
+    /// horizontally; pin only the vertical offset.
+    Centered { top: i32 },
+}
+
+/// Decide where to place the launcher on `mon_geom` given a window size
+/// and an optional saved position.
+///
+/// A saved position is honoured only when it actually fits the current
+/// monitor. A wildly out-of-range offset (e.g. an x saved on a wider
+/// external monitor that is no longer connected) is a stale layout
+/// leak, not a user preference, so we centre instead of clamping it to
+/// the edge. A minor overflow (the window spilling a little past the
+/// bottom/right edge) is clamped back into range.
+fn decide_placement(
+    mon_w: i32,
+    mon_h: i32,
+    win_w: i32,
+    win_h: i32,
+    saved: Option<crate::launcher_position::SavedPosition>,
+) -> Placement {
+    let Some(saved) = saved else {
+        return Placement::Centered {
+            top: DEFAULT_TOP_MARGIN,
+        };
+    };
+
+    // Reject positions whose origin is off the monitor entirely, or
+    // negative — these come from a different display layout.
+    let origin_off_screen = saved.left < 0
+        || saved.top < 0
+        || (mon_w > 0 && saved.left >= mon_w)
+        || (mon_h > 0 && saved.top >= mon_h);
+    if origin_off_screen {
+        return Placement::Centered {
+            top: DEFAULT_TOP_MARGIN,
+        };
+    }
+
+    // Origin is on-screen; clamp minor overflow so the whole window
+    // stays visible.
+    let mut left = saved.left;
+    let mut top = saved.top;
+    if mon_w > 0 && win_w > 0 {
+        left = left.min((mon_w - win_w).max(0));
+    }
+    if mon_h > 0 && win_h > 0 {
+        top = top.min((mon_h - win_h).max(0));
+    }
+    Placement::Pinned { top, left }
+}
+
+/// Read the current window size, falling back to the configured
+/// default width/height before the surface has been measured.
+fn window_size(window: &gtk::ApplicationWindow) -> (i32, i32) {
+    let mut w = window.width();
+    let mut h = window.height();
+    if w <= 0 {
+        w = window.default_width();
+    }
+    if h <= 0 {
+        h = window.default_height();
+    }
+    (w, h)
+}
+
+/// Validate and apply the saved (or default) placement for `monitor`,
+/// rewriting the anchor and margins on `window`.
+///
+/// This is the single source of truth for launcher positioning. It runs
+/// every time the launcher is shown (via `recompute_monitor`) and at
+/// startup, so a position saved on a now-disconnected monitor can never
+/// pin the surface off the currently connected screen.
+fn apply_validated_placement(window: &gtk::ApplicationWindow, monitor: &gtk::gdk::Monitor) {
+    use gtk4_layer_shell::{Edge, LayerShell};
+    let geom = monitor.geometry();
+    let (win_w, win_h) = window_size(window);
+    let connector = monitor.connector().map(|s| s.to_string());
+    let saved = crate::launcher_position::load(connector.as_deref());
+    match decide_placement(geom.width(), geom.height(), win_w, win_h, saved) {
+        Placement::Pinned { top, left } => {
+            window.set_anchor(Edge::Left, true);
+            window.set_margin(Edge::Top, top);
+            window.set_margin(Edge::Left, left);
+        }
+        Placement::Centered { top } => {
+            window.set_anchor(Edge::Left, false);
+            window.set_margin(Edge::Left, 0);
+            window.set_margin(Edge::Top, top);
         }
     }
 }
@@ -636,22 +755,38 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
     window.set_anchor(Edge::Top, true);
     window.set_keyboard_mode(gtk4_layer_shell::KeyboardMode::OnDemand);
 
-    // Restore per-monitor saved position if the user has dragged
-    // the launcher before. Anchor Left as well so the saved
-    // (top, left) margin pair lands at an exact pixel offset
-    // instead of the compositor recentring horizontally.
-    let connector_for_load = gtk::gdk::Display::default()
-        .and_then(|d| d.monitors().item(0).and_downcast::<gtk::gdk::Monitor>())
-        .and_then(|m| m.connector())
-        .map(|gs| gs.to_string());
-    if let Some(pos) = crate::launcher_position::load(connector_for_load.as_deref()) {
-        window.set_anchor(Edge::Left, true);
-        window.set_margin(Edge::Top, pos.top);
-        window.set_margin(Edge::Left, pos.left);
+    // Restore the per-monitor saved position through the same
+    // validation path used on every show(), so a position saved on a
+    // now-disconnected monitor can never pin the surface off the
+    // currently connected screen at cold start.
+    if let Some(monitor) = pick_current_monitor() {
+        window.set_monitor(Some(&monitor));
+        apply_validated_placement(&window, &monitor);
     } else {
         window.set_margin(Edge::Top, DEFAULT_TOP_MARGIN);
     }
     add_css_class(&window, "lixun-window");
+
+    // Apply the user's system-wide colour-scheme preference before the
+    // window is mapped, so the first frame already carries the right
+    // skin. Portal absence or a missing key is non-fatal: we keep the
+    // historical dark skin in that case.
+    if crate::color_scheme::read_initial().is_light() {
+        window.add_css_class("lixun-light");
+    }
+    let color_scheme_rx = crate::color_scheme::spawn_listener();
+    {
+        let window_for_scheme = window.clone();
+        glib::MainContext::default().spawn_local(async move {
+            while let Ok(scheme) = color_scheme_rx.recv().await {
+                if scheme.is_light() {
+                    window_for_scheme.add_css_class("lixun-light");
+                } else {
+                    window_for_scheme.remove_css_class("lixun-light");
+                }
+            }
+        });
+    }
 
     let blur = crate::kde_blur::BlurController::new(&window, daemon_config.gui.blur);
 
@@ -1436,18 +1571,7 @@ fn install_super_drag_cursor(
 pub(crate) fn report_launcher_geometry(window: &gtk::ApplicationWindow) {
     tracing::debug!("gui: report_launcher_geometry called");
     use gtk4_layer_shell::LayerShell;
-    let display = match gtk::gdk::Display::default() {
-        Some(d) => d,
-        None => {
-            tracing::debug!("gui: report_launcher_geometry: no display");
-            return;
-        }
-    };
-    let monitor = match display
-        .monitors()
-        .item(0)
-        .and_downcast::<gtk::gdk::Monitor>()
-    {
+    let monitor = match pick_current_monitor() {
         Some(m) => m,
         None => {
             tracing::debug!("gui: report_launcher_geometry: no monitor");
