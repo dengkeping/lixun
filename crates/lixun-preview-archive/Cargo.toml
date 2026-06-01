@@ -1,0 +1,26 @@
+[package]
+name = "lixun-preview-archive"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lixun-core = { path = "../lixun-core" }
+lixun-preview = { path = "../lixun-preview" }
+anyhow.workspace = true
+inventory.workspace = true
+tracing.workspace = true
+gtk = { package = "gtk4", version = "0.11", features = ["v4_16"] }
+zip = "2"
+tar = "0.4"
+flate2 = "1"
+zstd = "0.13"
+bzip2 = "0.5"
+sevenz-rust2 = "0.21"
+
+[dev-dependencies]
+zip = { version = "2", features = ["aes-crypto"] }
+
+[lib]
+name = "lixun_preview_archive"
+path = "src/lib.rs"

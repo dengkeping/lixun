@@ -42,6 +42,9 @@ use lixun_preview_office as _;
 #[cfg(feature = "av")]
 use lixun_preview_av as _;
 
+#[cfg(feature = "archive")]
+use lixun_preview_archive as _;
+
 #[cfg(test)]
 mod tests {
     use lixun_core::{Action, Category, DocId, Hit};
