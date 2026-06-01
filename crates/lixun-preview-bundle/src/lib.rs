@@ -45,6 +45,9 @@ use lixun_preview_av as _;
 #[cfg(feature = "archive")]
 use lixun_preview_archive as _;
 
+#[cfg(feature = "folder")]
+use lixun_preview_folder as _;
+
 #[cfg(test)]
 mod tests {
     use lixun_core::{Action, Category, DocId, Hit};
@@ -58,6 +61,7 @@ mod tests {
             subtitle: String::new(),
             icon_name: None,
             kind_label: None,
+            mime: None,
             score: 0.0,
             action: Action::OpenFile {
                 path: PathBuf::from("/tmp/demo.txt"),
@@ -80,6 +84,7 @@ mod tests {
             subtitle: String::new(),
             icon_name: None,
             kind_label: None,
+            mime: None,
             score: 0.0,
             action: Action::Launch {
                 exec: "firefox".into(),

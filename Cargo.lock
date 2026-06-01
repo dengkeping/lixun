@@ -5671,6 +5671,7 @@ dependencies = [
  "lixun-preview-av",
  "lixun-preview-code",
  "lixun-preview-email",
+ "lixun-preview-folder",
  "lixun-preview-image",
  "lixun-preview-office",
  "lixun-preview-pdf",
@@ -5702,6 +5703,18 @@ dependencies = [
  "lixun-core",
  "lixun-preview",
  "mail-parser",
+ "tracing",
+]
+
+[[package]]
+name = "lixun-preview-folder"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "gtk4",
+ "inventory",
+ "lixun-core",
+ "lixun-preview",
  "tracing",
 ]
 

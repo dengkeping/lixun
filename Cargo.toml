@@ -31,6 +31,7 @@ members = [
     "crates/lixun-preview-office",
     "crates/lixun-preview-av",
     "crates/lixun-preview-archive",
+    "crates/lixun-preview-folder",
 ]
 resolver = "2"
 
