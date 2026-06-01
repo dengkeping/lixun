@@ -11,11 +11,17 @@
 //! dimensions and on-disk file size so the user does not need to
 //! alt-tab to a file manager to check "how big is this".
 
+use std::cell::Cell;
 use std::path::Path;
+use std::rc::Rc;
 
 use gtk::prelude::*;
+use gtk::{gdk, glib};
 use lixun_core::{Action, Hit};
-use lixun_preview::{PreviewPlugin, PreviewPluginCfg, PreviewPluginEntry};
+use lixun_preview::{PreviewCapabilities, PreviewPlugin, PreviewPluginCfg, PreviewPluginEntry};
+
+mod canvas;
+use canvas::{ImageCanvas, zoomed_in, zoomed_out, MAX_ZOOM, MIN_ZOOM, ZOOM_STEP};
 
 const STRONG_EXTENSIONS: &[&str] = &[
     "png", "jpg", "jpeg", "gif", "webp", "avif", "bmp", "tiff", "tif", "svg", "ico",
@@ -32,6 +38,11 @@ const ANIMATED_EXTENSIONS: &[&str] = &["gif", "webp"];
 /// Extensions that GTK renders via librsvg — vectors, so we use
 /// `Picture::for_filename` to let GTK rescale on window resize.
 const VECTOR_EXTENSIONS: &[&str] = &["svg"];
+
+/// Pixels panned per unit of two-finger scroll delta. Touchpad deltas are
+/// small fractional values per event, so this stays modest to keep panning
+/// smooth rather than jumpy.
+const SCROLL_PAN_STEP: f64 = 12.0;
 
 pub struct ImagePreview;
 
@@ -64,6 +75,13 @@ impl PreviewPlugin for ImagePreview {
         0
     }
 
+    fn capabilities(&self) -> PreviewCapabilities {
+        PreviewCapabilities {
+            zoomable: true,
+            ..PreviewCapabilities::default()
+        }
+    }
+
     fn build(&self, hit: &Hit, _cfg: &PreviewPluginCfg<'_>) -> anyhow::Result<gtk::Widget> {
         let path = match &hit.action {
             Action::OpenFile { path } | Action::ShowInFileManager { path } => path.clone(),
@@ -76,73 +94,58 @@ impl PreviewPlugin for ImagePreview {
             .map(str::to_ascii_lowercase)
             .unwrap_or_default();
 
-        let picture = gtk::Picture::new();
-        picture.set_content_fit(gtk::ContentFit::Contain);
-        picture.set_can_shrink(true);
-        picture.set_hexpand(true);
-        picture.set_vexpand(true);
-        picture.add_css_class("lixun-preview-image");
-
         let mut intrinsic: Option<(i32, i32)> = None;
-
-        if VECTOR_EXTENSIONS.iter().any(|&e| e == ext) {
-            picture.set_filename(Some(&path));
-        } else if ANIMATED_EXTENSIONS.iter().any(|&e| e == ext) {
-            let media = gtk::MediaFile::for_filename(&path);
-            media.set_loop(true);
-            media.play();
-            picture.set_paintable(Some(&media));
-        } else {
-            #[cfg(feature = "image-decode")]
-            let texture_result = {
-                match lixun_image_decode::decode_to_dynamic_image(&path) {
-                    Ok(img) => {
-                        let width = img.width() as i32;
-                        let height = img.height() as i32;
-                        intrinsic = Some((width, height));
-                        
-                        let rgba = img.to_rgba8();
-                        let bytes = gdk::glib::Bytes::from_owned(rgba.into_raw());
-                        
-                        match gdk::MemoryTexture::new(
-                            width,
-                            height,
-                            gdk::MemoryFormat::R8g8b8a8,
-                            &bytes,
-                            (width * 4) as usize,
-                        ) {
-                            texture => {
-                                picture.set_paintable(Some(&texture));
-                                Ok(())
-                            }
-                        }
-                    }
-                    Err(e) => Err(e),
-                }
-            };
-            
-            #[cfg(not(feature = "image-decode"))]
-            let texture_result = gdk::Texture::from_filename(&path).map(|texture| {
-                intrinsic = Some((texture.width(), texture.height()));
-                picture.set_paintable(Some(&texture));
-            });
-            
-            if let Err(e) = texture_result {
-                tracing::warn!(
-                    "image: texture decode failed for {:?} ({}), falling back to Picture::set_filename",
-                    path,
-                    e
-                );
-                picture.set_filename(Some(&path));
-            }
-        }
 
         let scroll = gtk::ScrolledWindow::new();
         scroll.set_hscrollbar_policy(gtk::PolicyType::Automatic);
         scroll.set_vscrollbar_policy(gtk::PolicyType::Automatic);
-        scroll.set_child(Some(&picture));
         scroll.set_hexpand(true);
         scroll.set_vexpand(true);
+        // Honour the canvas' own natural size so an oversized image overflows the
+        // viewport and the scrollbars (hence panning) become active.
+        scroll.set_propagate_natural_width(true);
+        scroll.set_propagate_natural_height(true);
+
+        let is_vector = VECTOR_EXTENSIONS.iter().any(|&e| e == ext);
+        let is_animated = ANIMATED_EXTENSIONS.iter().any(|&e| e == ext);
+
+        let decoded_texture = if is_vector || is_animated {
+            None
+        } else {
+            decode_texture(&path, &mut intrinsic)
+        };
+
+        let mut toolbar: Option<gtk::Widget> = None;
+
+        if let Some(texture) = decoded_texture {
+            let canvas = ImageCanvas::new();
+            canvas.set_texture(&texture);
+            canvas.add_css_class("lixun-preview-image");
+            canvas.set_focusable(true);
+            canvas.set_can_focus(true);
+            wire_canvas_gestures(&canvas, &scroll);
+            toolbar = Some(build_image_toolbar(&canvas, &scroll));
+            scroll.set_child(Some(&canvas));
+        } else {
+            let picture = gtk::Picture::new();
+            picture.set_content_fit(gtk::ContentFit::Contain);
+            picture.set_can_shrink(true);
+            picture.set_hexpand(true);
+            picture.set_vexpand(true);
+            picture.add_css_class("lixun-preview-image");
+
+            if is_vector {
+                picture.set_filename(Some(&path));
+            } else if is_animated {
+                let media = gtk::MediaFile::for_filename(&path);
+                media.set_loop(true);
+                media.play();
+                picture.set_paintable(Some(&media));
+            } else {
+                picture.set_filename(Some(&path));
+            }
+            scroll.set_child(Some(&picture));
+        }
 
         let footer = gtk::Label::new(Some(&format_footer(&path, intrinsic)));
         footer.set_xalign(0.0);
@@ -153,6 +156,9 @@ impl PreviewPlugin for ImagePreview {
         footer.add_css_class("lixun-preview-image-footer");
 
         let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        if let Some(toolbar) = &toolbar {
+            vbox.append(toolbar);
+        }
         vbox.append(&scroll);
         vbox.append(&footer);
         vbox.add_css_class("lixun-preview-image-container");
@@ -166,6 +172,360 @@ impl PreviewPlugin for ImagePreview {
 
         Ok(vbox.upcast())
     }
+}
+
+/// Decode `path` into a GPU texture, recording its intrinsic size.
+/// Returns `None` (and logs) when decoding fails, so the caller can
+/// fall back to GTK's own loader via `Picture::set_filename`.
+fn decode_texture(path: &Path, intrinsic: &mut Option<(i32, i32)>) -> Option<gdk::Texture> {
+    #[cfg(feature = "image-decode")]
+    let result: anyhow::Result<gdk::Texture> = (|| {
+        let img = lixun_image_decode::decode_to_dynamic_image(path)?;
+        let width = img.width() as i32;
+        let height = img.height() as i32;
+        let rgba = img.to_rgba8();
+        let bytes = glib::Bytes::from_owned(rgba.into_raw());
+        let texture = gdk::MemoryTexture::new(
+            width,
+            height,
+            gdk::MemoryFormat::R8g8b8a8,
+            &bytes,
+            (width * 4) as usize,
+        );
+        *intrinsic = Some((width, height));
+        Ok(texture.upcast())
+    })();
+
+    #[cfg(not(feature = "image-decode"))]
+    let result: anyhow::Result<gdk::Texture> = gdk::Texture::from_filename(path)
+        .map(|texture| {
+            *intrinsic = Some((texture.width(), texture.height()));
+            texture
+        })
+        .map_err(Into::into);
+
+    match result {
+        Ok(texture) => Some(texture),
+        Err(e) => {
+            tracing::warn!(
+                "image: texture decode failed for {:?} ({}), falling back to Picture::set_filename",
+                path,
+                e
+            );
+            None
+        }
+    }
+}
+
+fn toolbar_button(icon: &str, tooltip: &str) -> gtk::Button {
+    let button = gtk::Button::from_icon_name(icon);
+    button.set_tooltip_text(Some(tooltip));
+    button.set_focus_on_click(false);
+    button.add_css_class("flat");
+    button
+}
+
+fn build_image_toolbar(canvas: &ImageCanvas, scroll: &gtk::ScrolledWindow) -> gtk::Widget {
+    let bar = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    bar.set_halign(gtk::Align::Center);
+    bar.set_margin_top(4);
+    bar.set_margin_bottom(4);
+    bar.add_css_class("lixun-preview-image-toolbar");
+
+    let zoom_out = toolbar_button("zoom-out-symbolic", "Zoom out");
+    let zoom_in = toolbar_button("zoom-in-symbolic", "Zoom in");
+    let zoom_reset = toolbar_button("zoom-original-symbolic", "Reset zoom");
+    let rotate_left = toolbar_button("object-rotate-left-symbolic", "Rotate left");
+    let rotate_right = toolbar_button("object-rotate-right-symbolic", "Rotate right");
+
+    {
+        let canvas_weak = canvas.downgrade();
+        let scroll_weak = scroll.downgrade();
+        zoom_out.connect_clicked(move |_| {
+            if let (Some(canvas), Some(scroll)) = (canvas_weak.upgrade(), scroll_weak.upgrade()) {
+                apply_zoom_centered(&canvas, &scroll, zoomed_out(canvas.zoom()), None, None);
+            }
+        });
+    }
+    {
+        let canvas_weak = canvas.downgrade();
+        let scroll_weak = scroll.downgrade();
+        zoom_in.connect_clicked(move |_| {
+            if let (Some(canvas), Some(scroll)) = (canvas_weak.upgrade(), scroll_weak.upgrade()) {
+                apply_zoom_centered(&canvas, &scroll, zoomed_in(canvas.zoom()), None, None);
+            }
+        });
+    }
+    {
+        let canvas_weak = canvas.downgrade();
+        let scroll_weak = scroll.downgrade();
+        zoom_reset.connect_clicked(move |_| {
+            if let (Some(canvas), Some(scroll)) = (canvas_weak.upgrade(), scroll_weak.upgrade()) {
+                apply_zoom_centered(&canvas, &scroll, 1.0, None, None);
+            }
+        });
+    }
+    {
+        let canvas_weak = canvas.downgrade();
+        rotate_left.connect_clicked(move |_| {
+            if let Some(canvas) = canvas_weak.upgrade() {
+                canvas.rotate_ccw();
+            }
+        });
+    }
+    {
+        let canvas_weak = canvas.downgrade();
+        rotate_right.connect_clicked(move |_| {
+            if let Some(canvas) = canvas_weak.upgrade() {
+                canvas.rotate_cw();
+            }
+        });
+    }
+
+    bar.append(&zoom_out);
+    bar.append(&zoom_in);
+    bar.append(&zoom_reset);
+    bar.append(&gtk::Separator::new(gtk::Orientation::Vertical));
+    bar.append(&rotate_left);
+    bar.append(&rotate_right);
+
+    bar.upcast()
+}
+
+/// Wire pinch/scroll zoom, drag panning, Shift+drag marquee selection,
+/// and keyboard zoom/rotate onto an [`ImageCanvas`] inside `scroll`.
+/// Ported from the PDF viewer's gesture pattern.
+fn wire_canvas_gestures(canvas: &ImageCanvas, scroll: &gtk::ScrolledWindow) {
+    // Pinch-to-zoom (touchpad): scale relative to the zoom at gesture start.
+    let zoom_gesture = gtk::GestureZoom::new();
+    let initial = Rc::new(Cell::new(1.0_f64));
+    {
+        let canvas_weak = canvas.downgrade();
+        let initial = Rc::clone(&initial);
+        zoom_gesture.connect_begin(move |_g, _seq| {
+            if let Some(canvas) = canvas_weak.upgrade() {
+                initial.set(canvas.zoom());
+            }
+        });
+    }
+    {
+        let canvas_weak = canvas.downgrade();
+        let scroll_weak = scroll.downgrade();
+        zoom_gesture.connect_scale_changed(move |_g, scale| {
+            let (Some(canvas), Some(scroll)) = (canvas_weak.upgrade(), scroll_weak.upgrade()) else {
+                return;
+            };
+            let target = (initial.get() * scale).clamp(MIN_ZOOM, MAX_ZOOM);
+            apply_zoom_centered(&canvas, &scroll, target, None, None);
+        });
+    }
+    canvas.add_controller(zoom_gesture);
+
+    // Ctrl+scroll zooms around the cursor; plain (two-finger) scroll pans the
+    // viewport on both axes.
+    let scroll_ctrl =
+        gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
+    {
+        let canvas_weak = canvas.downgrade();
+        let scroll_weak = scroll.downgrade();
+        scroll_ctrl.connect_scroll(move |ctl, dx, dy| {
+            let (Some(canvas), Some(scroll)) = (canvas_weak.upgrade(), scroll_weak.upgrade()) else {
+                return glib::Propagation::Proceed;
+            };
+            let state = ctl.current_event_state();
+            if !state.contains(gdk::ModifierType::CONTROL_MASK) {
+                let hadj = scroll.hadjustment();
+                let vadj = scroll.vadjustment();
+                hadj.set_value(hadj.value() + dx * SCROLL_PAN_STEP);
+                vadj.set_value(vadj.value() + dy * SCROLL_PAN_STEP);
+                return glib::Propagation::Stop;
+            }
+            let factor = if dy < 0.0 { ZOOM_STEP } else { 1.0 / ZOOM_STEP };
+            let target = (canvas.zoom() * factor).clamp(MIN_ZOOM, MAX_ZOOM);
+            apply_zoom_centered(&canvas, &scroll, target, None, None);
+            glib::Propagation::Stop
+        });
+    }
+    canvas.add_controller(scroll_ctrl);
+
+    // Middle-button drag pans the viewport. The gesture lives on the
+    // ScrolledWindow, not the canvas, so it receives button-2 events without
+    // competing with the canvas's primary-button selection gesture.
+    let pan = gtk::GestureDrag::builder().button(2).build();
+    let pan_start = Rc::new(Cell::new((0.0_f64, 0.0_f64)));
+    {
+        let scroll_weak = scroll.downgrade();
+        let pan_start = Rc::clone(&pan_start);
+        pan.connect_drag_begin(move |g, _x, _y| {
+            g.set_state(gtk::EventSequenceState::Claimed);
+            if let Some(scroll) = scroll_weak.upgrade() {
+                pan_start.set((scroll.hadjustment().value(), scroll.vadjustment().value()));
+            }
+        });
+    }
+    {
+        let scroll_weak = scroll.downgrade();
+        let pan_start = Rc::clone(&pan_start);
+        pan.connect_drag_update(move |_g, dx, dy| {
+            if let Some(scroll) = scroll_weak.upgrade() {
+                let (sx, sy) = pan_start.get();
+                scroll.hadjustment().set_value(sx - dx);
+                scroll.vadjustment().set_value(sy - dy);
+            }
+        });
+    }
+    scroll.add_controller(pan);
+
+    // Primary-button drag draws a selection marquee; a stationary click outside
+    // an existing marquee releases it. Capture phase so the gesture pre-empts the
+    // ScrolledWindow's built-in drag. Panning lives on the middle button / scroll.
+    let select = gtk::GestureDrag::builder().button(1).build();
+    select.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let sel_origin = Rc::new(Cell::new((0.0_f64, 0.0_f64)));
+    {
+        let canvas_weak = canvas.downgrade();
+        let sel_origin = Rc::clone(&sel_origin);
+        select.connect_drag_begin(move |g, x, y| {
+            g.set_state(gtk::EventSequenceState::Claimed);
+            sel_origin.set((x, y));
+            if let Some(canvas) = canvas_weak.upgrade() {
+                canvas.clear_marquee();
+            }
+        });
+    }
+    {
+        let canvas_weak = canvas.downgrade();
+        let sel_origin = Rc::clone(&sel_origin);
+        select.connect_drag_update(move |_g, dx, dy| {
+            if let Some(canvas) = canvas_weak.upgrade() {
+                let (ox, oy) = sel_origin.get();
+                if let Some(rect) = canvas.widget_drag_to_image_rect(ox, oy, dx, dy) {
+                    canvas.set_marquee(rect);
+                }
+            }
+        });
+    }
+    {
+        let canvas_weak = canvas.downgrade();
+        let sel_origin = Rc::clone(&sel_origin);
+        select.connect_drag_end(move |_g, dx, dy| {
+            // A near-zero drag is a plain click: release the marquee if the press
+            // landed outside it.
+            if dx.abs() >= 3.0 || dy.abs() >= 3.0 {
+                return;
+            }
+            if let Some(canvas) = canvas_weak.upgrade() {
+                let (ox, oy) = sel_origin.get();
+                if canvas.has_marquee() && !canvas.marquee_contains_widget_point(ox, oy) {
+                    canvas.clear_marquee();
+                }
+            }
+        });
+    }
+    canvas.add_controller(select);
+
+    // Keyboard: Ctrl +/-/0 zoom, R / Shift+R rotate, Ctrl+C copies the marquee.
+    let key = gtk::EventControllerKey::new();
+    key.set_propagation_phase(gtk::PropagationPhase::Capture);
+    {
+        let canvas_weak = canvas.downgrade();
+        key.connect_key_pressed(move |_ctl, keyval, _code, state| {
+            let Some(canvas) = canvas_weak.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
+            let ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
+            let shift = state.contains(gdk::ModifierType::SHIFT_MASK);
+            match keyval {
+                gdk::Key::equal | gdk::Key::plus if ctrl => {
+                    canvas.set_zoom(zoomed_in(canvas.zoom()));
+                    glib::Propagation::Stop
+                }
+                gdk::Key::minus | gdk::Key::underscore if ctrl => {
+                    canvas.set_zoom(zoomed_out(canvas.zoom()));
+                    glib::Propagation::Stop
+                }
+                gdk::Key::_0 if ctrl => {
+                    canvas.set_zoom(1.0);
+                    glib::Propagation::Stop
+                }
+                gdk::Key::r | gdk::Key::R => {
+                    if shift {
+                        canvas.rotate_ccw();
+                    } else {
+                        canvas.rotate_cw();
+                    }
+                    glib::Propagation::Stop
+                }
+                gdk::Key::c | gdk::Key::C if ctrl => {
+                    if let Some(texture) = canvas.marquee_texture() {
+                        if let Some(display) = gdk::Display::default() {
+                            display.clipboard().set_texture(&texture);
+                        }
+                        canvas.clear_marquee();
+                    }
+                    glib::Propagation::Stop
+                }
+                _ => glib::Propagation::Proceed,
+            }
+        });
+    }
+    scroll.add_controller(key);
+
+    let canvas_weak = canvas.downgrade();
+    scroll.connect_map(move |_| {
+        if let Some(canvas) = canvas_weak.upgrade() {
+            canvas.grab_focus();
+        }
+    });
+}
+
+/// Set `canvas` zoom to `new_zoom`, keeping the cursor point (or the
+/// viewport centre when unspecified) anchored. Mirrors the PDF viewer's
+/// `apply_zoom_centered`: it records the document-space point under the
+/// cursor, applies the zoom, then re-aligns the scroll adjustments on
+/// the next idle tick once the new natural size has been measured.
+fn apply_zoom_centered(
+    canvas: &ImageCanvas,
+    scroll: &gtk::ScrolledWindow,
+    new_zoom: f64,
+    cursor_x: Option<f64>,
+    cursor_y: Option<f64>,
+) {
+    let old_zoom = canvas.zoom();
+    if (new_zoom - old_zoom).abs() < 1e-4 {
+        return;
+    }
+    let hadj = scroll.hadjustment();
+    let vadj = scroll.vadjustment();
+    let cx = cursor_x.unwrap_or(scroll.width() as f64 * 0.5);
+    let cy = cursor_y.unwrap_or(scroll.height() as f64 * 0.5);
+    let doc_x = (hadj.value() + cx) / old_zoom;
+    let doc_y = (vadj.value() + cy) / old_zoom;
+
+    canvas.set_zoom(new_zoom);
+
+    let scroll_weak = scroll.downgrade();
+    let canvas_weak = canvas.downgrade();
+    glib::idle_add_local_once(move || {
+        let (Some(scroll), Some(canvas)) = (scroll_weak.upgrade(), canvas_weak.upgrade()) else {
+            return;
+        };
+        let z = canvas.zoom();
+        let hadj = scroll.hadjustment();
+        let vadj = scroll.vadjustment();
+        let target_h = doc_x * z - cx;
+        let target_v = doc_y * z - cy;
+        let h = target_h.clamp(
+            hadj.lower(),
+            (hadj.upper() - hadj.page_size()).max(hadj.lower()),
+        );
+        let v = target_v.clamp(
+            vadj.lower(),
+            (vadj.upper() - vadj.page_size()).max(vadj.lower()),
+        );
+        hadj.set_value(h);
+        vadj.set_value(v);
+    });
 }
 
 fn format_footer(path: &Path, intrinsic: Option<(i32, i32)>) -> String {
@@ -225,6 +585,7 @@ mod tests {
             secondary_action: None,
             source_instance: String::new(),
             row_menu: lixun_core::RowMenuDef::empty(),
+            mime: None,
         }
     }
 
@@ -282,6 +643,7 @@ mod tests {
             secondary_action: None,
             source_instance: String::new(),
             row_menu: lixun_core::RowMenuDef::empty(),
+            mime: None,
         };
         assert_eq!(ImagePreview.match_score(&hit), 0);
     }
