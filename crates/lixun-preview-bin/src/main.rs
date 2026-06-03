@@ -467,6 +467,7 @@ fn handle_command(
         }
         PreviewCommand::Close { epoch } => {
             cancel_idle(state);
+            let activation_token = mint_activation_token();
             if let Some(window) = state.window.borrow().as_ref() {
                 window.set_visible(false);
             }
@@ -474,7 +475,10 @@ fn handle_command(
                 let _ = outbound_tx.send_blocking(PreviewEvent::SetLauncherVisible { visible: true });
                 state.launcher_hidden_by_us.set(false);
             }
-            let _ = outbound_tx.send_blocking(PreviewEvent::Closed { epoch });
+            let _ = outbound_tx.send_blocking(PreviewEvent::Closed {
+                epoch,
+                activation_token,
+            });
             schedule_idle(state, app);
         }
         PreviewCommand::Hide { epoch } => {
@@ -489,6 +493,7 @@ fn handle_command(
             // seat. See PreviewCommand::Hide docstring in
             // lixun-ipc::preview for the full rationale.
             cancel_idle(state);
+            let activation_token = mint_activation_token();
             if let Some(window) = state.window.borrow().as_ref() {
                 window.set_visible(false);
             }
@@ -496,7 +501,10 @@ fn handle_command(
                 let _ = outbound_tx.send_blocking(PreviewEvent::SetLauncherVisible { visible: true });
                 state.launcher_hidden_by_us.set(false);
             }
-            let _ = outbound_tx.send_blocking(PreviewEvent::Closed { epoch });
+            let _ = outbound_tx.send_blocking(PreviewEvent::Closed {
+                epoch,
+                activation_token,
+            });
             schedule_idle(state, app);
         }
         PreviewCommand::Ping => {
@@ -1143,13 +1151,30 @@ fn install_close_controllers(
             let _ = outbound_for_close.send_blocking(PreviewEvent::SetLauncherVisible { visible: true });
             state_for_close.launcher_hidden_by_us.set(false);
         }
-        let _ = outbound_for_close.send_blocking(PreviewEvent::Closed { epoch });
+        let activation_token = mint_activation_token();
+        let _ = outbound_for_close.send_blocking(PreviewEvent::Closed {
+            epoch,
+            activation_token,
+        });
         if let Some(window) = state_for_close.window.borrow().as_ref() {
             window.set_visible(false);
         }
         schedule_idle(&state_for_close, &app_for_close);
         glib::Propagation::Stop
     });
+}
+
+/// Mint an xdg-activation token from the seat keyboard the preview
+/// currently owns. KWin only grants the seat to a layer-shell surface
+/// (the launcher) on an explicit activation request, never on its own
+/// when a sibling xdg-toplevel hides; the launcher consumes this token
+/// to reactivate itself. Must be called while the preview surface is
+/// still mapped and focused — i.e. before `set_visible(false)`.
+fn mint_activation_token() -> Option<String> {
+    let display = gtk::gdk::Display::default()?;
+    let ctx = display.app_launch_context();
+    ctx.startup_notify_id(None::<&gtk::gio::AppInfo>, &[] as &[gtk::gio::File])
+        .map(|s| s.to_string())
 }
 
 /// Hide window + start idle timer for Escape/Space keyboard close.
@@ -1169,7 +1194,11 @@ fn close_via_keyboard(
         let _ = outbound_tx.send_blocking(PreviewEvent::SetLauncherVisible { visible: true });
         state.launcher_hidden_by_us.set(false);
     }
-    let _ = outbound_tx.send_blocking(PreviewEvent::Closed { epoch });
+    let activation_token = mint_activation_token();
+    let _ = outbound_tx.send_blocking(PreviewEvent::Closed {
+        epoch,
+        activation_token,
+    });
     if let Some(window) = state.window.borrow().as_ref() {
         window.set_visible(false);
     }

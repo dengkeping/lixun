@@ -671,7 +671,10 @@ impl PreviewSpawner {
                             );
                         }
                     }
-                    PreviewEvent::Closed { epoch } => {
+                    PreviewEvent::Closed {
+                        epoch,
+                        activation_token,
+                    } => {
                         tracing::debug!(
                             "preview_spawn: pid={} Closed epoch={}",
                             pid,
@@ -690,10 +693,16 @@ impl PreviewSpawner {
                         // ExitPreviewMode MUST arrive after Show:
                         // it resets the launcher's preview_mode
                         // flag and grabs keyboard focus back to
-                        // the search entry. Without it, the next
-                        // arrow keypress would re-fire the debounce
-                        // path and spawn a new preview window.
-                        if let Err(e) = gui_control.dispatch(GuiCommand::ExitPreviewMode).await {
+                        // the search entry. The activation token the
+                        // preview minted while it held the seat
+                        // keyboard rides along so the launcher can
+                        // reactivate its own surface (KWin does not
+                        // hand the seat back to a layer surface on
+                        // its own).
+                        if let Err(e) = gui_control
+                            .dispatch(GuiCommand::ExitPreviewMode { activation_token })
+                            .await
+                        {
                             tracing::warn!(
                                 "preview_spawn: dispatch ExitPreviewMode after Closed failed: {}",
                                 e
@@ -718,7 +727,12 @@ impl PreviewSpawner {
                                 e
                             );
                         }
-                        if let Err(e) = gui_control.dispatch(GuiCommand::ExitPreviewMode).await {
+                        if let Err(e) = gui_control
+                            .dispatch(GuiCommand::ExitPreviewMode {
+                                activation_token: None,
+                            })
+                            .await
+                        {
                             tracing::warn!(
                                 "preview_spawn: dispatch ExitPreviewMode after Launched failed: {}",
                                 e
@@ -764,9 +778,9 @@ impl PreviewSpawner {
                             );
                         } else {
                             tracing::debug!(
-                                "preview_spawn: pid={} dispatch {:?} succeeded",
+                                "preview_spawn: pid={} SetLauncherVisible({}) dispatch succeeded",
                                 pid,
-                                cmd
+                                visible
                             );
                         }
                     }
@@ -848,7 +862,12 @@ async fn reset_to_dead(
     }
     // Preview process died unexpectedly (crash, SIGKILL, etc.)
     // — also leave preview mode so the launcher is usable again.
-    if let Err(e) = gui_control.dispatch(GuiCommand::ExitPreviewMode).await {
+    if let Err(e) = gui_control
+        .dispatch(GuiCommand::ExitPreviewMode {
+            activation_token: None,
+        })
+        .await
+    {
         tracing::warn!(
             "preview_spawn: dispatch ExitPreviewMode after pid={} exit failed: {}",
             pid,

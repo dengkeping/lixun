@@ -111,8 +111,8 @@ fn dispatch(controller: &LauncherController, cmd: GuiCommand) -> GuiResponse {
                 visible: controller.is_visible(),
             }
         }
-        GuiCommand::ExitPreviewMode => {
-            controller.exit_preview_mode();
+        GuiCommand::ExitPreviewMode { activation_token } => {
+            controller.exit_preview_mode(activation_token);
             GuiResponse::Ok {
                 visible: controller.is_visible(),
             }
@@ -140,6 +140,8 @@ fn accept_loop(listener: UnixListener, tx: async_channel::Sender<ControllerReque
             }
         };
 
+        let is_quit = matches!(cmd, GuiCommand::Quit);
+
         let (reply_tx, reply_rx) = sync_channel::<GuiResponse>(1);
         if tx
             .send_blocking(ControllerRequest {
@@ -164,7 +166,7 @@ fn accept_loop(listener: UnixListener, tx: async_channel::Sender<ControllerReque
             tracing::warn!("gui_server: write failed: {e}");
         }
 
-        if matches!(cmd, GuiCommand::Quit) {
+        if is_quit {
             tracing::info!("gui_server: Quit dispatched; accept loop exiting");
             return;
         }

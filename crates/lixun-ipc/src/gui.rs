@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use crate::PROTOCOL_VERSION;
 
 /// Command the daemon sends to the GUI process.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum GuiCommand {
     /// Show the launcher window (no-op if already visible).
     Show,
@@ -50,7 +50,13 @@ pub enum GuiCommand {
     /// would never flip back to false. Must arrive *after* `Show`
     /// in the Closed handler so the launcher is already visible
     /// when focus is grabbed.
-    ExitPreviewMode,
+    ///
+    /// `activation_token` is the xdg-activation token relayed from
+    /// `PreviewEvent::Closed`; the launcher consumes it to activate
+    /// its own surface and pull the seat keyboard back from the
+    /// closing preview. `None` on the launch/pid-exit paths where
+    /// the launcher is hidden rather than refocused.
+    ExitPreviewMode { activation_token: Option<String> },
 }
 
 /// Response from the GUI to a `GuiCommand`.
@@ -110,6 +116,12 @@ where
             "frame too short for version",
         ));
     }
+    if total_len > crate::MAX_FRAME_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "frame length exceeds maximum",
+        ));
+    }
     let mut version_buf = [0u8; 2];
     r.read_exact(&mut version_buf)?;
     let version = u16::from_be_bytes(version_buf);
@@ -163,6 +175,12 @@ where
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "frame too short for version",
+        ));
+    }
+    if total_len > crate::MAX_FRAME_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "frame length exceeds maximum",
         ));
     }
     let mut version_buf = [0u8; 2];

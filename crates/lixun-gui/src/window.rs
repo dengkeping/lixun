@@ -375,17 +375,25 @@ impl LauncherController {
     /// React to `GuiCommand::ExitPreviewMode` from the daemon: the
     /// warm preview process reported that the user dismissed its
     /// window (Escape/Space inside preview), so we must leave
-    /// preview mode and hand keyboard focus back to the search
-    /// entry. Without the `grab_focus`, the compositor may have
-    /// given focus to the preview window when it was first shown
-    /// (layer-shell + `KeyboardMode::OnDemand` does not guarantee
-    /// who owns keyboard focus), and after the preview hides its
-    /// surface the compositor has no obvious replacement — the
-    /// launcher would keep rendering but arrow keys would go
-    /// nowhere. The explicit grab brings keyboard focus back to
-    /// the entry so the user can keep typing / arrowing.
-    pub(crate) fn exit_preview_mode(&self) {
+    /// preview mode and pull keyboard focus back to the launcher.
+    ///
+    /// `grab_focus` alone is insufficient: it only chooses which
+    /// widget is focused *within* a surface that already owns the
+    /// Wayland seat keyboard. When the preview toplevel took the
+    /// seat and then hid, the compositor does not hand the seat
+    /// back to the launcher's layer surface on its own, so arrow
+    /// keys would go nowhere. The preview mints an xdg-activation
+    /// token from the dismissing keypress and relays it here;
+    /// `set_startup_id` + `present` consumes it to reactivate the
+    /// launcher surface, after which `grab_focus` routes input to
+    /// the entry. `activation_token` is `None` on launch/exit paths
+    /// where the launcher is hidden anyway.
+    pub(crate) fn exit_preview_mode(&self, activation_token: Option<String>) {
         self.set_preview_mode_active(false);
+        if let Some(token) = activation_token {
+            self.window.set_startup_id(&token);
+        }
+        self.window.present();
         self.entry.grab_focus();
     }
 
@@ -1251,6 +1259,7 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
             .unwrap_or_else(|| std::path::PathBuf::from("~/.config"))
             .join("lixun/config.toml");
         let _ = std::process::Command::new("xdg-open")
+            .arg("--")
             .arg(&config_path)
             .spawn();
     });
@@ -1548,8 +1557,7 @@ fn install_super_drag_cursor(
     let window_for_release = window.clone();
     let drag_for_release = std::rc::Rc::clone(&drag_accepted);
     key_ctrl.connect_key_released(move |_ctrl, key, _code, _state| {
-        if matches!(key, gtk::gdk::Key::Super_L | gtk::gdk::Key::Super_R)
-            && !drag_for_release.get()
+        if matches!(key, gtk::gdk::Key::Super_L | gtk::gdk::Key::Super_R) && !drag_for_release.get()
         {
             window_for_release.set_cursor(None);
         }

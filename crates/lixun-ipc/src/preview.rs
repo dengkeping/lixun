@@ -189,7 +189,16 @@ pub enum PreviewEvent {
     /// Acknowledgment that a `Close` was honoured. The window is
     /// no longer visible; the process is still warm waiting for
     /// the next `ShowOrUpdate` or for the idle timer to fire.
-    Closed { epoch: u64 },
+    ///
+    /// `activation_token` is an xdg-activation token the preview
+    /// minted from the close keypress while it held the seat
+    /// keyboard; the launcher consumes it to reactivate its own
+    /// surface, since KWin never returns the seat to the launcher's
+    /// layer surface on its own. `None` if minting failed.
+    Closed {
+        epoch: u64,
+        activation_token: Option<String>,
+    },
     /// The user successfully launched the previewed hit (Enter
     /// inside preview, or "Open" button). The preview process
     /// hides itself and returns to idle; the daemon should hide
@@ -305,6 +314,12 @@ where
                             "preview frame too short for version",
                         ));
                     }
+                    if len > crate::MAX_FRAME_LEN {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "preview frame length exceeds maximum",
+                        ));
+                    }
                     self.state = DecodeState::Version(len);
                 }
                 DecodeState::Version(len) => {
@@ -416,6 +431,12 @@ where
             "frame too short for version",
         ));
     }
+    if total_len > crate::MAX_FRAME_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "frame length exceeds maximum",
+        ));
+    }
     let mut version_buf = [0u8; 2];
     r.read_exact(&mut version_buf)?;
     let version = u16::from_be_bytes(version_buf);
@@ -517,8 +538,14 @@ mod tests {
         let mut buf = BytesMut::new();
         peer.encode(PreviewEvent::Ready { pid: 4242 }, &mut buf)
             .unwrap();
-        peer.encode(PreviewEvent::Closed { epoch: 9 }, &mut buf)
-            .unwrap();
+        peer.encode(
+            PreviewEvent::Closed {
+                epoch: 9,
+                activation_token: Some("tok-123".into()),
+            },
+            &mut buf,
+        )
+        .unwrap();
         peer.encode(PreviewEvent::Launched { epoch: 10 }, &mut buf)
             .unwrap();
         peer.encode(
@@ -535,7 +562,13 @@ mod tests {
             other => panic!("expected Ready, got {:?}", other),
         }
         match codec.decode(&mut buf).unwrap().unwrap() {
-            PreviewEvent::Closed { epoch } => assert_eq!(epoch, 9),
+            PreviewEvent::Closed {
+                epoch,
+                activation_token,
+            } => {
+                assert_eq!(epoch, 9);
+                assert_eq!(activation_token.as_deref(), Some("tok-123"));
+            }
             other => panic!("expected Closed, got {:?}", other),
         }
         match codec.decode(&mut buf).unwrap().unwrap() {
