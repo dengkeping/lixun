@@ -272,7 +272,10 @@ pub fn default_launch(hit: &lixun_core::Hit) -> anyhow::Result<()> {
         }
         Action::OpenUri { uri } => {
             tracing::debug!(uri = %uri, "default_launch: dispatching via xdg-open");
-            std::process::Command::new("xdg-open").arg(uri).spawn()?;
+            std::process::Command::new("xdg-open")
+                .arg("--")
+                .arg(uri)
+                .spawn()?;
             Ok(())
         }
         Action::OpenAttachment { .. } => {

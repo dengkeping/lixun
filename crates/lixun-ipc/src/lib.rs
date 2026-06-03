@@ -21,6 +21,12 @@ pub const PROTOCOL_VERSION_LEGACY: u16 = 4;
 /// Postcard binary wire format introduced in v5.
 pub const PROTOCOL_VERSION_BINARY: u16 = 5;
 
+/// Upper bound on a length-prefixed frame payload, in bytes. Readers
+/// reject any `u32` length prefix above this before allocating, so a
+/// hostile local peer cannot force a multi-gigabyte allocation. 64 MiB
+/// is far above any legitimate request or response.
+pub const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
+
 /// The protocol version this build emits on the wire. Decode paths
 /// still accept both [`PROTOCOL_VERSION_LEGACY`] and
 /// [`PROTOCOL_VERSION_BINARY`] regardless of which codec is compiled
@@ -436,7 +442,9 @@ pub enum Response {
     /// preempted by a newer `Request::Search` carrying a higher
     /// `epoch`. Best-effort: short queries may still complete and
     /// emit a normal `SearchChunk` before the cancel signal lands.
-    Cancelled { epoch: u64 },
+    Cancelled {
+        epoch: u64,
+    },
     /// Reply to every `Impact*` request. `applied_hot` and
     /// `requires_restart` are populated only on `ImpactSet`; both
     /// empty for `ImpactGet` / `ImpactExplain`. `persisted` is true
@@ -560,6 +568,12 @@ impl Decoder for FrameCodec {
                             "frame too short for version",
                         ));
                     }
+                    if len > MAX_FRAME_LEN {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "frame length exceeds maximum",
+                        ));
+                    }
                     self.state = DecodeState::Version(len);
                 }
                 DecodeState::Version(len) => {
@@ -633,6 +647,17 @@ mod tests {
 
         let decoded = codec.decode(&mut buf).unwrap().unwrap();
         assert!(matches!(decoded, Request::Toggle));
+    }
+
+    #[test]
+    fn test_decode_rejects_oversized_frame() {
+        let mut codec = FrameCodec::default();
+        let mut buf = BytesMut::new();
+        buf.put_u32((MAX_FRAME_LEN + 1) as u32);
+        buf.put_u16(PROTOCOL_VERSION);
+
+        let err = codec.decode(&mut buf).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[test]

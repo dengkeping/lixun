@@ -148,14 +148,14 @@ fn dispatch_action(action: &Action) -> Result<()> {
         }
         Action::OpenFile { path } => {
             let mut builder = std::process::Command::new("xdg-open");
-            builder.arg(path);
+            builder.arg("--").arg(path);
             spawn_reaped(&mut builder)?;
             Ok(())
         }
         Action::ShowInFileManager { path } => {
             if path.is_dir() {
                 let mut builder = std::process::Command::new("xdg-open");
-                builder.arg(path);
+                builder.arg("--").arg(path);
                 spawn_reaped(&mut builder)?;
             } else {
                 match show_in_file_manager(path) {
@@ -166,7 +166,7 @@ fn dispatch_action(action: &Action) -> Result<()> {
                         );
                         if let Some(parent) = path.parent() {
                             let mut builder = std::process::Command::new("xdg-open");
-                            builder.arg(parent);
+                            builder.arg("--").arg(parent);
                             spawn_reaped(&mut builder)?;
                         }
                     }
@@ -190,14 +190,14 @@ fn dispatch_action(action: &Action) -> Result<()> {
                 suggested_filename,
             )?;
             let mut builder = std::process::Command::new("xdg-open");
-            builder.arg(&target);
+            builder.arg("--").arg(&target);
             spawn_reaped(&mut builder)?;
             Ok(())
         }
         Action::OpenUri { uri } => {
             tracing::debug!(uri = %uri, "execute_action: dispatching via xdg-open");
             let mut builder = std::process::Command::new("xdg-open");
-            builder.arg(uri);
+            builder.arg("--").arg(uri);
             spawn_reaped(&mut builder)?;
             Ok(())
         }

@@ -58,6 +58,7 @@ fn make_doc(id: &str, category: Category, title: &str, body: &str) -> Document {
         source_instance: "bench".into(),
         secondary_action: None,
         extra: Vec::new(),
+        mime: None,
     }
 }
 
@@ -244,7 +245,8 @@ fn build_index(ranking: RankingConfig, corpus: &[Document]) -> (tempfile::TempDi
     for doc in corpus {
         index.upsert(doc, &mut writer).unwrap();
     }
-    index.commit(&mut writer).unwrap(); index.reload().unwrap();
+    index.commit(&mut writer).unwrap();
+    index.reload().unwrap();
     (tmp, index)
 }
 

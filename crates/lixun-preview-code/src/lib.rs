@@ -275,6 +275,7 @@ mod tests {
             secondary_action: None,
             source_instance: String::new(),
             row_menu: lixun_core::RowMenuDef::empty(),
+            mime: None,
         }
     }
 
@@ -320,6 +321,7 @@ mod tests {
             body: None,
             source_instance: String::new(),
             row_menu: lixun_core::RowMenuDef::empty(),
+            mime: None,
         };
         assert_eq!(CodePreview.match_score(&hit), 0);
     }

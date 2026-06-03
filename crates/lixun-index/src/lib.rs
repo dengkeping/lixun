@@ -9,7 +9,7 @@ mod warmer;
 use anyhow::Result;
 use chrono::Utc;
 use std::collections::{BTreeMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Weak};
 use tantivy::{
     DocAddress, Index, IndexReader, IndexWriter, ReloadPolicy, Searcher, TantivyDocument, Term,
@@ -168,7 +168,7 @@ pub struct LixunIndex {
 }
 
 impl LixunIndex {
-    pub fn create_or_open(index_path: &str, ranking: RankingConfig) -> Result<Self> {
+    pub fn create_or_open(index_path: impl AsRef<Path>, ranking: RankingConfig) -> Result<Self> {
         Self::create_or_open_with_plugins(index_path, &BTreeMap::new(), ranking)
             .map(|(index, _)| index)
     }
@@ -182,12 +182,12 @@ impl LixunIndex {
     /// `reindex_full` on startup; when `false`, sources catch up via
     /// `on_fs_events` / `on_tick` instead.
     pub fn create_or_open_with_plugins(
-        index_path: &str,
+        index_path: impl AsRef<Path>,
         plugin_fields_by_kind: &BTreeMap<&'static str, &'static [PluginFieldSpec]>,
         ranking: RankingConfig,
     ) -> Result<(Self, bool)> {
         let (schema, plugins) = LixunSchema::build_with_plugins(plugin_fields_by_kind)?;
-        let index_dir = PathBuf::from(index_path);
+        let index_dir = index_path.as_ref().to_path_buf();
         let version_path = index_dir.join(INDEX_VERSION_FILE);
         let meta_path = index_dir.join("meta.json");
 
@@ -200,7 +200,7 @@ impl LixunIndex {
         let needs_rebuild = !version_matches || !fingerprint_matches || !has_meta;
 
         let index = if !needs_rebuild {
-            Index::open_in_dir(index_path)?
+            Index::open_in_dir(&index_dir)?
         } else {
             if index_dir.exists() && !fingerprint_matches && version_matches {
                 tracing::info!(
@@ -209,7 +209,7 @@ impl LixunIndex {
                 );
             }
             recreate_index_dir(&index_dir, read_index_version_string(&version_path))?;
-            let dir = MmapDirectory::open(index_path)?;
+            let dir = MmapDirectory::open(&index_dir)?;
             let index = Index::create(
                 dir,
                 schema.schema.clone(),

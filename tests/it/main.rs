@@ -52,6 +52,7 @@ fn upsert_docs(idx: &mut LixunIndex, docs: &[Document]) {
         idx.upsert(d, &mut writer).unwrap();
     }
     idx.commit(&mut writer).unwrap();
+    idx.reload().unwrap();
 }
 
 fn search(idx: &LixunIndex, q: &str) -> Vec<String> {

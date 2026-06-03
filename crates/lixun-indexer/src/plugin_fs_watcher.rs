@@ -58,9 +58,14 @@ pub async fn start(registry: Arc<SourceRegistry>, sink: Arc<WriterSink>) -> Resu
     let dropped_cb = Arc::clone(&dropped_counter);
     let mut watcher = RecommendedWatcher::new(
         move |res: notify::Result<Event>| {
-            if let Ok(event) = res
-                && let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) = tx_cb.try_send(event)
-            {
+            let event = match res {
+                Ok(event) => event,
+                Err(e) => {
+                    tracing::error!("plugin fs watcher error (events may be lost): {}", e);
+                    return;
+                }
+            };
+            if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) = tx_cb.try_send(event) {
                 let prev = dropped_cb.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if prev == 0 || prev.is_multiple_of(100) {
                     tracing::warn!(

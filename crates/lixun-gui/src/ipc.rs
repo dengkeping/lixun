@@ -132,6 +132,14 @@ pub(crate) fn start_ipc_thread(
                     tracing::error!("Response frame too short");
                     break;
                 }
+                if resp_len > lixun_ipc::MAX_FRAME_LEN {
+                    tracing::error!(
+                        "Response frame length {} exceeds maximum {}",
+                        resp_len,
+                        lixun_ipc::MAX_FRAME_LEN
+                    );
+                    break;
+                }
                 let mut version_buf = [0u8; 2];
                 if let Err(e) = stream.read_exact(&mut version_buf) {
                     tracing::error!("Failed to read response version: {}", e);
@@ -191,7 +199,9 @@ pub(crate) fn start_ipc_thread(
                             break;
                         }
                     }
-                    Ok(Response::Cancelled { epoch: cancelled_epoch }) => {
+                    Ok(Response::Cancelled {
+                        epoch: cancelled_epoch,
+                    }) => {
                         tracing::debug!(
                             "ipc: search superseded (cancelled epoch {}, send epoch {})",
                             cancelled_epoch,

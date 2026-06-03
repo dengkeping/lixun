@@ -42,6 +42,7 @@ const RAW_EVENT_QUEUE_CAP: usize = 8192;
 const REFRESH_QUEUE_CAP: usize = 1024;
 const CONTROL_QUEUE_CAP: usize = 256;
 
+#[derive(Debug, PartialEq, Eq)]
 enum RawEvent {
     Upsert(PathBuf),
     Delete(PathBuf),
@@ -140,7 +141,13 @@ fn notify_thread_main(
     let raw_tx_cb = raw_tx.clone();
     let watcher_res = RecommendedWatcher::new(
         move |res: notify::Result<Event>| {
-            let Ok(event) = res else { return };
+            let event = match res {
+                Ok(event) => event,
+                Err(e) => {
+                    tracing::error!("notify watcher error (events may be lost): {}", e);
+                    return;
+                }
+            };
             dispatch_notify_event(&raw_tx_cb, event);
         },
         Config::default(),
@@ -244,16 +251,13 @@ fn dispatch_notify_event(raw_tx: &mpsc::Sender<RawEvent>, event: Event) {
         EventKind::Modify(notify::event::ModifyKind::Name(notify::event::RenameMode::To)) => {
             event.paths.into_iter().map(RawEvent::Upsert).collect()
         }
-        EventKind::Modify(notify::event::ModifyKind::Name(notify::event::RenameMode::Both)) => {
-            let mut v = Vec::with_capacity(event.paths.len());
-            for (i, p) in event.paths.into_iter().enumerate() {
-                if i == 0 {
-                    v.push(RawEvent::Delete(p));
-                } else {
-                    v.push(RawEvent::Upsert(p));
-                }
-            }
-            v
+        EventKind::Modify(notify::event::ModifyKind::Name(notify::event::RenameMode::Both))
+            if event.paths.len() == 2 =>
+        {
+            let mut paths = event.paths.into_iter();
+            let from = paths.next().expect("len checked == 2");
+            let to = paths.next().expect("len checked == 2");
+            vec![RawEvent::Delete(from), RawEvent::Upsert(to)]
         }
         EventKind::Create(_) | EventKind::Modify(_) => {
             event.paths.into_iter().map(RawEvent::Upsert).collect()
@@ -479,5 +483,55 @@ fn resolve_refresh(
         }
     } else {
         Resolved::Skip
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use notify::event::{ModifyKind, RenameMode};
+
+    fn drain(event: Event) -> Vec<RawEvent> {
+        let (tx, mut rx) = mpsc::channel(64);
+        dispatch_notify_event(&tx, event);
+        drop(tx);
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            out.push(ev);
+        }
+        out
+    }
+
+    #[test]
+    fn rename_both_two_paths_maps_delete_then_upsert() {
+        let from = PathBuf::from("/tmp/old.txt");
+        let to = PathBuf::from("/tmp/new.txt");
+        let event = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+            .add_path(from.clone())
+            .add_path(to.clone());
+        assert_eq!(
+            drain(event),
+            vec![RawEvent::Delete(from), RawEvent::Upsert(to)]
+        );
+    }
+
+    #[test]
+    fn rename_both_unexpected_path_count_degrades_to_upsert() {
+        // A malformed Both event must never emit a Delete (which would target
+        // the wrong document); it degrades to a conservative all-upsert.
+        let single = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+            .add_path(PathBuf::from("/tmp/only.txt"));
+        assert_eq!(
+            drain(single),
+            vec![RawEvent::Upsert(PathBuf::from("/tmp/only.txt"))]
+        );
+
+        let triple = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+            .add_path(PathBuf::from("/tmp/a.txt"))
+            .add_path(PathBuf::from("/tmp/b.txt"))
+            .add_path(PathBuf::from("/tmp/c.txt"));
+        let out = drain(triple);
+        assert!(out.iter().all(|e| matches!(e, RawEvent::Upsert(_))));
+        assert_eq!(out.len(), 3);
     }
 }

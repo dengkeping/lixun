@@ -194,14 +194,17 @@ impl PdfPageWidget {
             // Fall back to the widget's own width when no ScrolledWindow
             // is in the ancestry (e.g. headless unit tests). At least it
             // matches the pre-T9 behaviour.
-            if viewport <= 0 { self.width() } else { viewport }
+            if viewport <= 0 {
+                self.width()
+            } else {
+                viewport
+            }
         };
         let viewport_width_px = (viewport_width_logical as f64).max(0.0) * device_scale;
         let effective_zoom = if let Some(sz) = session.page_size(page) {
             let page_width_px_at_zoom_1 = sz.width_pt * BASE_DPI / POINTS_PER_INCH;
             if page_width_px_at_zoom_1 > 0.0 && viewport_width_px > 0.0 {
-                let viewport_zoom_cap =
-                    (viewport_width_px / page_width_px_at_zoom_1).max(0.25);
+                let viewport_zoom_cap = (viewport_width_px / page_width_px_at_zoom_1).max(0.25);
                 let clamped = user_zoom.min(viewport_zoom_cap).max(0.25);
                 tracing::trace!(
                     target = "lixun-preview-pdf",
@@ -298,8 +301,7 @@ impl PdfPageWidget {
                 else {
                     return;
                 };
-                let mut sel_rect =
-                    flip_rect_y_for_poppler_selection(&sel_rect_yup, sz.height_pt);
+                let mut sel_rect = flip_rect_y_for_poppler_selection(&sel_rect_yup, sz.height_pt);
                 let Some(page) = session.main_page(page_idx) else {
                     return;
                 };
@@ -316,19 +318,9 @@ impl PdfPageWidget {
                     return;
                 }
                 let x_lo = sel.anchor.point.x.min(sel.active.point.x).max(0.0);
-                let x_hi = sel
-                    .anchor
-                    .point
-                    .x
-                    .max(sel.active.point.x)
-                    .min(sz.width_pt);
+                let x_hi = sel.anchor.point.x.max(sel.active.point.x).min(sz.width_pt);
                 let y_lo = sel.anchor.point.y.min(sel.active.point.y).max(0.0);
-                let y_hi = sel
-                    .anchor
-                    .point
-                    .y
-                    .max(sel.active.point.y)
-                    .min(sz.height_pt);
+                let y_hi = sel.anchor.point.y.max(sel.active.point.y).min(sz.height_pt);
                 if x_hi - x_lo < 0.5 || y_hi - y_lo < 0.5 {
                     return;
                 }
@@ -348,11 +340,9 @@ impl PdfPageWidget {
                 let h = wr.height();
                 let t: f32 = 1.0;
                 snapshot.append_color(&border, &gtk::graphene::Rect::new(x, y, w, t));
-                snapshot
-                    .append_color(&border, &gtk::graphene::Rect::new(x, y + h - t, w, t));
+                snapshot.append_color(&border, &gtk::graphene::Rect::new(x, y + h - t, w, t));
                 snapshot.append_color(&border, &gtk::graphene::Rect::new(x, y, t, h));
-                snapshot
-                    .append_color(&border, &gtk::graphene::Rect::new(x + w - t, y, t, h));
+                snapshot.append_color(&border, &gtk::graphene::Rect::new(x + w - t, y, t, h));
             }
         }
     }
@@ -453,12 +443,12 @@ mod tests {
         DocumentSession::open(fixture, tx).ok()
     }
 
+    // Requires a GTK-initialized thread; libtest runs each test on a
+    // fresh worker thread, so GTK/GDK calls abort with the two-thread
+    // guard. Run with `--ignored` under a single-threaded GTK harness.
     #[test]
+    #[ignore]
     fn page_widget_measure_scales_with_zoom() {
-        if gtk::init().is_err() {
-            eprintln!("gtk init failed — skipping");
-            return;
-        }
         let Some(session) = fixture_session() else {
             eprintln!("fixture missing — skipping");
             return;

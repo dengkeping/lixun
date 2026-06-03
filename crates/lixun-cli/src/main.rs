@@ -44,6 +44,13 @@ async fn read_response_frame(stream: &mut UnixStream) -> Result<Response> {
     if resp_len < 2 {
         anyhow::bail!("response frame too short");
     }
+    if resp_len > lixun_ipc::MAX_FRAME_LEN {
+        anyhow::bail!(
+            "response frame length {} exceeds maximum {}",
+            resp_len,
+            lixun_ipc::MAX_FRAME_LEN
+        );
+    }
     let mut version_buf = [0u8; 2];
     stream.read_exact(&mut version_buf).await?;
     let mut resp_buf = vec![0u8; resp_len - 2];

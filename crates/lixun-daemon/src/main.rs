@@ -395,7 +395,7 @@ async fn async_main(
 
     let index_path = config.state_dir.join("index");
     let (index, rebuilt_from_scratch) = lixun_index::LixunIndex::create_or_open_with_plugins(
-        index_path.to_str().unwrap(),
+        &index_path,
         &registry.plugin_fields_by_kind,
         config.ranking_config(),
     )?;
@@ -617,8 +617,12 @@ async fn async_main(
     }
 
     let socket_path = socket_path();
-    if socket_path.exists() {
-        std::fs::remove_file(&socket_path)?;
+    // Unconditional remove (ignoring NotFound) avoids the TOCTOU window an
+    // exists()-then-remove pair would open before binding.
+    match std::fs::remove_file(&socket_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
     }
 
     tracing::info!("Listening on {:?}", socket_path);
@@ -1198,6 +1202,13 @@ async fn read_request(
     let frame_len = u32::from_be_bytes(hdr) as usize;
     if frame_len < 2 {
         anyhow::bail!("frame too short for version");
+    }
+    if frame_len > lixun_ipc::MAX_FRAME_LEN {
+        anyhow::bail!(
+            "frame length {} exceeds maximum {}",
+            frame_len,
+            lixun_ipc::MAX_FRAME_LEN
+        );
     }
     let mut ver_buf = [0u8; 2];
     stream_read.read_exact(&mut ver_buf).await?;

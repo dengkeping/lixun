@@ -162,8 +162,15 @@ mod tests {
     fn no_trigger_without_prefix() {
         assert!(src(false).on_query("ls", &ctx()).is_empty());
         assert!(src(false).on_query("", &ctx()).is_empty());
-        assert!(src(false).on_query(">", &ctx()).is_empty());
-        assert!(src(false).on_query(">   ", &ctx()).is_empty());
+    }
+
+    #[test]
+    fn bare_prefix_shows_placeholder() {
+        for q in [">", ">   "] {
+            let hits = src(false).on_query(q, &ctx());
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].id.0, "shell:__placeholder__");
+        }
     }
 
     #[test]
