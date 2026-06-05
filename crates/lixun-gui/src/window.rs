@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use gtk::gio;
 use gtk::prelude::*;
-use gtk4_layer_shell::{Edge, LayerShell};
+use gtk4_layer_shell::{Edge, KeyboardMode, LayerShell};
 use lixun_core::Category;
 
 use crate::factory::{
@@ -259,9 +259,9 @@ impl LauncherController {
                 report_launcher_geometry(&w);
             });
         }
-        self.entry.grab_focus();
+        self.arm_layer_shell_focus();
         tracing::info!(
-            "gui: show() called entry.grab_focus(); entry has_focus={}",
+            "gui: show() called arm_layer_shell_focus; entry has_focus={}",
             self.entry.has_focus()
         );
         self.entry.set_position(-1);
@@ -372,6 +372,30 @@ impl LauncherController {
         self.preview_mode_active.get()
     }
 
+    /// Re-arm layer-shell keyboard interactivity. Toggles the
+    /// keyboard mode `None → OnDemand` to force the compositor
+    /// (e.g. KWin) to re-evaluate `keyboard_interactivity` for the
+    /// layer surface, then routes focus to the entry.
+    ///
+    /// Why this exists. `zwlr_layer_surface_v1` keyboard focus is
+    /// compositor-controlled via `keyboard_interactivity`. Once
+    /// the surface has been mapped and unmapped at least once,
+    /// KWin does not regrant `OnDemand` keyboard focus on a
+    /// subsequent `set_visible(true)` — the surface still "exists"
+    /// with the prior mode, but the compositor sees no reason to
+    /// grant the seat keyboard back. Toggling the mode through
+    /// `None` triggers a re-evaluation that recovers focus.
+    ///
+    /// `xdg-toplevel`'s `set_startup_id` + `present` is NOT
+    /// applicable here — that is xdg-shell activation, semantically
+    /// distinct from layer-shell keyboard interactivity, and KWin
+    /// does not honour xdg-shell startup IDs on layer surfaces.
+    fn arm_layer_shell_focus(&self) {
+        self.window.set_keyboard_mode(KeyboardMode::None);
+        self.window.set_keyboard_mode(KeyboardMode::OnDemand);
+        self.entry.grab_focus();
+    }
+
     /// React to `GuiCommand::ExitPreviewMode` from the daemon: the
     /// warm preview process reported that the user dismissed its
     /// window (Escape/Space inside preview), so we must leave
@@ -382,19 +406,26 @@ impl LauncherController {
     /// Wayland seat keyboard. When the preview toplevel took the
     /// seat and then hid, the compositor does not hand the seat
     /// back to the launcher's layer surface on its own, so arrow
-    /// keys would go nowhere. The preview mints an xdg-activation
-    /// token from the dismissing keypress and relays it here;
-    /// `set_startup_id` + `present` consumes it to reactivate the
-    /// launcher surface, after which `grab_focus` routes input to
-    /// the entry. `activation_token` is `None` on launch/exit paths
-    /// where the launcher is hidden anyway.
+    /// keys would go nowhere. We rearm the layer-shell keyboard
+    /// interactivity (`arm_layer_shell_focus`) which forces the
+    /// compositor to re-evaluate `keyboard_interactivity` for the
+    /// surface, after which `grab_focus` routes input to the entry.
+    ///
+    /// `activation_token` is preserved on the wire (the preview
+    /// process still mints it as part of its dismissal handshake)
+    /// but unused by this body: layer surfaces are not toplevels
+    /// and do not honour xdg-shell startup IDs.
     pub(crate) fn exit_preview_mode(&self, activation_token: Option<String>) {
+        tracing::info!(
+            "gui: exit_preview_mode token_present={} window_visible={} entry_focus={} preview_active={}",
+            activation_token.is_some(),
+            self.window.is_visible(),
+            self.entry.has_focus(),
+            self.preview_mode_active.get()
+        );
+        let _ = activation_token;
         self.set_preview_mode_active(false);
-        if let Some(token) = activation_token {
-            self.window.set_startup_id(&token);
-        }
-        self.window.present();
-        self.entry.grab_focus();
+        self.arm_layer_shell_focus();
     }
 
     fn cancel_preview_debounce(&self) {
