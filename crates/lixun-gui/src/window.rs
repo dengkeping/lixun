@@ -1289,8 +1289,11 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
         let config_path = dirs::config_dir()
             .unwrap_or_else(|| std::path::PathBuf::from("~/.config"))
             .join("lixun/config.toml");
+        // xdg-utils' xdg-open rejects any argv that begins with '-' including
+        // the conventional GNU end-of-options separator. See the docstring on
+        // crates/lixun-gui/src/actions.rs::xdg_open_command for the protocol
+        // detail. Pass the target path directly.
         let _ = std::process::Command::new("xdg-open")
-            .arg("--")
             .arg(&config_path)
             .spawn();
     });

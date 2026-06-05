@@ -77,6 +77,10 @@ fn resolve_terminal_spawn(
     }
 }
 
+fn launch_argv(exec: &[String]) -> Option<(&str, &[String])> {
+    exec.split_first().map(|(p, a)| (p.as_str(), a))
+}
+
 fn terminal_spawn() -> TerminalSpawn {
     let on_path = std::env::var_os("PATH")
         .map(|paths| std::env::split_paths(&paths).any(|p| p.join("xdg-terminal-exec").is_file()))
@@ -100,6 +104,26 @@ fn show_in_file_manager(path: &std::path::Path) -> Result<()> {
 
 pub(crate) fn execute_action(hit: &Hit) -> Result<()> {
     dispatch_action(&hit.action)
+}
+
+/// Construct a `Command` invoking `xdg-open <target>` without any
+/// separator argument.
+///
+/// The xdg-utils `xdg-open` shell script does NOT accept `--` as an
+/// option terminator. Its argument parser rejects any argument
+/// starting with `-` (including `--`) with `exit_failure_syntax`,
+/// printing `xdg-open: unexpected option '--'` and exiting non-zero.
+/// All call sites must invoke `xdg-open <target>` directly.
+///
+/// Bare-target invocation is safe: indexed paths from lixun sources
+/// are absolute (begin with `/`), extracted attachments live under
+/// `$XDG_RUNTIME_DIR/lixun/attachments/...` (also absolute), and URI
+/// schemes always begin with ALPHA per RFC 3986, so no target value
+/// can collide with a flag-shaped argument.
+fn xdg_open_command(target: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+    let mut c = std::process::Command::new("xdg-open");
+    c.arg(target.as_ref());
+    c
 }
 
 fn dispatch_action(action: &Action) -> Result<()> {
@@ -126,36 +150,34 @@ fn dispatch_action(action: &Action) -> Result<()> {
                 }
             }
 
+            let Some((program, args)) = launch_argv(exec) else {
+                anyhow::bail!("Action::Launch has empty exec");
+            };
             if *terminal {
                 let spawn = terminal_spawn();
-                let mut args: Vec<&str> = spawn.args_before_exec.clone();
-                args.extend(exec.split_whitespace());
                 let mut builder = std::process::Command::new(&spawn.program);
-                builder.args(&args);
+                builder.args(&spawn.args_before_exec);
+                builder.arg(program);
+                builder.args(args);
                 spawn_reaped(&mut builder)?;
             } else {
-                let mut parts = exec.split_whitespace();
-                if let Some(cmd) = parts.next() {
-                    let mut builder = std::process::Command::new(cmd);
-                    builder.args(parts);
-                    if let Some(dir) = working_dir {
-                        builder.current_dir(dir);
-                    }
-                    spawn_reaped(&mut builder)?;
+                let mut builder = std::process::Command::new(program);
+                builder.args(args);
+                if let Some(dir) = working_dir {
+                    builder.current_dir(dir);
                 }
+                spawn_reaped(&mut builder)?;
             }
             Ok(())
         }
         Action::OpenFile { path } => {
-            let mut builder = std::process::Command::new("xdg-open");
-            builder.arg("--").arg(path);
+            let mut builder = xdg_open_command(path);
             spawn_reaped(&mut builder)?;
             Ok(())
         }
         Action::ShowInFileManager { path } => {
             if path.is_dir() {
-                let mut builder = std::process::Command::new("xdg-open");
-                builder.arg("--").arg(path);
+                let mut builder = xdg_open_command(path);
                 spawn_reaped(&mut builder)?;
             } else {
                 match show_in_file_manager(path) {
@@ -165,8 +187,7 @@ fn dispatch_action(action: &Action) -> Result<()> {
                             "FileManager1 DBus call failed: {e}; falling back to xdg-open"
                         );
                         if let Some(parent) = path.parent() {
-                            let mut builder = std::process::Command::new("xdg-open");
-                            builder.arg("--").arg(parent);
+                            let mut builder = xdg_open_command(parent);
                             spawn_reaped(&mut builder)?;
                         }
                     }
@@ -189,15 +210,13 @@ fn dispatch_action(action: &Action) -> Result<()> {
                 encoding,
                 suggested_filename,
             )?;
-            let mut builder = std::process::Command::new("xdg-open");
-            builder.arg("--").arg(&target);
+            let mut builder = xdg_open_command(&target);
             spawn_reaped(&mut builder)?;
             Ok(())
         }
         Action::OpenUri { uri } => {
             tracing::debug!(uri = %uri, "execute_action: dispatching via xdg-open");
-            let mut builder = std::process::Command::new("xdg-open");
-            builder.arg("--").arg(uri);
+            let mut builder = xdg_open_command(uri);
             spawn_reaped(&mut builder)?;
             Ok(())
         }
@@ -345,8 +364,22 @@ pub(crate) fn run_and_capture(
 
 #[cfg(test)]
 mod tests {
-    use super::{file_uri, resolve_terminal_spawn};
+    use super::{file_uri, launch_argv, resolve_terminal_spawn};
     use std::path::Path;
+
+    #[test]
+    fn dispatch_launch_uses_vec_directly_no_split() {
+        let exec: Vec<String> = vec!["echo".into(), "hello world".into()];
+        let (program, args) = launch_argv(&exec).expect("non-empty exec");
+        assert_eq!(program, "echo");
+        assert_eq!(args, &["hello world".to_string()]);
+    }
+
+    #[test]
+    fn launch_argv_returns_none_for_empty() {
+        let exec: Vec<String> = Vec::new();
+        assert!(launch_argv(&exec).is_none());
+    }
 
     #[test]
     fn terminal_prefers_xdg_terminal_exec_when_present() {
@@ -410,5 +443,37 @@ mod tests {
         assert!(!result.contains("%2F"));
         assert!(!result.contains("%2f"));
         assert_eq!(result, "file:///a/b/c/d/e.txt");
+    }
+
+    #[test]
+    fn xdg_open_command_omits_unsupported_separator() {
+        use super::xdg_open_command;
+        use std::ffi::OsStr;
+        let cmd = xdg_open_command("/tmp/foo.pdf");
+        let args: Vec<&OsStr> = cmd.get_args().collect();
+        assert!(
+            !args.iter().any(|a| *a == "--"),
+            "xdg-open (xdg-utils) rejects `--` with 'unexpected option'; the helper must not pass it"
+        );
+        let strs: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(strs, vec!["/tmp/foo.pdf".to_string()]);
+    }
+
+    #[test]
+    fn xdg_open_command_passes_pathbuf_through_unchanged() {
+        use super::xdg_open_command;
+        use std::ffi::OsStr;
+        use std::path::PathBuf;
+        let p = PathBuf::from("/home/user/Documents/spec.pdf");
+        let cmd = xdg_open_command(&p);
+        let args: Vec<&OsStr> = cmd.get_args().collect();
+        let strs: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(strs, vec!["/home/user/Documents/spec.pdf".to_string()]);
     }
 }

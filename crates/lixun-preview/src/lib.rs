@@ -237,28 +237,8 @@ pub fn default_launch(hit: &lixun_core::Hit) -> anyhow::Result<()> {
             Ok(())
         }
         Action::Launch { exec, .. } => {
-            let tokens: Vec<&str> = exec
-                .split_whitespace()
-                .filter(|tok| {
-                    !matches!(
-                        *tok,
-                        "%f" | "%F"
-                            | "%u"
-                            | "%U"
-                            | "%d"
-                            | "%D"
-                            | "%n"
-                            | "%N"
-                            | "%i"
-                            | "%c"
-                            | "%k"
-                            | "%v"
-                            | "%m"
-                    )
-                })
-                .collect();
-            let Some((program, args)) = tokens.split_first() else {
-                anyhow::bail!("empty exec line after field-code strip: {:?}", exec);
+            let Some((program, args)) = exec.split_first() else {
+                anyhow::bail!("Action::Launch has empty exec");
             };
             std::process::Command::new(program).args(args).spawn()?;
             Ok(())
@@ -272,10 +252,13 @@ pub fn default_launch(hit: &lixun_core::Hit) -> anyhow::Result<()> {
         }
         Action::OpenUri { uri } => {
             tracing::debug!(uri = %uri, "default_launch: dispatching via xdg-open");
-            std::process::Command::new("xdg-open")
-                .arg("--")
-                .arg(uri)
-                .spawn()?;
+            // xdg-utils' xdg-open rejects any argv that begins with '-' (it
+            // treats the conventional GNU end-of-options separator as an
+            // unrecognised option and bails). Pass the URI directly. Producers
+            // of Action::OpenUri are responsible for emitting URI strings
+            // whose first character is a scheme letter per RFC 3986, never a
+            // bare '-' or path that could be mistaken for an option flag.
+            std::process::Command::new("xdg-open").arg(uri).spawn()?;
             Ok(())
         }
         Action::OpenAttachment { .. } => {
