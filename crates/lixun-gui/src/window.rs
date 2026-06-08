@@ -829,7 +829,8 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
 
     let blur = crate::kde_blur::BlurController::new(&window, daemon_config.gui.blur);
 
-    let display = gtk::gdk::Display::default().unwrap();
+    let display = gtk::gdk::Display::default()
+        .ok_or_else(|| anyhow::anyhow!("No GDK display available; running headless?"))?;
 
     // Resolve window WIDTH as a percentage of the primary monitor.
     // Height is deliberately NOT pinned here: layer-shell surface
@@ -994,6 +995,7 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
 
     let semantic_enabled = daemon_config.plugin_sections.contains_key("semantic");
     let ocr_enabled = daemon_config.ocr.enabled;
+    let max_results = daemon_config.max_results;
 
     let entry_for_menu = entry.clone();
     let gesture = gtk::GestureClick::new();
@@ -1348,6 +1350,7 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
         std::rc::Rc::clone(&searching_indicator),
         std::rc::Rc::clone(&loading_timer),
         std::rc::Rc::clone(&claimed_prefixes),
+        max_results,
     );
 
     crate::keymap::install_keyboard_handler(
@@ -1858,6 +1861,7 @@ fn install_entry_handler(
     _searching_indicator: std::rc::Rc<std::cell::Cell<bool>>,
     loading_timer: std::rc::Rc<std::cell::RefCell<Option<glib::SourceId>>>,
     claimed_prefixes: std::rc::Rc<Vec<String>>,
+    max_results: u32,
 ) {
     tracing::info!("gui: install_entry_handler called, registering connect_changed");
     entry.connect_changed(move |e| {
@@ -1978,8 +1982,9 @@ fn install_entry_handler(
             *last_q.borrow_mut() = q.clone();
             let epoch_snapshot = epoch.load(Ordering::SeqCst);
             tracing::debug!(
-                "gui: debounce fired, sending search query={:?} epoch={}",
+                "gui: debounce fired, sending search query={:?} limit={} epoch={}",
                 q,
+                max_results,
                 epoch_snapshot
             );
             // Skip "Searching…" spinner for queries claimed by an
@@ -1994,7 +1999,7 @@ fn install_entry_handler(
             if !is_claimed {
                 status_for_debounce.show_loading();
             }
-            let _ = ipc.request_tx.send((q, 30, epoch_snapshot));
+            let _ = ipc.request_tx.send((q, max_results, epoch_snapshot));
             *pending_self.borrow_mut() = None;
         });
         *pending_debounce.borrow_mut() = Some(id);
@@ -2098,7 +2103,7 @@ mod tests {
             kind_label: None,
             score: 0.0,
             action: Action::Launch {
-                exec: "true".into(),
+                exec: vec!["true".into()],
                 terminal: false,
                 desktop_id: None,
                 desktop_file: None,
