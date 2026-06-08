@@ -3,6 +3,14 @@
 # Copy to ~/.config/lixun/config.toml and adjust to taste.
 # Every section below is optional; missing fields fall back to defaults.
 
+# Core host settings: indexer behaviour, path policy, result caps.
+[core]
+
+# Maximum number of search hits returned by the daemon, shared by the GUI and
+# the CLI dashboard. Clamped to 1..=1000. The CLI `search` subcommand's
+# `--limit` flag overrides this on a per-query basis.
+max_results = 30
+
 # Maximum file size to extract text from, in MiB.
 # Files larger than this are still indexed by name/metadata.
 max_file_size_mb = 50
@@ -472,12 +480,29 @@ max_file_size_mb = 200
 # ───────────────────────────────────────────────────────────────────
 # Inline command runner. Queries that begin with `>` are handed to this
 # plugin; e.g. `> ls`, `> git status`. Pressing Enter on the result
-# executes `sh -c <cmd>` in the configured working directory. Shell
-# queries are never recorded in the frecency log.
+# spawns the program in the configured working directory via the
+# terminal launcher. Shell queries are never recorded in the frecency
+# log.
 #
-# Risky commands (sudo, rm -rf, mkfs, dd) surface with a ⚠ badge and
-# emit a warn-level trace. Under `strict_mode = true` the plugin refuses
-# to return a hit for risky commands at all.
+# Execution model (default-secure, P0-B):
+#   `shell_mode = false` (default) parses the input with shell-words
+#   and execs argv directly — NO shell is interposed, so metacharacters
+#   (`;`, `&&`, `|`, `>`, backticks, `$(...)`, `~`, `*`) ride along as
+#   literal arguments and cannot be interpreted. argv[0] is matched
+#   against a built-in whitelist of safe, read-mostly programs
+#   (ls, echo, pwd, cat, grep, rg, fd, find, git, cargo, make, head,
+#   tail, wc, tree, stat, du, df, free, ps, top, htop, btop, uname,
+#   whoami, id, date, uptime, which, type, env). Non-whitelisted
+#   programs surface with a ⚠ badge under lenient mode and are dropped
+#   entirely under `strict_mode = true`.
+#
+#   `shell_mode = true` is the legacy path: the command is handed to
+#   `sh -c` verbatim. This unlocks pipelines, redirection, env-var
+#   expansion, and globbing, but the user is responsible for what they
+#   type — a query like `> rm -rf ~` will be honoured literally. Risky
+#   patterns (`sudo`, `rm -rf`, `mkfs`, `dd`) surface with a ⚠ badge
+#   and are blocked under `strict_mode = true`. Opt in only if you
+#   need shell features and accept the risk.
 #
 # Runtime requirement: a terminal launcher must be resolvable. Lixun
 # tries `xdg-terminal-exec` first (honours ~/.config/xdg-terminals.list),
@@ -486,14 +511,27 @@ max_file_size_mb = 200
 #
 # Presence of the `[shell]` header enables the plugin. All keys below
 # are optional.
+#
+# Execution model: by default the command is split into an argv vector
+# and the program is run directly, so shell metacharacters (`;`, `|`,
+# `$()`, redirects) carry no special meaning and command injection is
+# impossible. The first token (the program) is checked against a
+# built-in whitelist of read-only/developer tools (ls, cat, grep, rg,
+# fd, find, git, cargo, make, ps, df, env, …). Non-whitelisted programs
+# are dropped under `strict_mode = true` or surfaced with a ⚠ badge
+# under the default lenient mode. Set `shell_mode = true` to opt into
+# the legacy `sh -c <cmd>` path (full shell semantics) if you accept the
+# injection risk.
 [shell]
 # working_dir = "~"            # `~` expands to $HOME; absolute path also OK
-# strict_mode = false          # set true to block risky commands entirely
+# strict_mode = false          # true: drop non-whitelisted (argv mode) or risky (legacy mode) entirely
+# shell_mode  = false          # default: argv exec, no shell. true: legacy `sh -c <cmd>` (opt-in)
 # trigger_prefix = ">"         # reserved, not yet configurable — v1 hard-codes `>`
 
 # -----------------------------------------------------------------------------
-# [extract] — text-extraction cache. Shared by every extractor
-# (pdftotext, OOXML, OCR). Cache lives at ~/.cache/lixun/extract/v1/.
+# [extract] — text-extraction cache and in-process decompression caps.
+# Shared by every extractor (pdftotext, OOXML, OCR). Cache lives at
+# ~/.cache/lixun/extract/v1/.
 # Keyed by (path + mtime + size + engine version tag) or by content
 # hash for attachments. Invalidated automatically on mtime change.
 #
@@ -501,6 +539,7 @@ max_file_size_mb = 200
 [extract]
 # cache_max_mb = 500           # 0 disables the LRU sweep tick (cache grows unbounded)
 # cache_sweep_interval_secs = 600
+# extractor_max_decompress_mb = 64  # OOXML/ODT total uncompressed bytes cap
 
 # -----------------------------------------------------------------------------
 # [ocr] — optical character recognition for images and scan PDFs.

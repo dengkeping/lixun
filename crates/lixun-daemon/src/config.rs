@@ -7,11 +7,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 
 const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
-    "roots",
-    "exclude",
-    "exclude_regex",
-    "max_file_size_mb",
-    "extractor_timeout_secs",
+    "core",
     "ranking",
     "keybindings",
     "preview",
@@ -21,13 +17,23 @@ const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "impact",
 ];
 
+/// Top-level keys that used to live directly under the document root
+/// but now belong under `[core]`. The loader detects each one at parse
+/// time and emits a `tracing::warn!` so the user can migrate. The
+/// legacy values are not honoured and are removed from the raw
+/// document before the unknown-key sweep so they do not leak into
+/// [`Config::plugin_sections`].
+const LEGACY_TOP_LEVEL_KEYS: &[&str] = &[
+    "roots",
+    "exclude",
+    "exclude_regex",
+    "max_file_size_mb",
+    "extractor_timeout_secs",
+];
+
 #[derive(Debug, Deserialize)]
 struct ConfigToml {
-    roots: Option<Vec<String>>,
-    exclude: Option<Vec<String>>,
-    exclude_regex: Option<Vec<String>>,
-    max_file_size_mb: Option<u64>,
-    extractor_timeout_secs: Option<u64>,
+    core: Option<CoreToml>,
     ranking: Option<RankingToml>,
     keybindings: Option<KeybindingsToml>,
     preview: Option<PreviewToml>,
@@ -35,6 +41,24 @@ struct ConfigToml {
     extract: Option<ExtractToml>,
     ocr: Option<OcrToml>,
     impact: Option<ImpactToml>,
+}
+
+/// Wire-format mirror of the `[core]` table. Hosts the indexer's
+/// root list, substring and regex excludes, the extraction file-size
+/// cap, the extractor timeout, and the search result-count cap. Every
+/// field is optional so an absent or partially-populated table falls
+/// back to [`Config::default`] piecewise. `deny_unknown_fields` so
+/// typos inside `[core]` surface as parse errors instead of silently
+/// dropping into the plugin-sections sweep.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct CoreToml {
+    roots: Option<Vec<String>>,
+    exclude: Option<Vec<String>>,
+    exclude_regex: Option<Vec<String>>,
+    max_file_size_mb: Option<u64>,
+    extractor_timeout_secs: Option<u64>,
+    max_results: Option<u32>,
 }
 
 /// Parse-side mirror of [`OcrConfig`]. Every field is optional so the
@@ -89,14 +113,15 @@ impl Default for ImpactConfig {
     }
 }
 
-/// Parse-side mirror of [`ExtractConfig`]. Both knobs are optional so
-/// the impact profile can seed the default when the operator has not
-/// pinned an explicit value (per plan §5.3 precedence rule).
+/// Parse-side mirror of [`ExtractConfig`]. All knobs are optional so
+/// defaults and impact-profile seeds survive when the operator has not
+/// pinned explicit values.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct ExtractToml {
     cache_max_mb: Option<u64>,
     cache_sweep_interval_secs: Option<u64>,
+    extractor_max_decompress_mb: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -123,8 +148,8 @@ struct GuiToml {
     matugen_colors_path: Option<String>,
 }
 
-/// Text-extraction cache configuration. Shared by every extractor
-/// (pdftotext, OOXML, OCR) — lives under `~/.cache/lixun/extract/v1/`.
+/// Text-extraction configuration. Cache entries live under
+/// `~/.cache/lixun/extract/v1/`.
 /// Cache sweep is a tick-scheduled LRU eviction keyed by file mtime.
 /// `cache_max_mb = 0` disables the sweep tick (valid config, no warn).
 #[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq, Eq)]
@@ -133,6 +158,8 @@ pub struct ExtractConfig {
     pub cache_max_mb: u64,
     #[serde(default = "default_cache_sweep_interval_secs")]
     pub cache_sweep_interval_secs: u64,
+    #[serde(default = "default_extractor_max_decompress_mb")]
+    pub extractor_max_decompress_mb: u64,
 }
 
 impl Default for ExtractConfig {
@@ -140,6 +167,7 @@ impl Default for ExtractConfig {
         Self {
             cache_max_mb: default_cache_max_mb(),
             cache_sweep_interval_secs: default_cache_sweep_interval_secs(),
+            extractor_max_decompress_mb: default_extractor_max_decompress_mb(),
         }
     }
 }
@@ -149,6 +177,9 @@ fn default_cache_max_mb() -> u64 {
 }
 fn default_cache_sweep_interval_secs() -> u64 {
     600
+}
+fn default_extractor_max_decompress_mb() -> u64 {
+    64
 }
 
 /// OCR configuration. Disabled by default. Enabling requires
@@ -373,6 +404,7 @@ pub struct Config {
     pub exclude_regex: Vec<regex::Regex>,
     pub max_file_size_mb: u64,
     pub extractor_timeout_secs: u64,
+    pub max_results: u32,
     pub ranking_apps: f32,
     pub ranking_files: f32,
     pub ranking_mail: f32,
@@ -493,6 +525,7 @@ impl Default for Config {
             exclude_regex: Vec::new(),
             max_file_size_mb: 50,
             extractor_timeout_secs: 15,
+            max_results: 30,
             ranking_apps: 1.3,
             ranking_files: 1.2,
             ranking_mail: 1.0,
@@ -579,28 +612,39 @@ impl Config {
         let mut cfg = Self::default();
         let parsed: ConfigToml = toml::from_str(content)?;
 
-        if let Some(roots) = parsed.roots {
-            cfg.roots = roots.iter().map(|s| expand_tilde(s)).collect();
-        }
-        if let Some(extra) = parsed.exclude {
-            cfg.exclude.extend(extra);
-        }
-        if let Some(patterns) = parsed.exclude_regex {
-            for pat in patterns {
-                match regex::Regex::new(&pat) {
-                    Ok(r) => cfg.exclude_regex.push(r),
-                    Err(e) => {
-                        tracing::error!("config: skipping invalid exclude_regex '{}': {}", pat, e)
+        let user_set_max_file_size_mb = parsed
+            .core
+            .as_ref()
+            .and_then(|c| c.max_file_size_mb)
+            .is_some();
+        if let Some(core) = parsed.core {
+            if let Some(roots) = core.roots {
+                cfg.roots = roots.iter().map(|s| expand_tilde(s)).collect();
+            }
+            if let Some(extra) = core.exclude {
+                cfg.exclude.extend(extra);
+            }
+            if let Some(patterns) = core.exclude_regex {
+                for pat in patterns {
+                    match regex::Regex::new(&pat) {
+                        Ok(r) => cfg.exclude_regex.push(r),
+                        Err(e) => tracing::error!(
+                            "config: skipping invalid [core].exclude_regex '{}': {}",
+                            pat,
+                            e
+                        ),
                     }
                 }
             }
-        }
-        let user_set_max_file_size_mb = parsed.max_file_size_mb.is_some();
-        if let Some(max) = parsed.max_file_size_mb {
-            cfg.max_file_size_mb = max;
-        }
-        if let Some(timeout) = parsed.extractor_timeout_secs {
-            cfg.extractor_timeout_secs = timeout;
+            if let Some(max) = core.max_file_size_mb {
+                cfg.max_file_size_mb = max;
+            }
+            if let Some(timeout) = core.extractor_timeout_secs {
+                cfg.extractor_timeout_secs = timeout;
+            }
+            if let Some(n) = core.max_results {
+                cfg.max_results = n;
+            }
         }
         if let Some(ranking) = parsed.ranking {
             cfg.ranking_apps = ranking.apps.unwrap_or(1.3);
@@ -754,6 +798,9 @@ impl Config {
             if let Some(v) = extract_toml.cache_sweep_interval_secs {
                 cfg.extract.cache_sweep_interval_secs = v;
             }
+            if let Some(v) = extract_toml.extractor_max_decompress_mb {
+                cfg.extract.extractor_max_decompress_mb = v;
+            }
         }
         if !user_set_max_file_size_mb {
             cfg.max_file_size_mb = profile_seed.max_file_size_bytes / (1024 * 1024);
@@ -816,6 +863,18 @@ impl Config {
                         continue;
                     }
                     cfg.preview.plugin_sections.insert(key, value);
+                }
+            }
+            // Must precede the `plugin_sections` sweep below;
+            // otherwise legacy keys would be misdispatched to
+            // non-existent plugin factories instead of warned about.
+            for legacy_key in LEGACY_TOP_LEVEL_KEYS {
+                if top.remove(*legacy_key).is_some() {
+                    tracing::warn!(
+                        field = *legacy_key,
+                        "config: top-level `{}` is no longer supported; move it under [core] in ~/.config/lixun/config.toml. The legacy value has been ignored.",
+                        legacy_key
+                    );
                 }
             }
             for (key, value) in top {
@@ -951,6 +1010,15 @@ impl Config {
             );
             self.ocr.nice_level = clamped;
         }
+        if !(1..=1000).contains(&self.max_results) {
+            let clamped = self.max_results.clamp(1, 1000);
+            tracing::warn!(
+                "[core].max_results = {} out of 1..=1000, clamped to {}",
+                self.max_results,
+                clamped
+            );
+            self.max_results = clamped;
+        }
     }
 }
 
@@ -1036,6 +1104,7 @@ mod tests {
         let ec = ExtractConfig {
             cache_max_mb: 1024,
             cache_sweep_interval_secs: 30,
+            extractor_max_decompress_mb: 128,
         };
         let s = toml::to_string(&ec).unwrap();
         let parsed: ExtractConfig = toml::from_str(&s).unwrap();
@@ -1129,11 +1198,12 @@ mod tests {
     #[test]
     fn extract_config_parsed_from_toml() {
         let cfg = Config::from_toml_str(
-            "[extract]\ncache_max_mb = 1024\ncache_sweep_interval_secs = 120\n",
+            "[extract]\ncache_max_mb = 1024\ncache_sweep_interval_secs = 120\nextractor_max_decompress_mb = 128\n",
         )
         .unwrap();
         assert_eq!(cfg.extract.cache_max_mb, 1024);
         assert_eq!(cfg.extract.cache_sweep_interval_secs, 120);
+        assert_eq!(cfg.extract.extractor_max_decompress_mb, 128);
     }
 
     #[test]
@@ -1151,6 +1221,7 @@ mod tests {
         std::fs::create_dir_all(cfg_path.parent().unwrap()).unwrap();
         let fixture = "\
 # top-of-file comment kept verbatim
+[core]
 max_file_size_mb = 50
 
 [ranking]

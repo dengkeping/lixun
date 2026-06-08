@@ -13,6 +13,7 @@ fn test_config(root: std::path::PathBuf, state_dir: std::path::PathBuf) -> Confi
         exclude_regex: Vec::new(),
         max_file_size_mb: 1,
         extractor_timeout_secs: 1,
+        max_results: 30,
         ranking_apps: 1.0,
         ranking_files: 1.0,
         ranking_mail: 1.0,

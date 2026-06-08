@@ -30,6 +30,7 @@ fn test_toml_config() {
     let config_dir = tmp.path().join("lixun");
     fs::create_dir_all(&config_dir).unwrap();
     let mut f = fs::File::create(config_dir.join("config.toml")).unwrap();
+    writeln!(f, "[core]").unwrap();
     writeln!(f, "max_file_size_mb = 100").unwrap();
     writeln!(f, "ranking = {{ apps = 2.0 }}").unwrap();
 }
@@ -37,6 +38,7 @@ fn test_toml_config() {
 #[test]
 fn user_exclude_merges_with_defaults() {
     let toml = r#"
+        [core]
         exclude = ["MyProject/tmp", ".vscode"]
     "#;
     let cfg = Config::from_toml_str(toml).unwrap();
@@ -61,6 +63,7 @@ fn user_exclude_merges_with_defaults() {
 #[test]
 fn exclude_regex_compiled_from_toml() {
     let toml = r#"
+        [core]
         exclude_regex = ['\.~lock\..*#$', '\.pyc$']
     "#;
     let cfg = Config::from_toml_str(toml).unwrap();
@@ -76,6 +79,7 @@ fn exclude_regex_compiled_from_toml() {
 #[test]
 fn invalid_regex_patterns_dropped_not_fatal() {
     let toml = r#"
+        [core]
         exclude_regex = ['\.~lock\..*#$', '[unterminated', '\.tmp$']
     "#;
     let cfg = Config::from_toml_str(toml).unwrap();
@@ -88,7 +92,7 @@ fn invalid_regex_patterns_dropped_not_fatal() {
 
 #[test]
 fn missing_exclude_sections_leave_defaults_intact() {
-    let cfg = Config::from_toml_str("max_file_size_mb = 25").unwrap();
+    let cfg = Config::from_toml_str("[core]\nmax_file_size_mb = 25").unwrap();
     let defaults = Config::default().exclude;
     assert_eq!(cfg.exclude, defaults);
     assert!(cfg.exclude_regex.is_empty());
@@ -105,6 +109,7 @@ fn empty_config_has_no_plugin_sections() {
 fn unknown_top_level_keys_captured_as_plugin_sections() {
     let cfg = Config::from_toml_str(
         r#"
+        [core]
         max_file_size_mb = 25
 
         [thunderbird]
@@ -167,6 +172,7 @@ fn plugin_section_maildir_preserved_as_array() {
 fn known_keys_never_leak_into_plugin_sections() {
     let cfg = Config::from_toml_str(
         r#"
+        [core]
         roots = ["/tmp/custom"]
         exclude = [".foo"]
         max_file_size_mb = 100
@@ -379,4 +385,118 @@ fn preview_does_not_leak_into_plugin_sections() {
     assert!(!cfg.plugin_sections.contains_key("preview"));
     assert!(cfg.plugin_sections.contains_key("thunderbird"));
     assert_eq!(cfg.preview.max_file_size_mb, 250);
+}
+
+#[test]
+fn core_table_parses_with_max_results() {
+    let cfg = Config::from_toml_str(
+        r#"
+        [core]
+        max_results = 7
+    "#,
+    )
+    .unwrap();
+    assert_eq!(cfg.max_results, 7);
+}
+
+#[test]
+fn max_results_defaults_to_30_when_omitted_from_core() {
+    let cfg = Config::from_toml_str("[core]\nmax_file_size_mb = 50").unwrap();
+    assert_eq!(cfg.max_results, 30);
+    assert_eq!(
+        cfg.max_file_size_mb, 50,
+        "max_file_size_mb under [core] should still apply"
+    );
+}
+
+#[test]
+fn max_results_defaults_to_30_when_core_table_absent() {
+    let cfg = Config::from_toml_str("").unwrap();
+    assert_eq!(cfg.max_results, 30);
+}
+
+#[test]
+fn max_results_clamps_zero_to_one() {
+    let cfg = Config::from_toml_str("[core]\nmax_results = 0").unwrap();
+    assert_eq!(cfg.max_results, 1);
+}
+
+#[test]
+fn max_results_clamps_above_thousand_to_thousand() {
+    let cfg = Config::from_toml_str("[core]\nmax_results = 99999").unwrap();
+    assert_eq!(cfg.max_results, 1000);
+}
+
+#[test]
+fn core_table_parses_all_migrated_fields() {
+    let cfg = Config::from_toml_str(
+        r#"
+        [core]
+        roots = ["/tmp/example-root"]
+        exclude = ["my-custom-substring"]
+        exclude_regex = ['\.example$']
+        max_file_size_mb = 42
+        extractor_timeout_secs = 7
+        max_results = 25
+    "#,
+    )
+    .unwrap();
+    assert!(
+        cfg.roots
+            .iter()
+            .any(|p| p.to_string_lossy() == "/tmp/example-root"),
+        "roots under [core] should apply"
+    );
+    assert!(
+        cfg.exclude.iter().any(|s| s == "my-custom-substring"),
+        "exclude under [core] should merge with defaults"
+    );
+    assert_eq!(cfg.exclude_regex.len(), 1);
+    assert_eq!(cfg.max_file_size_mb, 42);
+    assert_eq!(cfg.extractor_timeout_secs, 7);
+    assert_eq!(cfg.max_results, 25);
+}
+
+#[test]
+fn legacy_top_level_keys_ignored_and_not_in_plugin_sections() {
+    let cfg = Config::from_toml_str(
+        r#"
+        roots = ["/legacy/should/be/dropped"]
+        exclude = ["legacy-should-be-dropped"]
+        exclude_regex = ['\.legacy$']
+        max_file_size_mb = 12345
+        extractor_timeout_secs = 999
+    "#,
+    )
+    .unwrap();
+    let defaults = Config::default();
+    assert!(
+        !cfg.roots
+            .iter()
+            .any(|p| p.to_string_lossy() == "/legacy/should/be/dropped"),
+        "legacy top-level `roots` must be ignored"
+    );
+    assert!(
+        !cfg.exclude.iter().any(|s| s == "legacy-should-be-dropped"),
+        "legacy top-level `exclude` must be ignored"
+    );
+    assert!(
+        cfg.exclude_regex.is_empty(),
+        "legacy top-level `exclude_regex` must be ignored"
+    );
+    assert_eq!(cfg.max_file_size_mb, defaults.max_file_size_mb);
+    assert_eq!(cfg.extractor_timeout_secs, defaults.extractor_timeout_secs);
+    for legacy in [
+        "roots",
+        "exclude",
+        "exclude_regex",
+        "max_file_size_mb",
+        "extractor_timeout_secs",
+    ] {
+        assert!(
+            !cfg.plugin_sections.contains_key(legacy),
+            "legacy key `{}` must not be swept into plugin_sections",
+            legacy
+        );
+    }
 }
