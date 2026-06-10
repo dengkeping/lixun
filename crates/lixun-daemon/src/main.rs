@@ -38,6 +38,7 @@ use lixun_daemon::hotkeys;
 use lixun_daemon::index_service::{self, IndexMutationTx, SearchHandle};
 use lixun_daemon::indexer;
 use lixun_daemon::preview_spawn::PreviewSpawner;
+use lixun_daemon::sources_glue::SourcesGlue;
 
 use lixun_indexer::plugin_fs_watcher;
 use lixun_indexer::watcher;
@@ -302,6 +303,13 @@ async fn async_main(
 ) -> Result<()> {
     tracing::info!("Config loaded: roots={:?}", config.roots);
 
+    // Arc the config up front; the runtime indexing hooks (extractor
+    // caps, OCR enqueue, body checker) live on the daemon-side
+    // SourcesGlue, not on the shared schema type.
+    let shared_config = Arc::new(config);
+    let config = shared_config.as_ref();
+    let sources = Arc::new(SourcesGlue::new(Arc::clone(&shared_config)));
+
     let mut extract_caps = lixun_extract::ExtractorCapabilities::probe(
         std::time::Duration::from_secs(config.extractor_timeout_secs),
     );
@@ -341,16 +349,16 @@ async fn async_main(
         };
 
     let extract_caps_arc = Arc::new(extract_caps.clone());
-    let _ = config.extractor_caps.set(Arc::clone(&extract_caps_arc));
+    let _ = sources.extractor_caps.set(Arc::clone(&extract_caps_arc));
     let ocr_enqueue_arc: Option<Arc<dyn lixun_sources::OcrEnqueue>> = ocr_queue
         .as_ref()
         .map(|q| Arc::new(OcrQueueEnqueuer(Arc::clone(q))) as Arc<dyn lixun_sources::OcrEnqueue>);
     if let Some(enq) = &ocr_enqueue_arc {
-        let _ = config.ocr_enqueue.set(Arc::clone(enq));
+        let _ = sources.ocr_enqueue.set(Arc::clone(enq));
     }
 
     // Registry build is split across the writer-service boot so the
-    // daemon can install `config.body_checker` (which wraps the live
+    // daemon can install `sources.body_checker` (which wraps the live
     // SearchHandle) BEFORE `FsSource` is constructed. Without this
     // split the fs source would be wired with `body_checker: None`
     // and the DB-16 OCR enqueue short-circuit would never fire.
@@ -431,12 +439,12 @@ async fn async_main(
 
     let body_checker_arc: Arc<dyn lixun_sources::HasBody> =
         Arc::new(SearchHandleBodyChecker::new(search.clone()));
-    let _ = config.body_checker.set(Arc::clone(&body_checker_arc));
+    let _ = sources.body_checker.set(Arc::clone(&body_checker_arc));
 
-    // Step 2: now that `config.body_checker` is populated, register
+    // Step 2: now that `sources.body_checker` is populated, register
     // the builtin apps + fs sources. FsSource picks up the checker
-    // via `config.build_fs_source` / `with_body_checker`.
-    register_builtin_nonplugin_sources(&mut registry, &config, &sources_state_dir, &profile)?;
+    // via `SourcesGlue::build_fs_source` / `with_body_checker`.
+    register_builtin_nonplugin_sources(&mut registry, &sources, &sources_state_dir, &profile)?;
 
     // Validate claimed_prefix uniqueness across all registered plugins.
     // Two plugins claiming the same prefix would make exclusive-claim
@@ -480,8 +488,6 @@ async fn async_main(
 
     registry.install_doc_store(Arc::new(search.clone()) as Arc<dyn lixun_mutation::DocStore>);
 
-    let shared_config = Arc::new(config);
-
     let frecency = FrecencyStore::load(&state_dir)?;
     let frecency = Arc::new(RwLock::new(frecency));
 
@@ -513,7 +519,7 @@ async fn async_main(
     let indexer_search = search.clone();
     let indexer_stats = Arc::clone(&stats);
     let indexer_state_dir = state_dir.clone();
-    let indexer_config = Arc::clone(&shared_config);
+    let indexer_sources = Arc::clone(&sources);
     let indexer_registry = Arc::clone(&registry);
     tokio::spawn(async move {
         if let Err(e) = run_incremental_indexer(
@@ -521,7 +527,7 @@ async fn async_main(
             indexer_search,
             indexer_stats,
             indexer_state_dir,
-            indexer_config,
+            indexer_sources,
             indexer_registry,
             rebuilt_from_scratch,
         )
@@ -695,13 +701,14 @@ async fn async_main(
                 let gui_control = Arc::clone(&gui_control);
                 let preview_spawner = Arc::clone(&preview_spawner);
                 let shared_config = Arc::clone(&shared_config);
+                let client_sources = Arc::clone(&sources);
                 let client_registry = Arc::clone(&registry);
                 let client_ocr_queue = ocr_queue.clone();
                 let client_ocr_worker_stats = Arc::clone(&ocr_worker_stats);
                 let client_profile_swap = Arc::clone(&profile_swap);
 
                 tokio::spawn(async move {
-                    if let Err(e) = handle_client(stream, search, mutation_tx, frecency, query_latch, query_log, stats, gui_control, preview_spawner, shared_config, client_registry, client_ocr_queue, client_ocr_worker_stats, client_profile_swap).await {
+                    if let Err(e) = handle_client(stream, search, mutation_tx, frecency, query_latch, query_log, stats, gui_control, preview_spawner, shared_config, client_sources, client_registry, client_ocr_queue, client_ocr_worker_stats, client_profile_swap).await {
                         tracing::debug!("Client error: {}", e);
                     }
                 });
@@ -769,14 +776,14 @@ async fn run_incremental_indexer(
     search: SearchHandle,
     stats: Arc<RwLock<IndexStats>>,
     state_dir: std::path::PathBuf,
-    config: Arc<config::Config>,
+    sources: Arc<SourcesGlue>,
     registry: Arc<lixun_indexer::SourceRegistry>,
     rebuilt_from_scratch: bool,
 ) -> Result<()> {
     let (fs_count, other_count) = indexer::run_incremental(
         &mutation_tx,
         &search,
-        config.as_ref(),
+        sources.as_ref(),
         registry.as_ref(),
         &state_dir,
         rebuilt_from_scratch,
@@ -794,17 +801,17 @@ async fn run_incremental_indexer(
 async fn do_reindex(
     mutation_tx: &IndexMutationTx,
     stats: &Arc<RwLock<IndexStats>>,
-    config: &config::Config,
+    sources: &SourcesGlue,
     registry: &lixun_indexer::SourceRegistry,
     state_dir: &std::path::Path,
     paths: Vec<std::path::PathBuf>,
 ) -> Result<usize, anyhow::Error> {
     let count = if paths.is_empty() {
-        indexer::reindex_full(mutation_tx, config, registry, state_dir)
+        indexer::reindex_full(mutation_tx, sources, registry, state_dir)
             .await?
             .total_docs
     } else {
-        indexer::reindex_paths(mutation_tx, config, &paths).await?
+        indexer::reindex_paths(mutation_tx, sources, &paths).await?
     };
 
     {
@@ -1278,6 +1285,7 @@ async fn handle_client(
     gui_control: Arc<GuiControl>,
     preview_spawner: Arc<PreviewSpawner>,
     config: Arc<config::Config>,
+    sources: Arc<SourcesGlue>,
     registry: Arc<lixun_indexer::SourceRegistry>,
     ocr_queue: Option<Arc<lixun_extract::ocr_queue::OcrQueue>>,
     ocr_worker_stats: Arc<lixun_indexer::ocr_tick::OcrWorkerStats>,
@@ -1441,14 +1449,14 @@ async fn handle_client(
                 } else {
                     let stats_for_task = Arc::clone(&stats);
                     let mutation_tx_for_task = mutation_tx.clone();
-                    let config_for_task = Arc::clone(&config);
+                    let sources_for_task = Arc::clone(&sources);
                     let registry_for_task = Arc::clone(&registry);
                     let state_dir_for_task = config.state_dir.clone();
                     tokio::spawn(async move {
                         let result = do_reindex(
                             &mutation_tx_for_task,
                             &stats_for_task,
-                            &config_for_task,
+                            &sources_for_task,
                             registry_for_task.as_ref(),
                             &state_dir_for_task,
                             paths,
@@ -1805,10 +1813,11 @@ fn register_plugin_sources(
 /// DB-16 short-circuit adapter via `with_body_checker`.
 fn register_builtin_nonplugin_sources(
     registry: &mut lixun_indexer::SourceRegistry,
-    config: &config::Config,
+    sources: &SourcesGlue,
     state_dir_root: &std::path::Path,
     profile: &lixun_core::ImpactProfile,
 ) -> anyhow::Result<()> {
+    let config = &sources.config;
     registry.register(
         "builtin:apps".into(),
         state_dir_root,
@@ -1820,10 +1829,10 @@ fn register_builtin_nonplugin_sources(
         config.exclude.clone(),
         config.exclude_regex.clone(),
         config.max_file_size_mb,
-        config.caps_arc(),
-        config.ocr_enqueue.get().cloned(),
+        sources.caps_arc(),
+        sources.ocr_enqueue.get().cloned(),
     )
-    .with_body_checker(config.body_checker.get().cloned())
+    .with_body_checker(sources.body_checker.get().cloned())
     .with_min_image_side_px(config.ocr.min_image_side_px)
     .with_rayon_threads(profile.rayon_threads);
     registry.register("builtin:fs".into(), state_dir_root, Arc::new(fs));

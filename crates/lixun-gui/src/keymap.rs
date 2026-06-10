@@ -7,7 +7,7 @@
 use glib::clone;
 use gtk::prelude::*;
 use lixun_core::Action;
-use lixun_daemon::config::Keybindings;
+use lixun_config::Keybindings;
 
 use crate::actions::{
     copy_to_clipboard, execute_action, execute_secondary_action, run_and_capture,

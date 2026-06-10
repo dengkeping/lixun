@@ -1,0 +1,21 @@
+[package]
+name = "lixun-config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared config.toml schema and loader for lixun host binaries"
+
+[dependencies]
+lixun-core = { path = "../lixun-core" }
+anyhow.workspace = true
+serde.workspace = true
+toml.workspace = true
+toml_edit.workspace = true
+tracing.workspace = true
+regex.workspace = true
+dirs.workspace = true
+num_cpus.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+arc-swap.workspace = true

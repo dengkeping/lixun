@@ -167,7 +167,7 @@ fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    let daemon_cfg = lixun_daemon::config::Config::load()?;
+    let daemon_cfg = lixun_config::Config::load()?;
     let preview_cfg = Rc::new(daemon_cfg.preview);
     let gui_cfg = Rc::new(daemon_cfg.gui);
 
@@ -444,8 +444,8 @@ fn handle_command(
     app: &gtk::Application,
     state: &Rc<PreviewState>,
     outbound_tx: &async_channel::Sender<PreviewEvent>,
-    preview_cfg: &Rc<lixun_daemon::config::PreviewConfig>,
-    gui_cfg: &Rc<lixun_daemon::config::GuiConfig>,
+    preview_cfg: &Rc<lixun_config::PreviewConfig>,
+    gui_cfg: &Rc<lixun_config::GuiConfig>,
 ) {
     match cmd {
         PreviewCommand::ShowOrUpdate {
@@ -571,8 +571,8 @@ fn show_or_update(
     app: &gtk::Application,
     state: &Rc<PreviewState>,
     outbound_tx: &async_channel::Sender<PreviewEvent>,
-    preview_cfg: &Rc<lixun_daemon::config::PreviewConfig>,
-    gui_cfg: &Rc<lixun_daemon::config::GuiConfig>,
+    preview_cfg: &Rc<lixun_config::PreviewConfig>,
+    gui_cfg: &Rc<lixun_config::GuiConfig>,
     hit: &Hit,
     requested_monitor: Option<&str>,
 ) -> Result<()> {
@@ -902,7 +902,7 @@ fn apply_monitor_and_cap(
     state: &Rc<PreviewState>,
     display: &gtk::gdk::Display,
     requested: Option<&str>,
-    gui_cfg: &Rc<lixun_daemon::config::GuiConfig>,
+    gui_cfg: &Rc<lixun_config::GuiConfig>,
 ) -> (i32, i32) {
     let window_ref = state.window.borrow();
     let Some(_window) = window_ref.as_ref() else {

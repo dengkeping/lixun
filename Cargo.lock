@@ -5379,6 +5379,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "lixun-config"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "arc-swap",
+ "dirs 5.0.1",
+ "lixun-core",
+ "num_cpus",
+ "regex",
+ "serde",
+ "tempfile",
+ "toml 0.8.23",
+ "toml_edit 0.22.27",
+ "tracing",
+]
+
+[[package]]
 name = "lixun-core"
 version = "0.6.0"
 dependencies = [
@@ -5407,6 +5424,7 @@ dependencies = [
  "futures",
  "getrandom 0.3.4",
  "libc",
+ "lixun-config",
  "lixun-core",
  "lixun-extract",
  "lixun-fusion",
@@ -5491,8 +5509,8 @@ dependencies = [
  "gtk4",
  "gtk4-layer-shell",
  "libc",
+ "lixun-config",
  "lixun-core",
- "lixun-daemon",
  "lixun-ipc",
  "lixun-preview",
  "notify",
@@ -5652,8 +5670,8 @@ dependencies = [
  "gtk4",
  "inventory",
  "libc",
+ "lixun-config",
  "lixun-core",
- "lixun-daemon",
  "lixun-ipc",
  "lixun-preview",
  "lixun-preview-bundle",

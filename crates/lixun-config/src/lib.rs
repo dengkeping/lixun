@@ -428,9 +428,6 @@ pub struct Config {
     pub impact: ImpactConfig,
     pub state_dir: PathBuf,
     pub plugin_sections: BTreeMap<String, toml::Value>,
-    pub extractor_caps: std::sync::OnceLock<std::sync::Arc<lixun_extract::ExtractorCapabilities>>,
-    pub ocr_enqueue: std::sync::OnceLock<std::sync::Arc<dyn lixun_sources::OcrEnqueue>>,
-    pub body_checker: std::sync::OnceLock<std::sync::Arc<dyn lixun_sources::HasBody>>,
 }
 
 /// Launcher + preview window sizing policy. Percentages are of the
@@ -549,9 +546,6 @@ impl Default for Config {
             impact: ImpactConfig::default(),
             state_dir: state_dir(),
             plugin_sections: BTreeMap::new(),
-            extractor_caps: std::sync::OnceLock::new(),
-            ocr_enqueue: std::sync::OnceLock::new(),
-            body_checker: std::sync::OnceLock::new(),
         }
     }
 }
@@ -888,40 +882,6 @@ impl Config {
         Ok(cfg)
     }
 
-    pub fn build_fs_source(&self) -> Result<lixun_sources::fs::FsSource> {
-        // Always exclude lixun's own state, data, cache and config
-        // directories. Without this guard, the fs source watches
-        // LanceDB's `_transactions/*.txn` and `_versions/*.manifest`
-        // rotations under $XDG_DATA_HOME/lixun/semantic/vectors/, the
-        // SQLite WAL/SHM under $XDG_STATE_HOME/lixun/, and the
-        // extract/fastembed caches \u2014 and re-injects them into the
-        // index as user files, which then floods the semantic worker
-        // with Delete events for its own internal storage. The
-        // hardcoded prefix list is derived from XDG dirs so it
-        // follows whatever the user has configured, and it is
-        // applied unconditionally on top of the user-supplied
-        // `exclude` list (cannot be turned off via config).
-        let mut exclude = lixun_sources::exclude::lixun_self_excludes();
-        exclude.extend(self.exclude.iter().cloned());
-
-        Ok(lixun_sources::fs::FsSource::with_regex_and_ocr(
-            self.roots.clone(),
-            exclude,
-            self.exclude_regex.clone(),
-            self.max_file_size_mb,
-            self.caps_arc(),
-            self.ocr_enqueue.get().cloned(),
-        )
-        .with_body_checker(self.body_checker.get().cloned())
-        .with_min_image_side_px(self.ocr.min_image_side_px))
-    }
-
-    pub fn caps_arc(&self) -> std::sync::Arc<lixun_extract::ExtractorCapabilities> {
-        self.extractor_caps.get().cloned().unwrap_or_else(|| {
-            std::sync::Arc::new(lixun_extract::ExtractorCapabilities::all_available_no_timeout())
-        })
-    }
-
     pub fn ranking_config(&self) -> lixun_core::RankingConfig {
         lixun_core::RankingConfig {
             apps: self.ranking_apps,
@@ -1019,30 +979,6 @@ impl Config {
             );
             self.max_results = clamped;
         }
-    }
-}
-
-impl lixun_indexer::IndexerSources for Config {
-    fn build_fs_source(&self) -> Result<lixun_sources::fs::FsSource> {
-        Config::build_fs_source(self)
-    }
-    fn exclude(&self) -> &[String] {
-        &self.exclude
-    }
-    fn max_file_size_mb(&self) -> u64 {
-        self.max_file_size_mb
-    }
-    fn caps(&self) -> std::sync::Arc<lixun_extract::ExtractorCapabilities> {
-        self.caps_arc()
-    }
-    fn ocr_enqueue(&self) -> Option<std::sync::Arc<dyn lixun_sources::OcrEnqueue>> {
-        self.ocr_enqueue.get().cloned()
-    }
-    fn body_checker(&self) -> Option<std::sync::Arc<dyn lixun_sources::HasBody>> {
-        self.body_checker.get().cloned()
-    }
-    fn min_image_side_px(&self) -> u32 {
-        self.ocr.min_image_side_px
     }
 }
 

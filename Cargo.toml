@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/lixun-core",
+    "crates/lixun-config",
     "crates/lixun-ipc",
     "crates/lixun-index",
     "crates/lixun-extract",

@@ -37,9 +37,6 @@ fn test_config(root: std::path::PathBuf, state_dir: std::path::PathBuf) -> Confi
         impact: ImpactConfig::default(),
         state_dir,
         plugin_sections: BTreeMap::new(),
-        extractor_caps: std::sync::OnceLock::new(),
-        ocr_enqueue: std::sync::OnceLock::new(),
-        body_checker: std::sync::OnceLock::new(),
     }
 }
 
@@ -70,8 +67,9 @@ async fn reindex_full_rebuilds_manifest_and_drops_phantom_entries() {
     let (mutation_tx, _search, _writer_handle) = spawn_writer_service(index).unwrap();
 
     let config = test_config(root.clone(), state_dir.clone());
+    let sources = lixun_daemon::sources_glue::SourcesGlue::new(std::sync::Arc::new(config));
     let registry = lixun_indexer::SourceRegistry::new();
-    let outcome = indexer::reindex_full(&mutation_tx, &config, &registry, &state_dir)
+    let outcome = indexer::reindex_full(&mutation_tx, &sources, &registry, &state_dir)
         .await
         .unwrap();
 

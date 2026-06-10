@@ -15,6 +15,7 @@ path = "src/lib.rs"
 [dependencies]
 lixun-fusion = { path = "../lixun-fusion" }
 lixun-core = { path = "../lixun-core" }
+lixun-config = { path = "../lixun-config" }
 lixun-extract = { path = "../lixun-extract" }
 lixun-ipc = { path = "../lixun-ipc" }
 lixun-index = { path = "../lixun-index" }

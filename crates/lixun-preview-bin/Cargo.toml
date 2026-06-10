@@ -16,7 +16,7 @@ stub = []
 lixun-core = { path = "../lixun-core" }
 lixun-preview = { path = "../lixun-preview" }
 lixun-preview-bundle = { path = "../lixun-preview-bundle" }
-lixun-daemon = { path = "../lixun-daemon" }
+lixun-config = { path = "../lixun-config" }
 lixun-ipc = { path = "../lixun-ipc" }
 anyhow.workspace = true
 clap.workspace = true

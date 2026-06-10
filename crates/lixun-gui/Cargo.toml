@@ -25,7 +25,7 @@ zbus = { version = "5", default-features = false, features = ["async-io", "block
 opener = "0.8"
 async-channel = "2"
 libc = "0.2"
-lixun-daemon = { path = "../lixun-daemon" }
+lixun-config = { path = "../lixun-config" }
 lixun-preview = { path = "../lixun-preview" }
 
 [dev-dependencies]

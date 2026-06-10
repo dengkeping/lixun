@@ -758,7 +758,7 @@ fn apply_validated_placement(window: &gtk::ApplicationWindow, monitor: &gtk::gdk
 pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
     let session_epoch = Arc::new(AtomicU64::new(0));
     let (ipc, ipc_event_rx) = start_ipc_thread(Arc::clone(&session_epoch));
-    let daemon_config = lixun_daemon::config::Config::load()?;
+    let daemon_config = lixun_config::Config::load()?;
 
     let window = gtk::ApplicationWindow::builder()
         .application(app)
@@ -903,7 +903,7 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
                 while let Ok(event) = style_rx.recv().await {
                     use crate::style_watcher::StyleEvent;
                     match event {
-                        StyleEvent::ConfigChanged => match lixun_daemon::config::Config::load() {
+                        StyleEvent::ConfigChanged => match lixun_config::Config::load() {
                             Ok(cfg) => {
                                 let theme = cfg.gui.theme.as_deref();
                                 style_manager.apply_theme(theme);
@@ -942,7 +942,7 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
                         }
                         StyleEvent::ThemeCssChanged => {
                             // Reload the active theme by re-resolving from current config.
-                            if let Ok(cfg) = lixun_daemon::config::Config::load() {
+                            if let Ok(cfg) = lixun_config::Config::load() {
                                 style_manager.apply_theme(cfg.gui.theme.as_deref());
                             }
                         }
