@@ -3,8 +3,8 @@
 use ratatui::{
     Frame,
     layout::Rect,
-    widgets::{Block, Borders, Gauge},
     style::{Color, Style},
+    widgets::{Block, Borders, Gauge},
 };
 
 use crate::dashboard::app::{App, FocusedWidget};
@@ -36,16 +36,13 @@ pub fn render_reindex_controls(frame: &mut Frame, area: Rect, app: &App) {
 
     let gauge = Gauge::default()
         .block(block)
-        .gauge_style(
-            Style::default()
-                .fg(if app.reindex_in_progress {
-                    Color::Yellow
-                } else if app.reindex_started.is_some() {
-                    Color::Green
-                } else {
-                    Color::Gray
-                })
-        )
+        .gauge_style(Style::default().fg(if app.reindex_in_progress {
+            Color::Yellow
+        } else if app.reindex_started.is_some() {
+            Color::Green
+        } else {
+            Color::Gray
+        }))
         .ratio(progress_ratio)
         .label(status_text);
 

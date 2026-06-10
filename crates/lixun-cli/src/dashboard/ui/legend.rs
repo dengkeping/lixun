@@ -3,9 +3,9 @@
 use ratatui::{
     Frame,
     layout::Rect,
-    widgets::{Block, Borders, Paragraph},
-    style::{Color, Style, Modifier},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
+    widgets::{Block, Borders, Paragraph},
 };
 
 use crate::dashboard::app::{App, FocusedWidget, InputMode, WidgetMode};
@@ -17,7 +17,12 @@ pub fn render_legend(frame: &mut Frame, area: Rect, app: &App) {
 
     let shortcuts = if app.log_filter_editing {
         vec![
-            Span::styled("FILTER EDIT: ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "FILTER EDIT: ",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw("Type to filter | "),
             Span::styled("Enter", Style::default().fg(Color::Yellow)),
             Span::raw(" apply | "),
@@ -28,7 +33,12 @@ pub fn render_legend(frame: &mut Frame, area: Rect, app: &App) {
         match (app.input_mode, app.widget_mode) {
             (InputMode::Editing, _) => {
                 vec![
-                    Span::styled("EDIT MODE: ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        "EDIT MODE: ",
+                        Style::default()
+                            .fg(Color::Green)
+                            .add_modifier(Modifier::BOLD),
+                    ),
                     Span::raw("Type to search | "),
                     Span::styled("Enter", Style::default().fg(Color::Yellow)),
                     Span::raw(" submit | "),
@@ -38,13 +48,18 @@ pub fn render_legend(frame: &mut Frame, area: Rect, app: &App) {
             }
             (InputMode::Navigation, WidgetMode::Focused) => {
                 let mut spans = vec![
-                    Span::styled("FOCUSED: ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        "FOCUSED: ",
+                        Style::default()
+                            .fg(Color::Green)
+                            .add_modifier(Modifier::BOLD),
+                    ),
                     Span::styled("j/k ↑↓", Style::default().fg(Color::Yellow)),
                     Span::raw(" scroll | "),
                     Span::styled("Esc", Style::default().fg(Color::Yellow)),
                     Span::raw(" exit"),
                 ];
-                
+
                 if app.focused_widget == FocusedWidget::LogViewer {
                     spans.push(Span::raw(" | "));
                     spans.push(Span::styled("i/w/e/d", Style::default().fg(Color::Yellow)));
@@ -52,7 +67,7 @@ pub fn render_legend(frame: &mut Frame, area: Rect, app: &App) {
                     spans.push(Span::styled("f", Style::default().fg(Color::Yellow)));
                     spans.push(Span::raw(" filter"));
                 }
-                
+
                 spans
             }
             (InputMode::Navigation, WidgetMode::Navigation) => {
@@ -70,7 +85,7 @@ pub fn render_legend(frame: &mut Frame, area: Rect, app: &App) {
                     Span::styled("r", Style::default().fg(Color::Yellow)),
                     Span::raw(" restart"),
                 ];
-                
+
                 if app.focused_widget == FocusedWidget::LogViewer {
                     spans.push(Span::raw(" | "));
                     spans.push(Span::styled("i/w/e/d", Style::default().fg(Color::Yellow)));
@@ -78,7 +93,7 @@ pub fn render_legend(frame: &mut Frame, area: Rect, app: &App) {
                     spans.push(Span::styled("f", Style::default().fg(Color::Yellow)));
                     spans.push(Span::raw(" filter"));
                 }
-                
+
                 spans
             }
         }

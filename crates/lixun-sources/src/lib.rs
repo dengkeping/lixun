@@ -11,10 +11,12 @@ pub mod manifest;
 pub mod mime_icons;
 pub mod ocr_enqueue;
 pub mod source;
+pub mod symlink_alias;
 
 pub use has_body::HasBody;
 pub use inventory;
 pub use ocr_enqueue::OcrEnqueue;
+pub use symlink_alias::SymlinkAliasNoter;
 pub use source::{
     IndexerSource, Mutation, MutationSink, PluginBuildContext, PluginFactory, PluginFactoryEntry,
     PluginInstance, QueryContext, SourceContext, SourceEvent, SourceEventKind, WatchSpec,

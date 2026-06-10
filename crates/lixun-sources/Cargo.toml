@@ -21,6 +21,7 @@ serde_json.workspace = true
 toml = "0.8"
 inventory.workspace = true
 mime_guess = "2"
+shell-words = "1"
 
 [dev-dependencies]
 tempfile.workspace = true

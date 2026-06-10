@@ -115,17 +115,13 @@ pub fn list_entries(path: &Path, cap: usize) -> Result<ArchiveListing, ArchiveEr
     match detect_format(path) {
         Some(Format::Zip) => list_zip(path, cap),
         Some(Format::Tar) => list_tar(Box::new(open(path)?), cap),
-        Some(Format::TarGz) => {
-            list_tar(Box::new(flate2::read::GzDecoder::new(open(path)?)), cap)
-        }
+        Some(Format::TarGz) => list_tar(Box::new(flate2::read::GzDecoder::new(open(path)?)), cap),
         Some(Format::TarZst) => {
             let dec = zstd::stream::read::Decoder::new(open(path)?)
                 .map_err(|e| ArchiveError::Malformed(e.to_string()))?;
             list_tar(Box::new(dec), cap)
         }
-        Some(Format::TarBz2) => {
-            list_tar(Box::new(bzip2::read::BzDecoder::new(open(path)?)), cap)
-        }
+        Some(Format::TarBz2) => list_tar(Box::new(bzip2::read::BzDecoder::new(open(path)?)), cap),
         Some(Format::SevenZ) => list_7z(path, cap),
         None => Err(ArchiveError::Unsupported),
     }
@@ -274,7 +270,10 @@ mod tests {
     #[test]
     fn detect_is_case_insensitive() {
         assert_eq!(detect_format(Path::new("PHOTOS.ZIP")), Some(Format::Zip));
-        assert_eq!(detect_format(Path::new("Backup.Tar.GZ")), Some(Format::TarGz));
+        assert_eq!(
+            detect_format(Path::new("Backup.Tar.GZ")),
+            Some(Format::TarGz)
+        );
     }
 
     #[test]

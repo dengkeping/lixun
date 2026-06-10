@@ -13,20 +13,20 @@ pub fn read_semantic_enabled() -> Result<Option<bool>> {
     let path = dirs::config_dir()
         .ok_or_else(|| anyhow::anyhow!("No config dir"))?
         .join("lixun/config.toml");
-    
+
     if !path.exists() {
         return Ok(None);
     }
-    
+
     let raw = std::fs::read_to_string(&path)?;
     let doc: toml_edit::DocumentMut = raw.parse()?;
-    
+
     let enabled = doc
         .get("semantic")
         .and_then(|item| item.as_table())
         .and_then(|table| table.get("enabled"))
         .and_then(|val| val.as_bool());
-    
+
     Ok(enabled)
 }
 
@@ -38,20 +38,20 @@ pub fn read_ocr_enabled() -> Result<Option<bool>> {
     let path = dirs::config_dir()
         .ok_or_else(|| anyhow::anyhow!("No config dir"))?
         .join("lixun/config.toml");
-    
+
     if !path.exists() {
         return Ok(None);
     }
-    
+
     let raw = std::fs::read_to_string(&path)?;
     let doc: toml_edit::DocumentMut = raw.parse()?;
-    
+
     let enabled = doc
         .get("ocr")
         .and_then(|item| item.as_table())
         .and_then(|table| table.get("enabled"))
         .and_then(|val| val.as_bool());
-    
+
     Ok(enabled)
 }
 
@@ -62,11 +62,11 @@ pub fn persist_ocr_enabled(enabled: bool) -> Result<PathBuf> {
     let path = dirs::config_dir()
         .ok_or_else(|| anyhow::anyhow!("No config dir"))?
         .join("lixun/config.toml");
-    
+
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    
+
     let new_doc = if path.exists() {
         let raw = std::fs::read_to_string(&path)?;
         let mut doc: toml_edit::DocumentMut = raw.parse()?;
@@ -81,7 +81,7 @@ pub fn persist_ocr_enabled(enabled: bool) -> Result<PathBuf> {
     } else {
         format!("[ocr]\nenabled = {enabled}\n")
     };
-    
+
     std::fs::write(&path, new_doc)?;
     Ok(path)
 }
@@ -93,11 +93,11 @@ pub fn persist_semantic_enabled(enabled: bool) -> Result<PathBuf> {
     let path = dirs::config_dir()
         .ok_or_else(|| anyhow::anyhow!("No config dir"))?
         .join("lixun/config.toml");
-    
+
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    
+
     let new_doc = if path.exists() {
         let raw = std::fs::read_to_string(&path)?;
         let mut doc: toml_edit::DocumentMut = raw.parse()?;
@@ -112,7 +112,7 @@ pub fn persist_semantic_enabled(enabled: bool) -> Result<PathBuf> {
     } else {
         format!("[semantic]\nenabled = {enabled}\n")
     };
-    
+
     std::fs::write(&path, new_doc)?;
     Ok(path)
 }

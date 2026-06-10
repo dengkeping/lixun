@@ -15,5 +15,5 @@ anyhow.workspace = true
 serde.workspace = true
 toml = "0.8"
 tracing.workspace = true
-regex.workspace = true
+shell-words = "1"
 dirs = "5"

@@ -2,11 +2,11 @@
 
 use crate::dashboard::app::{App, FocusedWidget};
 use ratatui::{
+    Frame,
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
-    Frame,
 };
 
 /// Render the socket status panel showing connection state and daemon metrics.

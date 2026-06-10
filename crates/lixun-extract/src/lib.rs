@@ -1,14 +1,26 @@
 //! Lixun Extract — text extraction from various file formats.
 
 use anyhow::Result;
+use std::io::Read;
 use std::path::Path;
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub mod cache;
 pub mod ocr;
 pub mod ocr_queue;
 pub mod shell;
+
+const MIB: u64 = 1024 * 1024;
+const DEFAULT_MAX_INPUT_BYTES: u64 = 10 * MIB;
+const DEFAULT_MAX_DECOMPRESS_BYTES: u64 = 64 * MIB;
+const DEFAULT_MAX_OUTPUT_BYTES: u64 = 16 * MIB;
+const DEFAULT_MAX_ZIP_ENTRIES: u32 = 10_000;
+const ZIP_ENTRY_MAX_BYTES: u64 = 32 * MIB;
+const RTF_MAX_TOKENS: u64 = 1_000_000;
+const RTF_MAX_NESTING_DEPTH: u32 = 256;
+const RTF_DEADLINE_CHECK_TOKENS: u64 = 1024;
+const RTF_NO_PROGRESS_LIMIT: u32 = 1024;
 
 pub trait Extractor {
     fn extract(&self, bytes: &[u8]) -> Result<String>;
@@ -18,6 +30,12 @@ pub trait Extractor {
 #[derive(Clone, Debug)]
 pub struct ExtractorCapabilities {
     pub timeout: Duration,
+    pub max_input_bytes: u64,
+    pub max_decompress_bytes: u64,
+    pub max_output_bytes: u64,
+    pub max_zip_entries: u32,
+    /// Cooperative in-process extraction deadline. `Duration::ZERO` disables it.
+    pub deadline: Duration,
     pub has_pdftotext: bool,
     pub has_antiword: bool,
     pub has_catdoc: bool,
@@ -47,6 +65,11 @@ impl ExtractorCapabilities {
     pub fn all_available_no_timeout() -> Self {
         Self {
             timeout: Duration::ZERO,
+            max_input_bytes: DEFAULT_MAX_INPUT_BYTES,
+            max_decompress_bytes: DEFAULT_MAX_DECOMPRESS_BYTES,
+            max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+            max_zip_entries: DEFAULT_MAX_ZIP_ENTRIES,
+            deadline: Duration::ZERO,
             has_pdftotext: true,
             has_antiword: true,
             has_catdoc: true,
@@ -106,6 +129,11 @@ impl ExtractorCapabilities {
         let has_tesseract = has_tesseract && !tesseract_langs.is_empty();
         Self {
             timeout,
+            max_input_bytes: DEFAULT_MAX_INPUT_BYTES,
+            max_decompress_bytes: DEFAULT_MAX_DECOMPRESS_BYTES,
+            max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+            max_zip_entries: DEFAULT_MAX_ZIP_ENTRIES,
+            deadline: Duration::ZERO,
             has_pdftotext: log_probe("pdftotext", command_exists("pdftotext")),
             has_antiword: log_probe("antiword", command_exists("antiword")),
             has_catdoc: log_probe("catdoc", command_exists("catdoc")),
@@ -242,9 +270,9 @@ pub(crate) fn extractor_for_ext_with_caps(
 ) -> Option<Box<dyn Extractor>> {
     match ext {
         "pdf" if caps.has_pdftotext => Some(Box::new(PdfExtractor::new(caps.timeout))),
-        "docx" | "xlsx" | "pptx" => Some(Box::new(OoxmlExtractor)),
-        "odt" => Some(Box::new(OdtExtractor)),
-        "rtf" => Some(Box::new(RtfExtractor)),
+        "docx" | "xlsx" | "pptx" => Some(Box::new(OoxmlExtractor::new(caps.clone()))),
+        "odt" => Some(Box::new(OdtExtractor::new(caps.clone()))),
+        "rtf" => Some(Box::new(RtfExtractor::new(caps.clone()))),
         "doc" if caps.has_antiword => Some(Box::new(ShellDocExtractor::new(caps.timeout))),
         "xls" if caps.has_catdoc => Some(Box::new(ShellXlsExtractor::new(caps.timeout))),
         "ppt" if caps.has_libreoffice => Some(Box::new(ShellPptExtractor::new(caps.timeout))),
@@ -272,12 +300,13 @@ pub fn extract_bytes(bytes: &[u8], ext_hint: Option<&str>) -> Result<String> {
 
 /// Try to extract text from a file path.
 pub fn extract_path(path: &Path) -> Result<String> {
+    let caps = capabilities();
     let ext = path
         .extension()
         .map(|e| e.to_string_lossy().to_lowercase())
         .unwrap_or_default();
 
-    if let Some(extractor) = extractor_for_ext(&ext) {
+    if let Some(extractor) = extractor_for_ext_with_caps(&ext, &caps) {
         let bytes = std::fs::read(path)?;
         let result =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| extractor.extract(&bytes)));
@@ -291,8 +320,10 @@ pub fn extract_path(path: &Path) -> Result<String> {
     // Text-like: try encoding detection
     match ext.as_str() {
         "txt" | "md" | "log" | "csv" | "json" | "xml" | "html" | "htm" | "yaml" | "yml"
-        | "toml" | "ini" | "cfg" | "conf" | "rs" | "py" | "js" | "ts" | "c" | "h" | "cpp" | "hpp"
-        | "java" | "go" | "sh" | "css" | "scss" | "sql" | "rb" => extract_text_file(path),
+        | "toml" | "ini" | "cfg" | "conf" | "rs" | "py" | "js" | "ts" | "c" | "h" | "cpp"
+        | "hpp" | "java" | "go" | "sh" | "css" | "scss" | "sql" | "rb" => {
+            extract_text_file(path, &caps)
+        }
         _ => {
             // Magic sniff for extension-less text files
             if ext.is_empty()
@@ -302,7 +333,7 @@ pub fn extract_path(path: &Path) -> Result<String> {
                 let n = std::io::Read::read(&mut f, &mut buf).unwrap_or(0);
                 let sniff = &buf[..n];
                 if n > 0 && !sniff.contains(&0) && std::str::from_utf8(sniff).is_ok() {
-                    return extract_text_file(path);
+                    return extract_text_file(path, &caps);
                 }
             }
             Ok(String::new())
@@ -310,16 +341,204 @@ pub fn extract_path(path: &Path) -> Result<String> {
     }
 }
 
-fn extract_text_file(path: &Path) -> Result<String> {
-    let bytes = std::fs::read(path)?;
+fn extract_text_file(path: &Path, caps: &ExtractorCapabilities) -> Result<String> {
+    let file = std::fs::File::open(path)?;
+    let file_len = file.metadata()?.len();
+    let read_cap = file_len.min(caps.max_input_bytes);
+    let mut bytes = Vec::with_capacity(read_cap.min(usize::MAX as u64) as usize);
+    file.take(caps.max_input_bytes).read_to_end(&mut bytes)?;
     if let Ok(text) = String::from_utf8(bytes.clone()) {
+        ensure_output_len(text.len(), caps.max_output_bytes, "text file output")?;
         return Ok(text);
     }
     let mut detector = chardetng::EncodingDetector::new();
     detector.feed(&bytes, true);
     let encoding = detector.guess(None, true);
     let (text, _, _) = encoding.decode(&bytes);
-    Ok(text.to_string())
+    let text = text.to_string();
+    ensure_output_len(text.len(), caps.max_output_bytes, "text file output")?;
+    Ok(text)
+}
+
+fn ensure_input_len(len: usize, cap: u64, label: &str) -> Result<()> {
+    let len = len as u64;
+    if len > cap {
+        anyhow::bail!("{label} size {len} exceeds cap {cap} bytes");
+    }
+    Ok(())
+}
+
+fn ensure_output_len(len: usize, cap: u64, label: &str) -> Result<()> {
+    let len = len as u64;
+    if len > cap {
+        anyhow::bail!("{label} size {len} exceeds cap {cap} bytes");
+    }
+    Ok(())
+}
+
+fn push_capped_bytes(output: &mut Vec<u8>, addition: &[u8], cap: u64, label: &str) -> Result<()> {
+    let len = (output.len() as u64)
+        .checked_add(addition.len() as u64)
+        .ok_or_else(|| anyhow::anyhow!("{label} size overflow"))?;
+    if len > cap {
+        anyhow::bail!("{label} size {len} exceeds cap {cap} bytes");
+    }
+    output.extend_from_slice(addition);
+    Ok(())
+}
+
+fn push_capped_str(output: &mut String, addition: &str, cap: u64, label: &str) -> Result<()> {
+    let len = (output.len() as u64)
+        .checked_add(addition.len() as u64)
+        .ok_or_else(|| anyhow::anyhow!("{label} size overflow"))?;
+    if len > cap {
+        anyhow::bail!("{label} size {len} exceeds cap {cap} bytes");
+    }
+    output.push_str(addition);
+    Ok(())
+}
+
+fn validate_zip_archive<R: std::io::Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    caps: &ExtractorCapabilities,
+    label: &str,
+) -> Result<()> {
+    if archive.len() > caps.max_zip_entries as usize {
+        anyhow::bail!(
+            "{label} zip entry count {} exceeds cap {}",
+            archive.len(),
+            caps.max_zip_entries
+        );
+    }
+
+    let mut total = 0_u64;
+    for i in 0..archive.len() {
+        let file = archive.by_index(i)?;
+        let name = file.name().to_string();
+        let size = file.size();
+        if size > ZIP_ENTRY_MAX_BYTES {
+            anyhow::bail!(
+                "{label} zip entry {name:?} uncompressed size {size} exceeds per-entry cap {ZIP_ENTRY_MAX_BYTES}"
+            );
+        }
+        total = total
+            .checked_add(size)
+            .ok_or_else(|| anyhow::anyhow!("{label} total decompressed size overflow"))?;
+        if total > caps.max_decompress_bytes {
+            anyhow::bail!(
+                "{label} total decompressed size {total} exceeds cap {} bytes",
+                caps.max_decompress_bytes
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn read_zip_file_to_string(
+    file: &mut zip::read::ZipFile<'_>,
+    caps: &ExtractorCapabilities,
+    label: &str,
+) -> Result<String> {
+    let size = file.size();
+    if size > ZIP_ENTRY_MAX_BYTES {
+        anyhow::bail!(
+            "{label} zip entry {:?} uncompressed size {size} exceeds per-entry cap {ZIP_ENTRY_MAX_BYTES}",
+            file.name()
+        );
+    }
+    if size > caps.max_decompress_bytes {
+        anyhow::bail!(
+            "{label} zip entry {:?} uncompressed size {size} exceeds decompress cap {} bytes",
+            file.name(),
+            caps.max_decompress_bytes
+        );
+    }
+    let mut content = String::new();
+    file.take(size.saturating_add(1))
+        .read_to_string(&mut content)?;
+    Ok(content)
+}
+
+fn extract_rtf_with_reader<F>(
+    bytes: &[u8],
+    caps: &ExtractorCapabilities,
+    mut read_next: F,
+) -> Result<String>
+where
+    F: for<'a> FnMut(&'a [u8]) -> Result<(&'a [u8], rtf_grimoire::tokenizer::Token)>,
+{
+    let started = Instant::now();
+    let mut input = bytes;
+    let mut text_bytes: Vec<u8> = Vec::new();
+    let mut token_count = 0_u64;
+    let mut depth = 0_u32;
+    let mut no_progress = 0_u32;
+
+    while !input.is_empty() {
+        if token_count.is_multiple_of(RTF_DEADLINE_CHECK_TOKENS) {
+            check_rtf_deadline(started, caps.deadline)?;
+        }
+
+        let before_len = input.len();
+        let (remaining, token) = read_next(input)?;
+        if remaining.len() >= before_len {
+            no_progress += 1;
+            if no_progress > RTF_NO_PROGRESS_LIMIT {
+                anyhow::bail!(
+                    "RTF parser made no progress for more than {RTF_NO_PROGRESS_LIMIT} iterations"
+                );
+            }
+            continue;
+        }
+        no_progress = 0;
+        input = remaining;
+
+        token_count += 1;
+        if token_count > RTF_MAX_TOKENS {
+            anyhow::bail!("RTF token count {token_count} exceeds cap {RTF_MAX_TOKENS}");
+        }
+
+        match token {
+            rtf_grimoire::tokenizer::Token::StartGroup => {
+                depth += 1;
+                if depth > RTF_MAX_NESTING_DEPTH {
+                    anyhow::bail!("RTF nesting depth {depth} exceeds cap {RTF_MAX_NESTING_DEPTH}");
+                }
+            }
+            rtf_grimoire::tokenizer::Token::EndGroup => {
+                depth = depth.saturating_sub(1);
+            }
+            rtf_grimoire::tokenizer::Token::Text(data) => {
+                push_capped_bytes(&mut text_bytes, &data, caps.max_output_bytes, "RTF output")?;
+            }
+            rtf_grimoire::tokenizer::Token::ControlWord { name, .. }
+                if name == "par" || name == "line" =>
+            {
+                push_capped_bytes(&mut text_bytes, b"\n", caps.max_output_bytes, "RTF output")?;
+            }
+            rtf_grimoire::tokenizer::Token::ControlSymbol('~') => {
+                push_capped_bytes(&mut text_bytes, b" ", caps.max_output_bytes, "RTF output")?;
+            }
+            rtf_grimoire::tokenizer::Token::Newline(data) => {
+                push_capped_bytes(&mut text_bytes, &data, caps.max_output_bytes, "RTF output")?;
+            }
+            _ => {}
+        }
+    }
+
+    if let Ok(text) = String::from_utf8(text_bytes.clone()) {
+        return Ok(text.trim().to_string());
+    }
+    let text: String = text_bytes.into_iter().map(|b| b as char).collect();
+    Ok(text.trim().to_string())
+}
+
+fn check_rtf_deadline(started: Instant, deadline: Duration) -> Result<()> {
+    if deadline != Duration::ZERO && started.elapsed() > deadline {
+        anyhow::bail!("RTF deadline exceeded");
+    }
+    Ok(())
 }
 
 // --- PDF ---
@@ -348,49 +567,69 @@ impl Extractor for PdfExtractor {
 
 // --- OOXML (DOCX/XLSX/PPTX) ---
 
-pub struct OoxmlExtractor;
+pub struct OoxmlExtractor {
+    caps: ExtractorCapabilities,
+}
+
+impl OoxmlExtractor {
+    pub fn new(caps: ExtractorCapabilities) -> Self {
+        Self { caps }
+    }
+}
 
 impl Extractor for OoxmlExtractor {
     fn extract(&self, bytes: &[u8]) -> Result<String> {
+        ensure_input_len(bytes.len(), self.caps.max_input_bytes, "OOXML input")?;
         let cursor = std::io::Cursor::new(bytes);
         let mut archive = zip::ZipArchive::new(cursor)?;
+        validate_zip_archive(&mut archive, &self.caps, "OOXML")?;
 
         // Try document.xml (DOCX), sheet XMLs (XLSX), slide XMLs (PPTX)
         let mut text = String::new();
 
         // DOCX: word/document.xml
         if let Ok(mut file) = archive.by_name("word/document.xml") {
-            let mut content = String::new();
-            std::io::Read::read_to_string(&mut file, &mut content)?;
-            text.push_str(&strip_xml_tags(&content));
+            let content = read_zip_file_to_string(&mut file, &self.caps, "OOXML")?;
+            push_capped_str(
+                &mut text,
+                &strip_xml_tags(&content),
+                self.caps.max_output_bytes,
+                "OOXML output",
+            )?;
         }
 
         // XLSX: xl/worksheets/*.xml
         if text.is_empty() {
-            let indices: Vec<_> = (0..archive.len()).collect();
-            for i in indices {
-                if let Ok(mut file) = archive.by_index(i)
-                    && file.name().starts_with("xl/worksheets/")
-                    && file.name().ends_with(".xml")
-                {
-                    let mut content = String::new();
-                    std::io::Read::read_to_string(&mut file, &mut content)?;
-                    text.push_str(&strip_xml_tags(&content));
+            for i in 0..archive.len() {
+                if let Ok(mut file) = archive.by_index(i) {
+                    let name = file.name().to_string();
+                    if name.starts_with("xl/worksheets/") && name.ends_with(".xml") {
+                        let content = read_zip_file_to_string(&mut file, &self.caps, "OOXML")?;
+                        push_capped_str(
+                            &mut text,
+                            &strip_xml_tags(&content),
+                            self.caps.max_output_bytes,
+                            "OOXML output",
+                        )?;
+                    }
                 }
             }
         }
 
         // PPTX: ppt/slides/*.xml
         if text.is_empty() {
-            let indices: Vec<_> = (0..archive.len()).collect();
-            for i in indices {
-                if let Ok(mut file) = archive.by_index(i)
-                    && file.name().starts_with("ppt/slides/")
-                    && file.name().ends_with(".xml")
-                {
-                    let mut content = String::new();
-                    std::io::Read::read_to_string(&mut file, &mut content)?;
-                    text.push_str(&strip_xml_tags(&content));
+            for i in 0..archive.len() {
+                if let Ok(mut file) = archive.by_index(i) {
+                    let name = file.name().to_string();
+                    if name.starts_with("ppt/slides/") && name.ends_with(".xml") {
+                        let content = read_zip_file_to_string(&mut file, &self.caps, "OOXML")?;
+                        push_capped_str(
+                            &mut text,
+                            &strip_xml_tags(&content),
+                            self.caps.max_output_bytes,
+                            "OOXML output",
+                        )?;
+                    }
                 }
             }
         }
@@ -409,18 +648,29 @@ impl Extractor for OoxmlExtractor {
 
 // --- ODT ---
 
-pub struct OdtExtractor;
+pub struct OdtExtractor {
+    caps: ExtractorCapabilities,
+}
+
+impl OdtExtractor {
+    pub fn new(caps: ExtractorCapabilities) -> Self {
+        Self { caps }
+    }
+}
 
 impl Extractor for OdtExtractor {
     fn extract(&self, bytes: &[u8]) -> Result<String> {
+        ensure_input_len(bytes.len(), self.caps.max_input_bytes, "ODT input")?;
         let cursor = std::io::Cursor::new(bytes);
         let mut archive = zip::ZipArchive::new(cursor)?;
+        validate_zip_archive(&mut archive, &self.caps, "ODT")?;
         let mut file = archive
             .by_name("content.xml")
             .map_err(|_| anyhow::anyhow!("ODT: content.xml not found"))?;
-        let mut content = String::new();
-        std::io::Read::read_to_string(&mut file, &mut content)?;
-        Ok(strip_xml_tags(&content).trim().to_string())
+        let content = read_zip_file_to_string(&mut file, &self.caps, "ODT")?;
+        let text = strip_xml_tags(&content).trim().to_string();
+        ensure_output_len(text.len(), self.caps.max_output_bytes, "ODT output")?;
+        Ok(text)
     }
 
     fn mime_types(&self) -> &'static [&'static str] {
@@ -430,42 +680,23 @@ impl Extractor for OdtExtractor {
 
 // --- RTF ---
 
-pub struct RtfExtractor;
+pub struct RtfExtractor {
+    caps: ExtractorCapabilities,
+}
+
+impl RtfExtractor {
+    pub fn new(caps: ExtractorCapabilities) -> Self {
+        Self { caps }
+    }
+}
 
 impl Extractor for RtfExtractor {
     fn extract(&self, bytes: &[u8]) -> Result<String> {
-        let (_, tokens) = rtf_grimoire::tokenizer::parse(bytes)
-            .map_err(|e| anyhow::anyhow!("RTF parse error: {:?}", e))?;
-
-        let mut text_bytes: Vec<u8> = Vec::new();
-        for token in &tokens {
-            match token {
-                rtf_grimoire::tokenizer::Token::Text(data) => {
-                    text_bytes.extend_from_slice(data);
-                }
-                rtf_grimoire::tokenizer::Token::ControlWord { name, .. } if name == "par" => {
-                    text_bytes.push(b'\n');
-                }
-                rtf_grimoire::tokenizer::Token::ControlWord { name, .. } if name == "line" => {
-                    text_bytes.push(b'\n');
-                }
-                rtf_grimoire::tokenizer::Token::ControlSymbol('~') => {
-                    text_bytes.push(b' ');
-                }
-                rtf_grimoire::tokenizer::Token::Newline(data) => {
-                    text_bytes.extend_from_slice(data);
-                }
-                _ => {}
-            }
-        }
-
-        // Try UTF-8 first, fallback to latin-1 (common RTF encoding)
-        if let Ok(text) = String::from_utf8(text_bytes.clone()) {
-            return Ok(text.trim().to_string());
-        }
-        // latin-1: each byte maps directly to Unicode code point U+0000..U+00FF
-        let text: String = text_bytes.into_iter().map(|b| b as char).collect();
-        Ok(text.trim().to_string())
+        ensure_input_len(bytes.len(), self.caps.max_input_bytes, "RTF input")?;
+        extract_rtf_with_reader(bytes, &self.caps, |input| {
+            rtf_grimoire::tokenizer::read_token(input)
+                .map_err(|e| anyhow::anyhow!("RTF parse error: {:?}", e))
+        })
     }
 
     fn mime_types(&self) -> &'static [&'static str] {
@@ -553,6 +784,138 @@ fn strip_xml_tags(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+
+    const TEST_MIB: u64 = 1024 * 1024;
+
+    fn capped_test_caps() -> ExtractorCapabilities {
+        let mut caps = ExtractorCapabilities::all_available_no_timeout();
+        caps.max_input_bytes = 10 * TEST_MIB;
+        caps.max_decompress_bytes = 64 * TEST_MIB;
+        caps.max_output_bytes = 16 * TEST_MIB;
+        caps.max_zip_entries = 10_000;
+        caps.deadline = Duration::ZERO;
+        caps
+    }
+
+    fn assert_cap_error(err: anyhow::Error, expected: &str) {
+        let message = err.to_string();
+        assert!(
+            message.contains(expected),
+            "expected error containing {expected:?}, got {message:?}"
+        );
+    }
+
+    fn zip_with_dummy_entries(entries: usize) -> Vec<u8> {
+        let cursor = std::io::Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(cursor);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for i in 0..entries {
+            writer
+                .start_file(format!("dummy/{i}.txt"), options)
+                .expect("start dummy entry");
+            writer.write_all(b"x").expect("write dummy entry");
+        }
+        writer.finish().expect("finish zip").into_inner()
+    }
+
+    fn docx_with_repeated_document_xml(uncompressed_bytes: u64) -> Vec<u8> {
+        let cursor = std::io::Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(cursor);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        writer
+            .start_file("word/document.xml", options)
+            .expect("start document.xml");
+        let mut payload = std::io::repeat(b'a').take(uncompressed_bytes);
+        std::io::copy(&mut payload, &mut writer).expect("write compressed document.xml");
+        writer.finish().expect("finish zip").into_inner()
+    }
+
+    #[test]
+    fn ooxml_rejects_when_entry_count_exceeds_cap() {
+        let mut caps = capped_test_caps();
+        caps.max_zip_entries = 10_000;
+        let bytes = zip_with_dummy_entries(11_000);
+
+        let err = OoxmlExtractor::new(caps).extract(&bytes).unwrap_err();
+
+        assert_cap_error(err, "entry");
+    }
+
+    #[test]
+    fn ooxml_rejects_zip_bomb_via_uncompressed_size() {
+        let mut caps = capped_test_caps();
+        caps.max_decompress_bytes = 64 * TEST_MIB;
+        let bytes = docx_with_repeated_document_xml(100 * TEST_MIB);
+
+        let err = OoxmlExtractor::new(caps).extract(&bytes).unwrap_err();
+
+        assert_cap_error(err, "size");
+    }
+
+    #[test]
+    fn rtf_caps_token_count() {
+        let caps = capped_test_caps();
+        let mut rtf = Vec::from(&b"{\\rtf1 "[..]);
+        for _ in 0..1_100_000 {
+            rtf.extend_from_slice(br"{\b x}");
+        }
+        rtf.push(b'}');
+
+        let err = RtfExtractor::new(caps).extract(&rtf).unwrap_err();
+
+        assert_cap_error(err, "token");
+    }
+
+    #[test]
+    fn rtf_caps_output_bytes() {
+        let mut caps = capped_test_caps();
+        caps.max_output_bytes = 8;
+
+        let err = RtfExtractor::new(caps)
+            .extract(br"{\rtf1 abcdefghijklmnopqrstuvwxyz}")
+            .unwrap_err();
+
+        assert_cap_error(err, "output");
+    }
+
+    #[test]
+    fn rtf_must_advance_guard_breaks_pathological_loop() {
+        let caps = capped_test_caps();
+        let err = extract_rtf_with_reader(b"{\\rtf1 x}", &caps, |input| {
+            Ok((input, rtf_grimoire::tokenizer::Token::Text(b"x".to_vec())))
+        })
+        .unwrap_err();
+
+        assert_cap_error(err, "progress");
+    }
+
+    #[test]
+    fn text_file_caps_input_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("large.txt");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(100 * TEST_MIB).unwrap();
+        let mut caps = capped_test_caps();
+        caps.max_input_bytes = TEST_MIB;
+
+        let result = extract_text_file(&path, &caps).unwrap();
+
+        assert!(result.len() <= TEST_MIB as usize);
+    }
+
+    #[test]
+    fn caps_default_all_available_no_timeout() {
+        let caps = ExtractorCapabilities::all_available_no_timeout();
+
+        assert_eq!(caps.max_input_bytes, 10 * TEST_MIB);
+        assert_eq!(caps.max_decompress_bytes, 64 * TEST_MIB);
+        assert_eq!(caps.max_output_bytes, 16 * TEST_MIB);
+        assert_eq!(caps.max_zip_entries, 10_000);
+        assert_eq!(caps.deadline, Duration::ZERO);
+    }
 
     #[test]
     fn test_strip_xml_tags() {
@@ -686,6 +1049,11 @@ mod tests {
     fn test_extractor_for_ext_respects_caps_struct() {
         let caps = ExtractorCapabilities {
             timeout: std::time::Duration::from_secs(15),
+            max_input_bytes: DEFAULT_MAX_INPUT_BYTES,
+            max_decompress_bytes: DEFAULT_MAX_DECOMPRESS_BYTES,
+            max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+            max_zip_entries: DEFAULT_MAX_ZIP_ENTRIES,
+            deadline: Duration::ZERO,
             has_pdftotext: false,
             has_antiword: false,
             has_catdoc: false,

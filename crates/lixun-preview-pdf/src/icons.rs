@@ -16,7 +16,8 @@ use gtk::glib;
 
 const MARQUEE_ICON_NAME: &str = "lixun-marquee-select-symbolic";
 
-const MARQUEE_SYMBOLIC_SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+const MARQUEE_SYMBOLIC_SVG: &[u8] =
+    br##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
   <rect x="3" y="3" width="10" height="10" fill="#bebebe" opacity="0.25"/>
   <rect x="2" y="2" width="2.5" height="1" fill="#bebebe"/>
   <rect x="6.75" y="2" width="2.5" height="1" fill="#bebebe"/>
@@ -61,7 +62,9 @@ pub fn marquee_icon_name() -> &'static str {
 }
 
 pub fn ensure_registered(display: &gdk::Display) {
-    let Some(root) = write_icon_once() else { return };
+    let Some(root) = write_icon_once() else {
+        return;
+    };
     let theme = gtk::IconTheme::for_display(display);
     if !theme.search_path().iter().any(|p| p == &root) {
         theme.add_search_path(&root);

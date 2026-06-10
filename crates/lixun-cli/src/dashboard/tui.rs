@@ -6,12 +6,9 @@ use anyhow::Result;
 use crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use ratatui::{
-    backend::CrosstermBackend,
-    Terminal,
-};
+use ratatui::{Terminal, backend::CrosstermBackend};
 
 /// Enter TUI mode: enable raw mode, enter alternate screen, enable mouse capture.
 /// Returns a Terminal instance ready for rendering.
@@ -30,7 +27,11 @@ pub fn enter_tui() -> Result<Terminal<CrosstermBackend<Stdout>>> {
 /// Exit TUI mode: disable mouse capture, leave alternate screen, disable raw mode.
 /// Also ensures the cursor is visible.
 pub fn exit_tui(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
     disable_raw_mode()?;
     terminal.show_cursor()?;
 

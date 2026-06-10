@@ -28,6 +28,7 @@ mod query_log;
 mod sched;
 mod top_hit;
 use frecency::FrecencyStore;
+use lixun_daemon::symlink_alias::SymlinkAliases;
 use query_latch::QueryLatchStore;
 use query_log::QueryLog;
 
@@ -412,7 +413,7 @@ async fn async_main(
     // so we can wire the SearchHandle-backed HasBody adapter into
     // `config.body_checker` — the builtin `fs` source reads that
     // OnceLock during its own construction.
-    let (mutation_tx, search, _writer_handle) = {
+    let (mutation_tx, search, mut writer_handle) = {
         let broadcasters = registry.broadcasters();
         let multi: std::sync::Arc<dyn lixun_mutation::MutationBroadcaster> =
             if broadcasters.is_empty() {
@@ -490,6 +491,8 @@ async fn async_main(
     let query_log = QueryLog::load(&state_dir)?;
     let query_log = Arc::new(RwLock::new(query_log));
 
+    let symlink_aliases = Arc::new(SymlinkAliases::load(&state_dir));
+
     let gui_control = Arc::new(GuiControl::new());
     let preview_spawner = Arc::new(PreviewSpawner::new(Arc::clone(&gui_control)));
 
@@ -533,6 +536,8 @@ async fn async_main(
     let watcher_enqueue = ocr_enqueue_arc.clone();
     let watcher_body_checker = Some(Arc::clone(&body_checker_arc));
     let watcher_min_image_side_px = shared_config.ocr.min_image_side_px;
+    let watcher_alias_noter: Option<Arc<dyn lixun_sources::SymlinkAliasNoter>> =
+        Some(Arc::clone(&symlink_aliases) as Arc<dyn lixun_sources::SymlinkAliasNoter>);
     tokio::spawn(async move {
         if let Err(e) = watcher::start(
             watcher_roots,
@@ -543,6 +548,7 @@ async fn async_main(
             watcher_enqueue,
             watcher_body_checker,
             watcher_min_image_side_px,
+            watcher_alias_noter,
             watcher_mutation,
         )
         .await
@@ -704,20 +710,52 @@ async fn async_main(
                 tracing::info!("Shutting down gracefully...");
                 gui_control.shutdown().await;
                 let _ = std::fs::remove_file(&socket_path);
-                let frecency = frecency.read().await;
-                if let Err(e) = frecency.save(&state_dir) {
-                    tracing::error!("Failed to save frecency store: {}", e);
+
+                {
+                    let frecency = frecency.read().await;
+                    if let Err(e) = frecency.save(&state_dir) {
+                        tracing::error!("Failed to save frecency store: {}", e);
+                    }
                 }
-                let latch = query_latch.read().await;
-                if let Err(e) = latch.save(&state_dir) {
-                    tracing::error!("Failed to save query latch store: {}", e);
+
+                {
+                    let latch = query_latch.read().await;
+                    if let Err(e) = latch.save(&state_dir) {
+                        tracing::error!("Failed to save query latch store: {}", e);
+                    }
                 }
-                let log = query_log.read().await;
-                if let Err(e) = log.save(&state_dir) {
-                    tracing::error!("Failed to save query log: {}", e);
+
+                {
+                    let log = query_log.read().await;
+                    if let Err(e) = log.save(&state_dir) {
+                        tracing::error!("Failed to save query log: {}", e);
+                    }
                 }
-                tracing::info!("Shutdown complete");
-                std::process::exit(0);
+
+                if let Err(e) = symlink_aliases.save(&state_dir) {
+                    tracing::error!("Failed to save symlink alias store: {}", e);
+                }
+
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    mutation_tx.send(index_service::Mutation::Shutdown),
+                )
+                .await;
+
+                match tokio::time::timeout(std::time::Duration::from_secs(30), &mut writer_handle).await {
+                    Ok(Ok(())) => {
+                        tracing::info!("shutdown: writer drain complete");
+                        break;
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!("writer join error: {e}");
+                        break;
+                    }
+                    Err(_) => {
+                        tracing::warn!("pending index mutations may not have committed");
+                        return Err(anyhow::anyhow!("writer drain timed out after 30s"));
+                    }
+                }
             }
         }
     }
@@ -1174,14 +1212,14 @@ async fn handle_search(
 async fn writer_task(
     mut stream_write: tokio::io::WriteHalf<tokio::net::UnixStream>,
     mut rx: mpsc::Receiver<Response>,
-    _negotiated_version: u16,
+    negotiated_version: u16,
 ) -> anyhow::Result<()> {
     while let Some(resp) = rx.recv().await {
-        let (version, payload) = lixun_ipc::encode_response(&resp)?;
+        let payload = lixun_ipc::encode_response_for_version(negotiated_version, &resp)?;
         let total_len = (2 + payload.len()) as u32;
         let mut out = BytesMut::with_capacity(4 + total_len as usize);
         out.put_u32(total_len);
-        out.put_u16(version);
+        out.put_u16(negotiated_version);
         out.put_slice(&payload);
         stream_write.write_all(&out).await?;
     }
@@ -2044,7 +2082,7 @@ mod tests {
             kind_label: None,
             score,
             action: Action::Launch {
-                exec: "true".into(),
+                exec: vec!["true".into()],
                 terminal: false,
                 desktop_id: None,
                 desktop_file: None,
@@ -2077,6 +2115,24 @@ mod tests {
     #[test]
     fn clamp_stage2_mult_boundary_cap() {
         assert_eq!(clamp_stage2_mult(6.0, 6.0), 6.0);
+    }
+
+    #[test]
+    fn total_multiplier_cap_clamps_combined_frecency_and_latch() {
+        let frecency_mult = 4.0_f32;
+        let latch_mult = 3.0_f32;
+        let raw_product = frecency_mult * latch_mult;
+        let total_cap = 6.0_f32;
+        let clamped = clamp_stage2_mult(raw_product, total_cap);
+        assert!(
+            (clamped - total_cap).abs() < 1e-5,
+            "combined multiplier {} ({} × {}) must be clamped to cap {}, got {}",
+            raw_product,
+            frecency_mult,
+            latch_mult,
+            total_cap,
+            clamped
+        );
     }
 
     #[test]
@@ -2115,5 +2171,66 @@ mod tests {
             hits.iter().map(|h| h.id.0.as_str()).collect::<Vec<_>>(),
             ["app:b", "app:c", "app:a"]
         );
+    }
+
+    async fn drain_one_frame(client: &mut tokio::net::UnixStream) -> (u16, Vec<u8>) {
+        let mut hdr = [0u8; 4];
+        client.read_exact(&mut hdr).await.expect("frame header");
+        let total_len = u32::from_be_bytes(hdr) as usize;
+        assert!(total_len >= 2, "frame too short for version");
+        let mut ver_buf = [0u8; 2];
+        client.read_exact(&mut ver_buf).await.expect("version");
+        let mut payload = vec![0u8; total_len - 2];
+        client.read_exact(&mut payload).await.expect("payload");
+        (u16::from_be_bytes(ver_buf), payload)
+    }
+
+    #[tokio::test]
+    async fn writer_task_honours_negotiated_legacy_when_legacy_handshake() {
+        let (server, mut client) = tokio::net::UnixStream::pair().expect("unix pair");
+        let (_read, write) = tokio::io::split(server);
+        let (tx, rx) = mpsc::channel::<Response>(1);
+        let handle = tokio::spawn(writer_task(write, rx, PROTOCOL_VERSION_LEGACY));
+        tx.send(Response::Visibility { visible: true })
+            .await
+            .expect("send response");
+        drop(tx);
+
+        let (version, payload) = drain_one_frame(&mut client).await;
+        handle.await.expect("writer join").expect("writer task ok");
+
+        assert_eq!(version, PROTOCOL_VERSION_LEGACY);
+        assert_eq!(
+            payload.first().copied(),
+            Some(b'{'),
+            "writer_task must emit JSON when daemon negotiated v4; got prefix {:?}",
+            payload.first()
+        );
+    }
+
+    #[tokio::test]
+    async fn writer_task_honours_negotiated_binary_when_binary_handshake() {
+        let (server, mut client) = tokio::net::UnixStream::pair().expect("unix pair");
+        let (_read, write) = tokio::io::split(server);
+        let (tx, rx) = mpsc::channel::<Response>(1);
+        let handle = tokio::spawn(writer_task(write, rx, PROTOCOL_VERSION_BINARY));
+        tx.send(Response::Visibility { visible: true })
+            .await
+            .expect("send response");
+        drop(tx);
+
+        let (version, payload) = drain_one_frame(&mut client).await;
+        handle.await.expect("writer join").expect("writer task ok");
+
+        assert_eq!(version, PROTOCOL_VERSION_BINARY);
+        assert_ne!(
+            payload.first().copied(),
+            Some(b'{'),
+            "writer_task must emit postcard when daemon negotiated v5; got prefix {:?}",
+            payload.first()
+        );
+        let back = lixun_ipc::decode_response(PROTOCOL_VERSION_BINARY, &payload)
+            .expect("postcard payload must decode at v5");
+        assert!(matches!(back, Response::Visibility { visible: true }));
     }
 }

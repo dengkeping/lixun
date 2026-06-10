@@ -65,9 +65,12 @@ impl SearchQueryState {
         if result.generation != self.generation {
             return false;
         }
-        self.total_matches = self
-            .total_matches
-            .saturating_sub(self.results.get(&result.page_idx).map(Vec::len).unwrap_or(0));
+        self.total_matches = self.total_matches.saturating_sub(
+            self.results
+                .get(&result.page_idx)
+                .map(Vec::len)
+                .unwrap_or(0),
+        );
         self.total_matches += result.rects.len();
         if result.rects.is_empty() {
             self.results.remove(&result.page_idx);

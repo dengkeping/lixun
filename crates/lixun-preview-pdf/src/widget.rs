@@ -56,11 +56,13 @@ use gtk::glib;
 use gtk::prelude::*;
 use gtk::subclass::prelude::*;
 
-use crate::canvas::{MAX_ZOOM, MIN_ZOOM, PdfCanvas, fit_to_page, fit_to_width, zoomed_in, zoomed_out};
+use crate::canvas::{
+    MAX_ZOOM, MIN_ZOOM, PdfCanvas, fit_to_page, fit_to_width, zoomed_in, zoomed_out,
+};
 use crate::document_session::DocumentSession;
+use crate::region_image::render_region_image;
 use crate::search::{SearchQueryState, SearchWorker};
 use crate::search_bar::PdfSearchBar;
-use crate::region_image::render_region_image;
 use crate::selection::{PagePoint, PdfSelection, PdfSelectionMode, collect_selected_text};
 use crate::worker::RenderResult;
 
@@ -341,7 +343,11 @@ fn schedule_auto_exit(view: &PdfView) {
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
     {
-        tracing::info!(target = "lixun-preview-pdf", "auto-exit scheduled in {} ms", ms);
+        tracing::info!(
+            target = "lixun-preview-pdf",
+            "auto-exit scheduled in {} ms",
+            ms
+        );
         let view_weak = view.downgrade();
         glib::timeout_add_local_once(std::time::Duration::from_millis(ms), move || {
             let Some(view) = view_weak.upgrade() else {
@@ -350,7 +356,10 @@ fn schedule_auto_exit(view: &PdfView) {
             if let Some(window) = view.root().and_downcast::<gtk::Window>() {
                 window.close();
             } else {
-                tracing::warn!(target = "lixun-preview-pdf", "auto-exit: could not resolve hosting window");
+                tracing::warn!(
+                    target = "lixun-preview-pdf",
+                    "auto-exit: could not resolve hosting window"
+                );
             }
         });
     }
@@ -898,8 +907,16 @@ mod parse_page_input_tests {
 
     #[test]
     fn edge_cases() {
-        assert_eq!(parse_page_input("0", 0), None, "n_pages=0 should yield None");
-        assert_eq!(parse_page_input("1", 0), None, "n_pages=0 should yield None");
+        assert_eq!(
+            parse_page_input("0", 0),
+            None,
+            "n_pages=0 should yield None"
+        );
+        assert_eq!(
+            parse_page_input("1", 0),
+            None,
+            "n_pages=0 should yield None"
+        );
         assert_eq!(
             parse_page_input("1.5", 10),
             None,

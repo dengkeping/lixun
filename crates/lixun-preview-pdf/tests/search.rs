@@ -34,12 +34,9 @@ fn find_text_matches_a_known_word() {
     assert!(n_pages >= 1, "expected at least one page");
 
     let page0 = doc.page(0).expect("page 0");
-    let text0 = page0
-        .text()
-        .map(|g| g.to_string())
-        .unwrap_or_default();
-    let query = first_word_of_at_least(&text0, 4)
-        .expect("page 0 should contain a word of length >= 4");
+    let text0 = page0.text().map(|g| g.to_string()).unwrap_or_default();
+    let query =
+        first_word_of_at_least(&text0, 4).expect("page 0 should contain a word of length >= 4");
 
     let mut total = 0usize;
     let mut per_page = Vec::with_capacity(n_pages as usize);
@@ -65,8 +62,8 @@ fn selected_text_round_trips_a_match_rect() {
 
     let page0 = doc.page(0).expect("page 0");
     let text0 = page0.text().map(|g| g.to_string()).unwrap_or_default();
-    let query = first_word_of_at_least(&text0, 4)
-        .expect("page 0 should contain a word of length >= 4");
+    let query =
+        first_word_of_at_least(&text0, 4).expect("page 0 should contain a word of length >= 4");
 
     for i in 0..n_pages {
         let page = doc.page(i).expect("page");

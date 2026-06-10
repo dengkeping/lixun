@@ -265,11 +265,7 @@ impl LixunIndex {
     /// `writer` — `LixunIndex` itself is immutable. This is what lets
     /// the daemon hold a single `Arc<LixunIndex>` shared between the
     /// writer task and the search hot path without a `Mutex`.
-    pub fn upsert(
-        &self,
-        doc: &Document,
-        writer: &mut IndexWriter<TantivyDocument>,
-    ) -> Result<()> {
+    pub fn upsert(&self, doc: &Document, writer: &mut IndexWriter<TantivyDocument>) -> Result<()> {
         let s = &self.schema;
 
         let term = tantivy::Term::from_field_text(s.id, &doc.id.0);
@@ -350,11 +346,7 @@ impl LixunIndex {
     }
 
     /// Delete a document by id.
-    pub fn delete_by_id(
-        &self,
-        id: &str,
-        writer: &mut IndexWriter<TantivyDocument>,
-    ) -> Result<()> {
+    pub fn delete_by_id(&self, id: &str, writer: &mut IndexWriter<TantivyDocument>) -> Result<()> {
         let term = tantivy::Term::from_field_text(self.schema.id, id);
         writer.delete_term(term);
         Ok(())
@@ -416,8 +408,7 @@ impl LixunIndex {
             Vec::new()
         };
 
-        let mut seen_addrs: HashSet<DocAddress> =
-            top_docs.iter().map(|(_, a)| *a).collect();
+        let mut seen_addrs: HashSet<DocAddress> = top_docs.iter().map(|(_, a)| *a).collect();
         let mut merged: Vec<(f32, DocAddress)> = top_docs;
         for (score, addr) in exact_addrs {
             if seen_addrs.insert(addr) {
@@ -573,7 +564,11 @@ impl LixunIndex {
             results.push((hit, breakdown));
         }
 
-        results.sort_by(|a, b| b.0.score.partial_cmp(&a.0.score).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| {
+            b.0.score
+                .partial_cmp(&a.0.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         results.truncate(query.limit as usize);
 
         Ok(results)
@@ -1097,7 +1092,8 @@ mod tests {
             index.upsert(doc, &mut writer).unwrap();
         }
 
-        index.commit(&mut writer).unwrap(); index.reload().unwrap();
+        index.commit(&mut writer).unwrap();
+        index.reload().unwrap();
         (tmp, index)
     }
 
@@ -1196,7 +1192,8 @@ mod tests {
         );
 
         index.upsert(&doc, &mut writer).unwrap();
-        index.commit(&mut writer).unwrap(); index.reload().unwrap();
+        index.commit(&mut writer).unwrap();
+        index.reload().unwrap();
         writer.wait_merging_threads().unwrap();
 
         let mut writer = index.writer(20_000_000).unwrap();
@@ -1206,7 +1203,8 @@ mod tests {
         index
             .delete_by_id("fs:/nonexistent.txt", &mut writer)
             .unwrap();
-        index.commit(&mut writer).unwrap(); index.reload().unwrap();
+        index.commit(&mut writer).unwrap();
+        index.reload().unwrap();
         writer.wait_merging_threads().unwrap();
 
         let results = index
@@ -1233,7 +1231,8 @@ mod tests {
                 )
                 .unwrap();
         }
-        index.commit(&mut writer).unwrap(); index.reload().unwrap();
+        index.commit(&mut writer).unwrap();
+        index.reload().unwrap();
         writer.wait_merging_threads().unwrap();
 
         let mut writer = index.writer(20_000_000).unwrap();
@@ -1244,7 +1243,8 @@ mod tests {
         assert!(ids.contains("fs:/tmp/a2.txt"));
 
         index.delete_by_id("fs:/tmp/a1.txt", &mut writer).unwrap();
-        index.commit(&mut writer).unwrap(); index.reload().unwrap();
+        index.commit(&mut writer).unwrap();
+        index.reload().unwrap();
         writer.wait_merging_threads().unwrap();
 
         let ids = index.all_doc_ids().unwrap();
@@ -1265,7 +1265,8 @@ mod tests {
 
         index.upsert(&doc1, &mut writer).unwrap();
         index.upsert(&doc2, &mut writer).unwrap();
-        index.commit(&mut writer).unwrap(); index.reload().unwrap();
+        index.commit(&mut writer).unwrap();
+        index.reload().unwrap();
 
         let results = index
             .search(&Query {
@@ -1589,7 +1590,8 @@ mod tests {
         let mut idx = LixunIndex::create_or_open(path, RankingConfig::default()).unwrap();
         let mut writer = idx.writer(20_000_000).unwrap();
         idx.upsert(&doc, &mut writer).unwrap();
-        idx.commit(&mut writer).unwrap(); idx.reload().unwrap();
+        idx.commit(&mut writer).unwrap();
+        idx.reload().unwrap();
         drop(idx);
 
         assert_eq!(

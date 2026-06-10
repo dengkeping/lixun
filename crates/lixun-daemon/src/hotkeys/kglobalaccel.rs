@@ -122,20 +122,11 @@ pub(super) async fn run(
     Ok(())
 }
 
-async fn supervisor_loop(
-    conn: Connection,
-    component_path: OwnedObjectPath,
-    tx: mpsc::Sender<()>,
-) {
+async fn supervisor_loop(conn: Connection, component_path: OwnedObjectPath, tx: mpsc::Sender<()>) {
     let mut backoff = RESUBSCRIBE_MIN_BACKOFF;
     loop {
-        let proxy = match zbus::Proxy::new(
-            &conn,
-            SERVICE,
-            component_path.as_str(),
-            COMPONENT_IFACE,
-        )
-        .await
+        let proxy = match zbus::Proxy::new(&conn, SERVICE, component_path.as_str(), COMPONENT_IFACE)
+            .await
         {
             Ok(p) => p,
             Err(e) => {
@@ -175,18 +166,13 @@ async fn supervisor_loop(
                     if component == COMPONENT_UNIQUE && action == ACTION_UNIQUE =>
                 {
                     if tx.send(()).await.is_err() {
-                        tracing::info!(
-                            "hotkeys[kglobalaccel]: receiver dropped, exiting listener"
-                        );
+                        tracing::info!("hotkeys[kglobalaccel]: receiver dropped, exiting listener");
                         return;
                     }
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    tracing::warn!(
-                        "hotkeys[kglobalaccel]: bad signal payload: {}",
-                        e
-                    );
+                    tracing::warn!("hotkeys[kglobalaccel]: bad signal payload: {}", e);
                 }
             }
         }
@@ -223,9 +209,10 @@ fn parse_qt_key(trigger: &str) -> Result<i32> {
                 if key.is_some() {
                     bail!("multiple non-modifier keys in trigger '{}'", trigger);
                 }
-                key = Some(key_for(part).ok_or_else(|| {
-                    anyhow!("unknown key '{}' in trigger '{}'", part, trigger)
-                })?);
+                key =
+                    Some(key_for(part).ok_or_else(|| {
+                        anyhow!("unknown key '{}' in trigger '{}'", part, trigger)
+                    })?);
             }
         }
     }

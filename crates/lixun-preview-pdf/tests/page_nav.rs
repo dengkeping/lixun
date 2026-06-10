@@ -6,8 +6,7 @@
 use std::path::PathBuf;
 
 fn fixture_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/multi-page.pdf")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/multi-page.pdf")
 }
 
 #[test]

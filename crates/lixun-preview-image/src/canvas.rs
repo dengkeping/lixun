@@ -240,8 +240,7 @@ impl ImageCanvas {
         for row in 0..mh as usize {
             let src_off = (my as usize + row) * src_stride + mx as usize * 4;
             let dst_off = row * dst_stride;
-            dst[dst_off..dst_off + dst_stride]
-                .copy_from_slice(&src[src_off..src_off + dst_stride]);
+            dst[dst_off..dst_off + dst_stride].copy_from_slice(&src[src_off..src_off + dst_stride]);
         }
 
         let bytes = gtk::glib::Bytes::from_owned(dst);

@@ -5,6 +5,7 @@ pub mod portal_identity;
 pub mod preview_spawn;
 pub mod semantic_supervisor;
 pub mod session_env;
+pub mod symlink_alias;
 
 pub use lixun_indexer::index_service;
 pub use lixun_indexer::indexer;

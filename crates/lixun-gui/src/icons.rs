@@ -154,11 +154,7 @@ fn icon_loader_loop(
         } else {
             None
         };
-        cache
-            .map
-            .write()
-            .unwrap()
-            .insert(key.clone(), texture);
+        cache.map.write().unwrap().insert(key.clone(), texture);
         // Best-effort: the receiver may have been dropped at
         // shutdown; we don't unwrap.
         let _ = ready_tx.send_blocking(key);

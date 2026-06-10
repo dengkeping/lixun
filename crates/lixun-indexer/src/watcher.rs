@@ -15,7 +15,7 @@ use crate::index_service::{IndexMutationTx, Mutation, fs_doc_id, index_file};
 use anyhow::Result;
 use lixun_extract::ExtractorCapabilities;
 use lixun_sources::exclude::path_excluded;
-use lixun_sources::{HasBody, OcrEnqueue};
+use lixun_sources::{HasBody, OcrEnqueue, SymlinkAliasNoter};
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -54,7 +54,14 @@ enum Control {
 
 enum RefreshJob {
     Refresh(PathBuf),
-    Delete(String),
+    /// Purge a doc-id and any descendant ids. Sole shape emitted for
+    /// `Delete` intents and `Resolved::Gone` paths because the watcher
+    /// cannot stat a vanished path to decide file-vs-directory.
+    /// `DeleteSubtree(fs_doc_id)` of a file-path strictly generalises
+    /// a single `Delete`: prefix==id matches that one doc, no other id
+    /// starts with `path + "/"` for a real file, so no false deletes.
+    /// For a directory it purges the dir doc plus every descendant.
+    DeleteSubtree(String),
 }
 
 static OVERFLOW_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -82,6 +89,7 @@ pub async fn start(
     ocr_enqueue: Option<Arc<dyn OcrEnqueue>>,
     body_checker: Option<Arc<dyn HasBody>>,
     min_image_side_px: u32,
+    alias_noter: Option<Arc<dyn SymlinkAliasNoter>>,
     mutation_tx: IndexMutationTx,
 ) -> Result<()> {
     let (raw_tx, raw_rx) = mpsc::channel::<RawEvent>(RAW_EVENT_QUEUE_CAP);
@@ -118,6 +126,7 @@ pub async fn start(
             ocr_enqueue: ocr_enqueue.clone(),
             body_checker: body_checker.clone(),
             min_image_side_px,
+            alias_noter: alias_noter.clone(),
         };
         tokio::spawn(resolver_task(
             worker_id,
@@ -314,10 +323,11 @@ async fn coalescer_task(
                 }
                 let snapshot = std::mem::take(&mut pending);
                 let count = snapshot.len();
-                for (path, intent) in snapshot {
+                let surviving = drop_descendant_deletes(snapshot);
+                for (path, intent) in surviving {
                     let job = match intent {
                         Intent::Refresh => RefreshJob::Refresh(path),
-                        Intent::Delete => RefreshJob::Delete(fs_doc_id(&path)),
+                        Intent::Delete => RefreshJob::DeleteSubtree(fs_doc_id(&path)),
                     };
                     if refresh_tx.send(job).await.is_err() {
                         return;
@@ -336,6 +346,37 @@ async fn coalescer_task(
     }
 }
 
+fn drop_descendant_deletes(
+    pending: HashMap<PathBuf, Intent>,
+) -> Vec<(PathBuf, Intent)> {
+    let mut delete_paths: Vec<PathBuf> = pending
+        .iter()
+        .filter(|(_, i)| matches!(i, Intent::Delete))
+        .map(|(p, _)| p.clone())
+        .collect();
+    delete_paths.sort_by_key(|p| p.as_os_str().len());
+    let mut covered: Vec<PathBuf> = Vec::with_capacity(delete_paths.len());
+    let mut redundant: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    for p in delete_paths {
+        if covered.iter().any(|parent| is_descendant(&p, parent)) {
+            redundant.insert(p);
+        } else {
+            covered.push(p);
+        }
+    }
+    pending
+        .into_iter()
+        .filter(|(p, i)| !(matches!(i, Intent::Delete) && redundant.contains(p)))
+        .collect()
+}
+
+fn is_descendant(child: &Path, parent: &Path) -> bool {
+    if child == parent {
+        return false;
+    }
+    child.starts_with(parent)
+}
+
 struct ResolverEnv {
     exclude: Arc<ExcludeSet>,
     max_file_size_mb: u64,
@@ -343,6 +384,7 @@ struct ResolverEnv {
     ocr_enqueue: Option<Arc<dyn OcrEnqueue>>,
     body_checker: Option<Arc<dyn HasBody>>,
     min_image_side_px: u32,
+    alias_noter: Option<Arc<dyn SymlinkAliasNoter>>,
 }
 
 async fn resolver_task(
@@ -355,9 +397,17 @@ async fn resolver_task(
 ) {
     while let Ok(job) = rx.recv().await {
         match job {
-            RefreshJob::Delete(id) => {
-                if let Err(e) = mutation_tx.send(Mutation::Delete(id.clone())).await {
-                    tracing::debug!("resolver[{}]: send delete {} failed: {}", worker_id, id, e);
+            RefreshJob::DeleteSubtree(prefix) => {
+                if let Err(e) = mutation_tx
+                    .send(Mutation::DeleteSubtree(prefix.clone()))
+                    .await
+                {
+                    tracing::debug!(
+                        "resolver[{}]: send delete_subtree {} failed: {}",
+                        worker_id,
+                        prefix,
+                        e
+                    );
                 }
             }
             RefreshJob::Refresh(path) => {
@@ -366,6 +416,7 @@ async fn resolver_task(
                 let caps_b = Arc::clone(&env.caps);
                 let enq_b = env.ocr_enqueue.clone();
                 let body_b = env.body_checker.clone();
+                let alias_b = env.alias_noter.clone();
                 let max_size = env.max_file_size_mb;
                 let min_side = env.min_image_side_px;
                 let result = tokio::task::spawn_blocking(move || {
@@ -377,6 +428,9 @@ async fn resolver_task(
                         enq_b.as_ref().map(|a| a.as_ref() as &dyn OcrEnqueue),
                         body_b.as_ref().map(|a| a.as_ref() as &dyn HasBody),
                         min_side,
+                        alias_b
+                            .as_ref()
+                            .map(|a| a.as_ref() as &dyn SymlinkAliasNoter),
                     )
                 })
                 .await;
@@ -407,10 +461,30 @@ async fn resolver_task(
                         }
                     }
                     Resolved::Gone => {
-                        let id = fs_doc_id(&path);
-                        if let Err(e) = mutation_tx.send(Mutation::Delete(id.clone())).await {
+                        // Key convention: the alias map is keyed on
+                        // the raw observed path string, the same
+                        // value `fs_doc_id` falls back to when
+                        // `canonicalize` fails on a vanished path.
+                        // If a prior index_file recorded an alias,
+                        // recover the canonical id and forget the
+                        // entry; otherwise fall back to the raw id.
+                        let observed = path.to_string_lossy().to_string();
+                        let id = match env.alias_noter.as_ref() {
+                            Some(noter) => match noter.resolve(&observed) {
+                                Some(canonical) => {
+                                    noter.forget(&canonical);
+                                    canonical
+                                }
+                                None => fs_doc_id(&path),
+                            },
+                            None => fs_doc_id(&path),
+                        };
+                        if let Err(e) = mutation_tx
+                            .send(Mutation::DeleteSubtree(id.clone()))
+                            .await
+                        {
                             tracing::debug!(
-                                "resolver[{}]: send gone-delete {} failed: {}",
+                                "resolver[{}]: send gone-delete-subtree {} failed: {}",
                                 worker_id,
                                 id,
                                 e
@@ -443,6 +517,7 @@ fn resolve_refresh(
     ocr_enqueue: Option<&dyn OcrEnqueue>,
     body_checker: Option<&dyn HasBody>,
     min_image_side_px: u32,
+    alias_noter: Option<&dyn SymlinkAliasNoter>,
 ) -> Resolved {
     let Ok(meta) = std::fs::metadata(path) else {
         return Resolved::Gone;
@@ -459,7 +534,23 @@ fn resolve_refresh(
             body_checker,
             min_image_side_px,
         ) {
-            Ok(doc) => Resolved::File(Box::new(doc)),
+            Ok(doc) => {
+                // When `path` traversed a symlink, `index_file`
+                // canonicalises and produces a doc-id that differs
+                // from the raw-path id the Gone arm would compute on
+                // a future delete. Record the mapping so the delete
+                // can recover the canonical id. Key on the raw
+                // observed path string (not the `fs:`-prefixed id)
+                // to match the Gone-arm lookup.
+                if let Some(noter) = alias_noter {
+                    let observed = path.to_string_lossy();
+                    let observed_id = format!("fs:{observed}");
+                    if observed_id != doc.id.0 {
+                        noter.note(&observed, &doc.id.0);
+                    }
+                }
+                Resolved::File(Box::new(doc))
+            }
             Err(_) => Resolved::Skip,
         }
     } else if meta.is_dir() {
@@ -513,6 +604,60 @@ mod tests {
             drain(event),
             vec![RawEvent::Delete(from), RawEvent::Upsert(to)]
         );
+    }
+
+    #[test]
+    fn dispatch_remove_directory_event_yields_subtree_delete() {
+        // The watcher cannot stat a vanished path; every Delete intent
+        // is emitted as DeleteSubtree at the resolver boundary. Here we
+        // verify the coalescer flush translation: a Delete intent for
+        // a directory-shaped path becomes RefreshJob::DeleteSubtree.
+        let dir = PathBuf::from("/tmp/lixun-watcher-test-dir");
+        let mut pending: HashMap<PathBuf, Intent> = HashMap::new();
+        pending.insert(dir.clone(), Intent::Delete);
+        let surviving = drop_descendant_deletes(pending);
+        assert_eq!(surviving.len(), 1);
+        let (path, intent) = &surviving[0];
+        assert_eq!(path, &dir);
+        assert!(matches!(intent, Intent::Delete));
+        let job = match intent {
+            Intent::Refresh => RefreshJob::Refresh(path.clone()),
+            Intent::Delete => RefreshJob::DeleteSubtree(fs_doc_id(path)),
+        };
+        assert!(matches!(job, RefreshJob::DeleteSubtree(_)));
+        if let RefreshJob::DeleteSubtree(prefix) = job {
+            assert_eq!(prefix, fs_doc_id(&dir));
+        }
+    }
+
+    #[test]
+    fn coalescer_drops_child_prefix_covered_by_parent() {
+        let parent = PathBuf::from("/tmp/lixun-x/a/b");
+        let child_file = PathBuf::from("/tmp/lixun-x/a/b/c.txt");
+        let child_dir = PathBuf::from("/tmp/lixun-x/a/b/sub");
+        let unrelated = PathBuf::from("/tmp/lixun-x/other.txt");
+        let mut pending: HashMap<PathBuf, Intent> = HashMap::new();
+        pending.insert(parent.clone(), Intent::Delete);
+        pending.insert(child_file.clone(), Intent::Delete);
+        pending.insert(child_dir.clone(), Intent::Delete);
+        pending.insert(unrelated.clone(), Intent::Delete);
+        let surviving = drop_descendant_deletes(pending);
+        let surviving_paths: std::collections::HashSet<PathBuf> =
+            surviving.into_iter().map(|(p, _)| p).collect();
+        assert!(surviving_paths.contains(&parent), "parent must survive");
+        assert!(
+            surviving_paths.contains(&unrelated),
+            "unrelated sibling must survive"
+        );
+        assert!(
+            !surviving_paths.contains(&child_file),
+            "file under parent must be dropped"
+        );
+        assert!(
+            !surviving_paths.contains(&child_dir),
+            "subdir under parent must be dropped"
+        );
+        assert_eq!(surviving_paths.len(), 2);
     }
 
     #[test]

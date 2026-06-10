@@ -3,9 +3,9 @@
 use ratatui::{
     Frame,
     layout::Rect,
-    widgets::{Block, Borders, Paragraph},
-    style::{Color, Style, Modifier},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
+    widgets::{Block, Borders, Paragraph},
 };
 
 use crate::dashboard::app::{App, FocusedWidget, RestartStatus, SemanticStatus};
@@ -37,22 +37,26 @@ pub fn render_services_panel(frame: &mut Frame, area: Rect, app: &App) {
     if let Some(ref stats) = app.ocr_stats {
         let mut ocr_line = vec![
             Span::styled("OCR: ", Style::default().fg(Color::White)),
-            Span::styled("ON", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "ON",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
         ];
 
         // Add queue stats
         let queue_info = format!(
             " (queue: {} pending, {} failed)",
-            stats.queue_pending,
-            stats.queue_failed
+            stats.queue_pending, stats.queue_failed
         );
-        
+
         let queue_color = if stats.queue_failed > 0 {
             Color::Yellow
         } else {
             Color::Gray
         };
-        
+
         ocr_line.push(Span::styled(queue_info, Style::default().fg(queue_color)));
         lines.push(Line::from(ocr_line));
     } else {
@@ -66,7 +70,12 @@ pub fn render_services_panel(frame: &mut Frame, area: Rect, app: &App) {
     let semantic_spans = match &app.semantic_status {
         SemanticStatus::On => vec![
             Span::styled("Semantic: ", Style::default().fg(Color::White)),
-            Span::styled("ON", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "ON",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
         ],
         SemanticStatus::Off => vec![
             Span::styled("Semantic: ", Style::default().fg(Color::White)),
@@ -74,11 +83,16 @@ pub fn render_services_panel(frame: &mut Frame, area: Rect, app: &App) {
         ],
         SemanticStatus::Warning(msg) => vec![
             Span::styled("Semantic: ", Style::default().fg(Color::White)),
-            Span::styled("WARN", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "WARN",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(format!(" ({})", msg), Style::default().fg(Color::Yellow)),
         ],
     };
-    
+
     lines.push(Line::from(semantic_spans));
 
     // Empty line for spacing
@@ -90,7 +104,12 @@ pub fn render_services_panel(frame: &mut Frame, area: Rect, app: &App) {
             if app.restart_pending {
                 vec![
                     Span::styled("Daemon: ", Style::default().fg(Color::White)),
-                    Span::styled("[Restarting...]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        "[Restarting...]",
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
                 ]
             } else {
                 vec![
@@ -101,15 +120,28 @@ pub fn render_services_panel(frame: &mut Frame, area: Rect, app: &App) {
         }
         RestartStatus::Restarting => vec![
             Span::styled("Daemon: ", Style::default().fg(Color::White)),
-            Span::styled("[Restarting...]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "[Restarting...]",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
         ],
         RestartStatus::Reconnecting => vec![
             Span::styled("Daemon: ", Style::default().fg(Color::White)),
-            Span::styled("[Reconnecting...]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "[Reconnecting...]",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
         ],
         RestartStatus::Failed(ref msg) => vec![
             Span::styled("Daemon: ", Style::default().fg(Color::White)),
-            Span::styled(format!("[Failed: {}]", msg), Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("[Failed: {}]", msg),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
         ],
     };
     lines.push(Line::from(restart_status_text));
@@ -118,7 +150,12 @@ pub fn render_services_panel(frame: &mut Frame, area: Rect, app: &App) {
     if matches!(app.restart_status, RestartStatus::Idle) && !app.restart_pending {
         lines.push(Line::from(vec![
             Span::styled("Press ", Style::default().fg(Color::DarkGray)),
-            Span::styled("'r'", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "'r'",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(" to restart daemon", Style::default().fg(Color::DarkGray)),
         ]));
     }

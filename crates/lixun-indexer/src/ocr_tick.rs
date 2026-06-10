@@ -190,7 +190,9 @@ where
                     "ocr tick: content filter rejected {} (low text-like component count)",
                     row.doc_id
                 );
-                if let Err(e) = queue.mark_failure(&row.doc_id, "content_filter: low-complexity image") {
+                if let Err(e) =
+                    queue.mark_failure(&row.doc_id, "content_filter: low-complexity image")
+                {
                     tracing::warn!("ocr tick: mark_failure after content filter failed: {e:#}");
                 }
                 return TickOutcome::PermanentSkip {

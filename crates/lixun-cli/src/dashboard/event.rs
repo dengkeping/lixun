@@ -3,14 +3,14 @@
 //! Provides an async event loop that multiplexes crossterm events (keyboard, mouse, resize)
 //! with periodic tick events using tokio's async runtime.
 
-use anyhow::{anyhow, Result};
+use crate::dashboard::log_entry::LogEntry;
+use anyhow::{Result, anyhow};
 use crossterm::event::{Event as CrosstermEvent, EventStream, KeyEvent, MouseEvent};
 use futures::{FutureExt, StreamExt};
 use std::time::Duration;
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 use tokio::task::JoinHandle;
 use tokio::time::interval;
-use crate::dashboard::log_entry::LogEntry;
 
 /// Events that can be received from the event handler.
 #[derive(Debug, Clone)]

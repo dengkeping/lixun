@@ -168,7 +168,7 @@ mod tests {
             kind_label: None,
             score,
             action: Action::Launch {
-                exec: "true".into(),
+                exec: vec!["true".into()],
                 terminal: false,
                 desktop_id: None,
                 desktop_file: None,
@@ -254,6 +254,69 @@ mod tests {
         assert!(!decision.acronym_match);
         assert!(!decision.has_strong_latch);
         assert_eq!(decision.dominance, 0.0);
+    }
+
+    #[test]
+    fn top_hit_promotes_when_both_thresholds_met_exactly_at_boundary() {
+        let hits = vec![
+            make_hit("app:firefox", "Firefox", 13.0),
+            make_hit("app:something", "Something", 10.0),
+        ];
+        let decision = select_top_hit(
+            "fire",
+            &hits,
+            &FrecencyStore::default(),
+            &QueryLatchStore::default(),
+            0,
+            0.6,
+            1.3,
+            3,
+        );
+        assert_eq!(decision.id, Some(hits[0].id.clone()));
+        assert!(decision.confidence >= 0.6);
+        assert!((decision.margin - 1.3).abs() < 0.001);
+    }
+
+    #[test]
+    fn top_hit_skips_when_confidence_below_boundary() {
+        let hits = vec![
+            make_hit("app:firefox", "Firefox", 13.0),
+            make_hit("app:something", "Something", 10.0),
+        ];
+        let decision = select_top_hit(
+            "xyz",
+            &hits,
+            &FrecencyStore::default(),
+            &QueryLatchStore::default(),
+            0,
+            0.6,
+            1.3,
+            3,
+        );
+        assert!(decision.id.is_none());
+        assert_eq!(decision.confidence, 0.0);
+        assert!(decision.margin >= 1.3);
+    }
+
+    #[test]
+    fn top_hit_skips_when_margin_below_boundary() {
+        let hits = vec![
+            make_hit("app:firefox", "Firefox", 12.99),
+            make_hit("app:something", "Something", 10.0),
+        ];
+        let decision = select_top_hit(
+            "fire",
+            &hits,
+            &FrecencyStore::default(),
+            &QueryLatchStore::default(),
+            0,
+            0.6,
+            1.3,
+            3,
+        );
+        assert!(decision.id.is_none());
+        assert!(decision.confidence >= 0.6);
+        assert!(decision.margin < 1.3);
     }
 
     #[test]

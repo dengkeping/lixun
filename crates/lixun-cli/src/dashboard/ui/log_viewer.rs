@@ -1,11 +1,11 @@
 //! Widget for viewing daemon logs.
 
 use ratatui::{
+    Frame,
     layout::Rect,
-    style::{Color, Style, Modifier},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem},
-    Frame,
 };
 
 use crate::dashboard::app::{App, FocusedWidget, WidgetMode};
@@ -31,29 +31,61 @@ pub fn render_log_viewer(frame: &mut Frame, area: Rect, app: &App) {
         Span::styled(
             "I",
             Style::default()
-                .fg(if app.log_filter_info { Color::White } else { Color::DarkGray })
-                .add_modifier(if app.log_filter_info { Modifier::BOLD } else { Modifier::empty() })
+                .fg(if app.log_filter_info {
+                    Color::White
+                } else {
+                    Color::DarkGray
+                })
+                .add_modifier(if app.log_filter_info {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
         ),
         Span::raw(" "),
         Span::styled(
             "W",
             Style::default()
-                .fg(if app.log_filter_warn { Color::Yellow } else { Color::DarkGray })
-                .add_modifier(if app.log_filter_warn { Modifier::BOLD } else { Modifier::empty() })
+                .fg(if app.log_filter_warn {
+                    Color::Yellow
+                } else {
+                    Color::DarkGray
+                })
+                .add_modifier(if app.log_filter_warn {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
         ),
         Span::raw(" "),
         Span::styled(
             "E",
             Style::default()
-                .fg(if app.log_filter_error { Color::Red } else { Color::DarkGray })
-                .add_modifier(if app.log_filter_error { Modifier::BOLD } else { Modifier::empty() })
+                .fg(if app.log_filter_error {
+                    Color::Red
+                } else {
+                    Color::DarkGray
+                })
+                .add_modifier(if app.log_filter_error {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
         ),
         Span::raw(" "),
         Span::styled(
             "D",
             Style::default()
-                .fg(if app.log_filter_debug { Color::White } else { Color::DarkGray })
-                .add_modifier(if app.log_filter_debug { Modifier::BOLD } else { Modifier::empty() })
+                .fg(if app.log_filter_debug {
+                    Color::White
+                } else {
+                    Color::DarkGray
+                })
+                .add_modifier(if app.log_filter_debug {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
         ),
         Span::raw("]"),
     ];
@@ -62,13 +94,15 @@ pub fn render_log_viewer(frame: &mut Frame, area: Rect, app: &App) {
         title_spans.push(Span::raw(" Filter: "));
         title_spans.push(Span::styled(
             format!("{}|", app.log_filter_text),
-            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
         ));
     } else if !app.log_filter_text.is_empty() {
         title_spans.push(Span::raw(" Filter: "));
         title_spans.push(Span::styled(
             &app.log_filter_text,
-            Style::default().fg(Color::Cyan)
+            Style::default().fg(Color::Cyan),
         ));
     }
 
@@ -78,7 +112,7 @@ pub fn render_log_viewer(frame: &mut Frame, area: Rect, app: &App) {
         .border_style(Style::default().fg(border_color));
 
     let filtered = app.filtered_logs();
-    
+
     if filtered.is_empty() {
         let empty_list = List::new(vec![ListItem::new("(no logs match filters)")])
             .block(block)
@@ -92,7 +126,7 @@ pub fn render_log_viewer(frame: &mut Frame, area: Rect, app: &App) {
     let scroll_offset = app.log_scroll.min(total_logs.saturating_sub(1));
     let start_idx = scroll_offset.saturating_sub(visible_height.saturating_sub(1));
     let end_idx = (scroll_offset + 1).min(total_logs);
-    
+
     let items: Vec<ListItem> = filtered
         .iter()
         .skip(start_idx)
@@ -105,12 +139,17 @@ pub fn render_log_viewer(frame: &mut Frame, area: Rect, app: &App) {
                 LogLevel::Debug => Color::DarkGray,
             };
             let level_str = entry.level.as_str();
-            
+
             let line = Line::from(vec![
-                Span::styled(format!("[{}] ", level_str), Style::default().fg(level_color).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    format!("[{}] ", level_str),
+                    Style::default()
+                        .fg(level_color)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::styled(&entry.message, Style::default().fg(level_color)),
             ]);
-            
+
             ListItem::new(line)
         })
         .collect();

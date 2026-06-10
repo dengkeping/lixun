@@ -111,10 +111,15 @@ fn bench_ipc_receive_to_model_insertion(c: &mut Criterion) {
                 let plan = lixun_gui::compute_render_plan(&hits, top_hit.as_ref());
                 if gtk_ready {
                     let model = gtk::StringList::new(&[]);
-                    let selection = gtk::SingleSelection::builder()
-                        .model(&model)
-                        .build();
-                    lixun_gui::update_results(&model, &selection, &plan.hits, plan.top_hit_index.and_then(|i| plan.hits.get(i)).map(|h| h.id.0.clone()));
+                    let selection = gtk::SingleSelection::builder().model(&model).build();
+                    lixun_gui::update_results(
+                        &model,
+                        &selection,
+                        &plan.hits,
+                        plan.top_hit_index
+                            .and_then(|i| plan.hits.get(i))
+                            .map(|h| h.id.0.clone()),
+                    );
                     black_box(&model);
                 } else {
                     black_box(plan);
@@ -130,10 +135,15 @@ fn bench_ipc_receive_to_model_insertion(c: &mut Criterion) {
                 let plan = lixun_gui::compute_render_plan(&hits, top_hit.as_ref());
                 if gtk_ready {
                     let model = gtk::StringList::new(&[]);
-                    let selection = gtk::SingleSelection::builder()
-                        .model(&model)
-                        .build();
-                    lixun_gui::update_results(&model, &selection, &plan.hits, plan.top_hit_index.and_then(|i| plan.hits.get(i)).map(|h| h.id.0.clone()));
+                    let selection = gtk::SingleSelection::builder().model(&model).build();
+                    lixun_gui::update_results(
+                        &model,
+                        &selection,
+                        &plan.hits,
+                        plan.top_hit_index
+                            .and_then(|i| plan.hits.get(i))
+                            .map(|h| h.id.0.clone()),
+                    );
                     black_box(&model);
                 } else {
                     black_box(plan);
@@ -152,9 +162,7 @@ fn bench_ipc_receive_to_model_insertion(c: &mut Criterion) {
                 let plan = lixun_gui::compute_render_plan(&hits, top_hit.as_ref());
                 if gtk_ready {
                     let model = gtk::StringList::new(&[]);
-                    let selection = gtk::SingleSelection::builder()
-                        .model(&model)
-                        .build();
+                    let selection = gtk::SingleSelection::builder().model(&model).build();
                     lixun_gui::update_results(
                         &model,
                         &selection,

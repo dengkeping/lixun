@@ -1,12 +1,12 @@
 //! Widget for displaying search results.
 
+use crate::dashboard::app::{App, FocusedWidget, WidgetMode};
 use ratatui::{
     Frame,
-    layout::{Rect, Constraint},
-    widgets::{Block, Borders, Table, Row, Cell},
-    style::{Color, Style, Modifier},
+    layout::{Constraint, Rect},
+    style::{Color, Modifier, Style},
+    widgets::{Block, Borders, Cell, Row, Table},
 };
-use crate::dashboard::app::{App, FocusedWidget, WidgetMode};
 
 pub fn render_results_list(frame: &mut Frame, area: Rect, app: &App) {
     let is_focused = app.focused_widget == FocusedWidget::ResultsList;
@@ -70,7 +70,7 @@ pub fn render_results_list(frame: &mut Frame, area: Rect, app: &App) {
             Cell::from("Subtitle"),
             Cell::from("Score"),
         ])
-        .style(Style::default().add_modifier(Modifier::BOLD))
+        .style(Style::default().add_modifier(Modifier::BOLD)),
     );
 
     frame.render_widget(table, area);

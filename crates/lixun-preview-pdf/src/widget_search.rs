@@ -149,9 +149,11 @@ fn wire_bar_signals(
             "next-match",
             false,
             glib::closure_local!(move |_b: PdfSearchBar| {
-                let (Some(canvas), Some(bar), Some(scroll)) =
-                    (canvas_weak.upgrade(), bar_weak.upgrade(), scroll_weak.upgrade())
-                else {
+                let (Some(canvas), Some(bar), Some(scroll)) = (
+                    canvas_weak.upgrade(),
+                    bar_weak.upgrade(),
+                    scroll_weak.upgrade(),
+                ) else {
                     return;
                 };
                 advance(&canvas, &bar, &scroll, &state, &session, true);
@@ -168,9 +170,11 @@ fn wire_bar_signals(
             "prev-match",
             false,
             glib::closure_local!(move |_b: PdfSearchBar| {
-                let (Some(canvas), Some(bar), Some(scroll)) =
-                    (canvas_weak.upgrade(), bar_weak.upgrade(), scroll_weak.upgrade())
-                else {
+                let (Some(canvas), Some(bar), Some(scroll)) = (
+                    canvas_weak.upgrade(),
+                    bar_weak.upgrade(),
+                    scroll_weak.upgrade(),
+                ) else {
                     return;
                 };
                 advance(&canvas, &bar, &scroll, &state, &session, false);
@@ -254,7 +258,9 @@ fn scroll_to_match(
         let target = (match_top - margin).max(vadj.lower());
         vadj.set_value(target);
     } else if match_bot > v + vh - margin {
-        let target = (match_bot - vh + margin).min(vadj.upper() - vh).max(vadj.lower());
+        let target = (match_bot - vh + margin)
+            .min(vadj.upper() - vh)
+            .max(vadj.lower());
         vadj.set_value(target);
     }
 }

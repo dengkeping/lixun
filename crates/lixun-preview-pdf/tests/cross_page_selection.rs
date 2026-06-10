@@ -30,7 +30,10 @@ fn open_doc() -> Document {
 fn collect_text(doc: &Document, sel: &PdfSelection) -> String {
     let mut out = String::new();
     let mut first = true;
-    let (start_page, end_page) = (sel.anchor.page.min(sel.active.page), sel.anchor.page.max(sel.active.page));
+    let (start_page, end_page) = (
+        sel.anchor.page.min(sel.active.page),
+        sel.anchor.page.max(sel.active.page),
+    );
     for page_idx in start_page..=end_page {
         let Some(page) = doc.page(page_idx as i32) else {
             continue;
@@ -67,16 +70,39 @@ fn cross_page_selection_collects_text_from_all_three_pages() {
 
     let sel = PdfSelection {
         // anchor: top-left of page 0 (PDF y-up: large y == top)
-        anchor: PagePoint { page: 0, point: PdfPoint { x: 0.0, y: h0 } },
+        anchor: PagePoint {
+            page: 0,
+            point: PdfPoint { x: 0.0, y: h0 },
+        },
         // active: bottom-right of page 2 (PDF y-up: y=0 == bottom)
-        active: PagePoint { page: 2, point: PdfPoint { x: w2.max(w0), y: 0.0 } },
-        mode: PdfSelectionMode::Text { style: SelectionStyle::Glyph },
+        active: PagePoint {
+            page: 2,
+            point: PdfPoint {
+                x: w2.max(w0),
+                y: 0.0,
+            },
+        },
+        mode: PdfSelectionMode::Text {
+            style: SelectionStyle::Glyph,
+        },
     };
 
     let text = collect_text(&doc, &sel);
-    assert!(text.contains("Page one"), "missing 'Page one' in: {:?}", text);
-    assert!(text.contains("Page two"), "missing 'Page two' in: {:?}", text);
-    assert!(text.contains("Page three"), "missing 'Page three' in: {:?}", text);
+    assert!(
+        text.contains("Page one"),
+        "missing 'Page one' in: {:?}",
+        text
+    );
+    assert!(
+        text.contains("Page two"),
+        "missing 'Page two' in: {:?}",
+        text
+    );
+    assert!(
+        text.contains("Page three"),
+        "missing 'Page three' in: {:?}",
+        text
+    );
 }
 
 #[test]
@@ -84,9 +110,17 @@ fn cross_page_selection_middle_page_is_full_page() {
     // Audit-style check: when start.page < page < end.page,
     // selection_rect_for_page returns the full page rect.
     let sel = PdfSelection {
-        anchor: PagePoint { page: 0, point: PdfPoint { x: 10.0, y: 20.0 } },
-        active: PagePoint { page: 2, point: PdfPoint { x: 30.0, y: 40.0 } },
-        mode: PdfSelectionMode::Text { style: SelectionStyle::Glyph },
+        anchor: PagePoint {
+            page: 0,
+            point: PdfPoint { x: 10.0, y: 20.0 },
+        },
+        active: PagePoint {
+            page: 2,
+            point: PdfPoint { x: 30.0, y: 40.0 },
+        },
+        mode: PdfSelectionMode::Text {
+            style: SelectionStyle::Glyph,
+        },
     };
     let r = selection_rect_for_page(&sel, 1, 612.0, 792.0).expect("rect for middle page");
     assert_eq!(r.x1(), 0.0);

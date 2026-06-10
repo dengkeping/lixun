@@ -136,8 +136,21 @@ pub struct DocId(pub String);
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Action {
     /// Launch an application.
+    ///
+    /// `exec` is a tokenised argv (program followed by arguments).
+    /// Sources that read shell-style command lines (e.g. `.desktop`
+    /// `Exec=` keys with quoted paths) MUST tokenise with
+    /// `shell_words::split` so that a path containing spaces stays a
+    /// single token. The host spawns argv directly without re-splitting.
+    ///
+    /// Back-compat: older indexes serialised `exec` as a single string.
+    /// The deserialiser accepts both shapes; on read of the legacy
+    /// string form it re-tokenises with `shell_words::split` (falling
+    /// back to a single-token vec when the input is unparseable).
+    /// Serialisation always emits a JSON array.
     Launch {
-        exec: String,
+        #[serde(deserialize_with = "deserialize_exec_string_or_vec")]
+        exec: Vec<String>,
         terminal: bool,
         desktop_id: Option<String>,
         desktop_file: Option<PathBuf>,
@@ -188,6 +201,22 @@ pub enum Action {
     /// `mailto:`, `https:`). Plugin-agnostic: the host does not know
     /// which application will handle the scheme.
     OpenUri { uri: String },
+}
+
+fn deserialize_exec_string_or_vec<'de, D>(d: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(match OneOrMany::deserialize(d)? {
+        OneOrMany::One(s) => shell_words::split(&s).unwrap_or_else(|_| vec![s]),
+        OneOrMany::Many(v) => v,
+    })
 }
 
 /// A single row context-menu item, GTK-free.
@@ -476,7 +505,7 @@ mod tests {
     fn test_action_serde_roundtrip() {
         let actions = vec![
             Action::Launch {
-                exec: "firefox".to_string(),
+                exec: vec!["firefox".to_string()],
                 terminal: false,
                 desktop_id: Some("firefox.desktop".to_string()),
                 desktop_file: Some(PathBuf::from("/usr/share/applications/firefox.desktop")),
@@ -568,6 +597,47 @@ mod tests {
                 }
                 _ => panic!("Action variant mismatch"),
             }
+        }
+    }
+
+    #[test]
+    fn action_launch_decodes_legacy_string_exec_via_shim() {
+        let legacy = r#"{"Launch":{"exec":"/usr/bin/firefox --safe-mode","terminal":false,"desktop_id":null,"desktop_file":null,"working_dir":null}}"#;
+        let decoded: Action = serde_json::from_str(legacy).unwrap();
+        match decoded {
+            Action::Launch { exec, .. } => {
+                assert_eq!(
+                    exec,
+                    vec!["/usr/bin/firefox".to_string(), "--safe-mode".to_string()]
+                );
+            }
+            _ => panic!("expected Action::Launch"),
+        }
+    }
+
+    #[test]
+    fn action_launch_encodes_as_vec() {
+        let act = Action::Launch {
+            exec: vec!["/usr/bin/foo".to_string(), "hello world".to_string()],
+            terminal: false,
+            desktop_id: None,
+            desktop_file: None,
+            working_dir: None,
+        };
+        let json = serde_json::to_string(&act).unwrap();
+        assert!(
+            json.contains(r#""exec":["/usr/bin/foo","hello world"]"#),
+            "expected JSON array for exec, got: {json}"
+        );
+        let decoded: Action = serde_json::from_str(&json).unwrap();
+        match decoded {
+            Action::Launch { exec, .. } => {
+                assert_eq!(
+                    exec,
+                    vec!["/usr/bin/foo".to_string(), "hello world".to_string()]
+                );
+            }
+            _ => panic!("expected Action::Launch"),
         }
     }
 

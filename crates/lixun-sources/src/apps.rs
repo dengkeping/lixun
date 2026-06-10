@@ -8,7 +8,7 @@ struct DesktopEntry {
     pub desktop_id: String,
     pub desktop_file: PathBuf,
     pub name: String,
-    pub exec: String,
+    pub exec: Vec<String>,
     pub terminal: bool,
     pub working_dir: Option<PathBuf>,
     pub icon: Option<String>,
@@ -57,7 +57,7 @@ impl AppsSource {
         let content = std::fs::read_to_string(path).ok()?;
 
         let mut name = String::new();
-        let mut exec = String::new();
+        let mut exec: Vec<String> = Vec::new();
         let mut terminal = false;
         let mut icon = None;
         let mut generic_name = None;
@@ -83,12 +83,11 @@ impl AppsSource {
                         name = val.trim().to_string();
                     }
                     "Exec" => {
-                        exec = val.trim().to_string();
-                        exec = exec
-                            .split_whitespace()
-                            .filter(|segment| !segment.starts_with('%'))
-                            .collect::<Vec<_>>()
-                            .join(" ");
+                        exec = shell_words::split(val.trim())
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter(|tok| !tok.starts_with('%'))
+                            .collect();
                     }
                     "Terminal" => {
                         terminal = val.trim().eq_ignore_ascii_case("true");
@@ -307,7 +306,7 @@ Terminal=false
         let entry = result.unwrap();
         assert_eq!(entry.desktop_id, "firefox.desktop");
         assert_eq!(entry.name, "Firefox");
-        assert_eq!(entry.exec, "/usr/bin/firefox");
+        assert_eq!(entry.exec, vec!["/usr/bin/firefox".to_string()]);
         assert!(!entry.terminal);
         assert_eq!(entry.icon.as_deref(), Some("firefox"));
     }
@@ -421,7 +420,28 @@ Exec=/usr/bin/test %f %F %u %U
         .unwrap();
 
         let entry = AppsSource::parse_desktop_file(&path).unwrap();
-        assert_eq!(entry.exec, "/usr/bin/test");
+        assert_eq!(entry.exec, vec!["/usr/bin/test".to_string()]);
+    }
+
+    #[test]
+    fn desktop_exec_preserves_quoted_arg() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("quoted.desktop");
+        fs::write(
+            &path,
+            "[Desktop Entry]\nName=Quoted\nExec=/usr/bin/foo --opt \"hello world\" %f\n",
+        )
+        .unwrap();
+
+        let entry = AppsSource::parse_desktop_file(&path).unwrap();
+        assert_eq!(
+            entry.exec,
+            vec![
+                "/usr/bin/foo".to_string(),
+                "--opt".to_string(),
+                "hello world".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -491,7 +511,7 @@ Exec=/usr/bin/test
 
         let entry = AppsSource::parse_desktop_file(&path).unwrap();
         assert_eq!(entry.name, "Test App");
-        assert_eq!(entry.exec, "/usr/bin/test");
+        assert_eq!(entry.exec, vec!["/usr/bin/test".to_string()]);
     }
 
     #[test]

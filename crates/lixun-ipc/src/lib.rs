@@ -37,11 +37,15 @@ pub const PROTOCOL_VERSION: u16 = PROTOCOL_VERSION_LEGACY;
 #[cfg(not(feature = "legacy-json-ipc"))]
 pub const PROTOCOL_VERSION: u16 = PROTOCOL_VERSION_BINARY;
 
-/// Error returned by [`encode_request`] / [`encode_response`].
+/// Error returned by [`encode_request`] / [`encode_response`] and their
+/// version-aware [`encode_request_for_version`] /
+/// [`encode_response_for_version`] counterparts. `UnsupportedVersion`
+/// mirrors [`DecodeError::UnsupportedVersion`].
 #[derive(Debug)]
 pub enum EncodeError {
     Json(serde_json::Error),
     Postcard(postcard::Error),
+    UnsupportedVersion(u16),
 }
 
 impl std::fmt::Display for EncodeError {
@@ -49,6 +53,9 @@ impl std::fmt::Display for EncodeError {
         match self {
             EncodeError::Json(e) => write!(f, "json encode error: {}", e),
             EncodeError::Postcard(e) => write!(f, "postcard encode error: {}", e),
+            EncodeError::UnsupportedVersion(v) => {
+                write!(f, "unsupported protocol version: {}", v)
+            }
         }
     }
 }
@@ -58,6 +65,7 @@ impl std::error::Error for EncodeError {
         match self {
             EncodeError::Json(e) => Some(e),
             EncodeError::Postcard(e) => Some(e),
+            EncodeError::UnsupportedVersion(_) => None,
         }
     }
 }
@@ -144,6 +152,28 @@ pub fn encode_response(resp: &Response) -> Result<(u16, Vec<u8>), EncodeError> {
     {
         let bytes = postcard::to_allocvec(resp)?;
         Ok((PROTOCOL_VERSION_BINARY, bytes))
+    }
+}
+
+/// Encode a request for the version negotiated with the peer, ignoring
+/// the build's compile-time codec choice. Use this on every send after
+/// the first frame so a rolling upgrade (v5 daemon serving a v4 CLI,
+/// or vice versa) speaks the version the peer understands.
+pub fn encode_request_for_version(version: u16, req: &Request) -> Result<Vec<u8>, EncodeError> {
+    match version {
+        PROTOCOL_VERSION_LEGACY => Ok(serde_json::to_vec(req)?),
+        PROTOCOL_VERSION_BINARY => Ok(postcard::to_allocvec(req)?),
+        other => Err(EncodeError::UnsupportedVersion(other)),
+    }
+}
+
+/// Encode a response for the negotiated version. See
+/// [`encode_request_for_version`].
+pub fn encode_response_for_version(version: u16, resp: &Response) -> Result<Vec<u8>, EncodeError> {
+    match version {
+        PROTOCOL_VERSION_LEGACY => Ok(serde_json::to_vec(resp)?),
+        PROTOCOL_VERSION_BINARY => Ok(postcard::to_allocvec(resp)?),
+        other => Err(EncodeError::UnsupportedVersion(other)),
     }
 }
 
@@ -1069,5 +1099,78 @@ mod tests {
             codec.decode(&mut buf).unwrap().unwrap(),
             Request::ImpactExplain
         ));
+    }
+
+    #[test]
+    fn encode_response_for_version_emits_legacy_json() {
+        let resp = Response::Visibility { visible: true };
+        let bytes = encode_response_for_version(PROTOCOL_VERSION_LEGACY, &resp)
+            .expect("legacy version must encode");
+        assert_eq!(
+            bytes.first().copied(),
+            Some(b'{'),
+            "v4 payload must be JSON-leading, got prefix {:?}",
+            bytes.first()
+        );
+        let back =
+            decode_response(PROTOCOL_VERSION_LEGACY, &bytes).expect("legacy bytes must decode");
+        assert!(matches!(back, Response::Visibility { visible: true }));
+    }
+
+    #[test]
+    fn encode_response_for_version_emits_binary_postcard() {
+        let resp = Response::Visibility { visible: true };
+        let bytes = encode_response_for_version(PROTOCOL_VERSION_BINARY, &resp)
+            .expect("binary version must encode");
+        assert_ne!(
+            bytes.first().copied(),
+            Some(b'{'),
+            "v5 payload must not be JSON-leading; got {:?}",
+            bytes.first()
+        );
+        let back = decode_response(PROTOCOL_VERSION_BINARY, &bytes)
+            .expect("binary bytes must decode via postcard");
+        assert!(matches!(back, Response::Visibility { visible: true }));
+    }
+
+    #[test]
+    fn encode_response_for_version_rejects_unknown() {
+        let resp = Response::Visibility { visible: true };
+        let err = encode_response_for_version(99, &resp)
+            .expect_err("unknown version must error");
+        match err {
+            EncodeError::UnsupportedVersion(v) => assert_eq!(v, 99),
+            other => panic!("expected UnsupportedVersion(99), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rolling_upgrade_v5_daemon_serves_v4_cli_status_round_trip() {
+        let req = Request::Status;
+        let req_bytes = encode_request_for_version(PROTOCOL_VERSION_LEGACY, &req)
+            .expect("v4 CLI encodes request");
+        let req_back = decode_request(PROTOCOL_VERSION_LEGACY, &req_bytes)
+            .expect("v5 daemon decodes v4 request");
+        assert!(matches!(req_back, Request::Status));
+
+        let resp = Response::Status {
+            indexed_docs: 42,
+            last_reindex: None,
+            errors: 0,
+            watcher: None,
+            writer: None,
+            memory: None,
+            reindex_in_progress: false,
+            reindex_started: None,
+            ocr: None,
+        };
+        let resp_bytes = encode_response_for_version(PROTOCOL_VERSION_LEGACY, &resp)
+            .expect("v5 daemon honours negotiated v4 for response");
+        let resp_back = decode_response(PROTOCOL_VERSION_LEGACY, &resp_bytes)
+            .expect("v4 CLI decodes the JSON response");
+        match resp_back {
+            Response::Status { indexed_docs, .. } => assert_eq!(indexed_docs, 42),
+            other => panic!("expected Status, got {:?}", other),
+        }
     }
 }

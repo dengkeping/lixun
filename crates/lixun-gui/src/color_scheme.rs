@@ -137,8 +137,7 @@ pub fn spawn_listener() -> Receiver<ColorScheme> {
 }
 
 fn listen_loop(tx: &Sender<ColorScheme>) -> Result<()> {
-    let conn =
-        blocking::Connection::session().context("connect to session bus for listener")?;
+    let conn = blocking::Connection::session().context("connect to session bus for listener")?;
     let proxy = blocking::Proxy::new(&conn, PORTAL_SERVICE, PORTAL_PATH, SETTINGS_IFACE)
         .context("open Settings portal proxy for listener")?;
     let iter = proxy
@@ -187,10 +186,7 @@ fn extract_color_scheme(reply: Value<'_>) -> Result<ColorScheme> {
             Value::U8(n) => return Ok(ColorScheme::from_portal_code(u32::from(n))),
             Value::I32(n) if n >= 0 => return Ok(ColorScheme::from_portal_code(n as u32)),
             Value::Value(inner) => current = *inner,
-            other => anyhow::bail!(
-                "color-scheme variant has unexpected type: {:?}",
-                other
-            ),
+            other => anyhow::bail!("color-scheme variant has unexpected type: {:?}", other),
         }
     }
     anyhow::bail!("color-scheme variant nested deeper than expected")
@@ -207,7 +203,10 @@ mod tests {
         assert_eq!(ColorScheme::from_portal_code(2), ColorScheme::PreferLight);
         // Unknown values fall back to default rather than misclassifying.
         assert_eq!(ColorScheme::from_portal_code(7), ColorScheme::Default);
-        assert_eq!(ColorScheme::from_portal_code(u32::MAX), ColorScheme::Default);
+        assert_eq!(
+            ColorScheme::from_portal_code(u32::MAX),
+            ColorScheme::Default
+        );
     }
 
     #[test]

@@ -14,7 +14,15 @@ use tokio::net::UnixStream;
 mod dashboard;
 
 const BUILTIN_VERBS: &[&str] = &[
-    "toggle", "show", "hide", "search", "reindex", "status", "impact", "check-exclude", "dashboard",
+    "toggle",
+    "show",
+    "hide",
+    "search",
+    "reindex",
+    "status",
+    "impact",
+    "check-exclude",
+    "dashboard",
 ];
 
 async fn open_daemon_stream() -> Result<UnixStream> {
@@ -27,12 +35,13 @@ async fn open_daemon_stream() -> Result<UnixStream> {
 }
 
 async fn write_request(stream: &mut UnixStream, req: &Request) -> Result<()> {
-    let json = serde_json::to_vec(req)?;
-    let total_len = (2 + json.len()) as u32;
-    let mut buf = BytesMut::with_capacity(4 + 2 + json.len());
+    let payload = lixun_ipc::encode_request_for_version(PROTOCOL_VERSION, req)
+        .context("encode request for protocol version")?;
+    let total_len = (2 + payload.len()) as u32;
+    let mut buf = BytesMut::with_capacity(4 + 2 + payload.len());
     buf.put_u32(total_len);
     buf.put_u16(PROTOCOL_VERSION);
-    buf.put_slice(&json);
+    buf.put_slice(&payload);
     stream.write_all(&buf).await?;
     Ok(())
 }
@@ -53,9 +62,11 @@ async fn read_response_frame(stream: &mut UnixStream) -> Result<Response> {
     }
     let mut version_buf = [0u8; 2];
     stream.read_exact(&mut version_buf).await?;
+    let version = u16::from_be_bytes(version_buf);
     let mut resp_buf = vec![0u8; resp_len - 2];
     stream.read_exact(&mut resp_buf).await?;
-    let resp: Response = serde_json::from_slice(&resp_buf)?;
+    let resp = lixun_ipc::decode_response(version, &resp_buf)
+        .with_context(|| format!("decode response payload (version {})", version))?;
     Ok(resp)
 }
 
@@ -199,10 +210,7 @@ fn root_command(plugin_verbs: &[CliVerb]) -> Command {
                 .about("Check if a path would be excluded by current config.")
                 .arg(Arg::new("path").required(true).help("Path to check")),
         )
-        .subcommand(
-            Command::new("dashboard")
-                .about("Launch btop-style TUI dashboard"),
-        );
+        .subcommand(Command::new("dashboard").about("Launch btop-style TUI dashboard"));
 
     for verb in plugin_verbs {
         if BUILTIN_VERBS.contains(&verb.name.as_str()) {
@@ -244,77 +252,35 @@ fn collect_plugin_invocation(head: &str, matches: &ArgMatches) -> (Vec<String>, 
 
 fn handle_check_exclude(path_str: &str) -> Result<()> {
     use std::path::Path;
-    
-    let config_path = dirs::config_dir()
-        .ok_or_else(|| anyhow::anyhow!("Cannot determine config directory"))?
-        .join("lixun/config.toml");
-    
-    let mut exclude_substrings = default_excludes();
-    let mut exclude_regexes = Vec::new();
-    
-    if config_path.exists() {
-        let content = std::fs::read_to_string(&config_path)?;
-        let parsed: toml::Value = toml::from_str(&content)?;
-        
-        if let Some(extra) = parsed.get("exclude").and_then(|v| v.as_array()) {
-            for item in extra {
-                if let Some(s) = item.as_str() {
-                    exclude_substrings.push(s.to_string());
-                }
-            }
-        }
-        
-        if let Some(patterns) = parsed.get("exclude_regex").and_then(|v| v.as_array()) {
-            for item in patterns {
-                if let Some(pat) = item.as_str() {
-                    match regex::Regex::new(pat) {
-                        Ok(r) => exclude_regexes.push((pat.to_string(), r)),
-                        Err(e) => eprintln!("warning: invalid regex '{}': {}", pat, e),
-                    }
-                }
-            }
-        }
-    }
-    
-    exclude_substrings.extend(lixun_sources::exclude::lixun_self_excludes());
-    
+
+    let config = lixun_daemon::config::Config::load()?;
+
     let path = Path::new(path_str);
     let path_lossy = path.to_string_lossy();
-    
-    for substr in &exclude_substrings {
+
+    for substr in &config.exclude {
         if path_lossy.contains(substr.as_str()) {
             println!("EXCLUDED by substring: '{}'", substr);
             return Ok(());
         }
     }
-    
-    for (pattern, regex) in &exclude_regexes {
+
+    for regex in &config.exclude_regex {
         if regex.is_match(&path_lossy) {
-            println!("EXCLUDED by regex: '{}'", pattern);
+            println!("EXCLUDED by regex: '{}'", regex.as_str());
             return Ok(());
         }
     }
-    
+
+    for substr in lixun_sources::exclude::lixun_self_excludes() {
+        if path_lossy.contains(substr.as_str()) {
+            println!("EXCLUDED by lixun self-exclude: '{}'", substr);
+            return Ok(());
+        }
+    }
+
     println!("NOT EXCLUDED");
     Ok(())
-}
-
-fn default_excludes() -> Vec<String> {
-    vec![
-        ".cache".into(),
-        ".local/share/Trash".into(),
-        ".steam".into(),
-        ".var/app".into(),
-        "node_modules".into(),
-        "target".into(),
-        ".git".into(),
-        ".venv".into(),
-        "__pycache__".into(),
-        ".thunderbird".into(),
-        ".swp".into(),
-        ".swo".into(),
-        ".swx".into(),
-    ]
 }
 
 #[tokio::main]
@@ -340,11 +306,15 @@ async fn main() -> Result<()> {
         "show" => handle_response(send_request(Request::Show).await?, false),
         "hide" => handle_response(send_request(Request::Hide).await?, false),
         "search" => {
+            let config = lixun_daemon::config::Config::load()
+                .unwrap_or_else(|_| lixun_daemon::config::Config::default());
             let query = sub_matches
                 .get_one::<String>("query")
                 .cloned()
                 .unwrap_or_default();
-            let limit = *sub_matches.get_one::<u32>("limit").unwrap_or(&20);
+            let limit = *sub_matches
+                .get_one::<u32>("limit")
+                .unwrap_or(&config.max_results);
             let explain = sub_matches.get_flag("explain");
             let resp = run_search(query, limit, explain).await?;
             handle_response(resp, false);
@@ -414,25 +384,36 @@ async fn main() -> Result<()> {
 }
 
 async fn dashboard_main() -> Result<()> {
-    use dashboard::{tui, App, EventHandler, ui, event::Event};
+    use dashboard::{App, EventHandler, event::Event, tui, ui};
     use std::process::Stdio;
     use std::time::Duration;
     use tokio::io::{AsyncBufReadExt, BufReader};
     use tokio::process::Command;
     use tokio::sync::mpsc;
-    
+
+    let config = lixun_daemon::config::Config::load()
+        .unwrap_or_else(|_| lixun_daemon::config::Config::default());
+
     tui::install_panic_hook();
     let mut terminal = tui::enter_tui()?;
-    
+
     let (log_tx, log_rx) = mpsc::unbounded_channel();
-    
+
     let mut child = Command::new("journalctl")
-        .args(["--user", "-u", "lixund", "--follow", "--lines=100", "--output=json", "--output-fields=MESSAGE,PRIORITY"])
+        .args([
+            "--user",
+            "-u",
+            "lixund",
+            "--follow",
+            "--lines=100",
+            "--output=json",
+            "--output-fields=MESSAGE,PRIORITY",
+        ])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true)
         .spawn();
-    
+
     if let Ok(ref mut child) = child {
         if let Some(stdout) = child.stdout.take() {
             tokio::spawn(async move {
@@ -449,13 +430,21 @@ async fn dashboard_main() -> Result<()> {
     } else {
         eprintln!("Failed to spawn journalctl subprocess; logs will be unavailable");
     }
-    
+
     let mut events = EventHandler::new(Duration::from_millis(250), Some(log_rx));
     let mut app = App::new();
-    
+
     let mut stream = open_daemon_stream().await?;
     write_request(&mut stream, &Request::Status).await?;
-    if let Response::Status { indexed_docs, memory, watcher, writer, ocr, .. } = read_response_frame(&mut stream).await? {
+    if let Response::Status {
+        indexed_docs,
+        memory,
+        watcher,
+        writer,
+        ocr,
+        ..
+    } = read_response_frame(&mut stream).await?
+    {
         app.indexed_docs = indexed_docs;
         app.memory = memory;
         app.watcher = watcher;
@@ -464,10 +453,10 @@ async fn dashboard_main() -> Result<()> {
         app.connected = true;
     }
     app.update_semantic_status();
-    
+
     loop {
         terminal.draw(|frame| ui::render_dashboard(frame, &mut app))?;
-        
+
         match events.next().await? {
             Event::Key(key) => {
                 app.handle_key(key);
@@ -488,33 +477,53 @@ async fn dashboard_main() -> Result<()> {
                         let _ = write_request(&mut s, &Request::Reindex { paths: vec![] }).await;
                     }
                 }
-                
+
                 if app.restart_pending {
                     app.restart_pending = false;
                     app.restart_status = dashboard::app::RestartStatus::Restarting;
                     app.connected = false;
-                    app.push_log_message("Restarting daemon...".to_string(), dashboard::LogLevel::Info);
-                    
+                    app.push_log_message(
+                        "Restarting daemon...".to_string(),
+                        dashboard::LogLevel::Info,
+                    );
+
                     let restart_result = Command::new("systemctl")
                         .args(["--user", "restart", "lixund.service"])
                         .output()
                         .await;
-                    
+
                     if let Err(e) = restart_result {
-                        app.restart_status = dashboard::app::RestartStatus::Failed(format!("systemctl failed: {}", e));
-                        app.push_log_message(format!("Failed to restart daemon: {}", e), dashboard::LogLevel::Error);
+                        app.restart_status = dashboard::app::RestartStatus::Failed(format!(
+                            "systemctl failed: {}",
+                            e
+                        ));
+                        app.push_log_message(
+                            format!("Failed to restart daemon: {}", e),
+                            dashboard::LogLevel::Error,
+                        );
                         continue;
                     }
-                    
+
                     tokio::time::sleep(Duration::from_millis(500)).await;
-                    
+
                     app.restart_status = dashboard::app::RestartStatus::Reconnecting;
                     let mut reconnected = false;
                     for attempt in 1..=30 {
-                        app.push_log_message(format!("Reconnecting... (attempt {}/30)", attempt), dashboard::LogLevel::Info);
+                        app.push_log_message(
+                            format!("Reconnecting... (attempt {}/30)", attempt),
+                            dashboard::LogLevel::Info,
+                        );
                         if let Ok(mut s) = open_daemon_stream().await {
                             if let Ok(_) = write_request(&mut s, &Request::Status).await {
-                                if let Ok(Response::Status { indexed_docs, memory, watcher, writer, ocr, .. }) = read_response_frame(&mut s).await {
+                                if let Ok(Response::Status {
+                                    indexed_docs,
+                                    memory,
+                                    watcher,
+                                    writer,
+                                    ocr,
+                                    ..
+                                }) = read_response_frame(&mut s).await
+                                {
                                     app.indexed_docs = indexed_docs;
                                     app.memory = memory;
                                     app.watcher = watcher;
@@ -523,7 +532,10 @@ async fn dashboard_main() -> Result<()> {
                                     app.connected = true;
                                     app.restart_status = dashboard::app::RestartStatus::Idle;
                                     app.update_semantic_status();
-                                    app.push_log_message("Daemon restarted successfully".to_string(), dashboard::LogLevel::Info);
+                                    app.push_log_message(
+                                        "Daemon restarted successfully".to_string(),
+                                        dashboard::LogLevel::Info,
+                                    );
                                     reconnected = true;
                                     break;
                                 }
@@ -531,23 +543,32 @@ async fn dashboard_main() -> Result<()> {
                         }
                         tokio::time::sleep(Duration::from_millis(500)).await;
                     }
-                    
+
                     if !reconnected {
-                        app.restart_status = dashboard::app::RestartStatus::Failed("timeout waiting for daemon".to_string());
-                        app.push_log_message("Failed to reconnect after 30 attempts".to_string(), dashboard::LogLevel::Error);
+                        app.restart_status = dashboard::app::RestartStatus::Failed(
+                            "timeout waiting for daemon".to_string(),
+                        );
+                        app.push_log_message(
+                            "Failed to reconnect after 30 attempts".to_string(),
+                            dashboard::LogLevel::Error,
+                        );
                     }
                 }
-                
+
                 if app.search_pending {
                     app.search_pending = false;
                     if let Ok(mut s) = open_daemon_stream().await {
-                        let _ = write_request(&mut s, &Request::Search {
-                            q: app.query_input.clone(),
-                            limit: 50,
-                            explain: false,
-                            epoch: 1,
-                        }).await;
-                        
+                        let _ = write_request(
+                            &mut s,
+                            &Request::Search {
+                                q: app.query_input.clone(),
+                                limit: config.max_results,
+                                explain: false,
+                                epoch: 1,
+                            },
+                        )
+                        .await;
+
                         let mut results = Vec::new();
                         loop {
                             if let Ok(frame) = read_response_frame(&mut s).await {
@@ -567,10 +588,18 @@ async fn dashboard_main() -> Result<()> {
                         app.set_search_results(results);
                     }
                 }
-                
+
                 if let Ok(mut s) = open_daemon_stream().await {
                     let _ = write_request(&mut s, &Request::Status).await;
-                    if let Ok(Response::Status { indexed_docs, memory, watcher, writer, ocr, .. }) = read_response_frame(&mut s).await {
+                    if let Ok(Response::Status {
+                        indexed_docs,
+                        memory,
+                        watcher,
+                        writer,
+                        ocr,
+                        ..
+                    }) = read_response_frame(&mut s).await
+                    {
                         app.indexed_docs = indexed_docs;
                         app.memory = memory;
                         app.watcher = watcher;
@@ -583,7 +612,7 @@ async fn dashboard_main() -> Result<()> {
             _ => {}
         }
     }
-    
+
     tui::exit_tui(&mut terminal)?;
     Ok(())
 }
@@ -911,5 +940,38 @@ mod tests {
             last_drain_at: Some(0),
         };
         assert!(format_ocr_block(Some(&stats)).contains("last drain: never"));
+    }
+
+    #[tokio::test]
+    async fn cli_decodes_postcard_response_when_negotiated_to_binary() {
+        let (server, mut client) = UnixStream::pair().expect("unix pair");
+
+        let writer = tokio::spawn(async move {
+            let resp = Response::Visibility { visible: true };
+            let payload =
+                lixun_ipc::encode_response_for_version(lixun_ipc::PROTOCOL_VERSION_BINARY, &resp)
+                    .expect("encode v5 response");
+            let total_len = (2 + payload.len()) as u32;
+            let mut server = server;
+            server
+                .write_all(&total_len.to_be_bytes())
+                .await
+                .expect("write len");
+            server
+                .write_all(&lixun_ipc::PROTOCOL_VERSION_BINARY.to_be_bytes())
+                .await
+                .expect("write version");
+            server.write_all(&payload).await.expect("write payload");
+            server.shutdown().await.expect("shutdown");
+        });
+
+        let resp = read_response_frame(&mut client)
+            .await
+            .expect("CLI must decode postcard response when daemon negotiates v5");
+        match resp {
+            Response::Visibility { visible } => assert!(visible),
+            other => panic!("expected Visibility(true), got {:?}", other),
+        }
+        writer.await.expect("writer join");
     }
 }

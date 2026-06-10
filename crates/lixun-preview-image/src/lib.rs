@@ -21,12 +21,12 @@ use lixun_core::{Action, Hit};
 use lixun_preview::{PreviewCapabilities, PreviewPlugin, PreviewPluginCfg, PreviewPluginEntry};
 
 mod canvas;
-use canvas::{ImageCanvas, zoomed_in, zoomed_out, MAX_ZOOM, MIN_ZOOM, ZOOM_STEP};
+use canvas::{ImageCanvas, MAX_ZOOM, MIN_ZOOM, ZOOM_STEP, zoomed_in, zoomed_out};
 
 const STRONG_EXTENSIONS: &[&str] = &[
-    "png", "jpg", "jpeg", "gif", "webp", "avif", "bmp", "tiff", "tif", "svg", "ico",
-    "heic", "heif", "jxl",
-    "cr2", "cr3", "nef", "nrw", "arw", "srf", "sr2", "dng", "raf", "orf", "rw2", "pef",
+    "png", "jpg", "jpeg", "gif", "webp", "avif", "bmp", "tiff", "tif", "svg", "ico", "heic",
+    "heif", "jxl", "cr2", "cr3", "nef", "nrw", "arw", "srf", "sr2", "dng", "raf", "orf", "rw2",
+    "pef",
 ];
 
 /// Extensions we route to `MediaFile` instead of `Texture` because
@@ -312,7 +312,8 @@ fn wire_canvas_gestures(canvas: &ImageCanvas, scroll: &gtk::ScrolledWindow) {
         let canvas_weak = canvas.downgrade();
         let scroll_weak = scroll.downgrade();
         zoom_gesture.connect_scale_changed(move |_g, scale| {
-            let (Some(canvas), Some(scroll)) = (canvas_weak.upgrade(), scroll_weak.upgrade()) else {
+            let (Some(canvas), Some(scroll)) = (canvas_weak.upgrade(), scroll_weak.upgrade())
+            else {
                 return;
             };
             let target = (initial.get() * scale).clamp(MIN_ZOOM, MAX_ZOOM);
@@ -323,13 +324,13 @@ fn wire_canvas_gestures(canvas: &ImageCanvas, scroll: &gtk::ScrolledWindow) {
 
     // Ctrl+scroll zooms around the cursor; plain (two-finger) scroll pans the
     // viewport on both axes.
-    let scroll_ctrl =
-        gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
+    let scroll_ctrl = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
     {
         let canvas_weak = canvas.downgrade();
         let scroll_weak = scroll.downgrade();
         scroll_ctrl.connect_scroll(move |ctl, dx, dy| {
-            let (Some(canvas), Some(scroll)) = (canvas_weak.upgrade(), scroll_weak.upgrade()) else {
+            let (Some(canvas), Some(scroll)) = (canvas_weak.upgrade(), scroll_weak.upgrade())
+            else {
                 return glib::Propagation::Proceed;
             };
             let state = ctl.current_event_state();
@@ -630,7 +631,7 @@ mod tests {
             kind_label: None,
             score: 1.0,
             action: Action::Launch {
-                exec: "firefox".into(),
+                exec: vec!["firefox".into()],
                 terminal: false,
                 desktop_id: None,
                 desktop_file: None,

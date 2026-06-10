@@ -80,7 +80,9 @@ impl PdfCanvas {
     /// because `PdfCanvas` is the child widget, not the parent — it does
     /// not own its scroll container and should not assume one exists.
     pub fn scroll_to_page(&self, scroll: &gtk::ScrolledWindow, page_index: u32) {
-        let Some(session) = self.session() else { return; };
+        let Some(session) = self.session() else {
+            return;
+        };
         let n_pages = session.n_pages();
         if n_pages == 0 {
             return;

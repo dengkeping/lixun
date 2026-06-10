@@ -80,10 +80,7 @@ pub(super) async fn run(
     Ok(())
 }
 
-async fn create_session_with_retry(
-    conn: &Connection,
-    token: &str,
-) -> Result<OwnedObjectPath> {
+async fn create_session_with_retry(conn: &Connection, token: &str) -> Result<OwnedObjectPath> {
     let mut backoff = RESUBSCRIBE_MIN_BACKOFF;
     loop {
         match create_session(conn, token).await {

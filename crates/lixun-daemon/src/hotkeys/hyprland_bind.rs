@@ -178,7 +178,11 @@ async fn read_existing_binds() -> anyhow::Result<Vec<HyprBind>> {
 /// Returns `None` when any modifier is unrecognised so we don't silently
 /// register a bind that ignores part of the user's intent.
 fn parse_trigger_for_hyprland(trigger: &str) -> Option<(u32, String)> {
-    let parts: Vec<&str> = trigger.split('+').map(str::trim).filter(|s| !s.is_empty()).collect();
+    let parts: Vec<&str> = trigger
+        .split('+')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
     if parts.is_empty() {
         return None;
     }

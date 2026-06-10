@@ -30,3 +30,9 @@
 # Throwaway spike experiments (benchmarks, PoCs) — never committed
 /spike/
 /rust_out
+
+# Internal working artifacts (planning notes, session evidence) - never tracked
+/.omo/
+/NOTEPAD.md
+/flowchart-mermaid.mmd
+/flowchart.svg

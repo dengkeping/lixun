@@ -1,12 +1,12 @@
 //! Main application state and loop for the TUI dashboard.
 
+use crate::dashboard::log_entry::{LogEntry, LogLevel};
 use chrono::{DateTime, Utc};
-use crossterm::event::{KeyCode, KeyEvent, MouseEvent, MouseEventKind, MouseButton};
+use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use lixun_core::Hit;
 use lixun_ipc::{MemoryStats, OcrStats, Response, WatcherStats, WriterStats};
-use std::collections::VecDeque;
 use ratatui::layout::{Position, Rect};
-use crate::dashboard::log_entry::{LogEntry, LogLevel};
+use std::collections::VecDeque;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RestartStatus {
@@ -143,10 +143,9 @@ impl FocusedWidget {
     pub fn move_up(self) -> Self {
         match self {
             // Top row → wraps to bottom (QueryInput)
-            Self::SocketPanel
-            | Self::IndexStats
-            | Self::ServicesPanel
-            | Self::ReindexControls => Self::QueryInput,
+            Self::SocketPanel | Self::IndexStats | Self::ServicesPanel | Self::ReindexControls => {
+                Self::QueryInput
+            }
             // LogViewer → top row (preserve column when possible: default to leftmost)
             Self::LogViewer => Self::SocketPanel,
             Self::ResultsList => Self::LogViewer,
@@ -158,10 +157,9 @@ impl FocusedWidget {
     pub fn move_down(self) -> Self {
         match self {
             // Top row → LogViewer (full-width below)
-            Self::SocketPanel
-            | Self::IndexStats
-            | Self::ServicesPanel
-            | Self::ReindexControls => Self::LogViewer,
+            Self::SocketPanel | Self::IndexStats | Self::ServicesPanel | Self::ReindexControls => {
+                Self::LogViewer
+            }
             Self::LogViewer => Self::ResultsList,
             Self::ResultsList => Self::QueryInput,
             // Bottom row → wraps to top (leftmost cell)
@@ -277,12 +275,10 @@ impl App {
             self.handle_filter_editing_key(key);
         } else {
             match self.input_mode {
-                InputMode::Navigation => {
-                    match self.widget_mode {
-                        WidgetMode::Navigation => self.handle_navigation_key(key),
-                        WidgetMode::Focused => self.handle_focused_key(key),
-                    }
-                }
+                InputMode::Navigation => match self.widget_mode {
+                    WidgetMode::Navigation => self.handle_navigation_key(key),
+                    WidgetMode::Focused => self.handle_focused_key(key),
+                },
                 InputMode::Editing => self.handle_editing_key(key),
             }
         }
@@ -351,20 +347,18 @@ impl App {
                     self.log_filter_editing = true;
                 }
             }
-            KeyCode::Enter => {
-                match self.focused_widget {
-                    FocusedWidget::QueryInput => {
-                        self.input_mode = InputMode::Editing;
-                    }
-                    FocusedWidget::ReindexControls => {
-                        self.reindex_pending = true;
-                    }
-                    FocusedWidget::LogViewer | FocusedWidget::ResultsList => {
-                        self.widget_mode = WidgetMode::Focused;
-                    }
-                    _ => {}
+            KeyCode::Enter => match self.focused_widget {
+                FocusedWidget::QueryInput => {
+                    self.input_mode = InputMode::Editing;
                 }
-            }
+                FocusedWidget::ReindexControls => {
+                    self.reindex_pending = true;
+                }
+                FocusedWidget::LogViewer | FocusedWidget::ResultsList => {
+                    self.widget_mode = WidgetMode::Focused;
+                }
+                _ => {}
+            },
             _ => {}
         }
     }
@@ -533,21 +527,21 @@ impl App {
 
     pub fn update_semantic_status(&mut self) {
         use crate::dashboard::config_mutation::read_semantic_enabled;
-        
+
         let config_enabled = read_semantic_enabled().ok().flatten().unwrap_or(false);
-        
+
         if !config_enabled {
             self.semantic_status = SemanticStatus::Off;
             return;
         }
-        
+
         let worker_running = std::process::Command::new("pgrep")
             .arg("-f")
             .arg("lixun-semantic-worker")
             .output()
             .map(|out| out.status.success())
             .unwrap_or(false);
-        
+
         self.semantic_status = if worker_running {
             SemanticStatus::On
         } else {
@@ -598,24 +592,30 @@ impl App {
     }
 
     pub fn filtered_logs(&self) -> Vec<&LogEntry> {
-        self.logs.iter().filter(|entry| {
-            // Level filter
-            let level_match = match entry.level {
-                LogLevel::Info => self.log_filter_info,
-                LogLevel::Warn => self.log_filter_warn,
-                LogLevel::Error => self.log_filter_error,
-                LogLevel::Debug => self.log_filter_debug,
-            };
-            
-            // Text filter (case-insensitive substring match)
-            let text_match = if self.log_filter_text.is_empty() {
-                true
-            } else {
-                entry.message.to_lowercase().contains(&self.log_filter_text.to_lowercase())
-            };
-            
-            level_match && text_match
-        }).collect()
+        self.logs
+            .iter()
+            .filter(|entry| {
+                // Level filter
+                let level_match = match entry.level {
+                    LogLevel::Info => self.log_filter_info,
+                    LogLevel::Warn => self.log_filter_warn,
+                    LogLevel::Error => self.log_filter_error,
+                    LogLevel::Debug => self.log_filter_debug,
+                };
+
+                // Text filter (case-insensitive substring match)
+                let text_match = if self.log_filter_text.is_empty() {
+                    true
+                } else {
+                    entry
+                        .message
+                        .to_lowercase()
+                        .contains(&self.log_filter_text.to_lowercase())
+                };
+
+                level_match && text_match
+            })
+            .collect()
     }
 
     /// Scroll results list up.
@@ -671,20 +671,26 @@ impl App {
     pub fn toggle_ocr(&mut self) {
         let new_state = self.ocr_stats.is_none();
         if let Err(e) = super::config_mutation::persist_ocr_enabled(new_state) {
-            self.push_log_message(format!("Failed to persist OCR config: {}", e), LogLevel::Error);
+            self.push_log_message(
+                format!("Failed to persist OCR config: {}", e),
+                LogLevel::Error,
+            );
         } else {
             self.restart_pending = true;
         }
     }
 
     pub fn toggle_semantic(&mut self) {
-        use crate::dashboard::config_mutation::{read_semantic_enabled, persist_semantic_enabled};
-        
+        use crate::dashboard::config_mutation::{persist_semantic_enabled, read_semantic_enabled};
+
         let current = read_semantic_enabled().ok().flatten().unwrap_or(false);
         let new_state = !current;
-        
+
         if let Err(e) = persist_semantic_enabled(new_state) {
-            self.push_log_message(format!("Failed to persist semantic config: {}", e), LogLevel::Error);
+            self.push_log_message(
+                format!("Failed to persist semantic config: {}", e),
+                LogLevel::Error,
+            );
         } else {
             self.restart_pending = true;
             self.update_semantic_status();
@@ -742,12 +748,30 @@ mod tests {
 
     #[test]
     fn test_2d_navigation_full_width_rows() {
-        assert_eq!(FocusedWidget::LogViewer.move_down(), FocusedWidget::ResultsList);
-        assert_eq!(FocusedWidget::ResultsList.move_down(), FocusedWidget::QueryInput);
-        assert_eq!(FocusedWidget::QueryInput.move_down(), FocusedWidget::SocketPanel);
-        assert_eq!(FocusedWidget::QueryInput.move_up(), FocusedWidget::ResultsList);
-        assert_eq!(FocusedWidget::LogViewer.move_left(), FocusedWidget::LogViewer);
-        assert_eq!(FocusedWidget::LogViewer.move_right(), FocusedWidget::LogViewer);
+        assert_eq!(
+            FocusedWidget::LogViewer.move_down(),
+            FocusedWidget::ResultsList
+        );
+        assert_eq!(
+            FocusedWidget::ResultsList.move_down(),
+            FocusedWidget::QueryInput
+        );
+        assert_eq!(
+            FocusedWidget::QueryInput.move_down(),
+            FocusedWidget::SocketPanel
+        );
+        assert_eq!(
+            FocusedWidget::QueryInput.move_up(),
+            FocusedWidget::ResultsList
+        );
+        assert_eq!(
+            FocusedWidget::LogViewer.move_left(),
+            FocusedWidget::LogViewer
+        );
+        assert_eq!(
+            FocusedWidget::LogViewer.move_right(),
+            FocusedWidget::LogViewer
+        );
     }
 
     #[test]

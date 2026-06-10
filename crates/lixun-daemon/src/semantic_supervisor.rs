@@ -490,22 +490,18 @@ mod should_spawn_tests {
 
     #[test]
     fn extra_fields_ignored_when_disabled() {
-        assert!(!should_spawn(Some(&val(
-            r#"
+        assert!(!should_spawn(Some(&val(r#"
             enabled = false
             text_model = "bge-small-en-v1.5"
-            "#
-        ))));
+            "#))));
     }
 
     #[test]
     fn extra_fields_ignored_when_enabled() {
-        assert!(should_spawn(Some(&val(
-            r#"
+        assert!(should_spawn(Some(&val(r#"
             enabled = true
             text_model = "bge-small-en-v1.5"
             batch_size = 32
-            "#
-        ))));
+            "#))));
     }
 }

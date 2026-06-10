@@ -95,4 +95,55 @@ mod tests {
         let out = rrf_fuse(&[], &[], 60.0);
         assert!(out.is_empty());
     }
+
+    #[test]
+    fn fuse_3way_all_agree_dominates() {
+        // When all three streams rank the same doc first, it accumulates
+        // three rank-1 contributions and must dominate every other doc.
+        let bm25 = vec![("hero".into(), 0.0), ("b".into(), 0.0)];
+        let text = vec![("hero".into(), 0.0), ("c".into(), 0.0)];
+        let image = vec![("hero".into(), 0.0), ("d".into(), 0.0)];
+        let out = rrf_fuse_3way(&bm25, &text, &image, 60.0);
+        assert_eq!(out[0].0, "hero");
+        let scores: HashMap<String, f32> = out.iter().cloned().collect();
+        let expect_hero = 3.0 * (1.0 / 61.0);
+        assert!((scores["hero"] - expect_hero).abs() < 1e-6);
+        // Hero strictly outranks any single-stream rank-2 doc.
+        assert!(scores["hero"] > scores["b"]);
+        assert!(scores["hero"] > scores["c"]);
+        assert!(scores["hero"] > scores["d"]);
+    }
+
+    #[test]
+    fn fuse_3way_partial_presence_surfaces() {
+        // A doc present in only one stream (and missing from the other
+        // two) still surfaces with that stream's reciprocal-rank score.
+        let bm25 = vec![("a".into(), 0.0), ("b".into(), 0.0)];
+        let text = vec![("a".into(), 0.0)];
+        let image = vec![("z".into(), 0.0)];
+        let out = rrf_fuse_3way(&bm25, &text, &image, 60.0);
+        let scores: HashMap<String, f32> = out.iter().cloned().collect();
+        // a: rank1 in bm25 + rank1 in text
+        let expect_a = 1.0 / 61.0 + 1.0 / 61.0;
+        // b: rank2 in bm25 only
+        let expect_b = 1.0 / 62.0;
+        // z: rank1 in image only — still present in the fused output
+        let expect_z = 1.0 / 61.0;
+        assert!((scores["a"] - expect_a).abs() < 1e-6);
+        assert!((scores["b"] - expect_b).abs() < 1e-6);
+        assert!(scores.contains_key("z"));
+        assert!((scores["z"] - expect_z).abs() < 1e-6);
+        assert_eq!(out[0].0, "a");
+    }
+
+    #[test]
+    fn fuse_3way_empty_image_equals_2way() {
+        // With an empty image stream, 3-way fusion is identical to the
+        // 2-way lexical+text fusion (the empty stream contributes zero).
+        let bm25 = vec![("a".into(), 0.0), ("b".into(), 0.0)];
+        let text = vec![("c".into(), 0.0), ("a".into(), 0.0)];
+        let three = rrf_fuse_3way(&bm25, &text, &[], 60.0);
+        let two = rrf_fuse(&bm25, &text, 60.0);
+        assert_eq!(three, two);
+    }
 }

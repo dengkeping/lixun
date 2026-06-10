@@ -53,6 +53,14 @@ pub enum Mutation {
     Delete(String),
     UpsertMany(Vec<Document>),
     DeleteMany(Vec<String>),
+    /// Purge every doc whose id equals `prefix` OR starts with
+    /// `prefix + "/"`. Sole entry point for directory removals and
+    /// rename-aways: a watched dir vanishes, the watcher emits this
+    /// once, and the writer enumerates affected ids client-side from
+    /// `all_doc_ids()` plus any uncommitted upserts staged in the same
+    /// batch, then issues exact-term deletes — no Tantivy schema
+    /// change, no prefix/regex query.
+    DeleteSubtree(String),
     DeleteSourceInstance {
         instance_id: String,
     },
@@ -360,6 +368,25 @@ async fn writer_loop(
                         }
                     }
 
+                    Mutation::DeleteSubtree(prefix) => {
+                        let matched = collect_subtree_ids(&shared, &pending_batch, &prefix);
+                        pending_batch
+                            .upserts
+                            .retain(|u| !id_in_subtree(&u.doc_id, &prefix));
+                        for id in matched {
+                            if let Err(e) = apply_delete(&shared, &mut writer, &id) {
+                                tracing::warn!(
+                                    "IndexService: delete_subtree {} failed: {}",
+                                    id,
+                                    e
+                                );
+                            } else {
+                                pending_batch.deletes.push(id);
+                                dirty = true;
+                            }
+                        }
+                    }
+
                     Mutation::DeleteSourceInstance { instance_id } => {
                         if let Err(e) =
                             apply_delete_source_instance(&shared, &mut writer, &instance_id)
@@ -461,6 +488,18 @@ async fn writer_loop(
                     dirty = true;
                 }
             }
+            Mutation::DeleteSubtree(prefix) => {
+                let matched = collect_subtree_ids(&shared, &pending_batch, &prefix);
+                pending_batch
+                    .upserts
+                    .retain(|u| !id_in_subtree(&u.doc_id, &prefix));
+                for id in matched {
+                    if apply_delete(&shared, &mut writer, &id).is_ok() {
+                        pending_batch.deletes.push(id);
+                    }
+                    dirty = true;
+                }
+            }
             Mutation::DeleteSourceInstance { instance_id } => {
                 let _ = apply_delete_source_instance(&shared, &mut writer, &instance_id);
                 dirty = true;
@@ -512,6 +551,48 @@ fn apply_delete(
 ) -> Result<()> {
     shared.delete_by_id(id, writer)?;
     Ok(())
+}
+
+fn id_in_subtree(id: &str, prefix: &str) -> bool {
+    if id == prefix {
+        return true;
+    }
+    if let Some(rest) = id.strip_prefix(prefix) {
+        return rest.starts_with('/');
+    }
+    false
+}
+
+fn collect_subtree_ids(
+    shared: &LixunIndex,
+    pending_batch: &MutationBatch,
+    prefix: &str,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    match shared.all_doc_ids() {
+        Ok(committed) => {
+            for id in committed {
+                if id_in_subtree(&id, prefix) {
+                    out.push(id);
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                "IndexService: delete_subtree({}) all_doc_ids failed: {}",
+                prefix,
+                e
+            );
+        }
+    }
+    for u in &pending_batch.upserts {
+        if id_in_subtree(&u.doc_id, prefix) {
+            out.push(u.doc_id.clone());
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 fn apply_upsert_body(
@@ -788,6 +869,110 @@ mod tests {
             );
             assert!(!doc.extract_fail);
         });
+    }
+
+    fn make_fs_doc(id: &str) -> Document {
+        use lixun_core::{Action, Category, DocId};
+        Document {
+            id: DocId(id.to_string()),
+            category: Category::File,
+            title: id.rsplit('/').next().unwrap_or(id).to_string(),
+            subtitle: id.to_string(),
+            icon_name: None,
+            kind_label: None,
+            body: None,
+            path: id.to_string(),
+            mtime: 0,
+            size: 0,
+            action: Action::OpenFile {
+                path: std::path::PathBuf::from(id),
+            },
+            extract_fail: false,
+            sender: None,
+            recipients: None,
+            mime: None,
+            source_instance: "builtin:fs".into(),
+            secondary_action: None,
+            extra: Vec::new(),
+        }
+    }
+
+    fn fresh_writer_service() -> (
+        tempfile::TempDir,
+        IndexMutationTx,
+        SearchHandle,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let idx = LixunIndex::create_or_open(
+            tmp.path().to_str().unwrap(),
+            lixun_core::RankingConfig::default(),
+        )
+        .unwrap();
+        let (tx, search, handle) = spawn_writer_service(idx).unwrap();
+        (tmp, tx, search, handle)
+    }
+
+    #[tokio::test]
+    async fn writer_subtree_delete_purges_matching_ids() {
+        let (_tmp, tx, search, _handle) = fresh_writer_service();
+        let docs = vec![
+            make_fs_doc("fs:/d"),
+            make_fs_doc("fs:/d/a.txt"),
+            make_fs_doc("fs:/d/sub/b.txt"),
+            make_fs_doc("fs:/other.txt"),
+        ];
+        tx.send(Mutation::UpsertMany(docs)).await.unwrap();
+        let _ = tx.commit_now().await.unwrap();
+        let before = search.all_doc_ids().await.unwrap();
+        assert!(before.contains("fs:/d"));
+        assert!(before.contains("fs:/d/a.txt"));
+        assert!(before.contains("fs:/d/sub/b.txt"));
+        assert!(before.contains("fs:/other.txt"));
+
+        tx.send(Mutation::DeleteSubtree("fs:/d".into()))
+            .await
+            .unwrap();
+        let _ = tx.commit_now().await.unwrap();
+
+        let after = search.all_doc_ids().await.unwrap();
+        assert!(!after.contains("fs:/d"), "prefix doc must be purged");
+        assert!(
+            !after.contains("fs:/d/a.txt"),
+            "direct child must be purged"
+        );
+        assert!(
+            !after.contains("fs:/d/sub/b.txt"),
+            "deep descendant must be purged"
+        );
+        assert!(
+            after.contains("fs:/other.txt"),
+            "unrelated sibling must survive",
+        );
+    }
+
+    #[tokio::test]
+    async fn writer_subtree_delete_catches_uncommitted_same_subtree_upsert() {
+        let (_tmp, tx, search, _handle) = fresh_writer_service();
+        tx.send(Mutation::UpsertMany(vec![make_fs_doc("fs:/keep.txt")]))
+            .await
+            .unwrap();
+        let _ = tx.commit_now().await.unwrap();
+
+        tx.send(Mutation::Upsert(Box::new(make_fs_doc("fs:/d/new.txt"))))
+            .await
+            .unwrap();
+        tx.send(Mutation::DeleteSubtree("fs:/d".into()))
+            .await
+            .unwrap();
+        let _ = tx.commit_now().await.unwrap();
+
+        let after = search.all_doc_ids().await.unwrap();
+        assert!(
+            !after.contains("fs:/d/new.txt"),
+            "uncommitted upsert in same batch must be caught by DeleteSubtree",
+        );
+        assert!(after.contains("fs:/keep.txt"), "unrelated doc must remain");
     }
 
     #[test]

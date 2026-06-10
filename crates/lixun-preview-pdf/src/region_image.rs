@@ -46,19 +46,9 @@ pub fn render_region_image(
 
     // PDF y-up bounding box, clamped to the page rectangle.
     let x_lo_pt = sel.anchor.point.x.min(sel.active.point.x).max(0.0);
-    let x_hi_pt = sel
-        .anchor
-        .point
-        .x
-        .max(sel.active.point.x)
-        .min(sz.width_pt);
+    let x_hi_pt = sel.anchor.point.x.max(sel.active.point.x).min(sz.width_pt);
     let y_lo_pt = sel.anchor.point.y.min(sel.active.point.y).max(0.0);
-    let y_hi_pt = sel
-        .anchor
-        .point
-        .y
-        .max(sel.active.point.y)
-        .min(sz.height_pt);
+    let y_hi_pt = sel.anchor.point.y.max(sel.active.point.y).min(sz.height_pt);
     let w_pt = x_hi_pt - x_lo_pt;
     let h_pt = y_hi_pt - y_lo_pt;
     if w_pt < 1.0 || h_pt < 1.0 {

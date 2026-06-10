@@ -174,7 +174,9 @@ fn bench_bursty_10keystrokes_200ms(c: &mut Criterion) {
 
 fn send_search(stream: &mut UnixStream, q: &str, limit: u32, epoch: u64) {
     let req = encode_search(q, limit, epoch);
-    stream.write_all(&req).expect("bench: write_all to daemon socket");
+    stream
+        .write_all(&req)
+        .expect("bench: write_all to daemon socket");
     stream.flush().expect("bench: flush daemon socket");
 }
 

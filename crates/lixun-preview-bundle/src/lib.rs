@@ -87,7 +87,7 @@ mod tests {
             mime: None,
             score: 0.0,
             action: Action::Launch {
-                exec: "firefox".into(),
+                exec: vec!["firefox".into()],
                 terminal: false,
                 desktop_id: None,
                 desktop_file: None,

@@ -179,9 +179,7 @@ impl PopplerHost {
         let (tx, rx) = mpsc::channel::<Cmd>();
         let join = std::thread::Builder::new()
             .name("pdf-poppler-host-test".to_string())
-            .spawn(move || {
-                host_loop_inner(path, initial_epoch, rx, result_tx, idle_cooldown)
-            })
+            .spawn(move || host_loop_inner(path, initial_epoch, rx, result_tx, idle_cooldown))
             .map_err(|e| anyhow::anyhow!("spawn poppler host: {}", e))?;
         Ok(Self {
             tx,
@@ -196,7 +194,13 @@ fn host_loop(
     rx: mpsc::Receiver<Cmd>,
     result_tx: async_channel::Sender<RenderResult>,
 ) {
-    host_loop_inner(initial_path, initial_epoch, rx, result_tx, read_idle_cooldown());
+    host_loop_inner(
+        initial_path,
+        initial_epoch,
+        rx,
+        result_tx,
+        read_idle_cooldown(),
+    );
 }
 
 fn host_loop_inner(
@@ -300,8 +304,8 @@ fn host_loop_inner(
                     document = None;
                     tracing::debug!(
                         target = "lixun-preview-pdf",
-                        idle_ms = u64::try_from(last_activity.elapsed().as_millis())
-                            .unwrap_or(u64::MAX),
+                        idle_ms =
+                            u64::try_from(last_activity.elapsed().as_millis()).unwrap_or(u64::MAX),
                         "poppler host: idle drop"
                     );
                 }
@@ -528,8 +532,8 @@ mod tests {
     fn stale_epoch_render_is_dropped() {
         let (tx, rx) = async_channel::unbounded::<RenderResult>();
         // host starts at epoch 5; job at epoch 3 must be dropped silently.
-        let host = PopplerHost::spawn(PathBuf::from("/nonexistent/x.pdf"), 5, tx)
-            .expect("spawn host");
+        let host =
+            PopplerHost::spawn(PathBuf::from("/nonexistent/x.pdf"), 5, tx).expect("spawn host");
         host.submit(RenderJob {
             page_index: 0,
             zoom_bucket: 4,
@@ -557,13 +561,8 @@ mod tests {
     fn idle_drop_releases_document_after_cooldown() {
         let pdf = sample_pdf_path();
         let (result_tx, _result_rx) = async_channel::unbounded::<RenderResult>();
-        let host = PopplerHost::spawn_with_cooldown(
-            pdf,
-            1,
-            result_tx,
-            Duration::from_millis(150),
-        )
-        .expect("spawn host");
+        let host = PopplerHost::spawn_with_cooldown(pdf, 1, result_tx, Duration::from_millis(150))
+            .expect("spawn host");
 
         // FindStart with a real query forces ensure_document_open.
         // Use an unbounded reply channel so find_scan's send_blocking
@@ -605,13 +604,8 @@ mod tests {
         // observe the open state at least once via the 20 ms polling
         // cadence before the host fires the drop. Lower values race
         // the poll loop and produce flakes.
-        let host = PopplerHost::spawn_with_cooldown(
-            pdf,
-            1,
-            result_tx,
-            Duration::from_millis(250),
-        )
-        .expect("spawn host");
+        let host = PopplerHost::spawn_with_cooldown(pdf, 1, result_tx, Duration::from_millis(250))
+            .expect("spawn host");
 
         let (find_tx, _find_rx) = async_channel::unbounded::<PageSearchResult>();
         host.find_start(1, "x".to_string(), 1, find_tx);

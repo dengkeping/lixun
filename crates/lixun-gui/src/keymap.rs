@@ -489,9 +489,7 @@ pub(crate) fn install_keyboard_handler(
                 // silently never fire. Prefer unshifted or alpha keys.
                 use gtk4_layer_shell::LayerShell;
                 let connector = gtk::gdk::Display::default()
-                    .and_then(|d| {
-                        d.monitors().item(0).and_downcast::<gtk::gdk::Monitor>()
-                    })
+                    .and_then(|d| d.monitors().item(0).and_downcast::<gtk::gdk::Monitor>())
                     .and_then(|m| m.connector())
                     .map(|gs| gs.to_string());
                 crate::launcher_position::clear(connector.as_deref());

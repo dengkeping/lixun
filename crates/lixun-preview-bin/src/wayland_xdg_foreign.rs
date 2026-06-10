@@ -41,7 +41,7 @@
 use anyhow::{Context, Result};
 use gdk4_wayland::prelude::WaylandSurfaceExtManual;
 use gtk::prelude::*;
-use wayland_client::globals::{registry_queue_init, GlobalList, GlobalListContents};
+use wayland_client::globals::{GlobalList, GlobalListContents, registry_queue_init};
 use wayland_client::protocol::wl_registry::WlRegistry;
 use wayland_client::protocol::wl_surface::WlSurface;
 use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle};

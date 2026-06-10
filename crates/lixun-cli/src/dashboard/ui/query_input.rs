@@ -1,17 +1,17 @@
 //! Widget for entering search queries.
 
 use ratatui::{
+    Frame,
     layout::Rect,
     style::{Color, Modifier, Style},
     widgets::{Block, Borders, Paragraph},
-    Frame,
 };
 
 use crate::dashboard::app::{App, InputMode};
 
 pub fn render_query_input(frame: &mut Frame, area: Rect, app: &App, focused: bool) {
     let is_editing = app.input_mode == InputMode::Editing && focused;
-    
+
     let title = if is_editing {
         "Query [EDIT - ESC to exit]"
     } else if focused {
@@ -24,9 +24,13 @@ pub fn render_query_input(frame: &mut Frame, area: Rect, app: &App, focused: boo
         .title(title)
         .borders(Borders::ALL)
         .border_style(if is_editing {
-            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD)
         } else if focused {
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         });

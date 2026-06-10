@@ -194,11 +194,7 @@ mod tests {
     /// for cleanup (best-effort `remove_dir_all`).
     fn tmp(name: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
-        p.push(format!(
-            "lixun-folder-test-{}-{}",
-            std::process::id(),
-            name
-        ));
+        p.push(format!("lixun-folder-test-{}-{}", std::process::id(), name));
         p
     }
 

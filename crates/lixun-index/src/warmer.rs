@@ -159,14 +159,8 @@ mod tests {
         let mut builder = Schema::builder();
         builder.add_text_field("title", TEXT | STORED);
         builder.add_i64_field("mtime", STORED);
-        builder.add_u64_field(
-            "rank",
-            NumericOptions::default().set_indexed().set_fast(),
-        );
-        builder.add_i64_field(
-            "score",
-            NumericOptions::default().set_indexed().set_fast(),
-        );
+        builder.add_u64_field("rank", NumericOptions::default().set_indexed().set_fast());
+        builder.add_i64_field("score", NumericOptions::default().set_indexed().set_fast());
         let schema = builder.build();
 
         let warmer = FastFieldWarmer::from_schema(&schema);

@@ -346,10 +346,7 @@ const MIN_ASPECT: f32 = 0.15;
 const MAX_ASPECT: f32 = 8.0;
 const MIN_BBOX_SIDE: u32 = 4;
 
-pub fn content_filter_check(
-    path: &Path,
-    min_text_components: u32,
-) -> Result<bool> {
+pub fn content_filter_check(path: &Path, min_text_components: u32) -> Result<bool> {
     let img = image::open(path)
         .with_context(|| format!("content filter: failed to open image: {}", path.display()))?;
 
@@ -367,7 +364,7 @@ pub fn content_filter_check(
 
     let gray = resized.to_luma8();
     let threshold = imageproc::contrast::otsu_level(&gray);
-    let binary: image::ImageBuffer<image::Luma<u8>, Vec<u8>> = 
+    let binary: image::ImageBuffer<image::Luma<u8>, Vec<u8>> =
         image::ImageBuffer::from_fn(gray.width(), gray.height(), |x, y| {
             if gray.get_pixel(x, y).0[0] >= threshold {
                 image::Luma([255u8])
@@ -379,7 +376,7 @@ pub fn content_filter_check(
     let components = imageproc::region_labelling::connected_components(
         &binary,
         imageproc::region_labelling::Connectivity::Eight,
-        image::Luma([0u8])
+        image::Luma([0u8]),
     );
 
     let mut component_stats: std::collections::HashMap<u32, ComponentStats> =
@@ -391,13 +388,15 @@ pub fn content_filter_check(
             if label == 0 {
                 continue;
             }
-            let stats = component_stats.entry(label).or_insert_with(|| ComponentStats {
-                min_x: x,
-                max_x: x,
-                min_y: y,
-                max_y: y,
-                area: 0,
-            });
+            let stats = component_stats
+                .entry(label)
+                .or_insert_with(|| ComponentStats {
+                    min_x: x,
+                    max_x: x,
+                    min_y: y,
+                    max_y: y,
+                    area: 0,
+                });
             stats.min_x = stats.min_x.min(x);
             stats.max_x = stats.max_x.max(x);
             stats.min_y = stats.min_y.min(y);
@@ -418,7 +417,7 @@ pub fn content_filter_check(
                 return false;
             }
             let aspect = bbox_w / bbox_h;
-            aspect >= MIN_ASPECT && aspect <= MAX_ASPECT
+            (MIN_ASPECT..=MAX_ASPECT).contains(&aspect)
         })
         .count() as u32;
 

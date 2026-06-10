@@ -1,27 +1,27 @@
 //! Dashboard UI widgets.
 
-pub mod socket_panel;
+pub mod index_stats;
+pub mod legend;
 pub mod log_viewer;
 pub mod query_input;
-pub mod results_list;
 pub mod reindex_controls;
-pub mod index_stats;
+pub mod results_list;
 pub mod services_panel;
-pub mod legend;
+pub mod socket_panel;
 
-pub use socket_panel::render_socket_panel;
+pub use index_stats::render_index_stats;
+pub use legend::render_legend;
 pub use log_viewer::render_log_viewer;
 pub use query_input::render_query_input;
-pub use results_list::render_results_list;
 pub use reindex_controls::render_reindex_controls;
-pub use index_stats::render_index_stats;
+pub use results_list::render_results_list;
 pub use services_panel::render_services_panel;
-pub use legend::render_legend;
+pub use socket_panel::render_socket_panel;
 
 use crate::dashboard::app::{App, FocusedWidget};
 use ratatui::{
-    layout::{Constraint, Direction, Layout},
     Frame,
+    layout::{Constraint, Direction, Layout},
 };
 
 /// Compose all dashboard widgets into a btop-style layout.

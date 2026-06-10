@@ -1,13 +1,13 @@
 //! Widget for displaying index statistics.
 
+use crate::dashboard::app::{App, FocusedWidget};
 use ratatui::{
     Frame,
     layout::Rect,
-    widgets::{Block, Borders, Paragraph},
     style::{Color, Style},
     text::{Line, Span},
+    widgets::{Block, Borders, Paragraph},
 };
-use crate::dashboard::app::{App, FocusedWidget};
 
 pub fn render_index_stats(frame: &mut Frame, area: Rect, app: &App) {
     let is_focused = app.focused_widget == FocusedWidget::IndexStats;
@@ -28,7 +28,10 @@ pub fn render_index_stats(frame: &mut Frame, area: Rect, app: &App) {
 
     // Watcher stats
     if let Some(watcher) = &app.watcher {
-        lines.push(Line::from(Span::styled("Watcher:", Style::default().fg(Color::Green))));
+        lines.push(Line::from(Span::styled(
+            "Watcher:",
+            Style::default().fg(Color::Green),
+        )));
         lines.push(Line::from(vec![
             Span::raw("  Directories: "),
             Span::raw(watcher.directories.to_string()),
@@ -70,7 +73,10 @@ pub fn render_index_stats(frame: &mut Frame, area: Rect, app: &App) {
 
     // Writer stats
     if let Some(writer) = &app.writer {
-        lines.push(Line::from(Span::styled("Writer:", Style::default().fg(Color::Magenta))));
+        lines.push(Line::from(Span::styled(
+            "Writer:",
+            Style::default().fg(Color::Magenta),
+        )));
         lines.push(Line::from(vec![
             Span::raw("  Commits: "),
             Span::raw(writer.commits.to_string()),

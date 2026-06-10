@@ -45,9 +45,7 @@ use anyhow::Context;
 use futures::{SinkExt, StreamExt};
 use lixun_core::Hit;
 use lixun_ipc::gui::GuiCommand;
-use lixun_ipc::preview::{
-    DaemonPreviewCodec, PreviewCommand, PreviewEvent, preview_socket_path,
-};
+use lixun_ipc::preview::{DaemonPreviewCodec, PreviewCommand, PreviewEvent, preview_socket_path};
 use tokio::net::UnixStream;
 use tokio::process::Command;
 use tokio::sync::{Mutex, mpsc};
@@ -236,9 +234,7 @@ impl PreviewSpawner {
                     // recursing once. We can't await recursive
                     // calls while holding the lock, so drop it
                     // first.
-                    tracing::warn!(
-                        "preview_spawn: writer channel closed, transitioning to Dead"
-                    );
+                    tracing::warn!("preview_spawn: writer channel closed, transitioning to Dead");
                     *state = PreviewLifecycle::Dead;
                     drop(state);
                     // Re-extract the hit and monitor is tricky
@@ -298,9 +294,7 @@ impl PreviewSpawner {
         let mut state = self.state.lock().await;
         match &mut *state {
             PreviewLifecycle::Dead => {
-                tracing::warn!(
-                    "preview_spawn: SetParent received while Dead, dropping handle"
-                );
+                tracing::warn!("preview_spawn: SetParent received while Dead, dropping handle");
             }
             PreviewLifecycle::Starting {
                 latest_parent_handle,
@@ -309,13 +303,8 @@ impl PreviewSpawner {
                 *latest_parent_handle = Some(handle);
             }
             PreviewLifecycle::Ready { cmd_tx, .. } => {
-                if cmd_tx
-                    .send(PreviewCommand::SetParent { handle })
-                    .is_err()
-                {
-                    tracing::warn!(
-                        "preview_spawn: writer channel closed during set_parent"
-                    );
+                if cmd_tx.send(PreviewCommand::SetParent { handle }).is_err() {
+                    tracing::warn!("preview_spawn: writer channel closed during set_parent");
                     *state = PreviewLifecycle::Dead;
                 }
             }
@@ -336,25 +325,16 @@ impl PreviewSpawner {
             }
             PreviewLifecycle::Ready { cmd_tx, .. } => {
                 if cmd_tx.send(PreviewCommand::ClearParent).is_err() {
-                    tracing::warn!(
-                        "preview_spawn: writer channel closed during clear_parent"
-                    );
+                    tracing::warn!("preview_spawn: writer channel closed during clear_parent");
                     *state = PreviewLifecycle::Dead;
                 }
             }
         }
     }
 
-    pub async fn set_launcher_geometry(
-        &self,
-        monitor: String,
-        x: i32,
-        y: i32,
-        w: i32,
-        h: i32,
-    ) {
+    pub async fn set_launcher_geometry(&self, monitor: String, x: i32, y: i32, w: i32, h: i32) {
         *self.cached_launcher_geometry.lock().await = Some((monitor.clone(), x, y, w, h));
-        
+
         let mut state = self.state.lock().await;
         match &mut *state {
             PreviewLifecycle::Dead => {
@@ -366,17 +346,19 @@ impl PreviewSpawner {
                 latest_launcher_geometry,
                 ..
             } => {
-                tracing::debug!(
-                    "preview_spawn: set_launcher_geometry while Starting, buffering"
-                );
+                tracing::debug!("preview_spawn: set_launcher_geometry while Starting, buffering");
                 *latest_launcher_geometry = Some((monitor, x, y, w, h));
             }
             PreviewLifecycle::Ready { cmd_tx, .. } => {
-                tracing::debug!(
-                    "preview_spawn: set_launcher_geometry sending to Ready preview"
-                );
+                tracing::debug!("preview_spawn: set_launcher_geometry sending to Ready preview");
                 if cmd_tx
-                    .send(PreviewCommand::LauncherGeometry { monitor, x, y, w, h })
+                    .send(PreviewCommand::LauncherGeometry {
+                        monitor,
+                        x,
+                        y,
+                        w,
+                        h,
+                    })
                     .is_err()
                 {
                     tracing::warn!(
@@ -460,9 +442,7 @@ impl PreviewSpawner {
         let child = cmd
             .spawn()
             .with_context(|| format!("spawn lixun-preview --socket-path {:?}", socket_path))?;
-        let pid = child
-            .id()
-            .context("spawned lixun-preview has no pid")?;
+        let pid = child.id().context("spawned lixun-preview has no pid")?;
 
         // Supervisor owns the Child via
         // `self.spawn_supervisor_task`; we smuggle it through a
@@ -483,11 +463,7 @@ impl PreviewSpawner {
                     pid,
                     status
                 ),
-                Err(e) => tracing::warn!(
-                    "preview_spawn: pid={} child.wait() failed: {}",
-                    pid,
-                    e
-                ),
+                Err(e) => tracing::warn!("preview_spawn: pid={} child.wait() failed: {}", pid, e),
             }
         });
 
@@ -554,11 +530,7 @@ impl PreviewSpawner {
                 let event = match frame {
                     Ok(e) => e,
                     Err(e) => {
-                        tracing::warn!(
-                            "preview_spawn: pid={} decode error: {}",
-                            pid,
-                            e
-                        );
+                        tracing::warn!("preview_spawn: pid={} decode error: {}", pid, e);
                         break;
                     }
                 };
@@ -607,7 +579,11 @@ impl PreviewSpawner {
                                     latest_parent_handle,
                                     latest_launcher_geometry,
                                     ..
-                                } => (latest_desired, latest_parent_handle, latest_launcher_geometry),
+                                } => (
+                                    latest_desired,
+                                    latest_parent_handle,
+                                    latest_launcher_geometry,
+                                ),
                                 _ => (None, None, None),
                             };
                             *s = PreviewLifecycle::Ready {
@@ -625,9 +601,7 @@ impl PreviewSpawner {
                         );
                         let (buffered, parent_handle, launcher_geom) = buffered;
                         if let Some(handle) = parent_handle
-                            && cmd_tx
-                                .send(PreviewCommand::SetParent { handle })
-                                .is_err()
+                            && cmd_tx.send(PreviewCommand::SetParent { handle }).is_err()
                         {
                             tracing::warn!(
                                 "preview_spawn: pid={} writer gone before buffered SetParent",
@@ -652,10 +626,21 @@ impl PreviewSpawner {
                         if let Some((monitor, x, y, w, h)) = launcher_geom {
                             tracing::debug!(
                                 "preview_spawn: pid={} draining buffered LauncherGeometry monitor={} x={} y={} w={} h={}",
-                                pid, monitor, x, y, w, h
+                                pid,
+                                monitor,
+                                x,
+                                y,
+                                w,
+                                h
                             );
                             if cmd_tx
-                                .send(PreviewCommand::LauncherGeometry { monitor, x, y, w, h })
+                                .send(PreviewCommand::LauncherGeometry {
+                                    monitor,
+                                    x,
+                                    y,
+                                    w,
+                                    h,
+                                })
                                 .is_err()
                             {
                                 tracing::warn!(
@@ -675,11 +660,7 @@ impl PreviewSpawner {
                         epoch,
                         activation_token,
                     } => {
-                        tracing::debug!(
-                            "preview_spawn: pid={} Closed epoch={}",
-                            pid,
-                            epoch
-                        );
+                        tracing::debug!("preview_spawn: pid={} Closed epoch={}", pid, epoch);
                         // Preview hid itself (Escape/Space).
                         // Reveal launcher so the user can keep
                         // navigating. The warm process stays
@@ -710,11 +691,7 @@ impl PreviewSpawner {
                         }
                     }
                     PreviewEvent::Launched { epoch } => {
-                        tracing::debug!(
-                            "preview_spawn: pid={} Launched epoch={}",
-                            pid,
-                            epoch
-                        );
+                        tracing::debug!("preview_spawn: pid={} Launched epoch={}", pid, epoch);
                         if let Err(e) = gui_control.dispatch(GuiCommand::Hide).await {
                             tracing::warn!(
                                 "preview_spawn: dispatch Hide after Launched failed: {}",
@@ -764,11 +741,7 @@ impl PreviewSpawner {
                         } else {
                             GuiCommand::Hide
                         };
-                        tracing::debug!(
-                            "preview_spawn: pid={} dispatching {:?} to GUI",
-                            pid,
-                            cmd
-                        );
+                        tracing::debug!("preview_spawn: pid={} dispatching {:?} to GUI", pid, cmd);
                         if let Err(e) = gui_control.dispatch(cmd).await {
                             tracing::warn!(
                                 "preview_spawn: pid={} SetLauncherVisible({}) dispatch failed: {}",

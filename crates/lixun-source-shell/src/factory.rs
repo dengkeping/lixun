@@ -23,6 +23,7 @@ impl PluginFactory for ShellFactory {
         struct ShellCfg {
             working_dir: Option<String>,
             strict_mode: Option<bool>,
+            shell_mode: Option<bool>,
         }
         let cfg: ShellCfg = raw.clone().try_into()?;
         let working_dir = cfg
@@ -34,6 +35,7 @@ impl PluginFactory for ShellFactory {
             source: Arc::new(ShellSource {
                 working_dir,
                 strict_mode: cfg.strict_mode.unwrap_or(false),
+                shell_mode: cfg.shell_mode.unwrap_or(false),
             }),
         }])
     }

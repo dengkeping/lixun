@@ -74,7 +74,11 @@ struct Args {
     /// chmods it 0600, and is responsible for unlinking it on exit.
     ///
     /// Mutually exclusive with `--standalone-file`.
-    #[arg(long, required_unless_present = "standalone_file", conflicts_with = "standalone_file")]
+    #[arg(
+        long,
+        required_unless_present = "standalone_file",
+        conflicts_with = "standalone_file"
+    )]
     socket_path: Option<PathBuf>,
 
     /// Debug-only: open the given file directly, bypassing the daemon
@@ -298,17 +302,20 @@ fn push_standalone_command(tx: &async_channel::Sender<InboundMsg>, path: PathBuf
 
 fn mime_guess_from_path(path: &std::path::Path) -> Option<String> {
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
-    Some(match ext.as_str() {
-        "pdf" => "application/pdf",
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        "svg" => "image/svg+xml",
-        "txt" | "md" | "log" => "text/plain",
-        "html" | "htm" => "text/html",
-        _ => return None,
-    }.into())
+    Some(
+        match ext.as_str() {
+            "pdf" => "application/pdf",
+            "png" => "image/png",
+            "jpg" | "jpeg" => "image/jpeg",
+            "gif" => "image/gif",
+            "webp" => "image/webp",
+            "svg" => "image/svg+xml",
+            "txt" | "md" | "log" => "text/plain",
+            "html" | "htm" => "text/html",
+            _ => return None,
+        }
+        .into(),
+    )
 }
 
 /// Bind the per-process Unix socket. The path was passed by the
@@ -472,7 +479,8 @@ fn handle_command(
                 window.set_visible(false);
             }
             if state.launcher_hidden_by_us.get() {
-                let _ = outbound_tx.send_blocking(PreviewEvent::SetLauncherVisible { visible: true });
+                let _ =
+                    outbound_tx.send_blocking(PreviewEvent::SetLauncherVisible { visible: true });
                 state.launcher_hidden_by_us.set(false);
             }
             let _ = outbound_tx.send_blocking(PreviewEvent::Closed {
@@ -498,7 +506,8 @@ fn handle_command(
                 window.set_visible(false);
             }
             if state.launcher_hidden_by_us.get() {
-                let _ = outbound_tx.send_blocking(PreviewEvent::SetLauncherVisible { visible: true });
+                let _ =
+                    outbound_tx.send_blocking(PreviewEvent::SetLauncherVisible { visible: true });
                 state.launcher_hidden_by_us.set(false);
             }
             let _ = outbound_tx.send_blocking(PreviewEvent::Closed {
@@ -524,10 +533,20 @@ fn handle_command(
                 imp.clear();
             }
         }
-        PreviewCommand::LauncherGeometry { monitor, x, y, w, h } => {
+        PreviewCommand::LauncherGeometry {
+            monitor,
+            x,
+            y,
+            w,
+            h,
+        } => {
             tracing::debug!(
                 "preview: received LauncherGeometry monitor={} x={} y={} w={} h={}",
-                monitor, x, y, w, h
+                monitor,
+                x,
+                y,
+                w,
+                h
             );
             state.launcher_monitor.replace(Some(monitor));
             state.launcher_rect.set(Some((x, y, w, h)));
@@ -817,7 +836,12 @@ fn check_overlap_and_hide_launcher(
 
     tracing::debug!(
         "check_overlap: launcher_mon={} preview_mon={} launcher=({},{},{}x{})",
-        launcher_mon, preview_mon, lx, ly, lw, lh
+        launcher_mon,
+        preview_mon,
+        lx,
+        ly,
+        lw,
+        lh
     );
 
     if preview_mon != *launcher_mon {
@@ -844,7 +868,10 @@ fn check_overlap_and_hide_launcher(
 
     tracing::debug!(
         "check_overlap: same monitor, preview allocation=({},{},{}x{})",
-        px, py, pw, ph
+        px,
+        py,
+        pw,
+        ph
     );
 
     if pw <= 0 || ph <= 0 || lw <= 0 || lh <= 0 {
@@ -856,7 +883,8 @@ fn check_overlap_and_hide_launcher(
 
     tracing::debug!(
         "check_overlap: overlaps={} hidden_by_us={}",
-        overlaps, state.launcher_hidden_by_us.get()
+        overlaps,
+        state.launcher_hidden_by_us.get()
     );
 
     if overlaps && !state.launcher_hidden_by_us.get() {
@@ -1148,7 +1176,8 @@ fn install_close_controllers(
     window.connect_close_request(move |_| {
         let epoch = state_for_close.current_epoch.get();
         if state_for_close.launcher_hidden_by_us.get() {
-            let _ = outbound_for_close.send_blocking(PreviewEvent::SetLauncherVisible { visible: true });
+            let _ = outbound_for_close
+                .send_blocking(PreviewEvent::SetLauncherVisible { visible: true });
             state_for_close.launcher_hidden_by_us.set(false);
         }
         let activation_token = mint_activation_token();

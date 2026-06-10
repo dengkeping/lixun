@@ -5361,7 +5361,9 @@ dependencies = [
  "dirs 5.0.1",
  "futures",
  "lixun-core",
+ "lixun-daemon",
  "lixun-index",
+ "lixun-indexer",
  "lixun-ipc",
  "lixun-mutation",
  "lixun-sources",
@@ -5383,6 +5385,7 @@ dependencies = [
  "chrono",
  "serde",
  "serde_json",
+ "shell-words",
  "tempfile",
 ]
 
@@ -5889,8 +5892,8 @@ dependencies = [
  "dirs 5.0.1",
  "lixun-core",
  "lixun-sources",
- "regex",
  "serde",
+ "shell-words",
  "toml 0.8.23",
  "tracing",
 ]
@@ -5934,6 +5937,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "shell-words",
  "tempfile",
  "toml 0.8.23",
  "tracing",
@@ -8309,6 +8313,12 @@ checksum = "f40ca3c46823713e0d4209592e8d6e826aa57e928f09752619fc696c499637f6"
 dependencies = [
  "lazy_static",
 ]
+
+[[package]]
+name = "shell-words"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc6fe69c597f9c37bfeeeeeb33da3530379845f10be461a66d16d03eca2ded77"
 
 [[package]]
 name = "shlex"
