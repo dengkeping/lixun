@@ -51,6 +51,7 @@ impl SourcesGlue {
         // applied unconditionally on top of the user-supplied
         // `exclude` list (cannot be turned off via config).
         let mut exclude = lixun_sources::exclude::lixun_self_excludes();
+        exclude.extend(plugin_fs_excludes());
         exclude.extend(self.config.exclude.iter().cloned());
 
         Ok(lixun_sources::fs::FsSource::with_regex_and_ocr(
@@ -64,6 +65,17 @@ impl SourcesGlue {
         .with_body_checker(self.body_checker.get().cloned())
         .with_min_image_side_px(self.config.ocr.min_image_side_px))
     }
+}
+
+/// Exclude patterns contributed by registered source-plugin
+/// factories (each plugin owns the data under its own directories
+/// and indexes it itself). Collected via the inventory registry so
+/// the daemon names no plugin.
+pub fn plugin_fs_excludes() -> Vec<String> {
+    lixun_sources::inventory::iter::<lixun_sources::PluginFactoryEntry>
+        .into_iter()
+        .flat_map(|entry| (entry.new)().fs_exclude_patterns())
+        .collect()
 }
 
 impl lixun_indexer::IndexerSources for SourcesGlue {

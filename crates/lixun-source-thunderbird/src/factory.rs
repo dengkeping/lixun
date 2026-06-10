@@ -30,6 +30,13 @@ impl PluginFactory for ThunderbirdFactory {
         "thunderbird"
     }
 
+    /// The profile directory is indexed through gloda + the
+    /// attachments source; the generic fs walker must not re-index
+    /// the raw mbox/msf files underneath it.
+    fn fs_exclude_patterns(&self) -> Vec<String> {
+        vec![".thunderbird".into()]
+    }
+
     fn build(&self, raw: &toml::Value, ctx: &PluginBuildContext) -> Result<Vec<PluginInstance>> {
         let section: ThunderbirdSectionToml = raw.clone().try_into()?;
 

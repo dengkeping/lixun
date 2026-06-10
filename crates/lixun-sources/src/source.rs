@@ -221,6 +221,16 @@ pub trait PluginFactory: Send + Sync {
     fn section(&self) -> &'static str;
 
     fn build(&self, raw: &toml::Value, ctx: &PluginBuildContext) -> Result<Vec<PluginInstance>>;
+
+    /// Filesystem path fragments the generic fs source should skip
+    /// because this plugin owns that data and indexes it itself
+    /// (e.g. an application's on-disk mail store). The daemon
+    /// collects these from every registered factory and appends
+    /// them to the fs exclude list — it never names a plugin or its
+    /// directories itself. Defaults to none.
+    fn fs_exclude_patterns(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// Compile-time plugin registration slot.

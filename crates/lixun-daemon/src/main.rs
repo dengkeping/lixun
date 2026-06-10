@@ -1824,17 +1824,9 @@ fn register_builtin_nonplugin_sources(
         Arc::new(lixun_sources::apps::AppsSource::new()),
     );
 
-    let fs = lixun_sources::fs::FsSource::with_regex_and_ocr(
-        config.roots.clone(),
-        config.exclude.clone(),
-        config.exclude_regex.clone(),
-        config.max_file_size_mb,
-        sources.caps_arc(),
-        sources.ocr_enqueue.get().cloned(),
-    )
-    .with_body_checker(sources.body_checker.get().cloned())
-    .with_min_image_side_px(config.ocr.min_image_side_px)
-    .with_rayon_threads(profile.rayon_threads);
+    let fs = sources
+        .build_fs_source()?
+        .with_rayon_threads(profile.rayon_threads);
     registry.register("builtin:fs".into(), state_dir_root, Arc::new(fs));
 
     Ok(())

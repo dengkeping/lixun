@@ -561,7 +561,6 @@ fn default_excludes() -> Vec<String> {
         ".git".into(),
         ".venv".into(),
         "__pycache__".into(),
-        ".thunderbird".into(),
         ".swp".into(),
         ".swo".into(),
         ".swx".into(),
