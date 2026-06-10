@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+pub mod embedded;
 pub mod impact;
 pub mod paths;
 
@@ -160,9 +161,25 @@ pub enum Action {
     OpenFile { path: PathBuf },
     /// Show file in file manager.
     ShowInFileManager { path: PathBuf },
-    /// Extract an attachment to a temp file and open it.
-    OpenAttachment {
-        mbox_path: PathBuf,
+    /// Open a byte-range embedded in a container file: read `length`
+    /// bytes at `byte_offset` from `container`, reverse the standard
+    /// MIME content-transfer-encoding (RFC 2045: `base64`,
+    /// `quoted-printable`, `7bit`, `8bit`, `binary`), write the
+    /// payload to a private temp file and open it with the default
+    /// handler (see [`embedded::extract_embedded_to_temp`]).
+    ///
+    /// Generic primitive: any source that indexes content stored
+    /// inside container files (mail stores, archives, bundles) may
+    /// emit it; hosts dispatch it without knowing which plugin
+    /// produced it.
+    ///
+    /// Back-compat: serialised as `OpenAttachment` with an
+    /// `mbox_path` field by older indexes; the aliases keep those
+    /// documents readable.
+    #[serde(alias = "OpenAttachment")]
+    OpenEmbedded {
+        #[serde(alias = "mbox_path")]
+        container: PathBuf,
         byte_offset: u64,
         length: u64,
         mime: String,
@@ -502,6 +519,33 @@ mod tests {
     }
 
     #[test]
+    fn test_open_embedded_reads_legacy_open_attachment_wire_shape() {
+        // Indexes written before the rename serialise the variant as
+        // `OpenAttachment` with an `mbox_path` field. The serde
+        // aliases must keep those documents loadable.
+        let legacy = r#"{"OpenAttachment":{"mbox_path":"/tmp/mail.mbox","byte_offset":100,"length":500,"mime":"application/pdf","encoding":"base64","suggested_filename":"test.pdf"}}"#;
+        let decoded: Action = serde_json::from_str(legacy).unwrap();
+        match decoded {
+            Action::OpenEmbedded {
+                container,
+                byte_offset,
+                length,
+                mime,
+                encoding,
+                suggested_filename,
+            } => {
+                assert_eq!(container, PathBuf::from("/tmp/mail.mbox"));
+                assert_eq!(byte_offset, 100);
+                assert_eq!(length, 500);
+                assert_eq!(mime, "application/pdf");
+                assert_eq!(encoding, "base64");
+                assert_eq!(suggested_filename, "test.pdf");
+            }
+            other => panic!("expected OpenEmbedded, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_action_serde_roundtrip() {
         let actions = vec![
             Action::Launch {
@@ -517,8 +561,8 @@ mod tests {
             Action::ShowInFileManager {
                 path: PathBuf::from("/tmp"),
             },
-            Action::OpenAttachment {
-                mbox_path: PathBuf::from("/tmp/mail.mbox"),
+            Action::OpenEmbedded {
+                container: PathBuf::from("/tmp/mail.mbox"),
                 byte_offset: 100,
                 length: 500,
                 mime: "application/pdf".to_string(),
@@ -552,16 +596,16 @@ mod tests {
                     assert_eq!(p1, p2);
                 }
                 (
-                    Action::OpenAttachment {
-                        mbox_path: mb1,
+                    Action::OpenEmbedded {
+                        container: mb1,
                         byte_offset: bo1,
                         length: l1,
                         mime: mi1,
                         encoding: en1,
                         suggested_filename: sf1,
                     },
-                    Action::OpenAttachment {
-                        mbox_path: mb2,
+                    Action::OpenEmbedded {
+                        container: mb2,
                         byte_offset: bo2,
                         length: l2,
                         mime: mi2,

@@ -1,5 +1,5 @@
 //! User-facing actions: open file, launch app, reveal in file manager,
-//! open URI (xdg-open), open attachment, copy to clipboard.
+//! open URI (xdg-open), open embedded payload, copy to clipboard.
 
 use anyhow::Result;
 use gio_unix::DesktopAppInfo;
@@ -8,9 +8,6 @@ use gtk::gio::prelude::*;
 use gtk::prelude::*;
 use lixun_core::{Action, Hit};
 
-use crate::attachments::{
-    decode_attachment, sanitize_filename, secure_runtime_dir_from_env, sweep_stale_attachments,
-};
 use crate::reaper::spawn_reaped;
 
 pub(crate) fn file_uri(abs: &std::path::Path) -> String {
@@ -116,8 +113,8 @@ pub(crate) fn execute_action(hit: &Hit) -> Result<()> {
 /// All call sites must invoke `xdg-open <target>` directly.
 ///
 /// Bare-target invocation is safe: indexed paths from lixun sources
-/// are absolute (begin with `/`), extracted attachments live under
-/// `$XDG_RUNTIME_DIR/lixun/attachments/...` (also absolute), and URI
+/// are absolute (begin with `/`), extracted embedded payloads live
+/// under `$XDG_RUNTIME_DIR/lixun/embedded/...` (also absolute), and URI
 /// schemes always begin with ALPHA per RFC 3986, so no target value
 /// can collide with a flag-shaped argument.
 fn xdg_open_command(target: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
@@ -195,16 +192,16 @@ fn dispatch_action(action: &Action) -> Result<()> {
             }
             Ok(())
         }
-        Action::OpenAttachment {
-            mbox_path,
+        Action::OpenEmbedded {
+            container,
             byte_offset,
             length,
             mime: _,
             encoding,
             suggested_filename,
         } => {
-            let target = extract_attachment_to_temp(
-                mbox_path,
+            let target = lixun_core::embedded::extract_embedded_to_temp(
+                container,
                 *byte_offset,
                 *length,
                 encoding,
@@ -260,53 +257,13 @@ pub(crate) fn execute_secondary_action(hit: &Hit) -> Result<()> {
     Ok(())
 }
 
-fn extract_attachment_to_temp(
-    mbox_path: &std::path::Path,
-    byte_offset: u64,
-    length: u64,
-    encoding: &str,
-    suggested_filename: &str,
-) -> Result<std::path::PathBuf> {
-    use std::io::{Read, Seek, SeekFrom};
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-
-    let xdg_dir_str = std::env::var("XDG_RUNTIME_DIR").ok();
-    let xdg_dir = xdg_dir_str.as_ref().map(std::path::Path::new);
-    let runtime_dir = secure_runtime_dir_from_env(xdg_dir)?;
-    let dir = runtime_dir.join("lixun/attachments");
-    std::fs::create_dir_all(&dir)?;
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
-
-    sweep_stale_attachments(&dir, std::time::Duration::from_secs(600));
-
-    let mut f = std::fs::File::open(mbox_path)?;
-    f.seek(SeekFrom::Start(byte_offset))?;
-    let mut raw = vec![0u8; length as usize];
-    f.read_exact(&mut raw)?;
-
-    let decoded = decode_attachment(&raw, encoding)?;
-    let safe = sanitize_filename(suggested_filename);
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let target = dir.join(format!("{ts}-{safe}"));
-    let mut file = std::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o600)
-        .open(&target)?;
-    std::io::Write::write_all(&mut file, &decoded)?;
-    Ok(target)
-}
-
 pub(crate) fn copy_to_clipboard(hit: &Hit) {
     let text = match &hit.action {
         Action::OpenFile { path } | Action::ShowInFileManager { path } => {
             path.to_string_lossy().to_string()
         }
         Action::OpenUri { uri } => uri.clone(),
-        Action::OpenAttachment { .. } => hit.title.clone(),
+        Action::OpenEmbedded { .. } => hit.title.clone(),
         _ => hit.title.clone(),
     };
 

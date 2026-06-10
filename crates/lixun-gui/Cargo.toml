@@ -22,8 +22,6 @@ wayland-client = "0.31"
 wayland-protocols-plasma = { version = "0.3", features = ["client"] }
 notify.workspace = true
 zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }
-base64 = "0.22"
-quoted_printable = "0.5"
 opener = "0.8"
 async-channel = "2"
 libc = "0.2"

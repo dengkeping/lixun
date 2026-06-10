@@ -8,6 +8,9 @@ license.workspace = true
 serde.workspace = true
 chrono.workspace = true
 shell-words = "1"
+anyhow.workspace = true
+base64 = "0.22"
+quoted_printable = "0.5"
 
 [dev-dependencies]
 serde_json.workspace = true

@@ -1,8 +1,19 @@
-//! Attachment decoding and temp-file lifecycle for Thunderbird attachments.
+//! Open-embedded-region helpers: extract a byte-range out of a
+//! container file, reverse a standard MIME content-transfer-encoding
+//! (RFC 2045), and materialise the result as a private temp file.
+//!
+//! This backs the generic [`crate::Action::OpenEmbedded`] primitive.
+//! It is deliberately plugin-agnostic: any source that indexes
+//! content stored inside container files (mail stores, archives,
+//! bundles) can emit the action, and hosts dispatch it without
+//! knowing which plugin produced it.
 
 use anyhow::Result;
 
-pub(crate) fn decode_attachment(raw: &[u8], encoding: &str) -> Result<Vec<u8>> {
+/// Reverse a standard MIME content-transfer-encoding (RFC 2045 §6).
+/// Accepted values: `base64`, `quoted-printable`, `7bit`, `8bit`,
+/// `binary` and the empty string (identity).
+pub fn decode_transfer_encoding(raw: &[u8], encoding: &str) -> Result<Vec<u8>> {
     use base64::Engine;
     match encoding.to_ascii_lowercase().as_str() {
         "base64" => {
@@ -22,7 +33,9 @@ pub(crate) fn decode_attachment(raw: &[u8], encoding: &str) -> Result<Vec<u8>> {
     }
 }
 
-pub(crate) fn sanitize_filename(s: &str) -> String {
+/// Strip path separators / NUL, leading dots, and cap length so an
+/// untrusted suggested filename cannot traverse out of the temp dir.
+pub fn sanitize_filename(s: &str) -> String {
     let mut out: String = s
         .chars()
         .filter(|c| !matches!(*c, '/' | '\\' | '\0'))
@@ -44,7 +57,7 @@ pub(crate) fn sanitize_filename(s: &str) -> String {
 /// Return the secure per-user runtime directory. If `XDG_RUNTIME_DIR` is not set,
 /// refuse the `/tmp` fallback (world-writable and vulnerable to symlink attacks)
 /// and return an informative error instead.
-pub(crate) fn secure_runtime_dir_from_env(
+pub fn secure_runtime_dir_from_env(
     xdg_runtime_dir: Option<&std::path::Path>,
 ) -> Result<std::path::PathBuf> {
     let dir = xdg_runtime_dir.ok_or_else(|| {
@@ -58,7 +71,9 @@ pub(crate) fn secure_runtime_dir_from_env(
     Ok(dir.to_path_buf())
 }
 
-pub(crate) fn sweep_stale_attachments(dir: &std::path::Path, max_age: std::time::Duration) {
+/// Remove extracted temp files older than `max_age` so the runtime
+/// dir does not accumulate stale payloads across sessions.
+pub fn sweep_stale_extractions(dir: &std::path::Path, max_age: std::time::Duration) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -72,51 +87,98 @@ pub(crate) fn sweep_stale_attachments(dir: &std::path::Path, max_age: std::time:
     }
 }
 
+/// Extract `length` bytes at `byte_offset` from `container`, reverse
+/// `encoding`, and write the payload to a fresh 0600 file under
+/// `$XDG_RUNTIME_DIR/lixun/embedded/`. Returns the temp file path.
+///
+/// The directory is created 0700 and swept of entries older than ten
+/// minutes on every call, so extracted payloads have a bounded
+/// lifetime and are never readable by other users.
+pub fn extract_embedded_to_temp(
+    container: &std::path::Path,
+    byte_offset: u64,
+    length: u64,
+    encoding: &str,
+    suggested_filename: &str,
+) -> Result<std::path::PathBuf> {
+    use std::io::{Read, Seek, SeekFrom};
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let xdg_dir_str = std::env::var("XDG_RUNTIME_DIR").ok();
+    let xdg_dir = xdg_dir_str.as_ref().map(std::path::Path::new);
+    let runtime_dir = secure_runtime_dir_from_env(xdg_dir)?;
+    let dir = runtime_dir.join("lixun/embedded");
+    std::fs::create_dir_all(&dir)?;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+
+    sweep_stale_extractions(&dir, std::time::Duration::from_secs(600));
+
+    let mut f = std::fs::File::open(container)?;
+    f.seek(SeekFrom::Start(byte_offset))?;
+    let mut raw = vec![0u8; length as usize];
+    f.read_exact(&mut raw)?;
+
+    let decoded = decode_transfer_encoding(&raw, encoding)?;
+    let safe = sanitize_filename(suggested_filename);
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let target = dir.join(format!("{ts}-{safe}"));
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(&target)?;
+    std::io::Write::write_all(&mut file, &decoded)?;
+    Ok(target)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::Path;
 
     #[test]
-    fn test_decode_attachment_base64() {
+    fn test_decode_base64() {
         use base64::Engine;
         let plain = b"Hello World";
         let encoded = base64::engine::general_purpose::STANDARD.encode(plain);
-        let decoded = decode_attachment(encoded.as_bytes(), "base64").unwrap();
+        let decoded = decode_transfer_encoding(encoded.as_bytes(), "base64").unwrap();
         assert_eq!(decoded, plain);
     }
 
     #[test]
-    fn test_decode_attachment_base64_strips_whitespace() {
+    fn test_decode_base64_strips_whitespace() {
         let raw = b"SGVs\r\nbG8=";
-        let decoded = decode_attachment(raw, "base64").unwrap();
+        let decoded = decode_transfer_encoding(raw, "base64").unwrap();
         assert_eq!(decoded, b"Hello");
     }
 
     #[test]
-    fn test_decode_attachment_base64_case_insensitive_encoding_label() {
+    fn test_decode_base64_case_insensitive_encoding_label() {
         let raw = b"SGVsbG8=";
-        let decoded = decode_attachment(raw, "BASE64").unwrap();
+        let decoded = decode_transfer_encoding(raw, "BASE64").unwrap();
         assert_eq!(decoded, b"Hello");
     }
 
     #[test]
-    fn test_decode_attachment_qp() {
-        let decoded = decode_attachment(b"Hello=20World", "quoted-printable").unwrap();
+    fn test_decode_qp() {
+        let decoded = decode_transfer_encoding(b"Hello=20World", "quoted-printable").unwrap();
         assert_eq!(decoded, b"Hello World");
     }
 
     #[test]
-    fn test_decode_attachment_passthrough_variants() {
+    fn test_decode_passthrough_variants() {
         for enc in ["7bit", "8bit", "binary", ""] {
-            let decoded = decode_attachment(b"Hello World", enc).unwrap();
+            let decoded = decode_transfer_encoding(b"Hello World", enc).unwrap();
             assert_eq!(decoded, b"Hello World", "encoding={enc}");
         }
     }
 
     #[test]
-    fn test_decode_attachment_unknown_encoding_errors() {
-        let result = decode_attachment(b"data", "rot13");
+    fn test_decode_unknown_encoding_errors() {
+        let result = decode_transfer_encoding(b"data", "rot13");
         assert!(result.is_err());
     }
 
@@ -154,7 +216,23 @@ mod tests {
     }
 
     #[test]
-    fn test_sweep_stale_attachments() {
+    fn test_sanitize_filename_multibyte_no_panic_at_boundary() {
+        let input = "あ".repeat(100);
+        assert_eq!(input.len(), 300);
+        let out = sanitize_filename(&input);
+        assert!(out.len() <= 200);
+    }
+
+    #[test]
+    fn test_sanitize_filename_emoji_no_panic_at_boundary() {
+        let input = "😀".repeat(60);
+        assert!(input.len() > 200);
+        let out = sanitize_filename(&input);
+        assert!(out.len() <= 200);
+    }
+
+    #[test]
+    fn test_sweep_stale_extractions() {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -168,7 +246,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(150));
         std::fs::write(&fresh_path, b"fresh").unwrap();
 
-        sweep_stale_attachments(&dir, std::time::Duration::from_millis(75));
+        sweep_stale_extractions(&dir, std::time::Duration::from_millis(75));
 
         let old_exists = old_path.exists();
         let fresh_exists = fresh_path.exists();
@@ -179,17 +257,9 @@ mod tests {
     }
 
     #[test]
-    fn test_sweep_stale_attachments_nonexistent_dir_is_noop() {
+    fn test_sweep_stale_extractions_nonexistent_dir_is_noop() {
         let p = std::path::Path::new("/nonexistent/lixun-sweep-test-path");
-        sweep_stale_attachments(p, std::time::Duration::from_secs(1));
-    }
-
-    #[test]
-    fn test_sanitize_filename_multibyte_no_panic_at_boundary() {
-        let input = "あ".repeat(100);
-        assert_eq!(input.len(), 300);
-        let out = sanitize_filename(&input);
-        assert!(out.len() <= 200);
+        sweep_stale_extractions(p, std::time::Duration::from_secs(1));
     }
 
     #[test]
@@ -208,13 +278,5 @@ mod tests {
             err.to_lowercase().contains("xdg_runtime_dir"),
             "error message should mention XDG_RUNTIME_DIR, got: {err}"
         );
-    }
-
-    #[test]
-    fn test_sanitize_filename_emoji_no_panic_at_boundary() {
-        let input = "😀".repeat(60);
-        assert!(input.len() > 200);
-        let out = sanitize_filename(&input);
-        assert!(out.len() <= 200);
     }
 }

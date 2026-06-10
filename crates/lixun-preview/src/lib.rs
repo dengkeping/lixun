@@ -207,10 +207,12 @@ pub trait PreviewPlugin: Send + Sync + 'static {
     /// Default implementation handles the generic path-based
     /// variants via `xdg-open` / `gio launch_default_for_uri`,
     /// generic URI dispatch (`Action::OpenUri { uri }`) via
-    /// `xdg-open uri`, and the generic command-line variants
-    /// (`Launch`, `Exec`) via `std::process::Command`. Plugins
-    /// whose domain needs plugin-internal state the default cannot
-    /// reach (e.g. mbox attachment extraction) MUST override this.
+    /// `xdg-open uri`, the embedded-payload primitive
+    /// (`Action::OpenEmbedded`) via temp-file extraction, and the
+    /// generic command-line variants (`Launch`, `Exec`) via
+    /// `std::process::Command`. Plugins whose domain needs
+    /// plugin-internal state the default cannot reach MUST override
+    /// this.
     ///
     /// Returning `Err` keeps the preview window open so the user
     /// can Escape cleanly; the host logs the error.
@@ -261,12 +263,30 @@ pub fn default_launch(hit: &lixun_core::Hit) -> anyhow::Result<()> {
             std::process::Command::new("xdg-open").arg(uri).spawn()?;
             Ok(())
         }
-        Action::OpenAttachment { .. } => {
-            anyhow::bail!(
-                "default_launch: {:?} is plugin-specific and has no generic fallback; \
-                 the plugin must override PreviewPlugin::launch",
-                std::mem::discriminant(&hit.action)
-            );
+        Action::OpenEmbedded {
+            container,
+            byte_offset,
+            length,
+            mime: _,
+            encoding,
+            suggested_filename,
+        } => {
+            // Generic primitive: extract the embedded byte-range to a
+            // private temp file, then dispatch like OpenFile. No
+            // knowledge of which plugin produced the action is needed.
+            let target = lixun_core::embedded::extract_embedded_to_temp(
+                container,
+                *byte_offset,
+                *length,
+                encoding,
+                suggested_filename,
+            )?;
+            let uri = gtk::gio::File::for_path(&target).uri();
+            if uri.is_empty() {
+                anyhow::bail!("cannot form URI from path {:?}", target);
+            }
+            gtk::gio::AppInfo::launch_default_for_uri(&uri, gtk::gio::AppLaunchContext::NONE)?;
+            Ok(())
         }
         Action::ReplaceQuery { .. } => {
             anyhow::bail!("ReplaceQuery has no standalone launch semantics");

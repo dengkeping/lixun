@@ -5382,7 +5382,10 @@ dependencies = [
 name = "lixun-core"
 version = "0.6.0"
 dependencies = [
+ "anyhow",
+ "base64 0.22.1",
  "chrono",
+ "quoted_printable",
  "serde",
  "serde_json",
  "shell-words",
@@ -5480,7 +5483,6 @@ version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-channel",
- "base64 0.22.1",
  "criterion",
  "dirs 5.0.1",
  "gdk4-wayland",
@@ -5495,7 +5497,6 @@ dependencies = [
  "lixun-preview",
  "notify",
  "opener",
- "quoted_printable",
  "serde_json",
  "tempfile",
  "toml_edit 0.22.27",

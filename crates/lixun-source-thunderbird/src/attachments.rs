@@ -123,8 +123,8 @@ impl ThunderbirdAttachmentsSource {
                         path: part.mbox_path.to_string_lossy().to_string(),
                         mtime: 0,
                         size: part.part_body_length,
-                        action: Action::OpenAttachment {
-                            mbox_path: part.mbox_path.clone(),
+                        action: Action::OpenEmbedded {
+                            container: part.mbox_path.clone(),
                             byte_offset: part.part_body_byte_offset,
                             length: part.part_body_length,
                             mime: part.mime.clone(),
