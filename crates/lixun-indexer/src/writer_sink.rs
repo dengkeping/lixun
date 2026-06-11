@@ -19,16 +19,26 @@ impl WriterSink {
 
     /// Send an `UpsertBody` mutation. The writer task fetches the
     /// doc by `doc_id`, overwrites its `body`, and writes it back.
-    /// No-ops (logged at debug) if the doc is already gone.
+    /// No-ops (logged at debug) if the doc is already gone, or
+    /// (logged at warn) if the indexed doc carries an mtime newer
+    /// than `expected_mtime` — the OCR queue row's snapshot of the
+    /// file mtime at enqueue time. Pass `None` only when no snapshot
+    /// exists; that disables the lost-update guard.
     ///
     /// Async because callers may already be on a tokio worker
     /// thread (the OCR tick is): nesting `block_on` there panics
     /// with "Cannot start a runtime from within a runtime".
-    pub async fn upsert_body(&self, doc_id: &str, body: &str) -> Result<()> {
+    pub async fn upsert_body(
+        &self,
+        doc_id: &str,
+        body: &str,
+        expected_mtime: Option<i64>,
+    ) -> Result<()> {
         self.tx
             .send(IndexMutation::UpsertBody {
                 doc_id: doc_id.to_string(),
                 body: body.to_string(),
+                expected_mtime,
             })
             .await?;
         Ok(())

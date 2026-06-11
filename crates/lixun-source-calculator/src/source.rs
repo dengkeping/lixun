@@ -116,6 +116,7 @@ mod tests {
 
     fn ctx() -> QueryContext<'static> {
         QueryContext {
+            cancel: None,
             instance_id: "calculator",
             state_dir: Path::new("/tmp/lixun-calc-test"),
         }

@@ -397,7 +397,7 @@ async fn async_main(
 
     register_plugin_sources(
         &mut registry,
-        &config,
+        config,
         &sources_state_dir,
         Arc::clone(&profile),
     )?;
@@ -934,6 +934,7 @@ async fn process_search_chunk(
     mut breakdowns: Vec<lixun_core::ScoreBreakdown>,
     phase: lixun_fusion::Phase,
     explain: bool,
+    cancel: &CancellationToken,
     q: &str,
     frecency: &Arc<RwLock<FrecencyStore>>,
     query_latch: &Arc<RwLock<QueryLatchStore>>,
@@ -962,11 +963,19 @@ async fn process_search_chunk(
         let q_str = q.to_string();
         let instance_id = claimer.instance_id.clone();
         let state_dir = claimer.state_dir.clone();
+        let cancel_probe = cancel.clone();
 
         let plugin_hits = tokio::task::spawn_blocking(move || {
+            // Superseded before the blocking pool even scheduled us:
+            // skip the plugin call instead of burning a worker.
+            if cancel_probe.is_cancelled() {
+                return Vec::new();
+            }
+            let is_cancelled = move || cancel_probe.is_cancelled();
             let ctx = QueryContext {
                 instance_id: &instance_id,
                 state_dir: &state_dir,
+                cancel: Some(&is_cancelled),
             };
             plugin.on_query(&q_str, &ctx)
         })
@@ -1005,14 +1014,13 @@ async fn process_search_chunk(
                 let stage2 = frec * lat;
                 let clamped = clamp_stage2_mult(stage2, total_cap);
                 hit.score *= clamped;
-                if explain {
-                    if let Some(b) = breakdowns.get_mut(i) {
+                if explain
+                    && let Some(b) = breakdowns.get_mut(i) {
                         b.frecency_mult = frec;
                         b.latch_mult = lat;
                         b.stage2_clamped = clamped;
                         b.final_score = hit.score;
                     }
-                }
             }
         }
 
@@ -1023,10 +1031,16 @@ async fn process_search_chunk(
                 let q_str = q.to_string();
                 let instance_id = entry.instance_id.clone();
                 let state_dir = entry.state_dir.clone();
+                let cancel_probe = cancel.clone();
                 plugin_tasks.push(tokio::task::spawn_blocking(move || {
+                    if cancel_probe.is_cancelled() {
+                        return Vec::new();
+                    }
+                    let is_cancelled = move || cancel_probe.is_cancelled();
                     let ctx = QueryContext {
                         instance_id: &instance_id,
                         state_dir: &state_dir,
+                        cancel: Some(&is_cancelled),
                     };
                     let start = std::time::Instant::now();
                     let result = plugin.on_query(&q_str, &ctx);
@@ -1144,6 +1158,10 @@ async fn handle_search(
     registry: Arc<lixun_indexer::SourceRegistry>,
     active_search_slot: Arc<tokio::sync::Mutex<Option<SearchSlot>>>,
 ) -> anyhow::Result<()> {
+    // The client-supplied limit is untrusted; cap it by the
+    // config-validated result ceiling so a buggy client cannot
+    // request an unbounded result set.
+    let limit = limit.min(config.max_results);
     let query_obj = lixun_core::Query {
         text: q.clone(),
         limit,
@@ -1174,6 +1192,7 @@ async fn handle_search(
                 breakdowns,
                 chunk.phase,
                 explain,
+                &cancel,
                 &q,
                 &frecency,
                 &query_latch,
@@ -1207,11 +1226,10 @@ async fn handle_search(
     }
 
     let mut slot = active_search_slot.lock().await;
-    if let Some(s) = slot.as_ref() {
-        if s.generation == generation {
+    if let Some(s) = slot.as_ref()
+        && s.generation == generation {
             *slot = None;
         }
-    }
 
     Ok(())
 }
@@ -1809,7 +1827,7 @@ fn register_plugin_sources(
 }
 
 /// Register the builtin apps + fs sources. Must run AFTER
-/// `config.body_checker` is populated so the fs source picks up the
+/// `sources.body_checker` is populated so the fs source picks up the
 /// DB-16 short-circuit adapter via `with_body_checker`.
 fn register_builtin_nonplugin_sources(
     registry: &mut lixun_indexer::SourceRegistry,
@@ -1817,7 +1835,6 @@ fn register_builtin_nonplugin_sources(
     state_dir_root: &std::path::Path,
     profile: &lixun_core::ImpactProfile,
 ) -> anyhow::Result<()> {
-    let config = &sources.config;
     registry.register(
         "builtin:apps".into(),
         state_dir_root,
@@ -1860,8 +1877,9 @@ impl lixun_sources::HasBody for SearchHandleBodyChecker {
             // rayon threads that drive maybe_enqueue_ocr are NOT tokio
             // workers, so this branch normally never fires; it is a
             // defensive fall-through for unforeseen callers.
-            tracing::debug!(
-                "body checker: called from tokio runtime thread, skipping short-circuit"
+            tracing::warn!(
+                "body checker: called from tokio runtime thread, skipping short-circuit \
+                 (OCR enqueue coverage degraded — caller is misrouted)"
             );
             return Ok(false);
         }
@@ -1875,8 +1893,9 @@ impl lixun_sources::HasBody for SearchHandleBodyChecker {
 
     fn get_body(&self, doc_id: &str) -> anyhow::Result<Option<String>> {
         if tokio::runtime::Handle::try_current().is_ok() {
-            tracing::debug!(
-                "body checker: get_body called from tokio runtime thread, skipping preservation"
+            tracing::warn!(
+                "body checker: get_body called from tokio runtime thread, skipping preservation \
+                 (OCR enqueue coverage degraded — caller is misrouted)"
             );
             return Ok(None);
         }

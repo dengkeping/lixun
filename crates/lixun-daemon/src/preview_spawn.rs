@@ -46,6 +46,31 @@ use futures::{SinkExt, StreamExt};
 use lixun_core::Hit;
 use lixun_ipc::gui::GuiCommand;
 use lixun_ipc::preview::{DaemonPreviewCodec, PreviewCommand, PreviewEvent, preview_socket_path};
+
+/// Upper bound on commands buffered toward a preview process. A
+/// wedged preview must cost bounded memory, not OOM the daemon. When
+/// the queue is full the newest command is dropped: the preview is
+/// already far behind, and the next command after it recovers carries
+/// a fresh epoch that supersedes everything dropped.
+const PREVIEW_CMD_QUEUE_CAP: usize = 64;
+
+/// Non-blocking send toward the preview writer task. Returns `true`
+/// when the channel is closed (writer task gone) so callers run their
+/// existing dead-writer transition; a full queue only drops the
+/// command with a warning.
+fn send_or_drop(cmd_tx: &mpsc::Sender<PreviewCommand>, cmd: PreviewCommand) -> bool {
+    match cmd_tx.try_send(cmd) {
+        Ok(()) => false,
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            tracing::warn!(
+                "preview_spawn: command queue full ({} pending); dropping command — preview process stalled?",
+                PREVIEW_CMD_QUEUE_CAP
+            );
+            false
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => true,
+    }
+}
 use tokio::net::UnixStream;
 use tokio::process::Command;
 use tokio::sync::{Mutex, mpsc};
@@ -53,6 +78,10 @@ use tokio_util::codec::Framed;
 
 use crate::gui_control::GuiControl;
 use crate::session_env;
+
+/// Launcher on-screen placement: monitor connector + x, y, width,
+/// height in logical pixels. Mirrors `PreviewCommand::LauncherGeometry`.
+type LauncherGeometry = (String, i32, i32, i32, i32);
 
 /// SIGTERM grace before escalating to SIGKILL, reused from the
 /// previous short-lived design. 200 ms is long enough for a
@@ -83,7 +112,9 @@ const CONNECT_POLL_INTERVAL: Duration = Duration::from_millis(15);
 /// The `pid` is kept in both `Starting` and `Ready` so
 /// `shutdown()` can SIGTERM the child without waiting for the
 /// state to progress.
+#[derive(Default)]
 enum PreviewLifecycle {
+    #[default]
     Dead,
     Starting {
         pid: u32,
@@ -105,7 +136,7 @@ enum PreviewLifecycle {
         /// `PreviewCommand::LauncherGeometry` after the buffered
         /// `ShowOrUpdate` so the preview can compute overlap with
         /// the launcher and request its hide on first paint.
-        latest_launcher_geometry: Option<(String, i32, i32, i32, i32)>,
+        latest_launcher_geometry: Option<LauncherGeometry>,
     },
     Ready {
         pid: u32,
@@ -113,16 +144,11 @@ enum PreviewLifecycle {
         /// Unbounded mpsc into the writer task; `send` failure
         /// means the writer has exited and the process is
         /// effectively dead.
-        cmd_tx: mpsc::UnboundedSender<PreviewCommand>,
+        cmd_tx: mpsc::Sender<PreviewCommand>,
         last_used: tokio::time::Instant,
     },
 }
 
-impl Default for PreviewLifecycle {
-    fn default() -> Self {
-        PreviewLifecycle::Dead
-    }
-}
 
 impl PreviewLifecycle {
     fn pid(&self) -> Option<u32> {
@@ -160,7 +186,7 @@ pub struct PreviewSpawner {
     /// Latest launcher geometry from GUI. Cached independently
     /// of preview lifecycle so it survives Dead→Starting→Ready
     /// transitions. Replayed on every cold start.
-    cached_launcher_geometry: Arc<Mutex<Option<(String, i32, i32, i32, i32)>>>,
+    cached_launcher_geometry: Arc<Mutex<Option<LauncherGeometry>>>,
 }
 
 impl PreviewSpawner {
@@ -228,7 +254,7 @@ impl PreviewSpawner {
                     hit: Box::new(hit),
                     monitor,
                 };
-                if cmd_tx.send(cmd).is_err() {
+                if send_or_drop(cmd_tx, cmd) {
                     // Writer task gone — process effectively
                     // dead. Transition and cold-start anew by
                     // recursing once. We can't await recursive
@@ -273,7 +299,7 @@ impl PreviewSpawner {
             PreviewLifecycle::Dead | PreviewLifecycle::Starting { .. } => Ok(()),
             PreviewLifecycle::Ready { cmd_tx, .. } => {
                 let cmd = PreviewCommand::Hide { epoch };
-                if cmd_tx.send(cmd).is_err() {
+                if send_or_drop(cmd_tx, cmd) {
                     tracing::warn!(
                         "preview_spawn: writer channel closed during hide, transitioning to Dead"
                     );
@@ -303,7 +329,7 @@ impl PreviewSpawner {
                 *latest_parent_handle = Some(handle);
             }
             PreviewLifecycle::Ready { cmd_tx, .. } => {
-                if cmd_tx.send(PreviewCommand::SetParent { handle }).is_err() {
+                if send_or_drop(cmd_tx, PreviewCommand::SetParent { handle }) {
                     tracing::warn!("preview_spawn: writer channel closed during set_parent");
                     *state = PreviewLifecycle::Dead;
                 }
@@ -324,7 +350,7 @@ impl PreviewSpawner {
                 *latest_parent_handle = None;
             }
             PreviewLifecycle::Ready { cmd_tx, .. } => {
-                if cmd_tx.send(PreviewCommand::ClearParent).is_err() {
+                if send_or_drop(cmd_tx, PreviewCommand::ClearParent) {
                     tracing::warn!("preview_spawn: writer channel closed during clear_parent");
                     *state = PreviewLifecycle::Dead;
                 }
@@ -351,16 +377,10 @@ impl PreviewSpawner {
             }
             PreviewLifecycle::Ready { cmd_tx, .. } => {
                 tracing::debug!("preview_spawn: set_launcher_geometry sending to Ready preview");
-                if cmd_tx
-                    .send(PreviewCommand::LauncherGeometry {
-                        monitor,
-                        x,
-                        y,
-                        w,
-                        h,
-                    })
-                    .is_err()
-                {
+                if send_or_drop(
+                    cmd_tx,
+                    PreviewCommand::LauncherGeometry { monitor, x, y, w, h },
+                ) {
                     tracing::warn!(
                         "preview_spawn: writer channel closed during set_launcher_geometry"
                     );
@@ -507,7 +527,7 @@ impl PreviewSpawner {
             // checks discard obsolete work in flight.
             let framed = Framed::new(stream, DaemonPreviewCodec::new());
             let (sink, mut reader) = framed.split();
-            let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<PreviewCommand>();
+            let (cmd_tx, mut cmd_rx) = mpsc::channel::<PreviewCommand>(PREVIEW_CMD_QUEUE_CAP);
 
             // Writer task: drain mpsc and push frames to socket.
             let writer_handle = tokio::spawn(async move {
@@ -601,7 +621,7 @@ impl PreviewSpawner {
                         );
                         let (buffered, parent_handle, launcher_geom) = buffered;
                         if let Some(handle) = parent_handle
-                            && cmd_tx.send(PreviewCommand::SetParent { handle }).is_err()
+                            && send_or_drop(&cmd_tx, PreviewCommand::SetParent { handle })
                         {
                             tracing::warn!(
                                 "preview_spawn: pid={} writer gone before buffered SetParent",
@@ -615,7 +635,7 @@ impl PreviewSpawner {
                                 hit: Box::new(hit),
                                 monitor,
                             };
-                            if cmd_tx.send(cmd).is_err() {
+                            if send_or_drop(&cmd_tx, cmd) {
                                 tracing::warn!(
                                     "preview_spawn: pid={} writer gone before buffered send",
                                     pid
@@ -633,16 +653,10 @@ impl PreviewSpawner {
                                 w,
                                 h
                             );
-                            if cmd_tx
-                                .send(PreviewCommand::LauncherGeometry {
-                                    monitor,
-                                    x,
-                                    y,
-                                    w,
-                                    h,
-                                })
-                                .is_err()
-                            {
+                            if send_or_drop(
+                                &cmd_tx,
+                                PreviewCommand::LauncherGeometry { monitor, x, y, w, h },
+                            ) {
                                 tracing::warn!(
                                     "preview_spawn: pid={} writer gone before buffered LauncherGeometry",
                                     pid

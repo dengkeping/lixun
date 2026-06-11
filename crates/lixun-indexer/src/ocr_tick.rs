@@ -77,6 +77,13 @@ pub trait IdleGate: Send + Sync + 'static {
 /// Abstracted out so unit tests can capture calls without spinning
 /// up a real `IndexWriter`. Production uses [`WriterSink`].
 ///
+/// `expected_mtime` is the file mtime captured in the queue row at
+/// enqueue time. Threading it through to the writer closes the OCR
+/// lost-update race: the writer's body injection is a
+/// read-modify-write of the committed doc, and without the snapshot
+/// it would clobber any newer upsert (committed or still staged)
+/// that landed for the same doc while OCR was running.
+///
 /// Async because [`tick_once`] runs on a tokio worker thread and
 /// the production implementation writes to the writer_loop mpsc
 /// with `tx.send(...).await`. A sync trait would force a nested
@@ -86,6 +93,7 @@ pub trait UpsertBodySink: Send + Sync + 'static {
         &'a self,
         doc_id: &'a str,
         body: &'a str,
+        expected_mtime: Option<i64>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>;
 }
 
@@ -94,8 +102,9 @@ impl UpsertBodySink for WriterSink {
         &'a self,
         doc_id: &'a str,
         body: &'a str,
+        expected_mtime: Option<i64>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
-        Box::pin(WriterSink::upsert_body(self, doc_id, body))
+        Box::pin(WriterSink::upsert_body(self, doc_id, body, expected_mtime))
     }
 }
 
@@ -245,7 +254,15 @@ where
                     let cur_mtime = filetime_secs(&md);
                     let cur_size = md.len();
                     if cur_mtime == expected_mtime && cur_size == expected_size {
-                        if let Err(e) = sink.upsert_body(&doc_id, &text).await {
+                        // The enqueue-time mtime travels with the
+                        // mutation so the writer can also reject the
+                        // write-back if the *indexed* doc has moved on
+                        // (a newer upsert committed or staged while
+                        // this job was in flight).
+                        if let Err(e) = sink
+                            .upsert_body(&doc_id, &text, Some(expected_mtime))
+                            .await
+                        {
                             tracing::warn!("ocr: upsert_body failed for {doc_id}: {e:#}");
                             return TickOutcome::Failed {
                                 doc_id,
@@ -505,6 +522,7 @@ mod tests {
             &'a self,
             doc_id: &'a str,
             body: &'a str,
+            _expected_mtime: Option<i64>,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
             let doc_id = doc_id.to_string();
             let body = body.to_string();

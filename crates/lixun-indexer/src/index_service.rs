@@ -17,6 +17,11 @@ use tokio::sync::{Semaphore, mpsc, oneshot};
 static COMMITS: AtomicU64 = AtomicU64::new(0);
 static LAST_COMMIT_LATENCY_MS: AtomicU64 = AtomicU64::new(0);
 static GENERATION: AtomicU64 = AtomicU64::new(0);
+/// Post-commit broadcast tasks that failed to join (panicked or were
+/// cancelled). Module-internal on purpose: surfacing it through
+/// `stats()` would ripple into the `lixun_ipc::WriterStats` wire
+/// type. Read it via [`broadcast_failures`].
+static BROADCAST_FAILURES: AtomicU64 = AtomicU64::new(0);
 
 pub fn stats() -> (u64, u64, u64) {
     (
@@ -24,6 +29,13 @@ pub fn stats() -> (u64, u64, u64) {
         LAST_COMMIT_LATENCY_MS.load(Ordering::Relaxed),
         GENERATION.load(Ordering::Relaxed),
     )
+}
+
+/// Count of post-commit mutation broadcasts whose `spawn_blocking`
+/// task did not complete cleanly. Not part of [`stats`] to keep the
+/// IPC `WriterStats` wire type stable.
+pub fn broadcast_failures() -> u64 {
+    BROADCAST_FAILURES.load(Ordering::Relaxed)
 }
 
 const COMMIT_MIN_INTERVAL: Duration = Duration::from_secs(3);
@@ -68,9 +80,20 @@ pub enum Mutation {
     /// and write it back. Silently skipped if no document matches
     /// (the doc was deleted between enqueue and OCR). Used by the
     /// deferred OCR worker to inject OCR'd text into the live index.
+    ///
+    /// `expected_mtime` is the file mtime captured when the OCR job
+    /// was enqueued (the OCR queue row carries it). The write-back
+    /// is a read-modify-write against the last-committed reader, so
+    /// without a guard it would clobber any newer upsert for the
+    /// same doc that landed between enqueue and apply — whether
+    /// already committed or still staged in the current batch. When
+    /// `Some`, the writer skips the body injection if either copy of
+    /// the doc carries a newer mtime. `None` preserves the old
+    /// unguarded behavior for producers without an mtime snapshot.
     UpsertBody {
         doc_id: String,
         body: String,
+        expected_mtime: Option<i64>,
     },
     /// Reply woken with the commit generation once every prior mutation has
     /// been applied and a commit has completed.
@@ -279,6 +302,15 @@ async fn writer_loop(
     let mut generation: u64 = 0;
     let mut pending_barriers: Vec<oneshot::Sender<u64>> = Vec::new();
     let mut pending_batch = MutationBatch::default();
+    // Prefixes deleted by `DeleteSubtree` in the current uncommitted
+    // batch. `collect_subtree_ids` only sees committed ids plus
+    // already-staged upserts, so an upsert that was queued in the
+    // channel behind the delete and processed afterwards would
+    // silently re-create an orphan under the deleted prefix. Any
+    // upsert landing under a tombstoned prefix before the next
+    // commit is dropped instead. Cleared by `do_commit` once the
+    // batch is durable.
+    let mut subtree_tombstones: Vec<String> = Vec::new();
     let mut commit_tick = tokio::time::interval(COMMIT_CHECK_INTERVAL);
     commit_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -314,6 +346,7 @@ async fn writer_loop(
                             &mut writer,
                             &mut generation,
                             &mut pending_barriers,
+                            &mut subtree_tombstones,
                             &mut dirty,
                             &mut last_commit,
                         ) {
@@ -329,7 +362,12 @@ async fn writer_loop(
                     }
 
                     Mutation::Upsert(doc) => {
-                        if let Err(e) = apply_upsert(&shared, &mut writer, doc.as_ref()) {
+                        if id_tombstoned(&doc.id.0, &subtree_tombstones) {
+                            tracing::debug!(
+                                "IndexService: upsert {} dropped, subtree deleted in this batch",
+                                doc.id.0
+                            );
+                        } else if let Err(e) = apply_upsert(&shared, &mut writer, doc.as_ref()) {
                             tracing::warn!("IndexService: upsert {} failed: {}", doc.id.0, e);
                         } else {
                             pending_batch.upserts.push(upserted_doc_from(doc.as_ref()));
@@ -339,7 +377,12 @@ async fn writer_loop(
 
                     Mutation::UpsertMany(docs) => {
                         for doc in &docs {
-                            if let Err(e) = apply_upsert(&shared, &mut writer, doc) {
+                            if id_tombstoned(&doc.id.0, &subtree_tombstones) {
+                                tracing::debug!(
+                                    "IndexService: upsert {} dropped, subtree deleted in this batch",
+                                    doc.id.0
+                                );
+                            } else if let Err(e) = apply_upsert(&shared, &mut writer, doc) {
                                 tracing::warn!("IndexService: upsert {} failed: {}", doc.id.0, e);
                             } else {
                                 pending_batch.upserts.push(upserted_doc_from(doc));
@@ -385,6 +428,9 @@ async fn writer_loop(
                                 dirty = true;
                             }
                         }
+                        if !subtree_tombstones.contains(&prefix) {
+                            subtree_tombstones.push(prefix);
+                        }
                     }
 
                     Mutation::DeleteSourceInstance { instance_id } => {
@@ -409,24 +455,40 @@ async fn writer_loop(
                         }
                     }
 
-                    Mutation::UpsertBody { doc_id, body } => {
-                        match apply_upsert_body(&shared, &mut writer, &doc_id, body) {
-                            Ok(Some(updated)) => {
-                                pending_batch.upserts.push(upserted_doc_from(&updated));
-                                dirty = true;
-                            }
-                            Ok(None) => {
-                                tracing::debug!(
-                                    "IndexService: upsert_body skipped, doc gone: {}",
-                                    doc_id
-                                );
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "IndexService: upsert_body {} failed: {}",
-                                    doc_id,
-                                    e
-                                );
+                    Mutation::UpsertBody {
+                        doc_id,
+                        body,
+                        expected_mtime,
+                    } => {
+                        if id_tombstoned(&doc_id, &subtree_tombstones) {
+                            tracing::debug!(
+                                "IndexService: upsert_body {} dropped, subtree deleted in this batch",
+                                doc_id
+                            );
+                        } else {
+                            match apply_upsert_body(
+                                &shared,
+                                &mut writer,
+                                &pending_batch,
+                                &doc_id,
+                                body,
+                                expected_mtime,
+                            ) {
+                                Ok(Some(updated)) => {
+                                    pending_batch.upserts.push(upserted_doc_from(&updated));
+                                    dirty = true;
+                                }
+                                Ok(None) => {
+                                    // Skip reason (doc gone / stale snapshot)
+                                    // already logged by apply_upsert_body.
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "IndexService: upsert_body {} failed: {}",
+                                        doc_id,
+                                        e
+                                    );
+                                }
                             }
                         }
                     }
@@ -440,6 +502,7 @@ async fn writer_loop(
                         &mut writer,
                         &mut generation,
                         &mut pending_barriers,
+                        &mut subtree_tombstones,
                         &mut dirty,
                         &mut last_commit,
                     ) {
@@ -461,14 +524,18 @@ async fn writer_loop(
     while let Ok(mutation) = rx.try_recv() {
         match mutation {
             Mutation::Upsert(doc) => {
-                if apply_upsert(&shared, &mut writer, doc.as_ref()).is_ok() {
+                if !id_tombstoned(&doc.id.0, &subtree_tombstones)
+                    && apply_upsert(&shared, &mut writer, doc.as_ref()).is_ok()
+                {
                     pending_batch.upserts.push(upserted_doc_from(doc.as_ref()));
                 }
                 dirty = true;
             }
             Mutation::UpsertMany(docs) => {
                 for doc in &docs {
-                    if apply_upsert(&shared, &mut writer, doc).is_ok() {
+                    if !id_tombstoned(&doc.id.0, &subtree_tombstones)
+                        && apply_upsert(&shared, &mut writer, doc).is_ok()
+                    {
                         pending_batch.upserts.push(upserted_doc_from(doc));
                     }
                     dirty = true;
@@ -499,13 +566,29 @@ async fn writer_loop(
                     }
                     dirty = true;
                 }
+                if !subtree_tombstones.contains(&prefix) {
+                    subtree_tombstones.push(prefix);
+                }
             }
             Mutation::DeleteSourceInstance { instance_id } => {
                 let _ = apply_delete_source_instance(&shared, &mut writer, &instance_id);
                 dirty = true;
             }
-            Mutation::UpsertBody { doc_id, body } => {
-                if let Ok(Some(updated)) = apply_upsert_body(&shared, &mut writer, &doc_id, body) {
+            Mutation::UpsertBody {
+                doc_id,
+                body,
+                expected_mtime,
+            } => {
+                if !id_tombstoned(&doc_id, &subtree_tombstones)
+                    && let Ok(Some(updated)) = apply_upsert_body(
+                        &shared,
+                        &mut writer,
+                        &pending_batch,
+                        &doc_id,
+                        body,
+                        expected_mtime,
+                    )
+                {
                     pending_batch.upserts.push(upserted_doc_from(&updated));
                     dirty = true;
                 }
@@ -521,6 +604,7 @@ async fn writer_loop(
             &mut writer,
             &mut generation,
             &mut pending_barriers,
+            &mut subtree_tombstones,
             &mut dirty,
             &mut last_commit,
         );
@@ -563,6 +647,13 @@ fn id_in_subtree(id: &str, prefix: &str) -> bool {
     false
 }
 
+/// True when `id` falls under any subtree prefix deleted earlier in
+/// the current uncommitted batch (see `subtree_tombstones` in
+/// `writer_loop`).
+fn id_tombstoned(id: &str, tombstones: &[String]) -> bool {
+    tombstones.iter().any(|p| id_in_subtree(id, p))
+}
+
 fn collect_subtree_ids(
     shared: &LixunIndex,
     pending_batch: &MutationBatch,
@@ -595,15 +686,64 @@ fn collect_subtree_ids(
     out
 }
 
+/// OCR lost-update guard. The body injection is a read-modify-write:
+/// fetch the committed doc, set `.body`, write the whole doc back.
+/// Without a guard, a full upsert for the same doc that landed after
+/// the OCR job was enqueued would be clobbered with the stale
+/// metadata snapshot. `expected_mtime` (the file mtime recorded in
+/// the OCR queue row at enqueue time) closes the race in both
+/// directions the writer can observe:
+///
+/// - committed: the fetched doc's mtime is newer than the snapshot,
+///   meaning a reindex of changed content already landed — the OCR
+///   text belongs to dead bytes;
+/// - staged: a newer upsert for the same id sits in the uncommitted
+///   `pending_batch`, invisible to `get_doc_by_id` (which reads the
+///   last-committed generation), so writing back the committed copy
+///   would silently undo it.
+///
+/// Both cases skip with a warn and return `Ok(None)`; the watcher's
+/// next pass re-enqueues OCR with fresh metadata if still needed.
+/// Equal mtimes proceed: OCR only adds a body to an otherwise
+/// unchanged doc.
 fn apply_upsert_body(
     shared: &LixunIndex,
     writer: &mut TantivyIndexWriter<TantivyDoc>,
+    pending_batch: &MutationBatch,
     doc_id: &str,
     body: String,
+    expected_mtime: Option<i64>,
 ) -> Result<Option<Document>> {
     let Some(mut doc) = shared.get_doc_by_id(doc_id)? else {
+        tracing::debug!("IndexService: upsert_body skipped, doc gone: {}", doc_id);
         return Ok(None);
     };
+    if let Some(expected) = expected_mtime {
+        if doc.mtime > expected {
+            tracing::warn!(
+                "IndexService: upsert_body {} skipped, committed doc mtime {} newer than OCR snapshot {}",
+                doc_id,
+                doc.mtime,
+                expected
+            );
+            return Ok(None);
+        }
+        if let Some(staged) = pending_batch
+            .upserts
+            .iter()
+            .filter(|u| u.doc_id == doc_id && u.mtime > expected)
+            .map(|u| u.mtime)
+            .max()
+        {
+            tracing::warn!(
+                "IndexService: upsert_body {} skipped, staged upsert mtime {} newer than OCR snapshot {}",
+                doc_id,
+                staged,
+                expected
+            );
+            return Ok(None);
+        }
+    }
     doc.body = Some(body);
     shared.upsert(&doc, writer)?;
     Ok(Some(doc))
@@ -623,6 +763,7 @@ fn do_commit(
     writer: &mut TantivyIndexWriter<TantivyDoc>,
     generation: &mut u64,
     pending_barriers: &mut Vec<oneshot::Sender<u64>>,
+    subtree_tombstones: &mut Vec<String>,
     dirty: &mut bool,
     last_commit: &mut Instant,
 ) -> Result<()> {
@@ -633,6 +774,10 @@ fn do_commit(
     *generation += 1;
     *dirty = false;
     *last_commit = Instant::now();
+    // The batch is durable and visible; subtree tombstones only
+    // guard the window between a DeleteSubtree and the commit that
+    // makes it visible to `collect_subtree_ids`.
+    subtree_tombstones.clear();
     let elapsed_ms = start.elapsed().as_millis().min(u64::MAX as u128) as u64;
     COMMITS.fetch_add(1, Ordering::Relaxed);
     LAST_COMMIT_LATENCY_MS.store(elapsed_ms, Ordering::Relaxed);
@@ -642,6 +787,11 @@ fn do_commit(
         *generation,
         start.elapsed()
     );
+    // Ordering is load-bearing: barrier acks must fire only after
+    // `shared.reload()` above has succeeded. `barrier()` callers
+    // (e.g. search-after-write paths) treat the ack as "my mutations
+    // are visible to the next searcher"; acking between commit and
+    // reload would let them read a pre-reload generation.
     for reply in pending_barriers.drain(..) {
         let _ = reply.send(*generation);
     }
@@ -669,7 +819,22 @@ fn flush_post_commit(
     pending_batch.generation = generation;
     let batch = std::mem::take(pending_batch);
     let bcaster = Arc::clone(broadcaster);
-    tokio::task::spawn_blocking(move || bcaster.broadcast(&batch));
+    // Fire-and-forget by design — the writer task must never await
+    // the broadcaster — but the outcome is still observed: a watcher
+    // task awaits the blocking handle so a panicking broadcaster is
+    // logged and counted instead of vanishing with a dropped
+    // JoinHandle.
+    let join = tokio::task::spawn_blocking(move || bcaster.broadcast(&batch));
+    tokio::spawn(async move {
+        if let Err(e) = join.await {
+            BROADCAST_FAILURES.fetch_add(1, Ordering::Relaxed);
+            tracing::error!(
+                "IndexService: post-commit broadcast for generation {} failed: {}",
+                generation,
+                e
+            );
+        }
+    });
 }
 
 pub fn fs_doc_id(path: &std::path::Path) -> String {
@@ -973,6 +1138,132 @@ mod tests {
             "uncommitted upsert in same batch must be caught by DeleteSubtree",
         );
         assert!(after.contains("fs:/keep.txt"), "unrelated doc must remain");
+    }
+
+    #[tokio::test]
+    async fn writer_subtree_delete_tombstones_later_upserts_in_same_batch() {
+        let (_tmp, tx, search, _handle) = fresh_writer_service();
+        tx.send(Mutation::UpsertMany(vec![
+            make_fs_doc("fs:/d/old.txt"),
+            make_fs_doc("fs:/keep.txt"),
+        ]))
+        .await
+        .unwrap();
+        let _ = tx.commit_now().await.unwrap();
+
+        // Upsert queued AFTER the subtree delete but applied within
+        // the same uncommitted batch: the tombstone must drop it,
+        // otherwise it re-creates an orphan under the deleted prefix.
+        tx.send(Mutation::DeleteSubtree("fs:/d".into()))
+            .await
+            .unwrap();
+        tx.send(Mutation::Upsert(Box::new(make_fs_doc("fs:/d/orphan.txt"))))
+            .await
+            .unwrap();
+        tx.send(Mutation::UpsertMany(vec![make_fs_doc(
+            "fs:/d/sub/orphan2.txt",
+        )]))
+        .await
+        .unwrap();
+        let _ = tx.commit_now().await.unwrap();
+
+        let after = search.all_doc_ids().await.unwrap();
+        assert!(
+            !after.contains("fs:/d/old.txt"),
+            "committed doc under prefix must be purged"
+        );
+        assert!(
+            !after.contains("fs:/d/orphan.txt"),
+            "upsert processed after DeleteSubtree in the same batch must be dropped",
+        );
+        assert!(
+            !after.contains("fs:/d/sub/orphan2.txt"),
+            "upsert_many processed after DeleteSubtree in the same batch must be dropped",
+        );
+        assert!(after.contains("fs:/keep.txt"), "unrelated doc must remain");
+
+        // Tombstones are cleared once the batch commits: a genuine
+        // re-creation of the subtree in a later batch must index.
+        tx.send(Mutation::Upsert(Box::new(make_fs_doc("fs:/d/reborn.txt"))))
+            .await
+            .unwrap();
+        let _ = tx.commit_now().await.unwrap();
+        let later = search.all_doc_ids().await.unwrap();
+        assert!(
+            later.contains("fs:/d/reborn.txt"),
+            "tombstone must not outlive the commit that made the delete durable",
+        );
+    }
+
+    #[tokio::test]
+    async fn writer_upsert_body_skips_when_committed_doc_newer_than_snapshot() {
+        let (_tmp, tx, search, _handle) = fresh_writer_service();
+        let mut doc = make_fs_doc("fs:/scan.png");
+        doc.mtime = 100;
+        tx.send(Mutation::Upsert(Box::new(doc))).await.unwrap();
+        let _ = tx.commit_now().await.unwrap();
+
+        // Snapshot older than the indexed doc: the OCR text belongs
+        // to bytes that were since reindexed — must be dropped.
+        tx.send(Mutation::UpsertBody {
+            doc_id: "fs:/scan.png".into(),
+            body: "stale ocr".into(),
+            expected_mtime: Some(50),
+        })
+        .await
+        .unwrap();
+        let _ = tx.commit_now().await.unwrap();
+        assert_eq!(
+            search.get_body("fs:/scan.png").await.unwrap(),
+            None,
+            "write-back with an older snapshot must be skipped",
+        );
+
+        // Snapshot matching the indexed doc: body lands.
+        tx.send(Mutation::UpsertBody {
+            doc_id: "fs:/scan.png".into(),
+            body: "fresh ocr".into(),
+            expected_mtime: Some(100),
+        })
+        .await
+        .unwrap();
+        let _ = tx.commit_now().await.unwrap();
+        assert_eq!(
+            search.get_body("fs:/scan.png").await.unwrap().as_deref(),
+            Some("fresh ocr"),
+        );
+    }
+
+    #[tokio::test]
+    async fn writer_upsert_body_skips_when_newer_upsert_staged_in_same_batch() {
+        let (_tmp, tx, search, _handle) = fresh_writer_service();
+        let mut doc = make_fs_doc("fs:/scan.png");
+        doc.mtime = 100;
+        tx.send(Mutation::Upsert(Box::new(doc))).await.unwrap();
+        let _ = tx.commit_now().await.unwrap();
+
+        // A newer full upsert is staged (uncommitted) when the OCR
+        // write-back arrives. The committed reader still shows
+        // mtime=100, so only the staged-batch check can catch this;
+        // without it the read-modify-write clobbers the new doc.
+        let mut newer = make_fs_doc("fs:/scan.png");
+        newer.mtime = 200;
+        newer.body = Some("fresh extract".into());
+        tx.send(Mutation::Upsert(Box::new(newer))).await.unwrap();
+        tx.send(Mutation::UpsertBody {
+            doc_id: "fs:/scan.png".into(),
+            body: "ocr of old bytes".into(),
+            expected_mtime: Some(100),
+        })
+        .await
+        .unwrap();
+        let _ = tx.commit_now().await.unwrap();
+
+        assert_eq!(
+            search.get_body("fs:/scan.png").await.unwrap().as_deref(),
+            Some("fresh extract"),
+            "staged newer upsert must win over the stale OCR write-back",
+        );
     }
 
     #[test]

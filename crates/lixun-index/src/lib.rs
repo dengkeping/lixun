@@ -118,6 +118,39 @@ impl LixunSchema {
 
         let schema = builder.build();
 
+        // Startup guard: phrase / proximity scoring requires every
+        // spotlight-tokenized full-text field to record term positions.
+        // A tantivy upgrade that silently demotes the index option would
+        // otherwise break ranking with no visible failure.
+        for (name, field) in [
+            ("title", title),
+            ("title_terms", title_terms),
+            ("title_initials", title_initials),
+            ("title_prefixes", title_prefixes),
+            ("body", body),
+            ("path", path),
+            ("sender", sender),
+            ("recipients", recipients),
+        ] {
+            let entry = schema.get_field_entry(field);
+            let tantivy::schema::FieldType::Str(text_opts) = entry.field_type() else {
+                anyhow::bail!("schema invariant: field `{name}` must be a text field");
+            };
+            let indexing = text_opts.get_indexing_options().ok_or_else(|| {
+                anyhow::anyhow!("schema invariant: field `{name}` must be indexed")
+            })?;
+            anyhow::ensure!(
+                indexing.index_option() == IndexRecordOption::WithFreqsAndPositions,
+                "schema invariant: field `{name}` must record positions (got {:?})",
+                indexing.index_option(),
+            );
+            anyhow::ensure!(
+                indexing.tokenizer() == "spotlight",
+                "schema invariant: field `{name}` must use the spotlight tokenizer (got {})",
+                indexing.tokenizer(),
+            );
+        }
+
         Ok((
             Self {
                 schema,
@@ -1030,7 +1063,15 @@ fn build_search_query(
 /// `None` if the analyzer was never registered (index in an unusual state);
 /// callers collapse to no-op in that branch.
 fn tokenize_with_spotlight(index: &tantivy::Index, text: &str) -> Option<Vec<String>> {
-    let mut analyzer = index.tokenizers().get("spotlight")?;
+    let Some(mut analyzer) = index.tokenizers().get("spotlight") else {
+        static MISSING_TOKENIZER_WARNED: std::sync::Once = std::sync::Once::new();
+        MISSING_TOKENIZER_WARNED.call_once(|| {
+            tracing::warn!(
+                "\"spotlight\" tokenizer not registered; phrase and coordination boosts disabled"
+            );
+        });
+        return None;
+    };
     let mut out = Vec::new();
     let mut stream = analyzer.token_stream(text);
     stream.process(&mut |tok| out.push(tok.text.clone()));
@@ -1085,7 +1126,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().to_str().unwrap();
 
-        let mut index = LixunIndex::create_or_open(path, ranking).unwrap();
+        let index = LixunIndex::create_or_open(path, ranking).unwrap();
         let mut writer = index.writer(20_000_000).unwrap();
 
         for doc in docs {
@@ -1183,7 +1224,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().to_str().unwrap();
 
-        let mut index = LixunIndex::create_or_open(path, RankingConfig::default()).unwrap();
+        let index = LixunIndex::create_or_open(path, RankingConfig::default()).unwrap();
         let mut writer = index.writer(20_000_000).unwrap();
         let doc = sample_document(
             "fs:/tmp/delete_me.txt",
@@ -1221,7 +1262,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().to_str().unwrap();
 
-        let mut index = LixunIndex::create_or_open(path, RankingConfig::default()).unwrap();
+        let index = LixunIndex::create_or_open(path, RankingConfig::default()).unwrap();
         let mut writer = index.writer(20_000_000).unwrap();
         for i in 0..3 {
             index
@@ -1257,7 +1298,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().to_str().unwrap();
 
-        let mut index = LixunIndex::create_or_open(path, RankingConfig::default()).unwrap();
+        let index = LixunIndex::create_or_open(path, RankingConfig::default()).unwrap();
         let mut writer = index.writer(20_000_000).unwrap();
 
         let doc1 = sample_document("fs:/tmp/same.txt", "old_title.txt", "old content");
@@ -1587,7 +1628,7 @@ mod tests {
             "fresh directory → rebuilt_from_scratch must be true"
         );
 
-        let mut idx = LixunIndex::create_or_open(path, RankingConfig::default()).unwrap();
+        let idx = LixunIndex::create_or_open(path, RankingConfig::default()).unwrap();
         let mut writer = idx.writer(20_000_000).unwrap();
         idx.upsert(&doc, &mut writer).unwrap();
         idx.commit(&mut writer).unwrap();

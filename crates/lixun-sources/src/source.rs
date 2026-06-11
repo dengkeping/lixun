@@ -15,6 +15,18 @@ pub struct SourceContext<'a> {
 pub struct QueryContext<'a> {
     pub instance_id: &'a str,
     pub state_dir: &'a Path,
+    /// Cooperative cancellation probe. The host sets this when the
+    /// search that triggered `on_query` can be superseded (a newer
+    /// keystroke); long-running plugins should poll
+    /// [`QueryContext::is_cancelled`] between work units and bail
+    /// early. `None` means the caller cannot be cancelled.
+    pub cancel: Option<&'a (dyn Fn() -> bool + Send + Sync)>,
+}
+
+impl QueryContext<'_> {
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.map(|probe| probe()).unwrap_or(false)
+    }
 }
 
 pub struct WatchSpec {

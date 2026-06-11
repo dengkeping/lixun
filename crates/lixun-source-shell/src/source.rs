@@ -45,6 +45,12 @@ pub struct ShellSource {
     /// command is handed verbatim to `sh -c`, restoring full shell
     /// semantics (pipes, redirects, globbing) for power users who
     /// accept the risk.
+    ///
+    /// `shell_mode = true` means exactly that: anything typed after
+    /// the prefix runs in a POSIX shell with the user's privileges —
+    /// including substitutions like `$(...)`. No escaping is applied,
+    /// by design. Leave it off unless every keystroke in the launcher
+    /// should be treated as a shell command line.
     pub shell_mode: bool,
 }
 
@@ -220,6 +226,7 @@ mod tests {
 
     fn ctx() -> QueryContext<'static> {
         QueryContext {
+            cancel: None,
             instance_id: "shell",
             state_dir: Path::new("/tmp/lixun-shell-test"),
         }

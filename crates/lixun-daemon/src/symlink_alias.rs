@@ -73,11 +73,7 @@ impl SymlinkAliases {
         let final_path = state_dir.join("symlink_aliases.json");
         let tmp_path = state_dir.join("symlink_aliases.json.tmp");
         let snapshot = OnDisk {
-            aliases: self
-                .map
-                .read()
-                .expect("symlink_alias map poisoned")
-                .clone(),
+            aliases: read_recover(&self.map).clone(),
         };
         let content = serde_json::to_string_pretty(&snapshot)?;
         std::fs::write(&tmp_path, content)?;
@@ -87,33 +83,45 @@ impl SymlinkAliases {
 
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
-        self.map.read().expect("symlink_alias map poisoned").len()
+        read_recover(&self.map).len()
     }
+}
+
+
+/// Read-lock the alias map, recovering from poisoning. The map is a
+/// plain String->String table, so the state a panicking writer left
+/// behind is still internally consistent; losing one note() is
+/// strictly better than panicking every later caller for the rest of
+/// the daemon's life.
+fn read_recover(
+    lock: &std::sync::RwLock<std::collections::HashMap<String, String>>,
+) -> std::sync::RwLockReadGuard<'_, std::collections::HashMap<String, String>> {
+    lock.read().unwrap_or_else(|poisoned| {
+        tracing::warn!("symlink_alias map poisoned; recovering");
+        poisoned.into_inner()
+    })
+}
+
+fn write_recover(
+    lock: &std::sync::RwLock<std::collections::HashMap<String, String>>,
+) -> std::sync::RwLockWriteGuard<'_, std::collections::HashMap<String, String>> {
+    lock.write().unwrap_or_else(|poisoned| {
+        tracing::warn!("symlink_alias map poisoned; recovering");
+        poisoned.into_inner()
+    })
 }
 
 impl SymlinkAliasNoter for SymlinkAliases {
     fn note(&self, observed: &str, canonical_id: &str) {
-        let mut guard = self
-            .map
-            .write()
-            .expect("symlink_alias map poisoned");
-        guard.insert(observed.to_string(), canonical_id.to_string());
+        write_recover(&self.map).insert(observed.to_string(), canonical_id.to_string());
     }
 
     fn resolve(&self, observed: &str) -> Option<String> {
-        self.map
-            .read()
-            .expect("symlink_alias map poisoned")
-            .get(observed)
-            .cloned()
+        read_recover(&self.map).get(observed).cloned()
     }
 
     fn forget(&self, canonical_id: &str) {
-        let mut guard = self
-            .map
-            .write()
-            .expect("symlink_alias map poisoned");
-        guard.retain(|_, v| v != canonical_id);
+        write_recover(&self.map).retain(|_, v| v != canonical_id);
     }
 }
 

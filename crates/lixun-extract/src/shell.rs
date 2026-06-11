@@ -41,6 +41,29 @@ impl Default for SystemRunner {
     }
 }
 
+/// Per-stream capture ceiling: a runaway extractor must not exhaust
+/// daemon memory. Beyond this the pipe is still drained (discarded)
+/// so the child never blocks on a full pipe buffer.
+const MAX_CAPTURED_STREAM_BYTES: usize = 16 * 1024 * 1024;
+
+/// Read `pipe` to EOF, keeping at most `cap` bytes. Bytes past the
+/// cap are read and discarded — stopping early would let the child
+/// fill the pipe and deadlock against `wait_timeout`.
+fn read_capped(mut pipe: impl Read, cap: usize) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        match pipe.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                let keep = n.min(cap.saturating_sub(buf.len()));
+                buf.extend_from_slice(&chunk[..keep]);
+            }
+        }
+    }
+    buf
+}
+
 impl CommandRunner for SystemRunner {
     fn run(&self, cmd: &str, args: &[&str], _input: Option<&[u8]>) -> Result<String> {
         let mut command = Command::new(cmd);
@@ -58,19 +81,13 @@ impl CommandRunner for SystemRunner {
         // so the Options MUST be Some. Drain concurrently in worker threads to
         // prevent the child from blocking on a full pipe buffer (~64KB on Linux)
         // while we wait for it to exit.
-        let mut stdout_pipe = child.stdout.take().expect("piped stdout");
-        let mut stderr_pipe = child.stderr.take().expect("piped stderr");
+        let stdout_pipe = child.stdout.take().expect("piped stdout");
+        let stderr_pipe = child.stderr.take().expect("piped stderr");
 
-        let stdout_handle = thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = stdout_pipe.read_to_end(&mut buf);
-            buf
-        });
-        let stderr_handle = thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = stderr_pipe.read_to_end(&mut buf);
-            buf
-        });
+        let stdout_handle =
+            thread::spawn(move || read_capped(stdout_pipe, MAX_CAPTURED_STREAM_BYTES));
+        let stderr_handle =
+            thread::spawn(move || read_capped(stderr_pipe, MAX_CAPTURED_STREAM_BYTES));
 
         let status = if self.timeout.is_zero() {
             child.wait()?
@@ -82,7 +99,7 @@ impl CommandRunner for SystemRunner {
                     let _ = child.kill();
                     let _ = child.wait();
                     // Killing the child closes the pipes, so the worker threads
-                    // will return from read_to_end. Join them to avoid leaks.
+                    // will return from read_capped. Join them to avoid leaks.
                     let _ = stdout_handle.join();
                     let _ = stderr_handle.join();
                     return Err(anyhow!(
@@ -278,5 +295,37 @@ mod tests {
             "expected >100KB output, got {}",
             out.len()
         );
+    }
+
+    #[test]
+    fn read_capped_truncates_but_drains_to_eof() {
+        let data = vec![b'x'; 256 * 1024];
+        let mut cursor = std::io::Cursor::new(&data);
+        let out = read_capped(&mut cursor, 1024);
+        assert_eq!(out.len(), 1024);
+        // The reader must have consumed the whole stream, not stopped
+        // at the cap — otherwise a real child would block on the pipe.
+        assert_eq!(cursor.position() as usize, data.len());
+    }
+
+    #[test]
+    fn read_capped_keeps_small_output_intact() {
+        let out = read_capped(std::io::Cursor::new(b"hello".to_vec()), 1024);
+        assert_eq!(out, b"hello");
+    }
+
+    #[test]
+    fn oversized_child_output_is_capped_without_deadlock() {
+        // 20 MiB of zeros exceeds MAX_CAPTURED_STREAM_BYTES; the runner
+        // must drain it all but keep only the cap.
+        let runner = SystemRunner::new(30);
+        let out = runner
+            .run(
+                "sh",
+                &["-c", "dd if=/dev/zero bs=1024 count=20480 2>/dev/null"],
+                None,
+            )
+            .unwrap();
+        assert_eq!(out.len(), MAX_CAPTURED_STREAM_BYTES);
     }
 }
