@@ -155,6 +155,7 @@ impl AnnHandle for LanceDbAnnHandle {
 
     async fn classify_query(&self, query: &str) -> Result<Modality> {
         let Some(router) = self.query_router.get() else {
+            tracing::debug!("query router not ready; defaulting to text");
             return Ok(Modality::Text);
         };
         let Some(vector) = self.embed_query_clip_text(query)? else {

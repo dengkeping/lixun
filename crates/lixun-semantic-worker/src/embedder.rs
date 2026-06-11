@@ -138,6 +138,19 @@ impl ClipTextEmbedder {
     }
 }
 
+/// True when `name` is a text-model id this build can load. Lets
+/// config sanitization degrade an unknown id (e.g. a typo in a
+/// daemon-pushed config) to the default model instead of aborting
+/// the worker.
+pub fn is_supported_text_model(name: &str) -> bool {
+    resolve_text_model(name).is_ok()
+}
+
+/// Image-model counterpart of [`is_supported_text_model`].
+pub fn is_supported_image_model(name: &str) -> bool {
+    resolve_image_model(name).is_ok()
+}
+
 fn resolve_text_model(name: &str) -> Result<(EmbeddingModel, usize)> {
     match name {
         // BAAI bge-small-en-v1.5. Output dimension stays 384 in both

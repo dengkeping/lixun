@@ -199,7 +199,7 @@ impl WorkerThread {
 
     fn maybe_compact(&mut self) {
         self.flush_count = self.flush_count.wrapping_add(1);
-        if self.flush_count % 50 != 0 {
+        if !self.flush_count.is_multiple_of(50) {
             return;
         }
         let store = self.store.clone();
@@ -241,10 +241,18 @@ impl WorkerThread {
             );
             return;
         }
-        if let Ok(mut j) = self.journal.lock() {
-            for id in &ids {
-                let _ = j.forget(id);
-            }
+        /* A poisoned mutex only means another thread panicked while
+        holding the lock; the journal/embedder state itself is a
+        plain map or session, so recovering the inner guard is sound
+        and keeps the batch from being silently dropped. */
+        let mut j = self.journal.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!(
+                "semantic embed worker: journal mutex poisoned; recovering inner guard"
+            );
+            poisoned.into_inner()
+        });
+        for id in &ids {
+            let _ = j.forget(id);
         }
     }
 
@@ -271,8 +279,14 @@ impl WorkerThread {
         #[cfg(not(feature = "idle-eviction"))]
         let text_handle = self.text.clone();
 
-        let vectors = match text_handle.lock() {
-            Ok(mut t) => match t.embed(texts) {
+        let vectors = {
+            let mut t = text_handle.lock().unwrap_or_else(|poisoned| {
+                tracing::warn!(
+                    "semantic embed worker: text embedder mutex poisoned; recovering inner guard"
+                );
+                poisoned.into_inner()
+            });
+            match t.embed(texts) {
                 Ok(v) => v,
                 Err(e) => {
                     tracing::warn!(
@@ -281,10 +295,6 @@ impl WorkerThread {
                     );
                     return;
                 }
-            },
-            Err(e) => {
-                tracing::error!("semantic embed worker: text embedder mutex poisoned: {e}");
-                return;
             }
         };
 
@@ -315,14 +325,18 @@ impl WorkerThread {
             .block_on(async move { store.upsert_text_batch(&rows).await });
         match upsert_res {
             Ok(()) => {
-                if let Ok(mut j) = self.journal.lock() {
-                    for doc in &batch {
-                        if let Err(e) = j.record(&doc.doc_id, CHANNEL_TEXT, now) {
-                            tracing::warn!(
-                                doc_id = %doc.doc_id,
-                                "semantic embed worker: journal record failed: {e:#}"
-                            );
-                        }
+                let mut j = self.journal.lock().unwrap_or_else(|poisoned| {
+                    tracing::warn!(
+                        "semantic embed worker: journal mutex poisoned; recovering inner guard"
+                    );
+                    poisoned.into_inner()
+                });
+                for doc in &batch {
+                    if let Err(e) = j.record(&doc.doc_id, CHANNEL_TEXT, now) {
+                        tracing::warn!(
+                            doc_id = %doc.doc_id,
+                            "semantic embed worker: journal record failed: {e:#}"
+                        );
                     }
                 }
             }
@@ -346,7 +360,7 @@ impl WorkerThread {
             .filter_map(|d| {
                 d.doc_id
                     .strip_prefix("fs:")
-                    .map(|p| std::path::PathBuf::from(p))
+                    .map(std::path::PathBuf::from)
             })
             .collect();
 
@@ -401,8 +415,14 @@ impl WorkerThread {
         #[cfg(not(feature = "idle-eviction"))]
         let image_handle = self.image.clone();
 
-        let vectors = match image_handle.lock() {
-            Ok(mut img) => match img.embed(paths_for_embed) {
+        let vectors = {
+            let mut img = image_handle.lock().unwrap_or_else(|poisoned| {
+                tracing::warn!(
+                    "semantic embed worker: image embedder mutex poisoned; recovering inner guard"
+                );
+                poisoned.into_inner()
+            });
+            match img.embed(paths_for_embed) {
                 Ok(v) => v,
                 Err(e) => {
                     tracing::warn!(
@@ -411,10 +431,6 @@ impl WorkerThread {
                     );
                     return;
                 }
-            },
-            Err(e) => {
-                tracing::error!("semantic embed worker: image embedder mutex poisoned: {e}");
-                return;
             }
         };
 
@@ -445,14 +461,18 @@ impl WorkerThread {
             .block_on(async move { store.upsert_image_batch(&rows).await });
         match upsert_res {
             Ok(()) => {
-                if let Ok(mut j) = self.journal.lock() {
-                    for doc in &batch {
-                        if let Err(e) = j.record(&doc.doc_id, CHANNEL_IMAGE, now) {
-                            tracing::warn!(
-                                doc_id = %doc.doc_id,
-                                "semantic embed worker: journal record failed: {e:#}"
-                            );
-                        }
+                let mut j = self.journal.lock().unwrap_or_else(|poisoned| {
+                    tracing::warn!(
+                        "semantic embed worker: journal mutex poisoned; recovering inner guard"
+                    );
+                    poisoned.into_inner()
+                });
+                for doc in &batch {
+                    if let Err(e) = j.record(&doc.doc_id, CHANNEL_IMAGE, now) {
+                        tracing::warn!(
+                            doc_id = %doc.doc_id,
+                            "semantic embed worker: journal record failed: {e:#}"
+                        );
                     }
                 }
             }
@@ -526,14 +546,24 @@ pub async fn start_backfill(
     let mut submitted = 0u64;
     for doc_id in all_ids {
         total += 1;
-        let already_text = match journal.lock() {
-            Ok(j) => j.was_embedded(&doc_id, CHANNEL_TEXT).unwrap_or(false),
-            Err(_) => false,
-        };
-        let already_image = match journal.lock() {
-            Ok(j) => j.was_embedded(&doc_id, CHANNEL_IMAGE).unwrap_or(false),
-            Err(_) => false,
-        };
+        /* Recover from poisoning instead of treating the lookup as
+        "not embedded", which would re-embed every remaining doc. */
+        let already_text = journal
+            .lock()
+            .unwrap_or_else(|poisoned| {
+                tracing::warn!("backfill: journal mutex poisoned; recovering inner guard");
+                poisoned.into_inner()
+            })
+            .was_embedded(&doc_id, CHANNEL_TEXT)
+            .unwrap_or(false);
+        let already_image = journal
+            .lock()
+            .unwrap_or_else(|poisoned| {
+                tracing::warn!("backfill: journal mutex poisoned; recovering inner guard");
+                poisoned.into_inner()
+            })
+            .was_embedded(&doc_id, CHANNEL_IMAGE)
+            .unwrap_or(false);
         if already_text && already_image {
             continue;
         }
@@ -568,7 +598,11 @@ pub async fn start_backfill(
         submitted += 1;
     }
 
-    if let Ok(mut j) = journal.lock() {
+    {
+        let mut j = journal.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("backfill: journal mutex poisoned; recovering inner guard");
+            poisoned.into_inner()
+        });
         let now = unix_seconds().to_string();
         let _ = j.meta_set("last_backfill_completed_at", &now);
         let _ = j.meta_set("last_backfill_total", &total.to_string());

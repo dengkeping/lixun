@@ -2,9 +2,10 @@
 //! handshake + empty-corpus search round-trip, asks for shutdown,
 //! confirms a clean exit.
 //!
-//! NOTE: first run downloads the fastembed model (~120 MB for
-//! `bge-small-en-v1.5`) into the per-test cache; budget 3-5 min.
-//! Subsequent runs reuse the on-disk cache and finish in seconds.
+//! NOTE: first run downloads the fastembed models (~400 MB total)
+//! into a cache shared across runs (`CARGO_TARGET_TMPDIR`); budget
+//! several minutes. Subsequent runs reuse the cache and finish in
+//! seconds. LanceDB/journal state stays in a per-test tempdir.
 
 use std::process::Stdio;
 use std::time::Duration;
@@ -37,10 +38,16 @@ async fn handshake_then_search_then_shutdown() {
 
     let listener = UnixListener::bind(&socket_path).expect("bind");
 
+    /* Model cache persists across test runs (cleared by `cargo
+    clean`); without it every run re-downloads ~400 MB. */
+    let cache_dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("fastembed-cache");
+    std::fs::create_dir_all(&cache_dir).expect("cache dir");
+
     let mut child = Command::new(WORKER_BIN)
         .arg("--socket")
         .arg(&socket_path)
         .env("LIXUN_SEMANTIC_DATA_DIR", &data_dir)
+        .env("LIXUN_SEMANTIC_CACHE_DIR", &cache_dir)
         .env("LIXUN_LOG", "warn")
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -48,10 +55,6 @@ async fn handshake_then_search_then_shutdown() {
         .spawn()
         .expect("spawn worker");
 
-    /* The worker downloads the embedder model on first run; that
-    happens after it accepts the connection but before HandshakeOk
-    comes back, so accept() must complete fast and the read for
-    HandshakeOk must tolerate a multi-minute wait. */
     let (stream, _) = timeout(Duration::from_secs(10), listener.accept())
         .await
         .expect("accept timed out")
@@ -65,7 +68,7 @@ async fn handshake_then_search_then_shutdown() {
         .await
         .expect("send handshake");
 
-    let ack = timeout(Duration::from_secs(600), framed.next())
+    let ack = timeout(Duration::from_secs(30), framed.next())
         .await
         .expect("handshake ack timeout")
         .expect("stream ended")
@@ -89,7 +92,10 @@ async fn handshake_then_search_then_shutdown() {
         .await
         .expect("send search");
 
-    let result = timeout(Duration::from_secs(60), framed.next())
+    /* HandshakeOk is sent before the embedders load, so a cold-cache
+    model download delays the first reply after it — budget for the
+    full download here, not on the handshake read. */
+    let result = timeout(Duration::from_secs(600), framed.next())
         .await
         .expect("search reply timeout")
         .expect("stream ended")

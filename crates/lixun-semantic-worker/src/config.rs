@@ -72,6 +72,32 @@ impl SemanticConfig {
     pub fn effective_max_concurrent_embed_tasks(&self, hint: Option<usize>) -> Option<usize> {
         self.max_concurrent_embed_tasks.or(hint)
     }
+
+    /// Replace unrecognized model ids with the built-in defaults,
+    /// warning once per field. Model ids may arrive from a
+    /// daemon-pushed config in later phases; an unknown id must not
+    /// abort the worker, and must never reach a loader that could
+    /// probe the network for an arbitrary repo.
+    pub fn sanitize_model_ids(&mut self) {
+        if !crate::embedder::is_supported_text_model(&self.text_model) {
+            let fallback = default_text_model();
+            tracing::warn!(
+                requested = %self.text_model,
+                %fallback,
+                "unsupported semantic.text_model; falling back to default"
+            );
+            self.text_model = fallback;
+        }
+        if !crate::embedder::is_supported_image_model(&self.image_model) {
+            let fallback = default_image_model();
+            tracing::warn!(
+                requested = %self.image_model,
+                %fallback,
+                "unsupported semantic.image_model; falling back to default"
+            );
+            self.image_model = fallback;
+        }
+    }
 }
 
 impl Default for SemanticConfig {
@@ -88,5 +114,30 @@ impl Default for SemanticConfig {
             rrf_k: default_rrf_k(),
             cache_subdir: default_cache_subdir(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_model_ids_replaces_unknown_ids_with_defaults() {
+        let mut cfg = SemanticConfig {
+            text_model: "definitely-not-a-model".into(),
+            image_model: "also-not-a-model".into(),
+            ..SemanticConfig::default()
+        };
+        cfg.sanitize_model_ids();
+        assert_eq!(cfg.text_model, default_text_model());
+        assert_eq!(cfg.image_model, default_image_model());
+    }
+
+    #[test]
+    fn sanitize_model_ids_keeps_supported_ids() {
+        let mut cfg = SemanticConfig::default();
+        cfg.sanitize_model_ids();
+        assert_eq!(cfg.text_model, default_text_model());
+        assert_eq!(cfg.image_model, default_image_model());
     }
 }

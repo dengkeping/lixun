@@ -20,7 +20,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use futures::{SinkExt, StreamExt};
 use tokio::net::UnixStream;
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 use tokio_util::codec::Framed;
 use tracing_subscriber::EnvFilter;
 
@@ -39,6 +39,15 @@ use lixun_semantic_worker::store::VectorStore;
 use lixun_semantic_worker::worker::{EmbedJob, spawn_worker, start_backfill};
 
 const REPLY_QUEUE_CAPACITY: usize = 256;
+
+/// Caps concurrently spawned search/classify tasks. The dispatch
+/// loop awaits a permit before spawning, so a request flood queues
+/// on the socket instead of growing the task set without bound.
+const SEARCH_CONCURRENCY: usize = 32;
+
+/// Per-request deadline for search/classify tasks; a wedged ANN or
+/// embedder call releases its permit instead of pinning it forever.
+const SEARCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[derive(Parser, Debug)]
 #[command(
@@ -154,8 +163,11 @@ async fn main() -> Result<()> {
 
     let (data_root, cache_root) = data_and_cache_roots()?;
     /* Phase 1 ships with the daemon's defaults. A future Cmd will
-    let the daemon push the live `[semantic]` config block. */
-    let cfg = SemanticConfig::default();
+    let the daemon push the live `[semantic]` config block; any such
+    config must pass through `sanitize_model_ids` before reaching the
+    embedder loaders. */
+    let mut cfg = SemanticConfig::default();
+    cfg.sanitize_model_ids();
 
     let cache_dir = cache_root.join(&cfg.cache_subdir);
     let text_embedder = load_text_embedder(&cfg.text_model, &cache_dir, 1, 1)
@@ -324,6 +336,8 @@ async fn main() -> Result<()> {
     Cmd::CallbackReply frames into its pending map via deliver(). */
     let ipc_doc_store = Arc::new(IpcDocStore::new(reply_tx.clone()));
 
+    let search_permits = Arc::new(Semaphore::new(SEARCH_CONCURRENCY));
+
     tracing::info!("semantic worker ready");
 
     while let Some(frame) = stream.next().await {
@@ -359,47 +373,114 @@ async fn main() -> Result<()> {
                 }
             }
             Cmd::SearchText { req_id, query, k } => {
+                /* Owned permit moves into the task; awaiting it here
+                applies backpressure to the dispatch loop once
+                SEARCH_CONCURRENCY requests are in flight. */
+                let permit = search_permits
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .context("search semaphore closed")?;
                 let ann = ann.clone();
                 let tx = reply_tx.clone();
                 tokio::spawn(async move {
-                    let reply = match ann.search_text(&query, k as usize).await {
-                        Ok(hits) => Msg::SearchResult { req_id, hits },
-                        Err(e) => Msg::Error {
-                            req_id,
-                            code: ErrorCode::Internal,
-                            detail: format!("{e:#}"),
-                        },
-                    };
+                    let _permit = permit;
+                    let reply =
+                        match tokio::time::timeout(SEARCH_TIMEOUT, ann.search_text(&query, k as usize))
+                            .await
+                        {
+                            Ok(Ok(hits)) => Msg::SearchResult { req_id, hits },
+                            Ok(Err(e)) => Msg::Error {
+                                req_id,
+                                code: ErrorCode::Internal,
+                                detail: format!("{e:#}"),
+                            },
+                            Err(_) => {
+                                tracing::error!(
+                                    req_id,
+                                    "search_text timed out after {}s",
+                                    SEARCH_TIMEOUT.as_secs()
+                                );
+                                Msg::Error {
+                                    req_id,
+                                    code: ErrorCode::Internal,
+                                    detail: "search_text timed out".into(),
+                                }
+                            }
+                        };
                     let _ = tx.send(reply).await;
                 });
             }
             Cmd::SearchImage { req_id, query, k } => {
+                let permit = search_permits
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .context("search semaphore closed")?;
                 let ann = ann.clone();
                 let tx = reply_tx.clone();
                 tokio::spawn(async move {
-                    let reply = match ann.search_image(&query, k as usize).await {
-                        Ok(hits) => Msg::SearchResult { req_id, hits },
-                        Err(e) => Msg::Error {
+                    let _permit = permit;
+                    let reply = match tokio::time::timeout(
+                        SEARCH_TIMEOUT,
+                        ann.search_image(&query, k as usize),
+                    )
+                    .await
+                    {
+                        Ok(Ok(hits)) => Msg::SearchResult { req_id, hits },
+                        Ok(Err(e)) => Msg::Error {
                             req_id,
                             code: ErrorCode::Internal,
                             detail: format!("{e:#}"),
                         },
+                        Err(_) => {
+                            tracing::error!(
+                                req_id,
+                                "search_image timed out after {}s",
+                                SEARCH_TIMEOUT.as_secs()
+                            );
+                            Msg::Error {
+                                req_id,
+                                code: ErrorCode::Internal,
+                                detail: "search_image timed out".into(),
+                            }
+                        }
                     };
                     let _ = tx.send(reply).await;
                 });
             }
             Cmd::ClassifyQuery { req_id, query } => {
+                let permit = search_permits
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .context("search semaphore closed")?;
                 let ann = ann.clone();
                 let tx = reply_tx.clone();
                 tokio::spawn(async move {
-                    let reply = match ann.classify_query(&query).await {
-                        Ok(modality) => Msg::ClassifyResult { req_id, modality },
-                        Err(e) => Msg::Error {
-                            req_id,
-                            code: ErrorCode::Internal,
-                            detail: format!("{e:#}"),
-                        },
-                    };
+                    let _permit = permit;
+                    let reply =
+                        match tokio::time::timeout(SEARCH_TIMEOUT, ann.classify_query(&query)).await
+                        {
+                            Ok(Ok(modality)) => Msg::ClassifyResult { req_id, modality },
+                            Ok(Err(e)) => Msg::Error {
+                                req_id,
+                                code: ErrorCode::Internal,
+                                detail: format!("{e:#}"),
+                            },
+                            Err(_) => {
+                                tracing::error!(
+                                    req_id,
+                                    "classify_query timed out after {}s",
+                                    SEARCH_TIMEOUT.as_secs()
+                                );
+                                Msg::Error {
+                                    req_id,
+                                    code: ErrorCode::Internal,
+                                    detail: "classify_query timed out".into(),
+                                }
+                            }
+                        };
                     let _ = tx.send(reply).await;
                 });
             }
@@ -452,19 +533,37 @@ async fn main() -> Result<()> {
 }
 
 fn data_and_cache_roots() -> Result<(PathBuf, PathBuf)> {
+    /* LIXUN_SEMANTIC_CACHE_DIR splits the (immutable, re-downloadable)
+    model cache away from the per-instance data root. Tests use it to
+    keep LanceDB/journal state in a throwaway dir while reusing one
+    persistent model cache, avoiding a multi-hundred-MB download per
+    run. Unset, the cache co-locates with the data override (old
+    behaviour) or falls back to the XDG cache dir. */
+    let cache_override = std::env::var_os("LIXUN_SEMANTIC_CACHE_DIR").map(PathBuf::from);
     if let Ok(p) = std::env::var("LIXUN_SEMANTIC_DATA_DIR") {
         let root = PathBuf::from(p);
         std::fs::create_dir_all(&root)
             .with_context(|| format!("creating data dir {}", root.display()))?;
-        return Ok((root.clone(), root));
+        let cache = match cache_override {
+            Some(c) => {
+                std::fs::create_dir_all(&c)
+                    .with_context(|| format!("creating cache dir {}", c.display()))?;
+                c
+            }
+            None => root.clone(),
+        };
+        return Ok((root, cache));
     }
     let data = dirs::data_dir()
         .context("XDG data dir unavailable")?
         .join("lixun")
         .join("semantic");
-    let cache = dirs::cache_dir()
-        .context("XDG cache dir unavailable")?
-        .join("lixun");
+    let cache = match cache_override {
+        Some(c) => c,
+        None => dirs::cache_dir()
+            .context("XDG cache dir unavailable")?
+            .join("lixun"),
+    };
     std::fs::create_dir_all(&data)
         .with_context(|| format!("creating data dir {}", data.display()))?;
     std::fs::create_dir_all(&cache)

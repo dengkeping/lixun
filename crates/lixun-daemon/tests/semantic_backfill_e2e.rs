@@ -184,8 +184,15 @@ async fn wait_until_connected(deadline: Duration) {
 async fn backfill_e2e_completes_and_search_recovers_unique_doc() {
     let bin = worker_bin();
     let tmp = tempfile::tempdir().expect("tempdir");
+    /* Keep the fastembed model cache in a location shared across test
+    runs (and with the worker's own integration tests) so only the
+    first-ever run pays the ~400MB model download; data stays in the
+    per-test tempdir. */
+    let cache_dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("fastembed-cache");
+    std::fs::create_dir_all(&cache_dir).expect("create shared model cache dir");
     unsafe {
         std::env::set_var("LIXUN_SEMANTIC_DATA_DIR", tmp.path());
+        std::env::set_var("LIXUN_SEMANTIC_CACHE_DIR", &cache_dir);
         std::env::set_var("LIXUN_SEMANTIC_WORKER", &bin);
     }
 
