@@ -98,9 +98,11 @@ pub enum WidgetMode {
 
 /// Which widget currently has focus for keyboard navigation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum FocusedWidget {
     SocketPanel,
     LogViewer,
+    #[default]
     QueryInput,
     ResultsList,
     ReindexControls,
@@ -191,11 +193,6 @@ impl FocusedWidget {
     }
 }
 
-impl Default for FocusedWidget {
-    fn default() -> Self {
-        Self::QueryInput
-    }
-}
 
 impl App {
     /// Create a new App instance with default values.

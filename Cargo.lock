@@ -5527,7 +5527,7 @@ dependencies = [
 
 [[package]]
 name = "lixun-image-decode"
-version = "0.1.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "image 0.25.10",

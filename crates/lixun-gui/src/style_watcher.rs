@@ -182,11 +182,10 @@ fn classify(
     if paths_equivalent(path, colors_css) {
         return Some(RawHit::ColorsCss);
     }
-    if let Some(theme) = theme_css {
-        if paths_equivalent(path, theme) {
+    if let Some(theme) = theme_css
+        && paths_equivalent(path, theme) {
             return Some(RawHit::ThemeCss);
         }
-    }
     None
 }
 

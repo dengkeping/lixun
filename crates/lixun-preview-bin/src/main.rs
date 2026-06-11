@@ -707,8 +707,8 @@ fn show_or_update(
     Ok(())
 }
 
-/// Build the persistent xdg-toplevel window skeleton: ApplicationWindow
-/// + vbox + header_box + content_scroll. Called once per process
+/// Build the persistent xdg-toplevel window skeleton: ApplicationWindow,
+/// vbox, header_box, content_scroll. Called once per process
 /// lifetime; subsequent commands mutate the existing widgets.
 ///
 /// The preview is a regular xdg-toplevel (not a layer-shell surface).
@@ -789,11 +789,10 @@ fn try_apply_pending_parent(state: &Rc<PreviewState>, window: &gtk::ApplicationW
             }
         }
     }
-    if let Some(imp) = importer.as_mut() {
-        if let Err(e) = imp.import(&handle, &wl_surface) {
+    if let Some(imp) = importer.as_mut()
+        && let Err(e) = imp.import(&handle, &wl_surface) {
             tracing::warn!("preview: xdg-foreign import failed: {}", e);
         }
-    }
 }
 
 fn check_overlap_and_hide_launcher(

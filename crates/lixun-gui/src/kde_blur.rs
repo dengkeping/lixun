@@ -147,17 +147,16 @@ impl BlurController {
             return;
         }
         st.enabled = enabled;
-        if !enabled {
-            if let Some(att) = st.attachment.take() {
+        if !enabled
+            && let Some(att) = st.attachment.take() {
                 att.detach();
             }
-        }
         drop(st);
 
         apply_no_blur_class(&self.window, !enabled);
 
-        if enabled {
-            if let Some(surface) = self.window.surface() {
+        if enabled
+            && let Some(surface) = self.window.surface() {
                 let (w, h) = (surface.width(), surface.height());
                 if w > 1 && h > 1 {
                     match BlurAttachment::create(&surface, w, h) {
@@ -170,7 +169,6 @@ impl BlurController {
                     }
                 }
             }
-        }
     }
 }
 

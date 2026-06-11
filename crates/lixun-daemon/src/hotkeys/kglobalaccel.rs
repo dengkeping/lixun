@@ -242,14 +242,12 @@ fn key_for(token: &str) -> Option<i32> {
         }
     }
     let lower = token.to_ascii_lowercase();
-    if let Some(rest) = lower.strip_prefix('f') {
-        if let Ok(n) = rest.parse::<u32>() {
-            if (1..=35).contains(&n) {
+    if let Some(rest) = lower.strip_prefix('f')
+        && let Ok(n) = rest.parse::<u32>()
+            && (1..=35).contains(&n) {
                 // Qt::Key_F1 = 0x01000030
                 return Some(0x0100_0030 + (n as i32 - 1));
             }
-        }
-    }
     Some(match lower.as_str() {
         "space" => 0x20,
         "escape" | "esc" => 0x0100_0000,

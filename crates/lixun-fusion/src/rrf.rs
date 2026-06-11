@@ -10,13 +10,13 @@ use std::collections::HashMap;
 
 pub fn rrf_fuse(bm25: &[(String, f32)], ann: &[(String, f32)], k: f32) -> Vec<(String, f32)> {
     let mut fused: HashMap<&str, f32> = HashMap::with_capacity(bm25.len() + ann.len());
-    for (rank0, (doc_id, _)) in bm25.iter().enumerate() {
-        let rank1 = (rank0 + 1) as f32;
-        *fused.entry(doc_id.as_str()).or_insert(0.0) += 1.0 / (k + rank1);
+    for (pos, (doc_id, _)) in bm25.iter().enumerate() {
+        let rank = (pos + 1) as f32; // RRF ranks are 1-based
+        *fused.entry(doc_id.as_str()).or_insert(0.0) += 1.0 / (k + rank);
     }
-    for (rank0, (doc_id, _)) in ann.iter().enumerate() {
-        let rank1 = (rank0 + 1) as f32;
-        *fused.entry(doc_id.as_str()).or_insert(0.0) += 1.0 / (k + rank1);
+    for (pos, (doc_id, _)) in ann.iter().enumerate() {
+        let rank = (pos + 1) as f32;
+        *fused.entry(doc_id.as_str()).or_insert(0.0) += 1.0 / (k + rank);
     }
     let mut out: Vec<(String, f32)> = fused
         .into_iter()
@@ -38,17 +38,17 @@ pub fn rrf_fuse_3way(
 ) -> Vec<(String, f32)> {
     let mut fused: HashMap<&str, f32> =
         HashMap::with_capacity(bm25.len() + text_ann.len() + image_ann.len());
-    for (rank0, (doc_id, _)) in bm25.iter().enumerate() {
-        let rank1 = (rank0 + 1) as f32;
-        *fused.entry(doc_id.as_str()).or_insert(0.0) += 1.0 / (k + rank1);
+    for (pos, (doc_id, _)) in bm25.iter().enumerate() {
+        let rank = (pos + 1) as f32; // RRF ranks are 1-based
+        *fused.entry(doc_id.as_str()).or_insert(0.0) += 1.0 / (k + rank);
     }
-    for (rank0, (doc_id, _)) in text_ann.iter().enumerate() {
-        let rank1 = (rank0 + 1) as f32;
-        *fused.entry(doc_id.as_str()).or_insert(0.0) += 1.0 / (k + rank1);
+    for (pos, (doc_id, _)) in text_ann.iter().enumerate() {
+        let rank = (pos + 1) as f32;
+        *fused.entry(doc_id.as_str()).or_insert(0.0) += 1.0 / (k + rank);
     }
-    for (rank0, (doc_id, _)) in image_ann.iter().enumerate() {
-        let rank1 = (rank0 + 1) as f32;
-        *fused.entry(doc_id.as_str()).or_insert(0.0) += 1.0 / (k + rank1);
+    for (pos, (doc_id, _)) in image_ann.iter().enumerate() {
+        let rank = (pos + 1) as f32;
+        *fused.entry(doc_id.as_str()).or_insert(0.0) += 1.0 / (k + rank);
     }
     let mut out: Vec<(String, f32)> = fused
         .into_iter()

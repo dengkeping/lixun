@@ -28,7 +28,7 @@ tracing-subscriber.workspace = true
 async-channel = "2"
 libc = "0.2"
 glib = "0.22"
-gtk = { package = "gtk4", version = "0.11", features = ["v4_16"] }
+gtk.workspace = true
 gdk4-wayland = { version = "0.11", features = ["wayland_crate"] }
 wayland-client = "0.31"
-wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
+wayland-protocols.workspace = true

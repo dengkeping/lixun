@@ -14,11 +14,10 @@ pub fn path_excluded(path: &Path, substrings: &[String], regexes: &[regex::Regex
 pub fn lixun_self_excludes() -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut push = |p: PathBuf| {
-        if let Some(s) = p.to_str() {
-            if !s.is_empty() {
+        if let Some(s) = p.to_str()
+            && !s.is_empty() {
                 out.push(s.to_string());
             }
-        }
     };
     if let Some(p) = dirs::data_dir() {
         push(p.join("lixun"));
@@ -37,11 +36,10 @@ pub fn lixun_self_excludes() -> Vec<String> {
     if let Some(p) = dirs::config_dir() {
         push(p.join("lixun"));
     }
-    if let Ok(custom) = std::env::var("LIXUN_SEMANTIC_DATA_DIR") {
-        if !custom.is_empty() {
+    if let Ok(custom) = std::env::var("LIXUN_SEMANTIC_DATA_DIR")
+        && !custom.is_empty() {
             push(PathBuf::from(custom));
         }
-    }
     out
 }
 

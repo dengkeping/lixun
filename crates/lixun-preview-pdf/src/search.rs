@@ -237,7 +237,7 @@ mod tests {
             rects: vec![],
             done_for_page: true,
         });
-        assert!(state.results.get(&0).is_none());
+        assert!(!state.results.contains_key(&0));
         assert_eq!(state.total_matches, 0);
         assert_eq!(state.finished_pages, 1);
         assert!(state.current.is_none());

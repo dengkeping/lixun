@@ -395,7 +395,7 @@ mod tests {
     fn search_titles(docs: &[Document], ranking: RankingConfig) -> Vec<lixun_core::Hit> {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().to_str().unwrap();
-        let mut index = LixunIndex::create_or_open(path, ranking).unwrap();
+        let index = LixunIndex::create_or_open(path, ranking).unwrap();
         let mut writer = index.writer(20_000_000).unwrap();
 
         for doc in docs {

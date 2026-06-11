@@ -419,11 +419,10 @@ async fn dashboard_main() -> Result<()> {
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stdout).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    if let Some(entry) = dashboard::LogEntry::parse(&line) {
-                        if log_tx.send(entry).is_err() {
+                    if let Some(entry) = dashboard::LogEntry::parse(&line)
+                        && log_tx.send(entry).is_err() {
                             break;
                         }
-                    }
                 }
             });
         }
@@ -513,9 +512,9 @@ async fn dashboard_main() -> Result<()> {
                             format!("Reconnecting... (attempt {}/30)", attempt),
                             dashboard::LogLevel::Info,
                         );
-                        if let Ok(mut s) = open_daemon_stream().await {
-                            if let Ok(_) = write_request(&mut s, &Request::Status).await {
-                                if let Ok(Response::Status {
+                        if let Ok(mut s) = open_daemon_stream().await
+                            && let Ok(_) = write_request(&mut s, &Request::Status).await
+                                && let Ok(Response::Status {
                                     indexed_docs,
                                     memory,
                                     watcher,
@@ -539,19 +538,39 @@ async fn dashboard_main() -> Result<()> {
                                     reconnected = true;
                                     break;
                                 }
-                            }
-                        }
                         tokio::time::sleep(Duration::from_millis(500)).await;
                     }
 
                     if !reconnected {
-                        app.restart_status = dashboard::app::RestartStatus::Failed(
-                            "timeout waiting for daemon".to_string(),
-                        );
-                        app.push_log_message(
-                            "Failed to reconnect after 30 attempts".to_string(),
-                            dashboard::LogLevel::Error,
-                        );
+                        // One last probe before declaring failure: the
+                        // daemon may have come up in the instant after
+                        // attempt 30's sleep elapsed.
+                        let mut final_probe_ok = false;
+                        if let Ok(mut s) = open_daemon_stream().await
+                            && write_request(&mut s, &Request::Status).await.is_ok()
+                            && matches!(
+                                read_response_frame(&mut s).await,
+                                Ok(Response::Status { .. })
+                            )
+                        {
+                            final_probe_ok = true;
+                        }
+                        if final_probe_ok {
+                            app.connected = true;
+                            app.restart_status = dashboard::app::RestartStatus::Idle;
+                            app.push_log_message(
+                                "Daemon restarted successfully (final probe)".to_string(),
+                                dashboard::LogLevel::Info,
+                            );
+                        } else {
+                            app.restart_status = dashboard::app::RestartStatus::Failed(
+                                "timeout waiting for daemon".to_string(),
+                            );
+                            app.push_log_message(
+                                "Failed to reconnect after 30 attempts".to_string(),
+                                dashboard::LogLevel::Error,
+                            );
+                        }
                     }
                 }
 
@@ -570,19 +589,15 @@ async fn dashboard_main() -> Result<()> {
                         .await;
 
                         let mut results = Vec::new();
-                        loop {
-                            if let Ok(frame) = read_response_frame(&mut s).await {
-                                match frame {
-                                    Response::SearchChunk { hits, phase, .. } => {
-                                        results.extend(hits);
-                                        if phase == Phase::Final {
-                                            break;
-                                        }
+                        while let Ok(frame) = read_response_frame(&mut s).await {
+                            match frame {
+                                Response::SearchChunk { hits, phase, .. } => {
+                                    results.extend(hits);
+                                    if phase == Phase::Final {
+                                        break;
                                     }
-                                    _ => break,
                                 }
-                            } else {
-                                break;
+                                _ => break,
                             }
                         }
                         app.set_search_results(results);

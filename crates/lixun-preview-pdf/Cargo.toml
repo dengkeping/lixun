@@ -10,11 +10,11 @@ lixun-preview = { path = "../lixun-preview" }
 anyhow.workspace = true
 inventory.workspace = true
 tracing.workspace = true
-gtk = { package = "gtk4", version = "0.11", features = ["v4_16"] }
+gtk.workspace = true
 poppler-rs = "0.26"
 cairo-rs = "0.22"
 gdk = { package = "gdk4", version = "0.11" }
-graphene = { package = "graphene-rs", version = "0.22" }
+graphene.workspace = true
 glib = "0.22"
 gio = "0.22"
 async-channel = "2"

@@ -221,7 +221,7 @@ mod tests {
         // nested file must NOT be counted in total_size.
         let nested = root.join("inner");
         fs::create_dir(&nested).unwrap();
-        write_bytes(&nested.join("deep.dat"), &vec![0u8; 100]);
+        write_bytes(&nested.join("deep.dat"), &[0u8; 100]);
 
         let result = list_dir(&root, 100).expect("list ok");
 

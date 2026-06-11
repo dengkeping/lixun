@@ -121,14 +121,14 @@ fn bench_warm_30char(c: &mut Criterion) {
     let mut stream = connect_system_daemon();
 
     for i in 0..50u64 {
-        let _ = search_roundtrip(&mut stream, &query_30, 30, i);
+        let _ = search_roundtrip(&mut stream, query_30, 30, i);
     }
 
     group.bench_function("warm-30char", |b| {
         let mut epoch = 50u64;
         b.iter(|| {
             epoch += 1;
-            black_box(search_roundtrip(&mut stream, &query_30, 30, epoch))
+            black_box(search_roundtrip(&mut stream, query_30, 30, epoch))
         });
     });
 

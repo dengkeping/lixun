@@ -64,10 +64,15 @@ impl LogEntry {
 
         let message = strip_ansi_codes(&message);
 
-        let priority = entry
-            .priority
-            .and_then(|p| p.parse::<u8>().ok())
-            .unwrap_or(6);
+        // Malformed PRIORITY maps to Warning (4), not Info: the entry
+        // is then visible in the dashboard's warn filter instead of
+        // silently blending into the info stream. Absent PRIORITY is
+        // normal journal behaviour and stays Info.
+        let priority = match entry.priority.as_deref().map(str::parse::<u8>) {
+            Some(Ok(p)) => p,
+            Some(Err(_)) => 4,
+            None => 6,
+        };
 
         Some(Self {
             level: LogLevel::from_priority(priority),

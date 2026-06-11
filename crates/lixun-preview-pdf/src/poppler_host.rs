@@ -477,11 +477,11 @@ fn find_scan(
 mod tests {
     use super::*;
 
-    /// Without GTK initialized we can't actually build a `MemoryTexture`,
-    /// so most behaviour we test here is the message-loop lifecycle:
-    /// spawn → ReplacePath → Shutdown → join cleanly; submitting a job
-    /// against a non-existent path produces a `RenderOutcome::Err`
-    /// rather than a panic.
+    // Without GTK initialized we can't actually build a `MemoryTexture`,
+    // so most behaviour we test here is the message-loop lifecycle:
+    // spawn → ReplacePath → Shutdown → join cleanly; submitting a job
+    // against a non-existent path produces a `RenderOutcome::Err`
+    // rather than a panic.
 
     fn fresh_host(path: PathBuf) -> (PopplerHost, async_channel::Receiver<RenderResult>) {
         let (tx, rx) = async_channel::unbounded::<RenderResult>();

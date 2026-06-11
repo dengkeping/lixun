@@ -91,6 +91,13 @@ regex = "1"
 # Compile-time plugin registration
 inventory = "0.3"
 
+# GTK stack (GUI + every preview plugin); single entry so the 10+
+# GTK crates can't drift across versions/features independently.
+gtk = { package = "gtk4", version = "0.11", features = ["v4_16"] }
+graphene = { package = "graphene-rs", version = "0.22" }
+wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
+syntect = { version = "5", default-features = false, features = ["parsing", "default-syntaxes", "default-themes", "regex-fancy"] }
+
 tempfile = "3"
 unicode-normalization = "0.1"
 

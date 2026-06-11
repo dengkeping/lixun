@@ -240,7 +240,7 @@ fn run_query(index: &LixunIndex, text: &str, limit: u32) -> Vec<String> {
 fn build_index(ranking: RankingConfig, corpus: &[Document]) -> (tempfile::TempDir, LixunIndex) {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().to_str().unwrap();
-    let mut index = LixunIndex::create_or_open(path, ranking).unwrap();
+    let index = LixunIndex::create_or_open(path, ranking).unwrap();
     let mut writer = index.writer(50_000_000).unwrap();
     for doc in corpus {
         index.upsert(doc, &mut writer).unwrap();
