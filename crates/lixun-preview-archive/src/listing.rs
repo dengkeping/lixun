@@ -131,6 +131,21 @@ fn open(path: &Path) -> Result<File, ArchiveError> {
     File::open(path).map_err(|e| ArchiveError::Io(e.to_string()))
 }
 
+/// Entry names come straight from attacker-controlled archive
+/// metadata. A listing-only preview never extracts, but absolute or
+/// `..`-traversal names must not be displayed verbatim as if they
+/// were ordinary members; annotate them instead of failing the
+/// whole listing.
+fn sanitize_entry_name(raw: &str) -> String {
+    let absolute = raw.starts_with('/') || raw.starts_with('\\');
+    let traversal = raw.split(['/', '\\']).any(|component| component == "..");
+    if absolute || traversal {
+        format!("{raw} (unsafe path)")
+    } else {
+        raw.to_string()
+    }
+}
+
 fn list_zip(path: &Path, cap: usize) -> Result<ArchiveListing, ArchiveError> {
     let file = open(path)?;
     let mut archive = zip::ZipArchive::new(file).map_err(map_zip_err)?;
@@ -146,7 +161,7 @@ fn list_zip(path: &Path, cap: usize) -> Result<ArchiveListing, ArchiveError> {
         // their entry names, sizes, and directory flags.
         let entry = archive.by_index_raw(i).map_err(map_zip_err)?;
         entries.push(Entry {
-            name: entry.name().to_string(),
+            name: sanitize_entry_name(entry.name()),
             size: entry.size(),
             is_dir: entry.is_dir(),
         });
@@ -197,7 +212,7 @@ fn list_tar(reader: Box<dyn Read>, cap: usize) -> Result<ArchiveListing, Archive
         let header = entry.header();
         let name = entry
             .path()
-            .map(|p| p.to_string_lossy().into_owned())
+            .map(|p| sanitize_entry_name(&p.to_string_lossy()))
             .unwrap_or_else(|_| String::from("<invalid path>"));
         let size = header.size().unwrap_or(0);
         let is_dir = header.entry_type().is_dir();
@@ -218,7 +233,7 @@ fn list_7z(path: &Path, cap: usize) -> Result<ArchiveListing, ArchiveError> {
 
     for entry in archive.files.iter().take(take) {
         entries.push(Entry {
-            name: entry.name().to_string(),
+            name: sanitize_entry_name(entry.name()),
             size: entry.size(),
             is_dir: entry.is_directory(),
         });
@@ -393,6 +408,50 @@ mod tests {
         assert!(!entry.is_dir);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn zip_traversal_entry_name_is_sanitized() {
+        let path = tmp("traversal.zip");
+        {
+            let file = File::create(&path).unwrap();
+            let mut zw = zip::ZipWriter::new(file);
+            let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default();
+            zw.start_file("../../etc/passwd", opts).unwrap();
+            zw.write_all(b"root:x:0:0").unwrap();
+            zw.start_file("benign.txt", opts).unwrap();
+            zw.write_all(b"ok").unwrap();
+            zw.finish().unwrap();
+        }
+
+        let listing = list_entries(&path, 5000).unwrap();
+        let names: Vec<&str> = listing.entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(
+            names.contains(&"../../etc/passwd (unsafe path)"),
+            "traversal name must carry the unsafe-path marker, got {names:?}"
+        );
+        assert!(!names.contains(&"../../etc/passwd"));
+        assert!(names.contains(&"benign.txt"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn sanitize_flags_absolute_and_traversal_names() {
+        assert_eq!(
+            sanitize_entry_name("/etc/shadow"),
+            "/etc/shadow (unsafe path)"
+        );
+        assert_eq!(
+            sanitize_entry_name("..\\..\\windows\\system32"),
+            "..\\..\\windows\\system32 (unsafe path)"
+        );
+        assert_eq!(sanitize_entry_name("a/../b"), "a/../b (unsafe path)");
+        // Benign names — including ones merely containing dots — pass
+        // through untouched.
+        assert_eq!(sanitize_entry_name("dir/hello.txt"), "dir/hello.txt");
+        assert_eq!(sanitize_entry_name("notes..txt"), "notes..txt");
+        assert_eq!(sanitize_entry_name("v1..2/file"), "v1..2/file");
     }
 
     #[test]

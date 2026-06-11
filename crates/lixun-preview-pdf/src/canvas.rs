@@ -122,12 +122,26 @@ mod imp {
         }
 
         fn set_property(&self, _id: usize, value: &glib::Value, pspec: &glib::ParamSpec) {
+            // A type-mismatched set must not panic the preview
+            // process — warn and drop the value instead.
             match pspec.name() {
-                "hadjustment" => self.obj().set_hadjustment_inner(value.get().unwrap()),
-                "vadjustment" => self.obj().set_vadjustment_inner(value.get().unwrap()),
-                "hscroll-policy" => self.hscroll_policy.set(value.get().unwrap()),
-                "vscroll-policy" => self.vscroll_policy.set(value.get().unwrap()),
-                _ => unimplemented!(),
+                "hadjustment" => match value.get() {
+                    Ok(adj) => self.obj().set_hadjustment_inner(adj),
+                    Err(e) => tracing::warn!("canvas set_property hadjustment: {e}"),
+                },
+                "vadjustment" => match value.get() {
+                    Ok(adj) => self.obj().set_vadjustment_inner(adj),
+                    Err(e) => tracing::warn!("canvas set_property vadjustment: {e}"),
+                },
+                "hscroll-policy" => match value.get() {
+                    Ok(policy) => self.hscroll_policy.set(policy),
+                    Err(e) => tracing::warn!("canvas set_property hscroll-policy: {e}"),
+                },
+                "vscroll-policy" => match value.get() {
+                    Ok(policy) => self.vscroll_policy.set(policy),
+                    Err(e) => tracing::warn!("canvas set_property vscroll-policy: {e}"),
+                },
+                other => tracing::warn!("canvas set_property: unknown property {other:?} ignored"),
             }
         }
 

@@ -10,7 +10,7 @@ use lixun_core::Action;
 use lixun_config::Keybindings;
 
 use crate::actions::{
-    copy_to_clipboard, execute_action, execute_secondary_action, run_and_capture,
+    copy_to_clipboard, execute_action, execute_secondary_action, run_and_capture_async,
 };
 use crate::factory::{cached_hit_by_id, synthetic_history_hits, update_results, with_cached_hits};
 use crate::ipc::{
@@ -411,7 +411,10 @@ pub(crate) fn install_keyboard_handler(
                     // ExecCapture: run the command headless, capture
                     // stdout, and replace the query text. Used by
                     // shell plugin to pipe command output into the
-                    // launcher instead of opening a terminal.
+                    // launcher instead of opening a terminal. The
+                    // capture waits on a worker thread; the query
+                    // replacement callback runs back on the main
+                    // thread once output (or a timeout) arrives.
                     if is_secondary
                         && let Some(sec) = &hit.secondary_action
                         && let Action::ExecCapture {
@@ -419,11 +422,14 @@ pub(crate) fn install_keyboard_handler(
                             working_dir,
                         } = sec.as_ref()
                     {
-                        if let Some(output) = run_and_capture(cmdline, working_dir.as_deref()) {
-                            entry.set_text(output.trim_end());
-                            entry.set_position(-1);
-                            entry.grab_focus();
-                        }
+                        let entry = entry.clone();
+                        run_and_capture_async(cmdline, working_dir.as_deref(), move |output| {
+                            if let Some(output) = output {
+                                entry.set_text(output.trim_end());
+                                entry.set_position(-1);
+                                entry.grab_focus();
+                            }
+                        });
                         should_hide = false;
                         return;
                     }

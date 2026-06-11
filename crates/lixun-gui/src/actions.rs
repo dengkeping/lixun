@@ -273,16 +273,50 @@ pub(crate) fn copy_to_clipboard(hit: &Hit) {
     tracing::info!("Copied to clipboard: {}", text);
 }
 
-pub(crate) fn run_and_capture(
+/// Run `cmdline` headless and deliver its captured stdout to
+/// `on_done` on the GTK main thread. Must be called from the main
+/// thread (it arms a `glib::spawn_future_local` future).
+///
+/// The wait happens on a dedicated worker thread so the GTK main
+/// loop never blocks: the previous implementation busy-waited up to
+/// 500ms with `thread::sleep` on the main thread, freezing the UI.
+/// `on_done` receives `Some(stdout)` on success, `None` on spawn
+/// failure, non-zero exit, non-UTF-8 output, or timeout.
+pub(crate) fn run_and_capture_async<F>(
+    cmdline: &[String],
+    working_dir: Option<&std::path::Path>,
+    on_done: F,
+) where
+    F: FnOnce(Option<String>) + 'static,
+{
+    if cmdline.is_empty() {
+        on_done(None);
+        return;
+    }
+
+    let cmdline = cmdline.to_vec();
+    let working_dir = working_dir.map(std::path::Path::to_path_buf);
+    let (tx, rx) = async_channel::bounded::<Option<String>>(1);
+
+    std::thread::spawn(move || {
+        let result = run_and_capture_blocking(&cmdline, working_dir.as_deref());
+        let _ = tx.send_blocking(result);
+    });
+
+    glib::spawn_future_local(async move {
+        let result = rx.recv().await.unwrap_or(None);
+        on_done(result);
+    });
+}
+
+/// Blocking half of `run_and_capture_async`: spawn, poll with
+/// `try_wait`, kill-and-reap on timeout. Runs on a worker thread.
+fn run_and_capture_blocking(
     cmdline: &[String],
     working_dir: Option<&std::path::Path>,
 ) -> Option<String> {
     use std::process::{Command, Stdio};
     use std::time::Duration;
-
-    if cmdline.is_empty() {
-        return None;
-    }
 
     let mut cmd = Command::new(&cmdline[0]);
     cmd.args(&cmdline[1..])
@@ -301,6 +335,11 @@ pub(crate) fn run_and_capture(
     loop {
         if start.elapsed() > timeout {
             tracing::warn!("run_and_capture: command timed out after 500ms");
+            // Kill and reap synchronously — we own this worker
+            // thread, so a blocking wait() is fine and avoids
+            // leaving a zombie behind.
+            let _ = child.kill();
+            let _ = child.wait();
             return None;
         }
         std::thread::sleep(Duration::from_millis(10));

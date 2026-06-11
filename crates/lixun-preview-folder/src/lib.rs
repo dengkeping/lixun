@@ -24,7 +24,9 @@
 
 mod listing;
 
+use std::cell::Cell;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use gtk::glib;
 use gtk::prelude::*;
@@ -93,7 +95,16 @@ impl PreviewPlugin for FolderPreview {
         scroll.set_child(Some(&list));
         root.append(&scroll);
 
-        spawn_listing(path, list, subtitle);
+        // Listing-generation counter owned by this widget (same
+        // epoch idiom as the pdf plugin's render pipeline): every
+        // spawn_listing call bumps it and stamps the in-flight
+        // future, so a slow listing that completes after a newer
+        // one was spawned for the same widget is discarded instead
+        // of overwriting the fresh rows. build() is currently the
+        // only spawner; any future in-place update path must reuse
+        // this same counter when it re-lists.
+        let epoch = Rc::new(Cell::new(0u64));
+        spawn_listing(path, list, subtitle, epoch);
 
         Ok(root.upcast())
     }
@@ -147,12 +158,30 @@ fn build_header(path: &std::path::Path) -> (gtk::Widget, gtk::Label) {
 /// the `ListBox` when it completes, keeping `build` well under its
 /// budget. The `subtitle` clone receives the "N files, M folders ·
 /// size" summary once results land.
-fn spawn_listing(path: PathBuf, list: gtk::ListBox, subtitle: gtk::Label) {
+///
+/// `epoch` guards against out-of-order completion: each call bumps
+/// the widget-owned counter and captures the new value; if another
+/// listing was spawned for the same widget before this one
+/// finished, the captured value no longer matches and the stale
+/// result is dropped without touching the rows.
+fn spawn_listing(path: PathBuf, list: gtk::ListBox, subtitle: gtk::Label, epoch: Rc<Cell<u64>>) {
+    let this_epoch = epoch.get().wrapping_add(1);
+    epoch.set(this_epoch);
     let work_path = path.clone();
     glib::spawn_future_local(async move {
         let outcome = gtk::gio::spawn_blocking(move || list_dir(&work_path, ENTRY_CAP))
             .await
             .unwrap_or_else(|_| Err(DirError::Io("listing task cancelled".to_string())));
+
+        if epoch.get() != this_epoch {
+            tracing::info!(
+                "folder: discarding stale listing for {:?} (epoch {} superseded by {})",
+                path,
+                this_epoch,
+                epoch.get()
+            );
+            return;
+        }
 
         clear_rows(&list);
 

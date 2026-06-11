@@ -646,11 +646,10 @@ fn pick_current_monitor() -> Option<gtk::gdk::Monitor> {
         && let Some(pointer) = seat.pointer()
     {
         let (surface, _, _) = pointer.surface_at_position();
-        if let Some(surface) = surface {
-            if let Some(monitor) = display.monitor_at_surface(&surface) {
+        if let Some(surface) = surface
+            && let Some(monitor) = display.monitor_at_surface(&surface) {
                 return Some(monitor);
             }
-        }
     }
     display
         .monitors()
@@ -852,9 +851,15 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
         .and_downcast::<gtk::gdk::Monitor>()
     {
         let geom = monitor.geometry();
-        let w = (geom.width() * i32::from(daemon_config.gui.width_percent) / 100)
+        // Compute in f64 and round: `i32 * percent / 100` truncates,
+        // which can undershoot the requested fraction by a pixel.
+        // Result is clamped to the configured max_*_px caps as before.
+        let percent_of = |dim: i32, percent: u8| -> i32 {
+            (f64::from(dim) * f64::from(percent) / 100.0).round() as i32
+        };
+        let w = percent_of(geom.width(), daemon_config.gui.width_percent)
             .min(daemon_config.gui.max_width_px);
-        let h = (geom.height() * i32::from(daemon_config.gui.height_percent) / 100)
+        let h = percent_of(geom.height(), daemon_config.gui.height_percent)
             .min(daemon_config.gui.max_height_px);
         window.set_default_size(w, -1);
         gui_max_content_height = h;
@@ -2123,17 +2128,17 @@ mod tests {
     #[test]
     fn response_routing_renders_hero() {
         let hits = vec![
-            mk_hit("app:firefox", "Firefox"),
-            mk_hit("app:chromium", "Chromium"),
-            mk_hit("app:thunderbird", "Thunderbird"),
+            mk_hit("app:editor-a", "Editor A"),
+            mk_hit("app:browser-b", "Browser B"),
+            mk_hit("app:mailer-c", "Mailer C"),
         ];
-        let top = DocId("app:firefox".into());
+        let top = DocId("app:editor-a".into());
         let plan = compute_render_plan(&hits, Some(&top));
         assert_eq!(plan.top_hit_index, Some(0));
         assert_eq!(plan.hits.len(), 3);
-        assert_eq!(plan.hits[0].id.0, "app:firefox");
-        assert_eq!(plan.hits[1].id.0, "app:chromium");
-        assert_eq!(plan.hits[2].id.0, "app:thunderbird");
+        assert_eq!(plan.hits[0].id.0, "app:editor-a");
+        assert_eq!(plan.hits[1].id.0, "app:browser-b");
+        assert_eq!(plan.hits[2].id.0, "app:mailer-c");
     }
 
     #[test]

@@ -82,7 +82,18 @@ impl PreviewPlugin for EmailPreview {
             ),
         };
 
-        let raw = fs::read(&path)?;
+        // Stat first so an oversized mailbox file never allocates more
+        // than MAX_EMAIL_BYTES; mail-parser copes with a truncated tail.
+        let raw = if fs::metadata(&path)?.len() > MAX_EMAIL_BYTES as u64 {
+            use std::io::Read;
+            let mut buf = Vec::with_capacity(MAX_EMAIL_BYTES);
+            fs::File::open(&path)?
+                .take(MAX_EMAIL_BYTES as u64)
+                .read_to_end(&mut buf)?;
+            buf
+        } else {
+            fs::read(&path)?
+        };
         let capped: &[u8] = if raw.len() > MAX_EMAIL_BYTES {
             &raw[..MAX_EMAIL_BYTES]
         } else {

@@ -96,6 +96,12 @@ pub(crate) fn start_ipc_thread(
             }
 
             loop {
+                // Cheap early-skip only: if the session epoch already
+                // moved on, don't bother blocking on the socket for a
+                // reply nobody wants. This check is advisory — the
+                // authoritative stale check is the one performed
+                // immediately before handing a decoded chunk to the
+                // event channel below.
                 if epoch_at_send != session_epoch.load(Ordering::SeqCst) {
                     tracing::debug!(
                         "ipc: dropping reply from stale session (sent in epoch {})",
@@ -112,6 +118,12 @@ pub(crate) fn start_ipc_thread(
                             || e.kind() == std::io::ErrorKind::TimedOut =>
                     {
                         tracing::debug!("ipc: read timeout, treating as Final");
+                        // Same authoritative pre-send check as the decoded
+                        // chunk path: never hand a synthetic Final for a
+                        // stale session to the event channel.
+                        if epoch_at_send != session_epoch.load(Ordering::SeqCst) {
+                            break;
+                        }
                         let _ = event_tx.send_blocking(IpcMessage::SearchChunk {
                             epoch: epoch_at_send,
                             phase: Phase::Final,
@@ -171,14 +183,6 @@ pub(crate) fn start_ipc_thread(
                             break;
                         }
 
-                        if epoch_at_send != session_epoch.load(Ordering::SeqCst) {
-                            tracing::debug!(
-                                "ipc: session epoch changed after chunk read, dropping commit (sent in epoch {})",
-                                epoch_at_send
-                            );
-                            break;
-                        }
-
                         let is_final = matches!(phase, Phase::Final);
                         tracing::debug!(
                             "ipc: chunk received epoch={} phase={:?} hits={}",
@@ -186,6 +190,20 @@ pub(crate) fn start_ipc_thread(
                             phase,
                             hits.len()
                         );
+
+                        // Authoritative stale check: compare against the
+                        // live atomic at the moment the decoded chunk is
+                        // handed to the event channel. A session-epoch
+                        // bump at any earlier point (between the loop-top
+                        // early-skip and here) is caught by this single
+                        // check, so no stale chunk can be committed.
+                        if epoch_at_send != session_epoch.load(Ordering::SeqCst) {
+                            tracing::debug!(
+                                "ipc: session epoch changed after chunk read, dropping commit (sent in epoch {})",
+                                epoch_at_send
+                            );
+                            break;
+                        }
                         let _ = event_tx.send_blocking(IpcMessage::SearchChunk {
                             epoch: resp_epoch,
                             phase,
@@ -498,7 +516,7 @@ mod tests {
             phase: Phase::Initial,
             hits: Vec::new(),
             calculation: None,
-            top_hit: Some(lixun_core::DocId("app:firefox".into())),
+            top_hit: Some(lixun_core::DocId("app:editor-a".into())),
             explanations: vec![],
             claimed: false,
         };
@@ -513,7 +531,7 @@ mod tests {
             } => {
                 assert_eq!(epoch, 42);
                 assert_eq!(phase, Phase::Initial);
-                assert_eq!(top_hit.as_ref().map(|d| d.0.as_str()), Some("app:firefox"));
+                assert_eq!(top_hit.as_ref().map(|d| d.0.as_str()), Some("app:editor-a"));
             }
             other => panic!("expected SearchChunk, got {:?}", other),
         }

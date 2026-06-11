@@ -29,11 +29,11 @@
 //!   separate `gtk::MediaControls` holding the stream. This path
 //!   does NOT go through `GtkVideo`, so `decodebin3` is not asked
 //!   to produce a video stream, and the audio-only assertion does
-//!   not fire. We keep a strong `Rc` reference to the
-//!   `gtk::MediaFile` alive by attaching it to the container via
-//!   `unsafe_set_data` — GTK owns the controls widget but the
-//!   stream object's lifetime must outlive the controls or the
-//!   transport freezes.
+//!   not fire. We keep a strong reference to the `gtk::MediaFile`
+//!   alive by capturing it in a `destroy`-signal closure on the
+//!   container — GTK owns the controls widget but the stream
+//!   object's lifetime must outlive the controls or the transport
+//!   freezes.
 //!
 //! # Autoplay
 //!
@@ -131,9 +131,21 @@ impl PreviewPlugin for AvPreview {
             vbox.append(&icon);
             vbox.append(&controls);
 
-            unsafe {
-                vbox.set_data::<gtk::MediaFile>("lixun-av-media-stream", media);
-            }
+            // Anchor the stream to the container without `unsafe`:
+            // the `destroy`-signal closure owns a strong reference
+            // to the MediaFile, and GObject keeps signal closures
+            // alive until the widget is finalized. The stream
+            // therefore lives exactly as long as the container —
+            // the same guarantee the previous `unsafe set_data`
+            // anchor provided, preserving the BUG-2 contract that
+            // audio-only transport keeps working while the preview
+            // is shown.
+            let media_anchor = media;
+            vbox.connect_destroy(move |_| {
+                // Body intentionally empty: the closure exists only
+                // to own `media_anchor` for the widget's lifetime.
+                let _ = &media_anchor;
+            });
         } else {
             let video = gtk::Video::new();
             video.set_media_stream(Some(&media));

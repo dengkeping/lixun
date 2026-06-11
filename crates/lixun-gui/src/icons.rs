@@ -58,8 +58,24 @@ thread_local! {
 
 fn icon_theme() -> Option<gtk::IconTheme> {
     THEME.with(|cell| {
-        cell.get_or_init(|| gdk::Display::default().map(|d| gtk::IconTheme::for_display(&d)))
-            .clone()
+        cell.get_or_init(|| {
+            let theme = gdk::Display::default().map(|d| gtk::IconTheme::for_display(&d));
+            if theme.is_none() {
+                // Warn once per process: THEME is thread-local, so
+                // the OnceCell alone would re-log on every thread
+                // that touches icon resolution.
+                use std::sync::atomic::{AtomicBool, Ordering};
+                static WARNED: AtomicBool = AtomicBool::new(false);
+                if !WARNED.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        "icon theme unavailable (no GDK display); \
+                         category fallback icon names are in use without theme lookup"
+                    );
+                }
+            }
+            theme
+        })
+        .clone()
     })
 }
 

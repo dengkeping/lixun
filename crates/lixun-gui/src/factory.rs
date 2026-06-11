@@ -767,11 +767,11 @@ mod tests {
 
     #[test]
     fn top_hit_doc_id_roundtrip() {
-        cache_top_hit_doc_id(Some("app:firefox".into()));
-        assert!(is_top_hit_doc("app:firefox"));
-        assert!(!is_top_hit_doc("app:chromium"));
+        cache_top_hit_doc_id(Some("app:editor-a".into()));
+        assert!(is_top_hit_doc("app:editor-a"));
+        assert!(!is_top_hit_doc("app:browser-b"));
         assert!(!is_top_hit_doc(""));
         cache_top_hit_doc_id(None);
-        assert!(!is_top_hit_doc("app:firefox"));
+        assert!(!is_top_hit_doc("app:editor-a"));
     }
 }

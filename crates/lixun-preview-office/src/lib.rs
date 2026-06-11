@@ -129,13 +129,14 @@ impl PreviewPlugin for OfficePreview {
             _ => anyhow::bail!("office plugin: hit has no openable path"),
         };
 
-        let soffice_bin = find_soffice();
-        if soffice_bin.is_none() {
+        // let-else keeps the missing-binary path on the error-widget
+        // branch with no panicking unwrap downstream.
+        let Some(soffice_bin) = find_soffice() else {
             return Ok(error_widget(
                 "libreoffice not installed — install libreoffice-still or \
                  libreoffice-fresh and retry.",
             ));
-        }
+        };
 
         let cache_dir = office_cache_dir();
         let cache_key = compute_cache_key(&path);
@@ -168,7 +169,6 @@ impl PreviewPlugin for OfficePreview {
 
         let (tx, rx): (Sender<ConvertOutcome>, Receiver<ConvertOutcome>) =
             async_channel::bounded(1);
-        let soffice_bin = soffice_bin.unwrap();
         let target_path = cache_file.clone();
         let source_path = path.clone();
         std::thread::spawn(move || {
@@ -362,16 +362,28 @@ fn run_soffice_convert(bin: &Path, src: &Path, dest: &Path) -> ConvertOutcome {
 
     let pid = child.id();
     let (done_tx, done_rx) = mpsc::channel();
-    std::thread::spawn(move || {
+    let waiter = std::thread::spawn(move || {
         let status = child.wait();
         let _ = done_tx.send(status);
     });
 
     let exit_status = match done_rx.recv_timeout(CONVERSION_TIMEOUT) {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => return ConvertOutcome::Err(format!("wait soffice: {}", e)),
+        Ok(Ok(s)) => {
+            // The waiter already sent its result, so this join is
+            // immediate; it just keeps the thread from outliving us.
+            let _ = waiter.join();
+            s
+        }
+        Ok(Err(e)) => {
+            let _ = waiter.join();
+            return ConvertOutcome::Err(format!("wait soffice: {}", e));
+        }
         Err(_) => {
             kill_pid(pid);
+            // The kill unblocks `child.wait()` in the waiter thread,
+            // which reaps the child; join so neither the thread nor
+            // a zombie outlives this function.
+            let _ = waiter.join();
             return ConvertOutcome::Err(format!(
                 "soffice exceeded {}s timeout — killed pid={}",
                 CONVERSION_TIMEOUT.as_secs(),
@@ -417,13 +429,25 @@ fn tempdir_sibling(parent: &Path) -> std::io::Result<PathBuf> {
     Ok(dir)
 }
 
+/// Terminate `pid`: SIGTERM first, then escalate to SIGKILL only if
+/// the process still exists after a short grace period. ESRCH (no
+/// such process) means it already exited — treated as success.
+/// Linux-only, like the rest of this file.
 fn kill_pid(pid: u32) {
-    unsafe {
-        libc::kill(pid as i32, libc::SIGTERM);
+    let pid = pid as i32;
+    let rc = unsafe { libc::kill(pid, libc::SIGTERM) };
+    if rc != 0 {
+        // ESRCH: already gone, nothing to escalate. Any other errno
+        // (EPERM) means SIGKILL would fail identically — bail out.
+        return;
     }
     std::thread::sleep(Duration::from_millis(250));
-    unsafe {
-        libc::kill(pid as i32, libc::SIGKILL);
+    // Signal 0 probes existence without sending anything; only
+    // escalate if the process survived the grace period.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
     }
 }
 
