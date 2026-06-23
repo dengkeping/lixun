@@ -2,8 +2,10 @@
 //!
 //! GTK4 has no `backdrop-filter` and Wayland forbids reading the backdrop
 //! pixels, so a real blur can only come from the compositor. KDE exposes
-//! `org_kde_kwin_blur_manager`; this module binds it from the registry
-//! and asks the compositor to blur the area underneath our surface.
+//! modern Plasma exposes `ext_background_effect_manager_v1`, while older
+//! Plasma exposes `org_kde_kwin_blur_manager`; this module binds the
+//! standard protocol first, falls back to the KDE-private protocol, and
+//! asks the compositor to blur the area underneath our surface.
 //!
 //! On compositors without the protocol (sway, niri, GNOME, …) every entry
 //! point silently no-ops: the user gets the translucent CSS panel without
@@ -37,6 +39,7 @@
 use gdk4_wayland::prelude::WaylandSurfaceExtManual;
 use gtk::prelude::*;
 use std::cell::RefCell;
+use std::ops::RangeInclusive;
 use std::rc::Rc;
 use wayland_client::globals::{GlobalList, GlobalListContents, registry_queue_init};
 use wayland_client::protocol::wl_compositor::WlCompositor;
@@ -44,8 +47,46 @@ use wayland_client::protocol::wl_region::WlRegion;
 use wayland_client::protocol::wl_registry::WlRegistry;
 use wayland_client::protocol::wl_surface::WlSurface;
 use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle};
+use wayland_protocols::ext::background_effect::v1::client::ext_background_effect_manager_v1::ExtBackgroundEffectManagerV1;
+use wayland_protocols::ext::background_effect::v1::client::ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1;
 use wayland_protocols_plasma::blur::client::org_kde_kwin_blur::OrgKdeKwinBlur;
 use wayland_protocols_plasma::blur::client::org_kde_kwin_blur_manager::OrgKdeKwinBlurManager;
+
+#[cfg(test)]
+fn bind_version(range: RangeInclusive<u32>, advertised: u32) -> Option<u32> {
+    let start = *range.start();
+    let end = *range.end();
+    if advertised < start {
+        None
+    } else {
+        Some(advertised.min(end))
+    }
+}
+
+fn backend_preference() -> [BlurBackendKind; 2] {
+    [
+        BlurBackendKind::ExtBackgroundEffect,
+        BlurBackendKind::KdeBlur,
+    ]
+}
+
+fn kde_blur_manager_bind_range() -> RangeInclusive<u32> {
+    1..=1
+}
+
+fn compositor_bind_range() -> RangeInclusive<u32> {
+    1..=6
+}
+
+fn background_effect_manager_bind_range() -> RangeInclusive<u32> {
+    1..=1
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BlurBackendKind {
+    ExtBackgroundEffect,
+    KdeBlur,
+}
 
 /// Border-radius (in CSS pixels) of `.lixun-window` in style.css. Must
 /// match so the blur region honours the rounded silhouette and the
@@ -55,9 +96,10 @@ const WINDOW_BORDER_RADIUS: i32 = 14;
 /// CSS class added to `.lixun-window` when blur is disabled so the
 /// stylesheet can compensate with a heavier background fill. This is
 /// the WM-agnostic half of the toggle: on compositors that don't
-/// implement `org_kde_kwin_blur_manager` (Hyprland, sway, niri, GNOME)
-/// the protocol attach is a no-op, but the class still toggles, so
-/// the panel always reflects the user's preference visually.
+/// implement either `ext_background_effect_manager_v1` or
+/// `org_kde_kwin_blur_manager` (Hyprland, sway, niri, GNOME) the protocol
+/// attach is a no-op, but the class still toggles, so the panel always
+/// reflects the user's preference visually.
 const NO_BLUR_CLASS: &str = "lixun-no-blur";
 
 /// Runtime controller for KDE compositor blur.
@@ -108,6 +150,9 @@ impl BlurController {
                 if !st.enabled {
                     return;
                 }
+                if let Some(old) = st.attachment.take() {
+                    old.detach();
+                }
                 match BlurAttachment::create(surface, width, height) {
                     Ok(Some(att)) => {
                         tracing::debug!("KDE blur enabled: {width}×{height} (layout)");
@@ -147,28 +192,30 @@ impl BlurController {
             return;
         }
         st.enabled = enabled;
-        if !enabled
-            && let Some(att) = st.attachment.take() {
-                att.detach();
-            }
+        if !enabled && let Some(att) = st.attachment.take() {
+            att.detach();
+        }
         drop(st);
 
         apply_no_blur_class(&self.window, !enabled);
 
-        if enabled
-            && let Some(surface) = self.window.surface() {
-                let (w, h) = (surface.width(), surface.height());
-                if w > 1 && h > 1 {
-                    match BlurAttachment::create(&surface, w, h) {
-                        Ok(Some(att)) => {
-                            tracing::debug!("KDE blur re-enabled: {w}×{h}");
-                            self.state.borrow_mut().attachment = Some(att);
-                        }
-                        Ok(None) => {}
-                        Err(e) => tracing::warn!("KDE blur re-attach failed: {e:#}"),
+        if enabled && let Some(surface) = self.window.surface() {
+            let (w, h) = (surface.width(), surface.height());
+            if w > 1 && h > 1 {
+                let old = self.state.borrow_mut().attachment.take();
+                if let Some(old) = old {
+                    old.detach();
+                }
+                match BlurAttachment::create(&surface, w, h) {
+                    Ok(Some(att)) => {
+                        tracing::debug!("KDE blur re-enabled: {w}×{h}");
+                        self.state.borrow_mut().attachment = Some(att);
                     }
+                    Ok(None) => {}
+                    Err(e) => tracing::warn!("KDE blur re-attach failed: {e:#}"),
                 }
             }
+        }
     }
 }
 
@@ -181,11 +228,27 @@ fn apply_no_blur_class(window: &gtk::ApplicationWindow, no_blur: bool) {
 }
 
 struct BlurAttachment {
-    blur: OrgKdeKwinBlur,
-    manager: OrgKdeKwinBlurManager,
+    backend: BlurBackend,
     surface: WlSurface,
     conn: Connection,
     _queue: EventQueue<RegistryState>,
+}
+
+enum BlurBackend {
+    ExtBackgroundEffect {
+        effect: ExtBackgroundEffectSurfaceV1,
+        manager: ExtBackgroundEffectManagerV1,
+    },
+    KdeBlur {
+        blur: OrgKdeKwinBlur,
+        manager: OrgKdeKwinBlurManager,
+    },
+}
+
+struct BlurProtocolContext<'a> {
+    globals: &'a GlobalList,
+    qh: &'a QueueHandle<RegistryState>,
+    compositor: &'a WlCompositor,
 }
 
 impl BlurAttachment {
@@ -236,22 +299,86 @@ impl BlurAttachment {
             registry_queue_init::<RegistryState>(&conn)?;
         let qh: QueueHandle<RegistryState> = queue.handle();
 
-        let manager = match globals.bind::<OrgKdeKwinBlurManager, _, _>(&qh, 1..=1, ()) {
-            Ok(m) => m,
-            Err(_) => return Ok(None),
-        };
-        let compositor = match globals.bind::<WlCompositor, _, _>(&qh, 4..=6, ()) {
+        let compositor = match globals.bind::<WlCompositor, _, _>(&qh, compositor_bind_range(), ())
+        {
             Ok(c) => c,
             Err(_) => return Ok(None),
         };
 
-        let blur = manager.create(&wl_surface, &qh, ());
+        let protocol = BlurProtocolContext {
+            globals: &globals,
+            qh: &qh,
+            compositor: &compositor,
+        };
+
+        for backend in backend_preference() {
+            if backend == BlurBackendKind::ExtBackgroundEffect
+                && let Some(backend) =
+                    Self::create_ext_background_effect(&protocol, &wl_surface, width, height)?
+            {
+                wl_surface.commit();
+                let _ = conn.flush();
+                return Ok(Some(Self {
+                    backend,
+                    surface: wl_surface,
+                    conn,
+                    _queue: queue,
+                }));
+            }
+        }
+
+        Self::create_kde_blur(&protocol, wl_surface, conn, queue, width, height)
+    }
+
+    fn create_ext_background_effect(
+        protocol: &BlurProtocolContext<'_>,
+        wl_surface: &WlSurface,
+        width: i32,
+        height: i32,
+    ) -> anyhow::Result<Option<BlurBackend>> {
+        let manager = match protocol.globals.bind::<ExtBackgroundEffectManagerV1, _, _>(
+            protocol.qh,
+            background_effect_manager_bind_range(),
+            (),
+        ) {
+            Ok(m) => m,
+            Err(_) => return Ok(None),
+        };
+
+        let effect = manager.get_background_effect(wl_surface, protocol.qh, ());
+
+        let region = protocol.compositor.create_region(protocol.qh, ());
+        add_rounded_rect(&region, width, height, WINDOW_BORDER_RADIUS);
+        effect.set_blur_region(Some(&region));
+        region.destroy();
+
+        Ok(Some(BlurBackend::ExtBackgroundEffect { effect, manager }))
+    }
+
+    fn create_kde_blur(
+        protocol: &BlurProtocolContext<'_>,
+        wl_surface: WlSurface,
+        conn: Connection,
+        queue: EventQueue<RegistryState>,
+        width: i32,
+        height: i32,
+    ) -> anyhow::Result<Option<Self>> {
+        let manager = match protocol.globals.bind::<OrgKdeKwinBlurManager, _, _>(
+            protocol.qh,
+            kde_blur_manager_bind_range(),
+            (),
+        ) {
+            Ok(m) => m,
+            Err(_) => return Ok(None),
+        };
+
+        let blur = manager.create(&wl_surface, protocol.qh, ());
 
         // Blur region follows the rounded silhouette so the compositor
         // doesn't blur pixels outside the visible rounded body (which
         // would produce a rectangular blur halo around the 14px corner
         // radius cutouts).
-        let region = compositor.create_region(&qh, ());
+        let region = protocol.compositor.create_region(protocol.qh, ());
         add_rounded_rect(&region, width, height, WINDOW_BORDER_RADIUS);
         blur.set_region(Some(&region));
         region.destroy();
@@ -272,8 +399,7 @@ impl BlurAttachment {
         let _ = conn.flush();
 
         Ok(Some(Self {
-            blur,
-            manager,
+            backend: BlurBackend::KdeBlur { blur, manager },
             surface: wl_surface,
             conn,
             _queue: queue,
@@ -281,8 +407,18 @@ impl BlurAttachment {
     }
 
     fn detach(self) {
-        self.manager.unset(&self.surface);
-        self.blur.release();
+        match self.backend {
+            BlurBackend::ExtBackgroundEffect { effect, manager } => {
+                effect.set_blur_region(None);
+                effect.destroy();
+                manager.destroy();
+                self.surface.commit();
+            }
+            BlurBackend::KdeBlur { blur, manager } => {
+                manager.unset(&self.surface);
+                blur.release();
+            }
+        }
         let _ = self.conn.flush();
     }
 }
@@ -310,6 +446,30 @@ impl Dispatch<OrgKdeKwinBlurManager, ()> for RegistryState {
         _: &mut Self,
         _: &OrgKdeKwinBlurManager,
         _: <OrgKdeKwinBlurManager as Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ExtBackgroundEffectManagerV1, ()> for RegistryState {
+    fn event(
+        _: &mut Self,
+        _: &ExtBackgroundEffectManagerV1,
+        _: <ExtBackgroundEffectManagerV1 as Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ExtBackgroundEffectSurfaceV1, ()> for RegistryState {
+    fn event(
+        _: &mut Self,
+        _: &ExtBackgroundEffectSurfaceV1,
+        _: <ExtBackgroundEffectSurfaceV1 as Proxy>::Event,
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
@@ -399,4 +559,47 @@ fn add_rounded_rect(region: &WlRegion, width: i32, height: i32, radius: i32) {
         band_count += 2;
     }
     tracing::debug!("  bands: {band_count} rects (top+bottom)");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kde_blur_manager_keeps_v1_compatibility() {
+        assert_eq!(kde_blur_manager_bind_range(), 1..=1);
+        assert_eq!(bind_version(kde_blur_manager_bind_range(), 0), None);
+        assert_eq!(bind_version(kde_blur_manager_bind_range(), 1), Some(1));
+        assert_eq!(bind_version(kde_blur_manager_bind_range(), 2), Some(1));
+        assert_eq!(bind_version(kde_blur_manager_bind_range(), 999), Some(1));
+    }
+
+    #[test]
+    fn compositor_range_accepts_old_and_new_globals() {
+        assert_eq!(compositor_bind_range(), 1..=6);
+        assert_eq!(bind_version(compositor_bind_range(), 0), None);
+        assert_eq!(bind_version(compositor_bind_range(), 1), Some(1));
+        assert_eq!(bind_version(compositor_bind_range(), 3), Some(3));
+        assert_eq!(bind_version(compositor_bind_range(), 6), Some(6));
+        assert_eq!(bind_version(compositor_bind_range(), 7), Some(6));
+    }
+
+    #[test]
+    fn old_compositor_range_would_reject_compatible_compositors() {
+        let old_range = 4..=6;
+        assert_eq!(bind_version(old_range.clone(), 1), None);
+        assert_eq!(bind_version(old_range.clone(), 3), None);
+        assert_eq!(bind_version(old_range, 4), Some(4));
+    }
+
+    #[test]
+    fn standardized_background_effect_is_preferred_before_kde_fallback() {
+        assert_eq!(
+            backend_preference(),
+            [
+                BlurBackendKind::ExtBackgroundEffect,
+                BlurBackendKind::KdeBlur
+            ]
+        );
+    }
 }
