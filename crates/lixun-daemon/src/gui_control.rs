@@ -70,7 +70,7 @@ impl GuiControl {
         }
 
         if state.pid.is_none() {
-            let pid = self.spawn(Arc::clone(self))?;
+            let pid = self.spawn(Arc::clone(self)).await?;
             state.pid = Some(pid);
             drop(state);
             wait_for_ready().await?;
@@ -159,9 +159,9 @@ impl GuiControl {
         matches!(read.await, Ok(Ok(_)))
     }
 
-    fn spawn(&self, self_arc: Arc<GuiControl>) -> anyhow::Result<u32> {
+    async fn spawn(&self, self_arc: Arc<GuiControl>) -> anyhow::Result<u32> {
         let mut cmd = tokio::process::Command::new("lixun-gui");
-        let env = session_env::discover_gui_env();
+        let env = session_env::discover_gui_env_async().await;
         for (k, v) in &env {
             cmd.env(k, v);
         }

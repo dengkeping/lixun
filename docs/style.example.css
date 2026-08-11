@@ -33,6 +33,7 @@
  *   #lixun-status-inner    - inner content box of the status bar
  *   .lixun-status          - class on the inner box (same node)
  *   .lixun-status-label    - muted text inside status bar
+ *   .lixun-status-error    - failed-launch message (with .lixun-status-label)
  *   .lixun-status-calc     - calculator result display
  *   .lixun-status-action   - action buttons in status bar (web search,
  *                            copy, etc.)
@@ -203,6 +204,12 @@ row:focus-within .lixun-hit,
 .lixun-status-label {
     color: #a8a8b2;
     font-size: 12px;
+}
+
+/* Must come after .lixun-status-label — both are applied to the same widget. */
+.lixun-status-error {
+    color: #ff6b6b;
+    font-weight: 500;
 }
 
 .lixun-status-calc {

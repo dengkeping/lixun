@@ -188,6 +188,8 @@ pub(crate) fn install_keyboard_handler(
         keybindings,
         #[strong]
         controller,
+        #[strong]
+        status_bar,
         move |_, key, _keycode, state| {
             let entry_focus = entry_has_focus(&entry, &window);
             let printable = is_printable_key(key, state);
@@ -441,6 +443,15 @@ pub(crate) fn install_keyboard_handler(
                     };
                     if let Err(e) = result {
                         tracing::error!("Action failed: {}", e);
+                        // Keep the launcher up and say what went wrong.
+                        // Hiding on a failed launch makes the failure
+                        // indistinguishable from success — the user sees
+                        // the window vanish and no application appear,
+                        // with nothing to act on. The double-click path
+                        // already declines to hide (factory.rs); mirror
+                        // it here.
+                        status_bar.show_error(&format!("Couldn't open “{}”: {}", hit.title, e));
+                        should_hide = false;
                     }
                 });
                 // Launch-completing action: drop the session cache

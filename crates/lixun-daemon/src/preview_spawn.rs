@@ -449,7 +449,7 @@ impl PreviewSpawner {
         // Reuse the same session-env discovery we use for the
         // GUI: preview must find `WAYLAND_DISPLAY`,
         // `XDG_RUNTIME_DIR`, etc. under systemd user manager.
-        let env = session_env::discover_gui_env();
+        let env = session_env::discover_gui_env_async().await;
         for (k, v) in &env {
             cmd.env(k, v);
         }

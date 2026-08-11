@@ -38,8 +38,17 @@ use std::time::Duration;
 /// long; large enough that the thread is effectively idle.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(2);
 
+/// A tracked child plus the program name it was spawned from, kept so the
+/// exit-status log can name the process. `Child` exposes only a pid, and by
+/// the time it exits `/proc/<pid>/cmdline` is gone — without capturing the
+/// program up front, a non-zero exit is an anonymous number.
+struct Tracked {
+    program: String,
+    child: Child,
+}
+
 struct ReaperState {
-    children: Mutex<Vec<Child>>,
+    children: Mutex<Vec<Tracked>>,
     cv: Condvar,
 }
 
@@ -80,13 +89,34 @@ fn reaper_loop(state: Arc<ReaperState>) {
         // retain_mut: keep children that are still running; drop
         // those that exited. `try_wait` consumes the zombie; the
         // subsequent drop only closes the pidfd/handle.
-        guard.retain_mut(|child| match child.try_wait() {
-            Ok(None) => true,           // still running
-            Ok(Some(_status)) => false, // exited, reaped
+        guard.retain_mut(|tracked| match tracked.child.try_wait() {
+            Ok(None) => true, // still running
+            Ok(Some(status)) if !status.success() => {
+                // The ONLY place a launch failure becomes visible.
+                // `Command::spawn()` succeeds as soon as the fork/exec
+                // lands, so a handler that execs fine and then dies on
+                // its own (missing X cookie, wrong desktop, bad argv)
+                // returns Ok to the caller and would otherwise vanish
+                // without trace — the launcher has already hidden by
+                // then, so the user just sees "nothing happened".
+                tracing::warn!(
+                    program = %tracked.program,
+                    pid = tracked.child.id(),
+                    code = ?status.code(),
+                    "reaper: launched child exited non-zero — the action likely failed to open"
+                );
+                false
+            }
+            Ok(Some(_status)) => false, // exited cleanly, reaped
             Err(e) => {
                 // ECHILD or similar: child vanished. Drop it —
                 // there's nothing to wait on anyway.
-                tracing::debug!(pid = child.id(), error = %e, "reaper: try_wait failed, dropping");
+                tracing::debug!(
+                    program = %tracked.program,
+                    pid = tracked.child.id(),
+                    error = %e,
+                    "reaper: try_wait failed, dropping"
+                );
                 false
             }
         });
@@ -99,11 +129,15 @@ fn reaper_loop(state: Arc<ReaperState>) {
 ///
 /// The reaper thread is started lazily on first use.
 pub(crate) fn spawn_reaped(cmd: &mut Command) -> std::io::Result<()> {
+    // Capture before spawning: `cmd` is borrowed mutably by `spawn`, and
+    // after the child exits there is no way to recover what it was.
+    let program = cmd.get_program().to_string_lossy().into_owned();
     let child = cmd.spawn()?;
+    tracing::debug!(program = %program, pid = child.id(), "reaper: spawned child");
     let state = reaper();
     {
         let mut guard = state.children.lock().expect("reaper mutex poisoned");
-        guard.push(child);
+        guard.push(Tracked { program, child });
     }
     state.cv.notify_one();
     Ok(())
@@ -165,6 +199,20 @@ mod tests {
             "reaper did not collect all five /bin/true children (leaked {})",
             final_len
         );
+    }
+
+    /// A child that exits non-zero must still be reaped (the warn-logging
+    /// arm returns `false` like the success arm, so no zombie survives it).
+    #[test]
+    fn spawn_reaped_reaps_failing_child() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        wait_for_len(0, Duration::from_secs(5));
+
+        let mut cmd = Command::new("/bin/false");
+        spawn_reaped(&mut cmd).expect("spawn /bin/false");
+
+        let final_len = wait_for_len(0, Duration::from_secs(5));
+        assert_eq!(final_len, 0, "reaper did not collect non-zero-exit child");
     }
 
     #[test]

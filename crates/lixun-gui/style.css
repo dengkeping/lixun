@@ -250,6 +250,15 @@ listview row:selected:hover {
     font-size: 12px;
 }
 
+/* Applied alongside .lixun-status-label, so it must come after it to win on
+   equal specificity. A failed launch is the one status message the user has
+   to notice: the launcher stays open instead of dismissing, and muted text
+   would read as an ordinary "no results". */
+.lixun-status-error {
+    color: var(--lixun-error);
+    font-weight: 500;
+}
+
 .lixun-status-calc {
     color: var(--lixun-on-surface);
     font-size: 14px;

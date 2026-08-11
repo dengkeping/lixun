@@ -22,4 +22,21 @@ RestartSec=2s
 Environment=FASTEMBED_CACHE_DIR=%h/.cache/lixun/fastembed
 
 [Install]
-WantedBy=default.target
+# MUST be graphical-session.target, not default.target. `After=` above only
+# orders units within one transaction, and default.target does not pull in
+# graphical-session.target — so hanging off default.target makes that ordering
+# inert and lixund races the session up. Measured on a Plasma 6 Wayland login:
+# lixund active at 15:07:14, graphical-session.target at 15:07:18, i.e. lixund
+# won by 4s and froze a pre-session environment (no XAUTHORITY, no
+# XDG_CURRENT_DESKTOP) for the lifetime of the process.
+#
+# That env is inherited by lixun-gui and in turn by every process it launches
+# for a search hit, so the symptom is remote from the cause: hits stop opening
+# (X11 clients get DISPLAY with no cookie) or open in the wrong application
+# (without XDG_CURRENT_DESKTOP, xdg-open skips the desktop-specific
+# kde-mimeapps.list and falls through to the first mimeinfo.cache entry).
+#
+# graphical-session.target is the conventional anchor for session-scoped user
+# services — kde-baloo.service, waybar.service et al. all hang off it — and
+# pairs with the PartOf= above so lixund also stops when the session ends.
+WantedBy=graphical-session.target

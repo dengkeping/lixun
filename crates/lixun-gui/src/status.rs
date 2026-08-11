@@ -95,6 +95,26 @@ impl StatusBar {
         self.revealer.set_reveal_child(true);
     }
 
+    /// Report a failed launch without dismissing the launcher.
+    ///
+    /// The counterpart to keeping the window open on `Err`: a silent failure
+    /// plus an auto-hiding launcher is indistinguishable from a successful
+    /// launch, which is exactly how a broken open path stays invisible.
+    pub(crate) fn show_error(&self, message: &str) {
+        self.clear();
+        let label = gtk::Label::new(Some(message));
+        add_css_class(&label, "lixun-status-label");
+        add_css_class(&label, "lixun-status-error");
+        label.set_hexpand(true);
+        label.set_halign(gtk::Align::Start);
+        // Long io::Error / anyhow chains must not stretch the launcher.
+        label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        label.set_tooltip_text(Some(message));
+        self.content.append(&label);
+        self.revealer.set_visible(true);
+        self.revealer.set_reveal_child(true);
+    }
+
     pub(crate) fn show_calculation(&self, calc: &Calculation) {
         self.clear();
         let text = format!("{} = {}", calc.expr, calc.result);
