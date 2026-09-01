@@ -80,11 +80,31 @@ fn jump_to_next_category(
     }
 }
 
+/// The modifier bits dispatch distinguishes on. Lock/IM state bits
+/// (CapsLock, NumLock, Button1…) are ignored on both sides.
+fn dispatch_modifier_mask() -> gtk::gdk::ModifierType {
+    gtk::gdk::ModifierType::CONTROL_MASK
+        | gtk::gdk::ModifierType::SHIFT_MASK
+        | gtk::gdk::ModifierType::ALT_MASK
+        | gtk::gdk::ModifierType::SUPER_MASK
+}
+
+/// Exact equality on the masked modifier set — NOT `contains`. With
+/// `contains`, bare "Down" would also fire on Ctrl+Down, shadowing
+/// `next_category`, and bare "space" `quick_look` would swallow
+/// `quick_look_alt` (<Ctrl>space). Extra held modifiers now make an
+/// accel NOT match, which is what lets Ctrl-chord rebinds coexist
+/// with plain bindings on the same base key.
+fn mods_match_exact(expected: gtk::gdk::ModifierType, state: gtk::gdk::ModifierType) -> bool {
+    let mask = dispatch_modifier_mask();
+    (state & mask) == (expected & mask)
+}
+
 fn accel_matches(accel: &str, key: gtk::gdk::Key, state: gtk::gdk::ModifierType) -> bool {
     let Some((expected_key, expected_mods)) = gtk::accelerator_parse(accel) else {
         return false;
     };
-    key == expected_key && state.contains(expected_mods)
+    key == expected_key && mods_match_exact(expected_mods, state)
 }
 
 /// True when the Entry or any of its descendants (the internal GtkText
@@ -199,6 +219,43 @@ pub(crate) fn install_keyboard_handler(
                 entry_focus,
                 printable
             );
+            // A focused button (category chip ToggleButton — a Button
+            // subclass — or the status bar's "Search the web") must stay
+            // activatable from the keyboard: without this, the capture-
+            // phase dispatch below swallows Return into `primary_action`
+            // and Space into `quick_look`, leaving the focus ring on a
+            // widget that keys can never activate. Proceed hands the key
+            // to GTK's default button activation. Printable keys other
+            // than Space still fall through to the warp-back-to-entry
+            // logic below.
+            if let Some(focused) = gtk::prelude::RootExt::focus(&window)
+                && focused.downcast_ref::<gtk::Button>().is_some()
+                && matches!(
+                    key,
+                    gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter | gtk::gdk::Key::space
+                )
+            {
+                return glib::signal::Propagation::Proceed;
+            }
+            // quick_look_alt (default <Ctrl>space) opens Quick Look on
+            // the selected row even while the entry owns focus. The
+            // bare-Space `quick_look` below requires focus to be OFF the
+            // entry (Space must stay typeable), which made previewing
+            // the Top Hit cost Down, Up, Space; the Ctrl chord carries
+            // no text so it can fire from typing position. Dispatched
+            // before the printable-key short-circuit on purpose.
+            if accel_matches(&keybindings.quick_look_alt, key, state)
+                && filter_model.n_items() > 0
+            {
+                controller.set_preview_mode_active(true);
+                let monitor = current_monitor_connector(&window);
+                selected_hit_in(&selection, &filter_model, |hit| {
+                    send_preview_request(hit, monitor.clone());
+                });
+                // Same focus re-assert as the quick_look branch below.
+                entry.grab_focus();
+                return glib::signal::Propagation::Stop;
+            }
             // Hard rule: printable unmodified keys belong to the focused
             // Entry. Forward them before any accel dispatch can swallow
             // them (e.g. bare-Space `quick_look` binding).
@@ -302,8 +359,38 @@ pub(crate) fn install_keyboard_handler(
                 entry.set_position(-1);
                 return glib::signal::Propagation::Stop;
             }
-            let ctrl = state.contains(gtk::gdk::ModifierType::CONTROL_MASK);
-            let shift = state.contains(gtk::gdk::ModifierType::SHIFT_MASK);
+            // Category jumps are dispatched BEFORE result navigation on
+            // their own configured accels (`next_category` /
+            // `previous_category`, default <Ctrl>Down/<Ctrl>Up). The old
+            // code hardcoded a Ctrl flag inside the result branches,
+            // which only worked because accel matching was inexact —
+            // rebinding `next_result` to any Ctrl chord made plain
+            // navigation unreachable.
+            if accel_matches(&keybindings.previous_category, key, state)
+                || accel_matches(&keybindings.next_category, key, state)
+            {
+                // BUG-5 regression guard: same defensive pin as Up/Down.
+                if filter_model.n_items() == 0 {
+                    entry.grab_focus();
+                    return glib::signal::Propagation::Stop;
+                }
+                let direction = if accel_matches(&keybindings.next_category, key, state) {
+                    1
+                } else {
+                    -1
+                };
+                let entry_had_focus = entry_has_focus(&entry, &window);
+                jump_to_next_category(&selection, &filter_model, direction);
+                let target = selection.selected();
+                if target != gtk::INVALID_LIST_POSITION {
+                    scroll_with_margin(&list_view, &selection, target, direction);
+                    controller.mark_user_selected();
+                }
+                if entry_had_focus && !controller.preview_mode_active() {
+                    list_view.grab_focus();
+                }
+                return glib::signal::Propagation::Stop;
+            }
             if accel_matches(&keybindings.previous_result, key, state) {
                 // Up on empty entry = let entry_key_controller handle history
                 if entry.text().is_empty() && entry_has_focus(&entry, &window) {
@@ -320,18 +407,6 @@ pub(crate) fn install_keyboard_handler(
                     return glib::signal::Propagation::Stop;
                 }
                 let entry_had_focus = entry_has_focus(&entry, &window);
-                if ctrl {
-                    jump_to_next_category(&selection, &filter_model, -1);
-                    let target = selection.selected();
-                    if target != gtk::INVALID_LIST_POSITION {
-                        scroll_with_margin(&list_view, &selection, target, -1);
-                        controller.mark_user_selected();
-                    }
-                    if entry_had_focus && !controller.preview_mode_active() {
-                        list_view.grab_focus();
-                    }
-                    return glib::signal::Propagation::Stop;
-                }
                 let current = selection.selected();
                 if current > 0 {
                     let target = current - 1;
@@ -353,18 +428,6 @@ pub(crate) fn install_keyboard_handler(
                     return glib::signal::Propagation::Stop;
                 }
                 let entry_had_focus = entry_has_focus(&entry, &window);
-                if ctrl {
-                    jump_to_next_category(&selection, &filter_model, 1);
-                    let target = selection.selected();
-                    if target != gtk::INVALID_LIST_POSITION {
-                        scroll_with_margin(&list_view, &selection, target, 1);
-                        controller.mark_user_selected();
-                    }
-                    if entry_had_focus && !controller.preview_mode_active() {
-                        list_view.grab_focus();
-                    }
-                    return glib::signal::Propagation::Stop;
-                }
                 let current = selection.selected();
                 let n = selection.n_items();
                 if current + 1 < n {
@@ -397,15 +460,53 @@ pub(crate) fn install_keyboard_handler(
             } else if accel_matches(&keybindings.primary_action, key, state)
                 || accel_matches(&keybindings.secondary_action, key, state)
             {
+                // Zero results: Enter falls back to the web search the
+                // status bar advertises (which was mouse-only before)
+                // instead of silently closing the launcher and wiping
+                // the session. Empty query = nothing to search, stay up.
+                if filter_model.n_items() == 0 {
+                    let q = entry.text().to_string();
+                    if !q.is_empty() {
+                        crate::status::open_web_search(&q);
+                        controller.clear_and_hide();
+                    }
+                    return glib::signal::Propagation::Stop;
+                }
                 let mut should_hide = true;
                 let query_at_click = entry.text().to_string();
-                let is_secondary =
-                    accel_matches(&keybindings.secondary_action, key, state) || shift || ctrl;
+                let is_secondary = accel_matches(&keybindings.secondary_action, key, state);
                 selected_hit_in(&selection, &filter_model, |hit| {
+                    // Secondary ReplaceQuery chains the hit's value back
+                    // into the entry (e.g. Shift+Enter on a calculator
+                    // result continues the computation) — mid-session,
+                    // never a launch.
+                    if is_secondary
+                        && let Some(sec) = &hit.secondary_action
+                        && let Action::ReplaceQuery { q } = sec.as_ref()
+                    {
+                        entry.set_text(q);
+                        entry.set_position(-1);
+                        entry.grab_focus();
+                        should_hide = false;
+                        return;
+                    }
                     if let Action::ReplaceQuery { q } = &hit.action {
                         entry.set_text(q);
                         entry.set_position(-1);
                         entry.grab_focus();
+                        should_hide = false;
+                        return;
+                    }
+                    // Primary CopyText: put the value on the clipboard,
+                    // confirm via toast, and KEEP the launcher open so
+                    // the user can keep chaining (calculator results).
+                    if !is_secondary
+                        && let Action::CopyText { text } = &hit.action
+                    {
+                        if let Some(display) = gtk::gdk::Display::default() {
+                            display.clipboard().set_text(text);
+                        }
+                        status_bar.show_toast(&format!("Copied: {}", text));
                         should_hide = false;
                         return;
                     }
@@ -467,6 +568,14 @@ pub(crate) fn install_keyboard_handler(
                 }
                 glib::signal::Propagation::Stop
             } else if accel_matches(&keybindings.copy, key, state) {
+                // Selected text in the entry wins: Ctrl+C with a live
+                // selection is native text copy, not hit copy. Without
+                // this Proceed, copying selected query text was
+                // impossible — the capture-phase dispatch always stole
+                // the chord.
+                if entry_has_focus(&entry, &window) && entry.selection_bounds().is_some() {
+                    return glib::signal::Propagation::Proceed;
+                }
                 // Copy is treated as a completed action (the user
                 // got what they wanted — a clipboard value), so
                 // clear the session on hide. But copy itself does
@@ -474,7 +583,11 @@ pub(crate) fn install_keyboard_handler(
                 // next Escape/focus-loss, which will hit hide()
                 // and persist the session again. That's the
                 // current UX and this commit does not change it.
-                selected_hit_in(&selection, &filter_model, copy_to_clipboard);
+                selected_hit_in(&selection, &filter_model, |hit| {
+                    let copied = copy_to_clipboard(hit);
+                    // Make the invisible action visible.
+                    status_bar.show_toast(&format!("Copied: {}", copied));
+                });
                 glib::signal::Propagation::Stop
             } else if accel_matches(&keybindings.quick_look, key, state)
                 && !entry_has_focus(&entry, &window)
@@ -595,4 +708,77 @@ pub(crate) fn install_keyboard_handler(
         }
     ));
     entry.add_controller(entry_key_controller);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{accel_matches, mods_match_exact};
+    use gtk::gdk::{Key, ModifierType};
+
+    #[test]
+    fn mods_match_exact_requires_equality_not_containment() {
+        // A bare binding must NOT match while Ctrl is held.
+        assert!(!mods_match_exact(
+            ModifierType::empty(),
+            ModifierType::CONTROL_MASK
+        ));
+        // The exact chord matches.
+        assert!(mods_match_exact(
+            ModifierType::CONTROL_MASK,
+            ModifierType::CONTROL_MASK
+        ));
+        // An extra Shift on a Ctrl chord must not match.
+        assert!(!mods_match_exact(
+            ModifierType::CONTROL_MASK,
+            ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK
+        ));
+        // Lock/pointer bits outside the dispatch mask are ignored.
+        assert!(mods_match_exact(
+            ModifierType::empty(),
+            ModifierType::LOCK_MASK
+        ));
+    }
+
+    /// All `gtk::accelerator_parse`-backed assertions live in ONE
+    /// test: `gtk::init()` pins "the GTK main thread" to whichever
+    /// thread runs it first and the libtest harness gives every test
+    /// its own thread, so two such tests in parallel would trip the
+    /// gtk4-rs main-thread assertion. Headless environments (no
+    /// display) skip silently.
+    #[test]
+    fn accel_matches_is_exact_on_modifiers() {
+        if gtk::init().is_err() {
+            eprintln!("skipping accel_matches_is_exact_on_modifiers: no display");
+            return;
+        }
+        // Bare "Down" must no longer match Ctrl+Down — that chord
+        // belongs to `next_category`.
+        assert!(accel_matches("Down", Key::Down, ModifierType::empty()));
+        assert!(!accel_matches("Down", Key::Down, ModifierType::CONTROL_MASK));
+        assert!(accel_matches(
+            "<Ctrl>Down",
+            Key::Down,
+            ModifierType::CONTROL_MASK
+        ));
+        // Shift+Enter secondary must still match "<Shift>Return".
+        assert!(accel_matches(
+            "<Shift>Return",
+            Key::Return,
+            ModifierType::SHIFT_MASK
+        ));
+        assert!(!accel_matches("<Shift>Return", Key::Return, ModifierType::empty()));
+        // Bare "space" quick_look must not fire on Ctrl+space so it
+        // cannot shadow quick_look_alt.
+        assert!(accel_matches("space", Key::space, ModifierType::empty()));
+        assert!(!accel_matches("space", Key::space, ModifierType::CONTROL_MASK));
+        assert!(accel_matches(
+            "<Ctrl>space",
+            Key::space,
+            ModifierType::CONTROL_MASK
+        ));
+        // CapsLock must not break plain bindings.
+        assert!(accel_matches("Return", Key::Return, ModifierType::LOCK_MASK));
+        // Unparseable accels never match.
+        assert!(!accel_matches("<Bogus>x", Key::x, ModifierType::empty()));
+    }
 }

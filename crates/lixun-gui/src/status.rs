@@ -1,15 +1,19 @@
 //! Bottom status bar: loading spinner, empty-state with web-search fallback,
-//! inline calculator result. Exposed as a self-contained widget that `window.rs`
+//! transient copy toast. Exposed as a self-contained widget that `window.rs`
 //! appends and drives.
 
 use gtk::prelude::*;
-use lixun_core::Calculation;
 
 use crate::factory::add_css_class;
 
 pub(crate) struct StatusBar {
     revealer: gtk::Revealer,
     content: gtk::Box,
+    /// Bumped on every state change so a pending toast auto-hide
+    /// timeout can tell whether the bar still shows *its* toast; a
+    /// stale timeout must not collapse a newer loading/empty/error
+    /// state that replaced the toast within its 1.5 s lifetime.
+    epoch: std::rc::Rc<std::cell::Cell<u64>>,
 }
 
 impl StatusBar {
@@ -40,7 +44,11 @@ impl StatusBar {
 
         revealer.set_child(Some(&content));
 
-        Self { revealer, content }
+        Self {
+            revealer,
+            content,
+            epoch: std::rc::Rc::new(std::cell::Cell::new(0)),
+        }
     }
 
     pub(crate) fn widget(&self) -> &gtk::Revealer {
@@ -48,19 +56,71 @@ impl StatusBar {
     }
 
     fn clear(&self) {
+        self.epoch.set(self.epoch.get() + 1);
         while let Some(child) = self.content.first_child() {
             self.content.remove(&child);
         }
     }
 
-    pub(crate) fn show_loading(&self) {
+    /// Shared chassis for the spinner states (loading, slow search,
+    /// indexing): spinner + label, revealed.
+    fn show_spinner(&self, text: &str) {
         self.clear();
         let spinner = gtk::Spinner::new();
         spinner.start();
-        let label = gtk::Label::new(Some("Searching\u{2026}"));
+        let label = gtk::Label::new(Some(text));
         add_css_class(&label, "lixun-status-label");
         self.content.append(&spinner);
         self.content.append(&label);
+        self.revealer.set_visible(true);
+        self.revealer.set_reveal_child(true);
+    }
+
+    pub(crate) fn show_loading(&self) {
+        self.show_spinner("Searching\u{2026}");
+    }
+
+    /// The IPC read watchdog expired without a Final. The reader
+    /// keeps the connection open, so a slow Final can still arrive
+    /// and replace this; meanwhile the spinner stays up so the state
+    /// reads as "still working", never as an authoritative
+    /// "No results".
+    pub(crate) fn show_still_searching(&self) {
+        self.show_spinner("Still searching \u{2014} the daemon is slow\u{2026}");
+    }
+
+    /// First-run/reindex state for a zero-hit query: while the
+    /// indexer is still filling the index an empty result is not
+    /// authoritative, so present progress instead of the definitive
+    /// empty state.
+    pub(crate) fn show_indexing(&self, indexed_docs: u64) {
+        self.show_spinner(&format!(
+            "Indexing\u{2026} {} documents so far \u{2014} results may be incomplete",
+            indexed_docs
+        ));
+    }
+
+    /// Transport to the daemon failed (connect/write/read error).
+    /// Keeps the user's query intact and offers the existing
+    /// `app.relaunch` action — actionable, unlike a fabricated
+    /// "No results".
+    pub(crate) fn show_daemon_unresponsive(&self) {
+        self.clear();
+        let label = gtk::Label::new(Some("Search daemon isn't responding"));
+        add_css_class(&label, "lixun-status-label");
+        add_css_class(&label, "lixun-status-error");
+        label.set_hexpand(true);
+        label.set_halign(gtk::Align::Start);
+        self.content.append(&label);
+
+        let button = gtk::Button::with_label("Relaunch");
+        add_css_class(&button, "lixun-status-action");
+        button.connect_clicked(|_| {
+            if let Some(app) = gtk::gio::Application::default() {
+                app.activate_action("relaunch", None);
+            }
+        });
+        self.content.append(&button);
         self.revealer.set_visible(true);
         self.revealer.set_reveal_child(true);
     }
@@ -83,11 +143,7 @@ impl StatusBar {
             add_css_class(&button, "lixun-status-action");
             let q = query.to_string();
             button.connect_clicked(move |_| {
-                let encoded = urlencode(&q);
-                let url = format!("https://duckduckgo.com/?q={}", encoded);
-                if let Err(e) = opener::open(&url) {
-                    tracing::error!("Failed to open web search URL: {}", e);
-                }
+                open_web_search(&q);
             });
             self.content.append(&button);
         }
@@ -115,27 +171,36 @@ impl StatusBar {
         self.revealer.set_reveal_child(true);
     }
 
-    pub(crate) fn show_calculation(&self, calc: &Calculation) {
+    // Calculator results are presented as a normal hit row (the
+    // calculator source emits the evaluated value as the hit title);
+    // the former `show_calculation` status-bar path was dead code.
+
+    /// Transient confirmation ("Copied: …") that auto-hides after
+    /// 1.5 s. Any other `show_*`/`hide` within that window wins: the
+    /// timeout checks the epoch and leaves newer content alone.
+    pub(crate) fn show_toast(&self, message: &str) {
         self.clear();
-        let text = format!("{} = {}", calc.expr, calc.result);
-        let label = gtk::Label::new(Some(&text));
-        add_css_class(&label, "lixun-status-calc");
+        let label = gtk::Label::new(Some(message));
+        add_css_class(&label, "lixun-status-label");
         label.set_hexpand(true);
         label.set_halign(gtk::Align::Start);
+        label.set_ellipsize(gtk::pango::EllipsizeMode::End);
         self.content.append(&label);
-
-        let button = gtk::Button::with_label("Copy");
-        add_css_class(&button, "lixun-status-action");
-        let result = calc.result.clone();
-        button.connect_clicked(move |_| {
-            if let Some(display) = gtk::gdk::Display::default() {
-                display.clipboard().set_text(&result);
-            }
-        });
-        self.content.append(&button);
-
         self.revealer.set_visible(true);
         self.revealer.set_reveal_child(true);
+
+        let shown_at = self.epoch.get();
+        let epoch = std::rc::Rc::clone(&self.epoch);
+        let revealer = self.revealer.clone();
+        glib::timeout_add_local_once(std::time::Duration::from_millis(1500), move || {
+            if epoch.get() != shown_at {
+                return;
+            }
+            // Same phantom-margin fix as `hide`: drop the revealer
+            // out of allocation, don't just fade the child.
+            revealer.set_reveal_child(false);
+            revealer.set_visible(false);
+        });
     }
 
     pub(crate) fn hide(&self) {
@@ -146,6 +211,18 @@ impl StatusBar {
         // still leaves a visible gap during the transition.
         self.revealer.set_reveal_child(false);
         self.revealer.set_visible(false);
+    }
+}
+
+/// Open a web search for `query` in the default browser. Shared by
+/// the status bar's "Search the web" button and the keymap's
+/// Enter-on-zero-results fallback so both paths build the identical
+/// URL.
+pub(crate) fn open_web_search(query: &str) {
+    let encoded = urlencode(query);
+    let url = format!("https://duckduckgo.com/?q={}", encoded);
+    if let Err(e) = opener::open(&url) {
+        tracing::error!("Failed to open web search URL: {}", e);
     }
 }
 

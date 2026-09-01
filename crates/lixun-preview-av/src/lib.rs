@@ -94,7 +94,7 @@ impl PreviewPlugin for AvPreview {
         }
 
         if hit
-            .kind_label
+            .mime
             .as_deref()
             .is_some_and(|m| m.starts_with("audio/") || m.starts_with("video/"))
         {
@@ -218,7 +218,7 @@ mod tests {
     use lixun_core::{Category, DocId};
     use std::path::PathBuf;
 
-    fn file_hit(path: impl Into<PathBuf>, kind: Option<&str>) -> Hit {
+    fn file_hit(path: impl Into<PathBuf>, mime: Option<&str>) -> Hit {
         let path = path.into();
         Hit {
             id: DocId(canonical_fs_doc_id(&path)),
@@ -229,7 +229,7 @@ mod tests {
                 .unwrap_or_default(),
             subtitle: path.display().to_string(),
             icon_name: None,
-            kind_label: kind.map(str::to_string),
+            kind_label: None,
             score: 1.0,
             action: Action::OpenFile { path },
             extract_fail: false,
@@ -239,7 +239,7 @@ mod tests {
             secondary_action: None,
             source_instance: String::new(),
             row_menu: lixun_core::RowMenuDef::empty(),
-            mime: None,
+            mime: mime.map(str::to_string),
         }
     }
 

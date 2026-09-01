@@ -979,10 +979,11 @@ pub fn index_file(
     } else {
         (None, false)
     };
-    let (icon_name, kind_label) = if is_dir {
-        ("folder".to_string(), "Folder".to_string())
+    let (icon_name, kind_label, mime) = if is_dir {
+        ("folder".to_string(), "Folder".to_string(), None)
     } else {
-        lixun_sources::fs::FsSource::metadata_for_path(path)
+        let (icon, kind, mime) = lixun_sources::fs::FsSource::metadata_for_path(path);
+        (icon, kind, Some(mime))
     };
 
     Ok(Document {
@@ -1002,7 +1003,7 @@ pub fn index_file(
         extract_fail,
         sender: None,
         recipients: None,
-        mime: None,
+        mime,
         source_instance: "builtin:fs".into(),
         secondary_action: Some(Action::ShowInFileManager {
             path: path.to_path_buf(),
@@ -1112,6 +1113,25 @@ mod tests {
                 "extract=Ok(None) with no indexed body must leave body None",
             );
             assert!(!doc.extract_fail);
+        });
+    }
+
+    #[test]
+    fn index_file_populates_mime_for_files() {
+        with_isolated_cache(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let txt = tmp.path().join("note.txt");
+            std::fs::write(&txt, b"hello").unwrap();
+
+            let caps = lixun_extract::ExtractorCapabilities::all_available_no_timeout();
+            let doc = index_file(&txt, 100, &caps, None, None, 0).unwrap();
+            // Preview plugins fall back to `Hit.mime` when the
+            // extension is inconclusive; the live-index path must
+            // populate it (kind_label carries the human label).
+            assert_eq!(doc.mime.as_deref(), Some("text/plain"));
+
+            let dir_doc = index_file(tmp.path(), 100, &caps, None, None, 0).unwrap();
+            assert!(dir_doc.mime.is_none(), "directories carry no mime");
         });
     }
 

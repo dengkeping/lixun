@@ -74,12 +74,14 @@ window.background,
    scrolled.vexpand(false) on the initial ScrolledWindow builder in
    window.rs for the same reason. */
 /* Glass / liquid-glass treatment.
-   Background alpha is intentionally low (~0.35) so a compositor blur
+   Background alpha is 0.70: low enough that a compositor blur
    behind the surface (KDE org_kde_kwin_blur, Hyprland `layerrule = blur`,
-   ...) shines through with a tinted, slightly luminescent feel. On
-   compositors without backdrop blur, this still degrades to a clean
-   translucent panel — the surface beneath shows through but un-blurred,
-   which is harmless.
+   ...) shines through with a tinted, slightly luminescent feel, and
+   high enough that text keeps contrast over light wallpapers — blur
+   only AVERAGES the backdrop, it never darkens it, so a thinner tint
+   lets a bright wallpaper wash the foreground text out. On
+   compositors without backdrop blur, `.lixun-no-blur` below raises
+   the alpha further still.
 
    The linear-gradient on top of the base tint adds a faint top-edge
    highlight (~3% white) that fades out by 50%, mimicking the way real
@@ -92,7 +94,7 @@ window.background,
         linear-gradient(180deg,
             rgba(255, 255, 255, 0.035) 0%,
             rgba(255, 255, 255, 0.0)  50%),
-        alpha(var(--lixun-surface), 0.50);
+        alpha(var(--lixun-surface), 0.70);
     border-radius: 14px;
     border: 0.5px solid rgba(255, 255, 255, 0.12);
     box-shadow: 0 24px 64px rgba(0, 0, 0, 0.55),
@@ -101,9 +103,15 @@ window.background,
     min-width: 480px;
 }
 
+/* Font sizes are declared in pt (1pt = 4/3 px at the 96dpi
+   baseline) so GTK's xft-dpi / text-scaling-factor ("Large Text")
+   accessibility setting scales them. px stays for paddings,
+   margins, radii and borders, which track widget geometry, not
+   text size. */
+
 /* ----- Search entry ----- */
 .lixun-entry {
-    font-size: 24px;
+    font-size: 18pt;
     font-weight: 300;
     padding: 0;
     background-color: transparent;
@@ -126,6 +134,36 @@ window.background,
 
 .lixun-entry placeholder {
     color: var(--lixun-outline);
+}
+
+/* ----- Category filter chips -----
+   ToggleButtons inside the #lixun-chips box. Host themes paint
+   buttons as opaque grey slabs, which reads as foreign chrome on
+   the glass; restyle them as quiet outlined pills. `:checked` is
+   the active filter and takes the accent tint. */
+.lixun-chips {
+    background-color: transparent;
+}
+
+.lixun-chip {
+    padding: 2px 10px;
+    border-radius: 999px;
+    background-color: transparent;
+    background-image: none;
+    border: 1px solid var(--lixun-outline-variant);
+    color: var(--lixun-on-surface-variant);
+    font-size: 8.25pt;
+    box-shadow: none;
+}
+
+.lixun-chip:hover {
+    background-color: rgba(255, 255, 255, 0.06);
+}
+
+.lixun-chip:checked {
+    background-color: alpha(var(--lixun-primary), 0.25);
+    border-color: alpha(var(--lixun-primary), 0.35);
+    color: var(--lixun-on-primary-container);
 }
 
 /* ----- Results container -----
@@ -155,10 +193,11 @@ listview {
     background-color: rgba(255, 255, 255, 0.06);
 }
 
-/* Selection indicator = hero frame only (see `.lixun-top-hit` below).
-   Neutralise every GTK theme fill on the selected row so the hero
-   frame is the sole visual cue. The theme (Breeze, Adwaita, etc.)
-   aggressively paints `row:selected`; we stomp it at three layers. */
+/* Selection indicator = `.lixun-top-hit` below, nothing else.
+   Neutralise every GTK theme fill on the selected row so our own
+   cursor styling is the sole visual cue. The theme (Breeze, Adwaita,
+   etc.) aggressively paints `row:selected`; we stomp it at three
+   layers. */
 listview row,
 listview row:selected,
 listview row:selected:focus,
@@ -168,26 +207,35 @@ listview row:selected:hover {
 }
 
 /* No focus ring on the row itself — selection is carried by
-   `.lixun-top-hit` (background + bigger title + card outline),
+   `.lixun-top-hit` (accent fill + inset accent bar + bolder title),
    and an extra white outline on every focused row stacks visual
    noise on top of it. Keyboard accessibility is unaffected:
    arrow-key navigation still moves the SingleSelection, which
    updates `.lixun-top-hit` via apply_selected_styling. */
 
-/* Hero (top-hit) row: card-like elevation. The row factory toggles
-   `.lixun-top-hit` onto the selected item only, so this class is
-   itself the selection indicator.
+/* Selection-cursor row. The row factory toggles `.lixun-top-hit`
+   onto the selected item only, so this class is itself the
+   selection indicator.
    CRITICAL: keep the BOX MODEL identical to `.lixun-hit` (same
    padding, no extra border) so the row height does not change
    when selection moves between rows. ListView virtualization
    measures row height once; if selection grows the row, the last
    visible row gets clipped at the viewport edge (BUG-6). Visual
-   distinction is carried by background only (Spotlight-style),
-   no outline. */
+   distinction is carried by an accent-tinted fill plus an inset
+   left accent bar — the inset box-shadow paints inside the border
+   box and never affects layout, so BUG-6 holds. */
 .lixun-top-hit {
     padding: 8px 12px;
-    background-color: rgba(255, 255, 255, 0.08);
+    background-color: alpha(var(--lixun-primary), 0.15);
+    box-shadow: inset 3px 0 0 0 var(--lixun-primary);
     border-radius: 10px;
+}
+
+/* Reassert the accent fill against `.lixun-hit:hover` (0,2,0 beats
+   the bare class above) so hovering the selected row does not wash
+   the selection tint back to the neutral hover grey. */
+.lixun-top-hit:hover {
+    background-color: alpha(var(--lixun-primary), 0.15);
 }
 
 /* Structural Top Hit hero row: decorates row 0 of the results
@@ -198,41 +246,46 @@ listview row:selected:hover {
    `.lixun-top-hit` above, which is the stateful selection-cursor
    indicator and moves with arrow keys; the two classes stack
    independently on the same row when the user hasn't moved the
-   cursor off row 0. */
+   cursor off row 0 (hero card + accent bar, the later hero rules
+   winning the tie on background/padding). The 1px border is
+   compensated by -1px padding on each edge so the hero's overall
+   box size is unchanged by the border (BUG-6 discipline; the hero
+   row is taller than plain rows anyway via its 48px icon, but its
+   own height must not shift either). */
 .lixun-top-hit-hero {
-    padding: 10px 12px;
+    padding: 9px 11px;
     background-color: rgba(255, 255, 255, 0.08);
+    border: 1px solid var(--lixun-outline-variant);
     border-radius: 10px;
 }
 
 .lixun-top-hit-hero .lixun-title {
-    font-size: 16px;
+    font-size: 12pt;
 }
 
 /* ----- Title / subtitle / kind ----- */
 .lixun-title {
     font-weight: 500;
     color: var(--lixun-on-surface);
-    font-size: 14px;
+    font-size: 10.5pt;
 }
 
-/* Restored 16 px on selected title — user-preferred visual emphasis.
-   The row-clip concern that initially drove removing this is now
-   addressed by a taller `.lixun-results` min-height (480 px) so the
-   viewport always has headroom for the slightly bigger selected row
-   plus several unselected rows below it. */
+/* Selected-title emphasis via weight, not size: a font-size bump
+   changes the row's natural height, which violates the BUG-6
+   box-model invariant on `.lixun-top-hit` above. Weight 600 reads
+   as emphasis at identical line metrics. */
 .lixun-top-hit .lixun-title {
-    font-size: 16px;
+    font-weight: 600;
 }
 
 .lixun-subtitle {
     color: var(--lixun-on-surface-variant);
-    font-size: 11px;
+    font-size: 8.25pt;
 }
 
 .lixun-kind {
-    color: var(--lixun-outline);
-    font-size: 10px;
+    color: var(--lixun-on-surface-variant);
+    font-size: 8.25pt;
     font-weight: 500;
     margin-right: 4px;
 }
@@ -247,7 +300,7 @@ listview row:selected:hover {
 
 .lixun-status-label {
     color: var(--lixun-on-surface-variant);
-    font-size: 12px;
+    font-size: 9pt;
 }
 
 /* Applied alongside .lixun-status-label, so it must come after it to win on
@@ -261,7 +314,7 @@ listview row:selected:hover {
 
 .lixun-status-calc {
     color: var(--lixun-on-surface);
-    font-size: 14px;
+    font-size: 10.5pt;
     font-weight: 500;
     font-family: ui-monospace, "JetBrains Mono", monospace;
 }
@@ -272,22 +325,39 @@ listview row:selected:hover {
     border: 1px solid alpha(var(--lixun-primary), 0.35);
     border-radius: 6px;
     padding: 2px 10px;
-    font-size: 11px;
+    font-size: 8.25pt;
 }
 
 .lixun-status-action:hover {
     background-color: alpha(var(--lixun-primary), 0.35);
 }
 
-/* ----- Context menu (popover) ----- */
+/* ----- Popovers (context menu, Get Info) -----
+   Popups are separate surfaces: the compositor blur region covers
+   only the main layer surface, never popups, so a popover must NOT
+   reuse the window's glass alpha — a half-transparent popup over
+   arbitrary desktop content is unreadable. Near-opaque surface +
+   explicit foreground instead. `contents` (plus `arrow`) is what
+   GTK4 actually paints for a plain gtk::Popover; the host theme
+   fills it with its own surface colour unless we repaint it. */
+popover > arrow,
+popover > contents {
+    background-color: alpha(var(--lixun-surface), 0.95);
+}
+
+popover > contents {
+    color: var(--lixun-on-surface);
+    border-radius: 10px;
+}
+
 popover.menu {
-    background-color: alpha(var(--lixun-surface), 0.50);
+    background-color: alpha(var(--lixun-surface), 0.95);
     border-radius: 10px;
     border: 0.5px solid rgba(255, 255, 255, 0.05);
 }
 
 popover.menu contents {
-    font-size: 14px;
+    font-size: 10.5pt;
     padding: 4px;
     background-color: transparent;
 }
@@ -296,6 +366,7 @@ popover.menu modelbutton {
     min-height: 28px;
     padding: 4px 12px;
     background-color: transparent;
+    color: var(--lixun-on-surface);
     border-radius: 6px;
 }
 
@@ -326,8 +397,11 @@ popover.menu modelbutton:hover {
     }
 }
 
+/* Durations must match the class-removal timers in window.rs
+   (120 ms) — a longer animation gets cut off mid-flight when the
+   class is removed. */
 .lixun-showing {
-    animation: lixun-fade-slide-in 150ms ease-out;
+    animation: lixun-fade-slide-in 120ms ease-out;
 }
 
 .lixun-hiding {
@@ -358,8 +432,8 @@ popover.menu modelbutton:hover {
    Two flips are needed:
    * the `--lixun-*` palette swaps to a light Material You skin, and
    * every hardcoded `rgba(255,255,255,*)` overlay (rim highlight,
-     border, inset shadow, hover backdrop, hero frame, status divider,
-     popover.menu chrome) is replaced with a `rgba(0,0,0,*)`
+     border, inset shadow, hover backdrop, chip hover, hero frame,
+     status divider, popover.menu chrome) is replaced with a `rgba(0,0,0,*)`
      equivalent so each specular cue keeps its intended visual role on
      a bright substrate. Drop shadows are also lightened from
      0.55/0.40 alpha to 0.12/0.10 — heavy shadows on a light panel
@@ -391,7 +465,7 @@ popover.lixun-light {
         linear-gradient(180deg,
             rgba(0, 0, 0, 0.04) 0%,
             rgba(0, 0, 0, 0.0)  50%),
-        alpha(var(--lixun-surface), 0.50);
+        alpha(var(--lixun-surface), 0.70);
     border: 0.5px solid rgba(0, 0, 0, 0.18);
     box-shadow: 0 24px 64px rgba(0, 0, 0, 0.12),
                 0 8px  16px rgba(0, 0, 0, 0.10),
@@ -410,8 +484,23 @@ popover.lixun-light {
     background-color: rgba(0, 0, 0, 0.06);
 }
 
-.lixun-light .lixun-top-hit {
+/* :not(:checked) keeps this 0,3,0 hover from stomping the accent
+   tint of `.lixun-chip:checked` (0,2,0). */
+.lixun-light .lixun-chip:hover:not(:checked) {
     background-color: rgba(0, 0, 0, 0.05);
+}
+
+/* Accent fill thinned to 0.12 on the light substrate — the same
+   0.15 over near-white reads heavier than over dark glass. The
+   inset accent bar and chip `:checked` tint need no light variant:
+   their `var(--lixun-primary)` already resolves to the light
+   palette's accent through the token cascade. */
+.lixun-light .lixun-top-hit {
+    background-color: alpha(var(--lixun-primary), 0.12);
+}
+
+.lixun-light .lixun-top-hit:hover {
+    background-color: alpha(var(--lixun-primary), 0.12);
 }
 
 .lixun-light .lixun-top-hit-hero {

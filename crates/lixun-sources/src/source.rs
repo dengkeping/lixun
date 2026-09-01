@@ -243,6 +243,18 @@ pub trait PluginFactory: Send + Sync {
     fn fs_exclude_patterns(&self) -> Vec<String> {
         Vec::new()
     }
+
+    /// True when the plugin is fully functional with defaults: the
+    /// daemon then calls [`PluginFactory::build`] with an empty table
+    /// even when the config lacks the plugin's section, so zero-config
+    /// sources work out of the box. An explicit section still applies
+    /// its config — including an `enabled = false` opt-out, which the
+    /// factory itself honours. Sources that need operator-supplied
+    /// config (mail paths, profiles, credentials) keep the default
+    /// `false` and stay gated on their section's presence.
+    fn default_enabled(&self) -> bool {
+        false
+    }
 }
 
 /// Compile-time plugin registration slot.

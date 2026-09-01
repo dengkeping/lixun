@@ -30,6 +30,7 @@
 
 use std::fs::File;
 use std::io::{BufRead, BufReader};
+use std::sync::LazyLock;
 
 use gtk::prelude::*;
 use lixun_core::{Action, Hit};
@@ -41,6 +42,14 @@ use syntect::util::LinesWithEndings;
 
 const DISPLAY_CAP_BYTES: usize = 50 * 1024;
 const DEFAULT_THEME: &str = "Solarized (dark)";
+
+/// Syntect's bundled dumps cost tens of milliseconds to
+/// deserialize; paying that on every `build()` made each
+/// arrow-step through code hits noticeably laggy. Both sets are
+/// immutable after load (`Send + Sync`), so deserialize once per
+/// process and share.
+static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
+static THEME_SET: LazyLock<ThemeSet> = LazyLock::new(ThemeSet::load_defaults);
 
 const STRONG_EXTENSIONS: &[&str] = &[
     "rs", "py", "js", "ts", "jsx", "tsx", "go", "c", "cc", "cpp", "cxx", "h", "hh", "hpp", "hxx",
@@ -84,14 +93,14 @@ impl PreviewPlugin for CodePreview {
 
         let (body, truncated) = read_capped(&path)?;
 
-        let syntax_set = SyntaxSet::load_defaults_newlines();
-        let theme_set = ThemeSet::load_defaults();
-        let theme_name = resolve_theme_name(cfg, &theme_set);
+        let syntax_set = &*SYNTAX_SET;
+        let theme_set = &*THEME_SET;
+        let theme_name = resolve_theme_name(cfg, theme_set);
         let theme = &theme_set.themes[theme_name];
 
-        let syntax = pick_syntax(&syntax_set, &path, &body);
+        let syntax = pick_syntax(syntax_set, &path, &body);
 
-        let markup = match render_pango_markup(&body, syntax, theme, &syntax_set) {
+        let markup = match render_pango_markup(&body, syntax, theme, syntax_set) {
             Ok(m) => m,
             Err(e) => {
                 tracing::warn!(

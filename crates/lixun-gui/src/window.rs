@@ -84,8 +84,11 @@ pub(crate) type CategoryFilter = std::rc::Rc<std::cell::Cell<Option<Category>>>;
 /// Frozen snapshot of a user search session, captured on hide and
 /// restored on show. Mirrors Spotlight's UX: if the user dismisses
 /// the launcher without launching anything (Escape, focus-loss,
-/// toggle-off, preview), their query, results, and cursor position
+/// toggle-off, preview), their query, results, and selection
 /// survive so the next show picks up exactly where they left off.
+/// The restored query is presented fully selected, so typing
+/// replaces it wholesale (the Spotlight contract) while Enter and
+/// the arrows still act on the restored results.
 ///
 /// Only a launch action (Enter, double-click, calculator copy)
 /// clears this cache — everything else keeps it. A silent
@@ -116,6 +119,14 @@ pub(crate) struct SessionSnapshot {
 }
 
 pub(crate) const DEFAULT_TOP_MARGIN: i32 = 140;
+
+/// Entry logo variants, embedded so installed binaries don't depend
+/// on the source checkout's `packaging/` directory (the previous
+/// `CARGO_MANIFEST_DIR` path only exists on the build machine). The
+/// light logo serves the (default) dark skin; the dark logo serves
+/// the light skin.
+const LOGO_LIGHT_SVG: &[u8] = include_bytes!("../../../packaging/icons/lixun-logo-light.svg");
+const LOGO_DARK_SVG: &[u8] = include_bytes!("../../../packaging/icons/lixun-logo-dark.svg");
 
 /// Transition latch duration. `connect_leave` fires spuriously during the
 /// show transition on some compositors (Hyprland, sway); ignoring leave
@@ -251,7 +262,12 @@ impl LauncherController {
         }
 
         self.window.remove_css_class("lixun-hiding");
-        self.window.add_css_class("lixun-showing");
+        // Reduced motion: skip the CSS motion class (and its removal
+        // timer below) entirely when the desktop disables animations.
+        let animate = animations_enabled();
+        if animate {
+            self.window.add_css_class("lixun-showing");
+        }
         self.window.set_visible(true);
         {
             let w = self.window.clone();
@@ -264,16 +280,23 @@ impl LauncherController {
             "gui: show() called arm_layer_shell_focus; entry has_focus={}",
             self.entry.has_focus()
         );
-        self.entry.set_position(-1);
+        // Select the (possibly restored) query wholesale: typing on
+        // reopen replaces it instead of appending ("firefoxchrome").
+        self.entry.select_region(0, -1);
+        // Armed on BOTH paths: the guard papers over compositor
+        // focus-settle races on show (see JUST_SHOWED_GUARD_MS), not
+        // just the animation window.
         self.just_showed_until
             .set(Instant::now() + Duration::from_millis(JUST_SHOWED_GUARD_MS));
 
-        let window_weak = self.window.downgrade();
-        glib::timeout_add_local_once(Duration::from_millis(120), move || {
-            if let Some(w) = window_weak.upgrade() {
-                w.remove_css_class("lixun-showing");
-            }
-        });
+        if animate {
+            let window_weak = self.window.downgrade();
+            glib::timeout_add_local_once(Duration::from_millis(120), move || {
+                if let Some(w) = window_weak.upgrade() {
+                    w.remove_css_class("lixun-showing");
+                }
+            });
+        }
         true
     }
 
@@ -285,6 +308,13 @@ impl LauncherController {
     /// Does NOT exit the process; only `quit()` does.
     pub(crate) fn hide(&self) -> bool {
         self.cancel_preview_debounce();
+        // Reset the flag WITHOUT dismissing the preview: the daemon
+        // routes its overlap-unmap (preview_spawn.rs
+        // SetLauncherVisible(false)) through `GuiCommand::Hide` →
+        // here, and sending PreviewHide on that path would tear down
+        // the very preview that asked us to unmap. User-driven
+        // dismissals go through `toggle`/`clear_and_hide`, which call
+        // `dismiss_active_preview` first.
         self.preview_mode_active.set(false);
         self.persist_session();
         self.animate_hide();
@@ -297,14 +327,33 @@ impl LauncherController {
     /// the task and expects a fresh launcher next time.
     pub(crate) fn clear_and_hide(&self) -> bool {
         self.cancel_preview_debounce();
-        self.preview_mode_active.set(false);
+        // A completed launch dismisses a live preview too — leaving
+        // its toplevel behind after the launcher vanished orphans it.
+        self.dismiss_active_preview();
         self.clear_session();
         self.animate_hide();
         false
     }
 
+    /// Send the preview-hide request iff a preview session is live,
+    /// and drop the local flag. Same request the keymap Escape path
+    /// sends; the epoch machinery on the preview side makes a
+    /// duplicate harmless.
+    fn dismiss_active_preview(&self) {
+        if self.preview_mode_active.get() {
+            crate::ipc::send_preview_hide_request();
+            self.preview_mode_active.set(false);
+        }
+    }
+
     fn animate_hide(&self) {
         self.window.remove_css_class("lixun-showing");
+        if !animations_enabled() {
+            // Reduced motion: no .lixun-hiding keyframe, no 120 ms
+            // defer — unmap immediately.
+            self.window.set_visible(false);
+            return;
+        }
         self.window.add_css_class("lixun-hiding");
 
         let window_weak = self.window.downgrade();
@@ -321,6 +370,10 @@ impl LauncherController {
     /// `window.is_visible()` and picks show or hide.
     pub(crate) fn toggle(&self) -> bool {
         if self.window.is_visible() {
+            // Super+Space with a preview open dismisses both:
+            // hiding only the launcher would orphan the preview
+            // toplevel with no keyboard path back to it.
+            self.dismiss_active_preview();
             self.hide()
         } else {
             self.show()
@@ -589,7 +642,9 @@ impl LauncherController {
         }
 
         self.entry.set_text(&snapshot.query);
-        self.entry.set_position(-1);
+        // Restored query arrives fully selected (see the
+        // `SessionSnapshot` docs): first keystroke replaces it.
+        self.entry.select_region(0, -1);
 
         // Defer scroll restore until after GTK lays out the new rows;
         // vadjustment.upper() is only valid post-allocate, so calling
@@ -633,6 +688,18 @@ impl LauncherController {
             apply_validated_placement(&self.window, &monitor);
         }
     }
+}
+
+/// Honour the desktop's reduced-motion preference: when
+/// `gtk-enable-animations` is off, `show`/`animate_hide` skip the CSS
+/// motion classes and their fixed 120 ms timers. The
+/// JUST_SHOWED_GUARD latch is independent of this — it papers over
+/// compositor focus races, not animation timing — and stays armed
+/// either way.
+fn animations_enabled() -> bool {
+    gtk::Settings::default()
+        .map(|s| s.is_gtk_enable_animations())
+        .unwrap_or(true)
 }
 
 /// Pick the monitor the launcher should appear on.
@@ -754,6 +821,83 @@ fn apply_validated_placement(window: &gtk::ApplicationWindow, monitor: &gtk::gdk
     }
 }
 
+/// Resolved path of the user config the settings-menu toggles edit.
+fn user_config_path() -> std::path::PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("~/.config"))
+        .join("lixun/config.toml")
+}
+
+/// Read + parse the user config for the settings-menu toggles. A
+/// missing file means "all defaults" and yields an empty document —
+/// the old code silently no-oped there, so first-run users could
+/// never toggle anything. Read/parse failures surface on the status
+/// bar and return `None`.
+fn load_config_document(status_bar: &StatusBar) -> Option<toml_edit::DocumentMut> {
+    let config_path = user_config_path();
+    match std::fs::read_to_string(&config_path) {
+        Ok(content) => match content.parse::<toml_edit::DocumentMut>() {
+            Ok(doc) => Some(doc),
+            Err(e) => {
+                status_bar.show_error(&format!("Couldn't parse config.toml: {}", e));
+                None
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Some(toml_edit::DocumentMut::new())
+        }
+        Err(e) => {
+            status_bar.show_error(&format!("Couldn't read config.toml: {}", e));
+            None
+        }
+    }
+}
+
+/// Write the edited config back; failures surface on the status bar
+/// (a silent `let _ =` made the toggle look successful while the
+/// daemon restarted into the old config). Returns success.
+fn write_config_document(doc: &toml_edit::DocumentMut, status_bar: &StatusBar) -> bool {
+    let config_path = user_config_path();
+    if let Some(parent) = config_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(e) = std::fs::write(&config_path, doc.to_string()) {
+        status_bar.show_error(&format!("Couldn't write config.toml: {}", e));
+        return false;
+    }
+    true
+}
+
+/// Build and pop the settings menu under the entry's logo. Shared by
+/// the logo-area right-click gesture and the logo icon press so both
+/// affordances show the identical menu. Toggle state is spelled out
+/// as text ("On"/"Off") — a colour-only indicator is invisible to
+/// colourblind users.
+fn popup_settings_menu(entry: &gtk::Entry, semantic_enabled: bool, ocr_enabled: bool) {
+    let menu = gtk::PopoverMenu::from_model(None::<&gtk::gio::MenuModel>);
+    let menu_model = gtk::gio::Menu::new();
+
+    menu_model.append(Some("Relaunch Daemon"), Some("app.relaunch"));
+
+    let semantic_label = if semantic_enabled {
+        "Semantic Search: On"
+    } else {
+        "Semantic Search: Off"
+    };
+    menu_model.append(Some(semantic_label), Some("app.toggle-semantic"));
+
+    let ocr_label = if ocr_enabled { "OCR: On" } else { "OCR: Off" };
+    menu_model.append(Some(ocr_label), Some("app.toggle-ocr"));
+
+    menu_model.append(Some("Open Config"), Some("app.open-config"));
+
+    menu.set_menu_model(Some(&menu_model));
+    menu.set_parent(entry);
+    let rect = gtk::gdk::Rectangle::new(0, entry.height(), 1, 1);
+    menu.set_pointing_to(Some(&rect));
+    menu.popup();
+}
+
 pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
     let session_epoch = Arc::new(AtomicU64::new(0));
     let (ipc, ipc_event_rx) = start_ipc_thread(Arc::clone(&session_epoch));
@@ -808,23 +952,14 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
     // Apply the user's system-wide colour-scheme preference before the
     // window is mapped, so the first frame already carries the right
     // skin. Portal absence or a missing key is non-fatal: we keep the
-    // historical dark skin in that case.
-    if crate::color_scheme::read_initial().is_light() {
+    // historical dark skin in that case. The listener that tracks
+    // live scheme changes is installed further down, once the entry
+    // exists — it also swaps the entry's logo variant.
+    let initial_scheme_is_light = crate::color_scheme::read_initial().is_light();
+    if initial_scheme_is_light {
         window.add_css_class("lixun-light");
     }
     let color_scheme_rx = crate::color_scheme::spawn_listener();
-    {
-        let window_for_scheme = window.clone();
-        glib::MainContext::default().spawn_local(async move {
-            while let Ok(scheme) = color_scheme_rx.recv().await {
-                if scheme.is_light() {
-                    window_for_scheme.add_css_class("lixun-light");
-                } else {
-                    window_for_scheme.remove_css_class("lixun-light");
-                }
-            }
-        });
-    }
 
     let blur = crate::kde_blur::BlurController::new(&window, daemon_config.gui.blur);
 
@@ -990,53 +1125,76 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
     entry.set_widget_name("lixun-entry");
     add_css_class(&entry, "lixun-entry");
 
-    let icon_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../packaging/icons/lixun-logo-light.svg");
-    let icon_file = gtk::gio::File::for_path(&icon_path);
-    if let Ok(icon) = gtk::gdk::Texture::from_file(&icon_file) {
-        entry.set_icon_from_paintable(gtk::EntryIconPosition::Primary, Some(&icon));
+    let logo_light = gtk::gdk::Texture::from_bytes(&glib::Bytes::from_static(LOGO_LIGHT_SVG))
+        .inspect_err(|e| tracing::warn!("failed to decode embedded light logo: {}", e))
+        .ok();
+    let logo_dark = gtk::gdk::Texture::from_bytes(&glib::Bytes::from_static(LOGO_DARK_SVG))
+        .inspect_err(|e| tracing::warn!("failed to decode embedded dark logo: {}", e))
+        .ok();
+    let initial_logo = if initial_scheme_is_light {
+        &logo_dark
+    } else {
+        &logo_light
+    };
+    if let Some(icon) = initial_logo {
+        entry.set_icon_from_paintable(gtk::EntryIconPosition::Primary, Some(icon));
         entry.set_icon_activatable(gtk::EntryIconPosition::Primary, true);
+    }
+
+    // Track live scheme changes: skin class on the window, matching
+    // logo variant on the entry (light logo on the dark skin and
+    // vice versa).
+    {
+        let window_for_scheme = window.clone();
+        let entry_for_scheme = entry.clone();
+        let logo_light = logo_light.clone();
+        let logo_dark = logo_dark.clone();
+        glib::MainContext::default().spawn_local(async move {
+            while let Ok(scheme) = color_scheme_rx.recv().await {
+                if scheme.is_light() {
+                    window_for_scheme.add_css_class("lixun-light");
+                    if let Some(logo) = logo_dark.as_ref() {
+                        entry_for_scheme
+                            .set_icon_from_paintable(gtk::EntryIconPosition::Primary, Some(logo));
+                    }
+                } else {
+                    window_for_scheme.remove_css_class("lixun-light");
+                    if let Some(logo) = logo_light.as_ref() {
+                        entry_for_scheme
+                            .set_icon_from_paintable(gtk::EntryIconPosition::Primary, Some(logo));
+                    }
+                }
+            }
+        });
     }
 
     let semantic_enabled = daemon_config.plugin_sections.contains_key("semantic");
     let ocr_enabled = daemon_config.ocr.enabled;
     let max_results = daemon_config.max_results;
 
+    // The settings menu opens from two affordances: right-click over
+    // the logo area (x < 60) and a plain click on the logo icon
+    // itself (the icon is activatable above).
     let entry_for_menu = entry.clone();
     let gesture = gtk::GestureClick::new();
     gesture.set_button(3);
     gesture.connect_pressed(move |_gesture, _n_press, x, _y| {
         if x < 60.0 {
-            let menu = gtk::PopoverMenu::from_model(None::<&gtk::gio::MenuModel>);
-            let menu_model = gtk::gio::Menu::new();
-
-            menu_model.append(Some("Relaunch Daemon"), Some("app.relaunch"));
-
-            let semantic_label = if semantic_enabled {
-                "🟢 Semantic Search"
-            } else {
-                "🔴 Semantic Search"
-            };
-            menu_model.append(Some(semantic_label), Some("app.toggle-semantic"));
-
-            let ocr_label = if ocr_enabled { "🟢 OCR" } else { "🔴 OCR" };
-            menu_model.append(Some(ocr_label), Some("app.toggle-ocr"));
-
-            menu_model.append(Some("Open Config"), Some("app.open-config"));
-
-            menu.set_menu_model(Some(&menu_model));
-            menu.set_parent(&entry_for_menu);
-            let rect = gtk::gdk::Rectangle::new(0, entry_for_menu.height(), 1, 1);
-            menu.set_pointing_to(Some(&rect));
-            menu.popup();
+            popup_settings_menu(&entry_for_menu, semantic_enabled, ocr_enabled);
         }
     });
     entry.add_controller(gesture);
 
+    entry.connect_icon_press(move |entry, pos| {
+        if pos == gtk::EntryIconPosition::Primary {
+            popup_settings_menu(entry, semantic_enabled, ocr_enabled);
+        }
+    });
+
     vbox.append(&entry);
 
     let current_category: CategoryFilter = std::rc::Rc::new(std::cell::Cell::new(None));
-    let chips = build_category_chips(&current_category);
+    let chips = build_category_chips(&current_category, &daemon_config.keybindings);
     chips.container.set_visible(false);
     vbox.append(&chips.container);
 
@@ -1111,9 +1269,17 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
         .autoselect(true)
         .build();
 
+    // Built before the factory: the row action handlers surface
+    // launch failures through the status bar (they used to vanish
+    // into the log).
+    let status_bar = std::rc::Rc::new(StatusBar::new());
+
     let list_view = gtk::ListView::builder()
         .model(&selection)
-        .factory(&create_list_factory(entry.clone()))
+        .factory(&create_list_factory(
+            entry.clone(),
+            std::rc::Rc::clone(&status_bar),
+        ))
         .build();
     list_view.set_widget_name("lixun-results");
     scrolled.set_child(Some(&list_view));
@@ -1123,7 +1289,6 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
         move || filter.changed(gtk::FilterChange::Different)
     });
 
-    let status_bar = std::rc::Rc::new(StatusBar::new());
     vbox.append(status_bar.widget());
 
     window.set_child(Some(&vbox));
@@ -1241,22 +1406,20 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
 
     let toggle_semantic_action = gio::SimpleAction::new("toggle-semantic", None);
     let semantic_current = daemon_config.plugin_sections.contains_key("semantic");
+    let status_for_semantic = std::rc::Rc::clone(&status_bar);
     toggle_semantic_action.connect_activate(move |_, _| {
-        let config_path = dirs::config_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("~/.config"))
-            .join("lixun/config.toml");
-
-        if let Ok(content) = std::fs::read_to_string(&config_path)
-            && let Ok(mut doc) = content.parse::<toml_edit::DocumentMut>()
-        {
-            if semantic_current {
-                doc.remove("semantic");
-            } else {
-                let mut table = toml_edit::Table::new();
-                table.insert("enabled", toml_edit::value(true));
-                doc.insert("semantic", toml_edit::Item::Table(table));
-            }
-            let _ = std::fs::write(&config_path, doc.to_string());
+        let Some(mut doc) = load_config_document(&status_for_semantic) else {
+            return;
+        };
+        if semantic_current {
+            doc.remove("semantic");
+        } else {
+            let mut table = toml_edit::Table::new();
+            table.insert("enabled", toml_edit::value(true));
+            doc.insert("semantic", toml_edit::Item::Table(table));
+        }
+        if !write_config_document(&doc, &status_for_semantic) {
+            return;
         }
 
         let _ = std::process::Command::new("systemctl")
@@ -1267,22 +1430,20 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
 
     let toggle_ocr_action = gio::SimpleAction::new("toggle-ocr", None);
     let ocr_current = daemon_config.ocr.enabled;
+    let status_for_ocr = std::rc::Rc::clone(&status_bar);
     toggle_ocr_action.connect_activate(move |_, _| {
-        let config_path = dirs::config_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("~/.config"))
-            .join("lixun/config.toml");
-
-        if let Ok(content) = std::fs::read_to_string(&config_path)
-            && let Ok(mut doc) = content.parse::<toml_edit::DocumentMut>()
-        {
-            if let Some(ocr_table) = doc.get_mut("ocr").and_then(|v| v.as_table_mut()) {
-                ocr_table.insert("enabled", toml_edit::value(!ocr_current));
-            } else {
-                let mut table = toml_edit::Table::new();
-                table.insert("enabled", toml_edit::value(!ocr_current));
-                doc.insert("ocr", toml_edit::Item::Table(table));
-            }
-            let _ = std::fs::write(&config_path, doc.to_string());
+        let Some(mut doc) = load_config_document(&status_for_ocr) else {
+            return;
+        };
+        if let Some(ocr_table) = doc.get_mut("ocr").and_then(|v| v.as_table_mut()) {
+            ocr_table.insert("enabled", toml_edit::value(!ocr_current));
+        } else {
+            let mut table = toml_edit::Table::new();
+            table.insert("enabled", toml_edit::value(!ocr_current));
+            doc.insert("ocr", toml_edit::Item::Table(table));
+        }
+        if !write_config_document(&doc, &status_for_ocr) {
+            return;
         }
 
         let _ = std::process::Command::new("systemctl")
@@ -1293,9 +1454,7 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
 
     let open_config_action = gio::SimpleAction::new("open-config", None);
     open_config_action.connect_activate(move |_, _| {
-        let config_path = dirs::config_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("~/.config"))
-            .join("lixun/config.toml");
+        let config_path = user_config_path();
         // xdg-utils' xdg-open rejects any argv that begins with '-' including
         // the conventional GNU end-of-options separator. See the docstring on
         // crates/lixun-gui/src/actions.rs::xdg_open_command for the protocol
@@ -1335,6 +1494,29 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
         glib::spawn_future_local(async move {
             while let Ok(_key) = icon_ready_rx.recv().await {
                 filter_for_icons.changed(gtk::FilterChange::Different);
+            }
+        });
+    }
+
+    // Drain the reaper's launch-failure channel on the GTK main loop.
+    // A helper process that execs fine and dies later fails after the
+    // launcher has hidden, so the status bar cannot carry the
+    // message — raise a desktop notification instead.
+    {
+        let failure_rx = crate::reaper::failure_rx();
+        let app_for_notify = app.clone();
+        glib::spawn_future_local(async move {
+            while let Ok(failure) = failure_rx.recv().await {
+                let body = match failure.code {
+                    Some(code) => format!(
+                        "Couldn't open {} — exited with code {}",
+                        failure.program, code
+                    ),
+                    None => format!("Couldn't open {} — killed by a signal", failure.program),
+                };
+                let notification = gio::Notification::new("Lixun");
+                notification.set_body(Some(&body));
+                app_for_notify.send_notification(None, &notification);
             }
         });
     }
@@ -1685,6 +1867,12 @@ fn install_response_handler(
 ) {
     let pending_hits = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
     let last_epoch = std::rc::Rc::new(std::cell::Cell::new(0u64));
+    // Zero-hit path: cached daemon Status sample plus a latch that
+    // stops fetch threads from stacking up while one round-trip is
+    // still in flight (see `present_zero_hit_status`).
+    let index_status_cache: std::rc::Rc<std::cell::RefCell<Option<IndexStatusSnapshot>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
+    let index_status_inflight = std::rc::Rc::new(std::cell::Cell::new(false));
 
     glib::spawn_future_local(async move {
         while let Ok(msg) = event_rx.recv().await {
@@ -1693,7 +1881,6 @@ fn install_response_handler(
                     epoch,
                     phase,
                     hits,
-                    calculation,
                     top_hit,
                     claimed,
                 } => {
@@ -1807,22 +1994,25 @@ fn install_response_handler(
                             }
 
                             let has_anything = !plan.hits.is_empty();
-                            if let Some(calc) = calculation.as_ref() {
-                                chips_container.set_visible(true);
-                                scrolled.set_visible(false);
-                                scrolled.set_vexpand(false);
-                                status.show_calculation(calc);
-                            } else if !has_anything {
+                            // Calculator results present as a normal hit row
+                            // (the calculator source emits the value as the
+                            // hit title); the old status-bar calculation
+                            // path was dead code and has been removed.
+                            if !has_anything {
                                 let q = last_query.borrow().clone();
                                 if !q.is_empty() {
                                     chips_container.set_visible(true);
                                     scrolled.set_visible(false);
                                     scrolled.set_vexpand(false);
-                                    if searching_indicator.get() {
-                                        status.show_empty("Searching...");
-                                    } else {
-                                        status.show_empty(&q);
-                                    }
+                                    present_zero_hit_status(
+                                        &q,
+                                        claimed,
+                                        epoch,
+                                        &status,
+                                        &session_epoch,
+                                        &index_status_cache,
+                                        &index_status_inflight,
+                                    );
                                     selection.set_selected(gtk::INVALID_LIST_POSITION);
                                 } else {
                                     chips_container.set_visible(false);
@@ -1835,18 +2025,109 @@ fn install_response_handler(
                                 let list_has_rows = !plan.hits.is_empty();
                                 scrolled.set_visible(list_has_rows);
                                 scrolled.set_vexpand(false);
-                                if searching_indicator.get() {
-                                    status.show_empty("Searching...");
-                                } else {
-                                    status.hide();
-                                }
+                                status.hide();
                             }
                         }
                     }
                 }
+                crate::ipc::IpcMessage::TransportFailed { epoch } => {
+                    if epoch < session_epoch.load(Ordering::SeqCst) {
+                        tracing::debug!("gui: dropping stale TransportFailed epoch={}", epoch);
+                        continue;
+                    }
+                    if let Some(id) = loading_timer.borrow_mut().take() {
+                        id.remove();
+                    }
+                    pending_hits.borrow_mut().clear();
+                    searching_indicator.set(false);
+                    // Keep the query and any rendered results as they
+                    // are: an actionable error plus the user's context
+                    // beats a scrubbed launcher claiming "No results".
+                    status.show_daemon_unresponsive();
+                }
+                crate::ipc::IpcMessage::SearchTimeout { epoch } => {
+                    if epoch < session_epoch.load(Ordering::SeqCst) {
+                        tracing::debug!("gui: dropping stale SearchTimeout epoch={}", epoch);
+                        continue;
+                    }
+                    // The IPC reader keeps its connection open, so a
+                    // slow Final can still land and replace this. Keep
+                    // the spinner up; just explain the wait.
+                    if let Some(id) = loading_timer.borrow_mut().take() {
+                        id.remove();
+                    }
+                    status.show_still_searching();
+                }
             }
         }
     });
+}
+
+/// Cached daemon Status sample for the zero-hit path: when it was
+/// fetched and what it said (`None` payload = fetch failed).
+type IndexStatusSnapshot = (Instant, Option<(u64, bool)>);
+
+/// Decide the status-bar presentation for a genuine zero-hit Final.
+///
+/// During the minutes-long first index (and any full reindex) the
+/// definitive "No results" is a lie — the documents just are not in
+/// the index yet. For non-claimed queries, ask the daemon once
+/// whether a reindex is running (sampled off the main thread over a
+/// one-shot socket with a 500 ms read bound, cached for ~5 s) and
+/// show indexing progress instead of the empty state.
+fn present_zero_hit_status(
+    q: &str,
+    claimed: bool,
+    epoch: u64,
+    status: &std::rc::Rc<StatusBar>,
+    session_epoch: &Arc<AtomicU64>,
+    cache: &std::rc::Rc<std::cell::RefCell<Option<IndexStatusSnapshot>>>,
+    fetch_inflight: &std::rc::Rc<std::cell::Cell<bool>>,
+) {
+    // Claimed queries (shell `>`, calculator `=`) are answered by
+    // their plugin, not the index — a reindex is irrelevant to them.
+    if claimed {
+        status.show_empty(q);
+        return;
+    }
+
+    const INDEX_STATUS_TTL: Duration = Duration::from_secs(5);
+    let cached = cache
+        .borrow()
+        .as_ref()
+        .and_then(|(at, st)| (at.elapsed() < INDEX_STATUS_TTL).then_some(*st));
+    match cached {
+        Some(Some((docs, true))) => status.show_indexing(docs),
+        Some(_) => status.show_empty(q),
+        None => {
+            // Show the empty state immediately; upgrade to the
+            // indexing state when (and only if) the daemon reports a
+            // reindex in progress and the session hasn't moved on.
+            status.show_empty(q);
+            if fetch_inflight.get() {
+                return;
+            }
+            fetch_inflight.set(true);
+            let (tx, rx) = async_channel::bounded::<Option<(u64, bool)>>(1);
+            std::thread::spawn(move || {
+                let _ = tx.send_blocking(crate::ipc::request_index_status());
+            });
+            let cache = std::rc::Rc::clone(cache);
+            let fetch_inflight = std::rc::Rc::clone(fetch_inflight);
+            let status = std::rc::Rc::clone(status);
+            let session_epoch = Arc::clone(session_epoch);
+            glib::spawn_future_local(async move {
+                let st = rx.recv().await.ok().flatten();
+                fetch_inflight.set(false);
+                *cache.borrow_mut() = Some((Instant::now(), st));
+                if let Some((docs, true)) = st
+                    && epoch == session_epoch.load(Ordering::SeqCst)
+                {
+                    status.show_indexing(docs);
+                }
+            });
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1976,6 +2257,7 @@ fn install_entry_handler(
         let pending_self = std::rc::Rc::clone(&pending_debounce);
         let epoch = Arc::clone(&session_epoch);
         let prefixes_for_debounce = std::rc::Rc::clone(&claimed_prefixes);
+        let loading_timer_for_debounce = std::rc::Rc::clone(&loading_timer);
         // 30 ms keystroke debounce. A6 (8a309de) introduced
         // cooperative cancellation in the daemon's collector, so
         // superseded queries are aborted server-side and the GUI
@@ -2001,8 +2283,24 @@ fn install_entry_handler(
             let is_claimed = prefixes_for_debounce
                 .iter()
                 .any(|p| trimmed.starts_with(p.as_str()));
+            // Delayed spinner: cancel whatever the previous keystroke
+            // armed, then re-arm. The spinner only appears if this
+            // search is still unanswered after 120 ms — warm queries
+            // Final in ~20 ms, so they never flash the launcher's
+            // bottom edge. The Final handler cancels the pending
+            // timer (as do the empty-query and transport-error
+            // paths).
+            if let Some(id) = loading_timer_for_debounce.borrow_mut().take() {
+                id.remove();
+            }
             if !is_claimed {
-                status_for_debounce.show_loading();
+                let timer_slot = std::rc::Rc::clone(&loading_timer_for_debounce);
+                let timer_id =
+                    glib::timeout_add_local_once(Duration::from_millis(120), move || {
+                        *timer_slot.borrow_mut() = None;
+                        status_for_debounce.show_loading();
+                    });
+                *loading_timer_for_debounce.borrow_mut() = Some(timer_id);
             }
             let _ = ipc.request_tx.send((q, max_results, epoch_snapshot));
             *pending_self.borrow_mut() = None;
@@ -2040,7 +2338,10 @@ impl CategoryChips {
     }
 }
 
-fn build_category_chips(current: &CategoryFilter) -> CategoryChips {
+fn build_category_chips(
+    current: &CategoryFilter,
+    keybindings: &lixun_config::Keybindings,
+) -> CategoryChips {
     let container = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     container.set_widget_name("lixun-chips");
     container.set_margin_top(4);
@@ -2055,13 +2356,26 @@ fn build_category_chips(current: &CategoryFilter) -> CategoryChips {
         ("Attachments", Some(Category::Attachment)),
     ];
 
+    // Tooltip shows each chip's *resolved* accelerator — read from the
+    // parsed keybindings, never hardcoded, so user rebinds stay truthful.
+    let accels = [
+        keybindings.filter_all.as_str(),
+        keybindings.filter_apps.as_str(),
+        keybindings.filter_files.as_str(),
+        keybindings.filter_mail.as_str(),
+        keybindings.filter_attachments.as_str(),
+    ];
+
     let mut buttons: Vec<gtk::ToggleButton> = Vec::with_capacity(5);
     let group_anchor: Option<gtk::ToggleButton> = None;
     let mut group_anchor = group_anchor;
 
-    for (label, _cat) in &labels {
+    for ((label, _cat), accel) in labels.iter().zip(accels) {
         let b = gtk::ToggleButton::with_label(label);
         add_css_class(&b, "lixun-chip");
+        if let Some((key, mods)) = gtk::accelerator_parse(accel) {
+            b.set_tooltip_text(Some(&gtk::accelerator_get_label(key, mods)));
+        }
         if let Some(anchor) = group_anchor.as_ref() {
             b.set_group(Some(anchor));
         } else {

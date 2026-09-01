@@ -219,6 +219,12 @@ fn dispatch_action(action: &Action) -> Result<()> {
         }
         Action::ReplaceQuery { .. } => Ok(()),
         Action::ExecCapture { .. } => Ok(()),
+        Action::CopyText { text } => {
+            if let Some(display) = gtk::gdk::Display::default() {
+                display.clipboard().set_text(text);
+            }
+            Ok(())
+        }
         Action::Exec {
             cmdline,
             working_dir,
@@ -257,12 +263,16 @@ pub(crate) fn execute_secondary_action(hit: &Hit) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn copy_to_clipboard(hit: &Hit) {
+/// Copy the hit's canonical text (path, URI, or title) to the
+/// clipboard and return what was copied so UI callers can surface a
+/// confirmation (this module stays UI-free).
+pub(crate) fn copy_to_clipboard(hit: &Hit) -> String {
     let text = match &hit.action {
         Action::OpenFile { path } | Action::ShowInFileManager { path } => {
             path.to_string_lossy().to_string()
         }
         Action::OpenUri { uri } => uri.clone(),
+        Action::CopyText { text } => text.clone(),
         Action::OpenEmbedded { .. } => hit.title.clone(),
         _ => hit.title.clone(),
     };
@@ -271,6 +281,7 @@ pub(crate) fn copy_to_clipboard(hit: &Hit) {
         display.clipboard().set_text(&text);
     }
     tracing::info!("Copied to clipboard: {}", text);
+    text
 }
 
 /// Run `cmdline` headless and deliver its captured stdout to

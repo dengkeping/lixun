@@ -14,7 +14,17 @@ impl PluginFactory for CalculatorFactory {
         "calculator"
     }
 
-    fn build(&self, _raw: &toml::Value, _ctx: &PluginBuildContext) -> Result<Vec<PluginInstance>> {
+    /// Zero-config: the daemon registers the calculator even without a
+    /// `[calculator]` section. `enabled = false` in an explicit section
+    /// opts out.
+    fn default_enabled(&self) -> bool {
+        true
+    }
+
+    fn build(&self, raw: &toml::Value, _ctx: &PluginBuildContext) -> Result<Vec<PluginInstance>> {
+        if raw.get("enabled").and_then(|v| v.as_bool()) == Some(false) {
+            return Ok(Vec::new());
+        }
         Ok(vec![PluginInstance {
             instance_id: "calculator".into(),
             source: Arc::new(CalculatorSource),

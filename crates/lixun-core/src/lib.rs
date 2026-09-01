@@ -225,6 +225,10 @@ pub enum Action {
     /// `mailto:`, `https:`). Plugin-agnostic: the host does not know
     /// which application will handle the scheme.
     OpenUri { uri: String },
+    /// Put `text` on the clipboard. Generic primitive for hits whose
+    /// payload IS the answer (a computed value, a snippet): the host
+    /// copies verbatim without knowing which plugin produced it.
+    CopyText { text: String },
 }
 
 fn deserialize_exec_string_or_vec<'de, D>(d: D) -> Result<Vec<String>, D::Error>

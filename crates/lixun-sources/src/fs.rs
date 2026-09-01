@@ -193,11 +193,17 @@ impl FsSource {
             .expect("failed to build rayon pool")
     }
 
-    pub fn metadata_for_path(path: &Path) -> (String, String) {
+    /// Returns `(icon_name, kind_label, mime)` for a regular file.
+    /// `kind_label` is a human-readable label ("PDF Document") for
+    /// display; `mime` is the raw guessed type ("application/pdf")
+    /// that preview plugins match on when the extension alone is
+    /// inconclusive.
+    pub fn metadata_for_path(path: &Path) -> (String, String, String) {
         let mime = mime_guess::from_path(path).first_or_octet_stream();
         (
             mime_icons::mime_to_icon_name(&mime),
             mime_icons::human_kind(&mime),
+            mime.to_string(),
         )
     }
 
@@ -205,12 +211,8 @@ impl FsSource {
         let (icon_name, kind_label, mime) = if meta.is_dir {
             ("folder".to_string(), "Folder".to_string(), None)
         } else {
-            let mime_obj = mime_guess::from_path(&meta.path).first_or_octet_stream();
-            let (icon, kind) = (
-                mime_icons::mime_to_icon_name(&mime_obj),
-                mime_icons::human_kind(&mime_obj),
-            );
-            (icon, kind, Some(mime_obj.to_string()))
+            let (icon, kind, mime) = Self::metadata_for_path(&meta.path);
+            (icon, kind, Some(mime))
         };
 
         Document {
