@@ -15,6 +15,7 @@
 /.local/
 /.local-plans/
 /.sisyphus/
+/conductor/
 
 # Local-only notes and instructions, not distributed with the repo
 /AGENTS.md
@@ -36,3 +37,9 @@
 /NOTEPAD.md
 /flowchart-mermaid.mmd
 /flowchart.svg
+
+# Local security audit working area (hunter findings, PoC scripts) - never tracked
+/.security-research/
+
+# Security research workspace (local-only, not distributed)
+/.security-research/

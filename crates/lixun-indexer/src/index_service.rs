@@ -98,6 +98,13 @@ pub enum Mutation {
     /// Reply woken with the commit generation once every prior mutation has
     /// been applied and a commit has completed.
     Barrier(oneshot::Sender<u64>),
+    /// Reply woken once every prior mutation has been applied to the
+    /// index writer — NOT necessarily committed. Cheap backpressure
+    /// ack for bulk producers (crawl batches): unlike `Barrier`, it
+    /// does not park the producer until the commit timer fires, so
+    /// ingest throughput is bounded by writer speed instead of
+    /// `COMMIT_MIN_INTERVAL`.
+    Applied(oneshot::Sender<()>),
     Shutdown,
     /// Force a commit now and reply with the resulting generation.
     CommitNow(oneshot::Sender<u64>),
@@ -121,6 +128,15 @@ impl IndexMutationTx {
         self.send(Mutation::Barrier(tx)).await?;
         rx.await
             .map_err(|_| anyhow::anyhow!("barrier dropped before commit"))
+    }
+
+    /// Wait until every previously sent mutation has been applied to
+    /// the index writer (backpressure), without waiting for a commit.
+    pub async fn applied(&self) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(Mutation::Applied(tx)).await?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("applied ack dropped"))
     }
 
     pub async fn commit_now(&self) -> Result<u64> {
@@ -149,6 +165,31 @@ impl IndexMutationTx {
 pub struct SearchHandle {
     index: Arc<LixunIndex>,
     permits: Arc<Semaphore>,
+    /// Bounded lexical result cache keyed by (query text, limit,
+    /// reload epoch). The epoch component means a commit+reload
+    /// naturally invalidates every prior entry; stage-2 (frecency /
+    /// latch) is applied downstream per request, so click feedback
+    /// stays live even on a cache hit.
+    result_cache: Arc<std::sync::Mutex<ResultCache>>,
+}
+
+type CachedPairs = Vec<(lixun_core::Hit, lixun_core::ScoreBreakdown)>;
+
+struct ResultCache(std::collections::HashMap<(String, u32, u64), CachedPairs>);
+
+const RESULT_CACHE_MAX: usize = 64;
+
+impl ResultCache {
+    fn get(&self, key: &(String, u32, u64)) -> Option<CachedPairs> {
+        self.0.get(key).cloned()
+    }
+
+    fn put(&mut self, key: (String, u32, u64), pairs: CachedPairs) {
+        if self.0.len() >= RESULT_CACHE_MAX {
+            self.0.clear();
+        }
+        self.0.insert(key, pairs);
+    }
 }
 
 impl SearchHandle {
@@ -160,6 +201,9 @@ impl SearchHandle {
         Self {
             index,
             permits: Arc::new(Semaphore::new(concurrency.max(1))),
+            result_cache: Arc::new(std::sync::Mutex::new(ResultCache(
+                std::collections::HashMap::new(),
+            ))),
         }
     }
 
@@ -191,9 +235,24 @@ impl SearchHandle {
         &self,
         query: &lixun_core::Query,
     ) -> Result<Vec<(lixun_core::Hit, lixun_core::ScoreBreakdown)>> {
+        let key = (
+            query.text.clone(),
+            query.limit,
+            self.index.reload_epoch(),
+        );
+        if let Ok(cache) = self.result_cache.lock()
+            && let Some(pairs) = cache.get(&key)
+        {
+            return Ok(pairs);
+        }
         let q = query.clone();
-        self.run_blocking(move |idx| idx.search_with_breakdown(&q))
-            .await
+        let pairs = self
+            .run_blocking(move |idx| idx.search_with_breakdown(&q))
+            .await?;
+        if let Ok(mut cache) = self.result_cache.lock() {
+            cache.put(key, pairs.clone());
+        }
+        Ok(pairs)
     }
 
     pub async fn all_doc_ids(&self) -> Result<std::collections::HashSet<String>> {
@@ -225,6 +284,17 @@ impl SearchHandle {
     ) -> Result<Option<(lixun_core::Hit, lixun_core::ScoreBreakdown)>> {
         let id = doc_id.to_string();
         self.run_blocking(move |idx| idx.hydrate_doc_by_id(&id))
+            .await
+    }
+
+    /// Batch hydration: one blocking hop for the whole id list instead
+    /// of one `spawn_blocking` round trip per doc. Ids with no live doc
+    /// are skipped; order is preserved.
+    pub async fn hydrate_docs(
+        &self,
+        doc_ids: Vec<String>,
+    ) -> Result<Vec<(lixun_core::Hit, lixun_core::ScoreBreakdown)>> {
+        self.run_blocking(move |idx| idx.hydrate_docs_by_ids(&doc_ids))
             .await
     }
 }
@@ -337,6 +407,12 @@ async fn writer_loop(
                         } else {
                             pending_barriers.push(reply);
                         }
+                    }
+
+                    Mutation::Applied(reply) => {
+                        // Channel order guarantees every prior mutation on
+                        // this receiver has already been applied above.
+                        let _ = reply.send(());
                     }
 
                     Mutation::CommitNow(reply) => {
@@ -594,6 +670,9 @@ async fn writer_loop(
                 }
             }
             Mutation::Barrier(reply) => pending_barriers.push(reply),
+            Mutation::Applied(reply) => {
+                let _ = reply.send(());
+            }
             Mutation::CommitNow(reply) => pending_barriers.push(reply),
             Mutation::Shutdown => {}
         }

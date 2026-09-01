@@ -22,8 +22,36 @@ pub struct LanceDbAnnHandle {
     text_embedder: OnceLock<Arc<Mutex<TextEmbedder>>>,
     clip_text_embedder: OnceLock<Arc<Mutex<ClipTextEmbedder>>>,
     query_router: OnceLock<Arc<QueryRouter>>,
+    text_query_cache: Mutex<QueryVecCache>,
+    clip_query_cache: Mutex<QueryVecCache>,
     #[cfg(feature = "idle-eviction")]
     supervisor: OnceLock<Arc<EmbedderSupervisor>>,
+}
+
+/// Bounded query→vector cache. Query embedding is ONNX inference and
+/// the same string is embedded repeatedly (classify + image search in
+/// one request; backspace/retype churn across requests). Eviction is
+/// a wholesale clear at capacity — embeddings are pure functions of
+/// the query, so correctness never depends on what stays cached.
+struct QueryVecCache(std::collections::HashMap<String, Vec<f32>>);
+
+const QUERY_EMBED_CACHE_MAX: usize = 128;
+
+impl QueryVecCache {
+    fn new() -> Self {
+        Self(std::collections::HashMap::new())
+    }
+
+    fn get(&self, q: &str) -> Option<Vec<f32>> {
+        self.0.get(q).cloned()
+    }
+
+    fn put(&mut self, q: &str, v: Vec<f32>) {
+        if self.0.len() >= QUERY_EMBED_CACHE_MAX {
+            self.0.clear();
+        }
+        self.0.insert(q.to_string(), v);
+    }
 }
 
 impl LanceDbAnnHandle {
@@ -33,6 +61,8 @@ impl LanceDbAnnHandle {
             text_embedder: OnceLock::new(),
             clip_text_embedder: OnceLock::new(),
             query_router: OnceLock::new(),
+            text_query_cache: Mutex::new(QueryVecCache::new()),
+            clip_query_cache: Mutex::new(QueryVecCache::new()),
             #[cfg(feature = "idle-eviction")]
             supervisor: OnceLock::new(),
         }
@@ -77,6 +107,12 @@ impl LanceDbAnnHandle {
     }
 
     fn embed_query_text(&self, query: &str) -> Result<Option<Vec<f32>>> {
+        if let Ok(cache) = self.text_query_cache.lock()
+            && let Some(v) = cache.get(query)
+        {
+            return Ok(Some(v));
+        }
+
         #[cfg(feature = "idle-eviction")]
         let embedder = match self.supervisor.get() {
             Some(s) => s.text()?,
@@ -97,10 +133,22 @@ impl LanceDbAnnHandle {
         let mut vectors = guard
             .embed(vec![query.to_string()])
             .context("ann query: text embed")?;
-        Ok(vectors.pop())
+        let vector = vectors.pop();
+        if let Some(v) = &vector
+            && let Ok(mut cache) = self.text_query_cache.lock()
+        {
+            cache.put(query, v.clone());
+        }
+        Ok(vector)
     }
 
     fn embed_query_clip_text(&self, query: &str) -> Result<Option<Vec<f32>>> {
+        if let Ok(cache) = self.clip_query_cache.lock()
+            && let Some(v) = cache.get(query)
+        {
+            return Ok(Some(v));
+        }
+
         #[cfg(feature = "idle-eviction")]
         let embedder = match self.supervisor.get() {
             Some(s) => s.clip_text()?,
@@ -121,7 +169,13 @@ impl LanceDbAnnHandle {
         let mut vectors = guard
             .embed(vec![query.to_string()])
             .context("ann query: CLIP text embed")?;
-        Ok(vectors.pop())
+        let vector = vectors.pop();
+        if let Some(v) = &vector
+            && let Ok(mut cache) = self.clip_query_cache.lock()
+        {
+            cache.put(query, v.clone());
+        }
+        Ok(vector)
     }
 }
 

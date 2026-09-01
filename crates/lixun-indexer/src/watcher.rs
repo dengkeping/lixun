@@ -111,7 +111,12 @@ pub async fn start(
         })?;
 
     let coalesce_exclude = Arc::clone(&exclude_arc);
-    tokio::spawn(coalescer_task(raw_rx, refresh_tx.clone(), coalesce_exclude));
+    tokio::spawn(coalescer_task(
+        raw_rx,
+        refresh_tx.clone(),
+        coalesce_exclude,
+        roots.clone(),
+    ));
 
     for worker_id in 0..RESOLVER_WORKERS {
         let rx = refresh_rx.clone();
@@ -292,6 +297,7 @@ async fn coalescer_task(
     mut raw_rx: mpsc::Receiver<RawEvent>,
     refresh_tx: async_channel::Sender<RefreshJob>,
     exclude: Arc<ExcludeSet>,
+    roots: Vec<PathBuf>,
 ) {
     let mut pending: HashMap<PathBuf, Intent> = HashMap::new();
     let mut flush_tick = tokio::time::interval(COALESCE_FLUSH_INTERVAL);
@@ -318,6 +324,28 @@ async fn coalescer_task(
             }
 
             _ = flush_tick.tick() => {
+                // Overflow recovery FIRST (and independent of whether any
+                // events survived): a full raw queue means events were
+                // dropped at the notify boundary, so the per-path intents
+                // below are incomplete. Requeue a walk of every root —
+                // coarse, but it degrades granularity instead of
+                // correctness; a silently stale index was the old failure
+                // mode. Resolver-side directory expansion re-enqueues one
+                // Refresh per file, and the extract cache absorbs the
+                // re-extraction cost of unchanged files.
+                if OVERFLOW_FLAG.swap(false, Ordering::Relaxed) {
+                    tracing::warn!(
+                        "watcher: raw event queue overflowed (total: {}); rescanning {} root(s) to recover dropped events",
+                        OVERFLOW_COUNT.load(Ordering::Relaxed),
+                        roots.len()
+                    );
+                    for root in &roots {
+                        if refresh_tx.send(RefreshJob::Refresh(root.clone())).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+
                 if pending.is_empty() {
                     continue;
                 }
@@ -334,13 +362,6 @@ async fn coalescer_task(
                     }
                 }
                 tracing::debug!("coalescer: flushed {} paths", count);
-
-                if OVERFLOW_FLAG.swap(false, Ordering::Relaxed) {
-                    tracing::warn!(
-                        "watcher: raw event queue overflowed (total: {})",
-                        OVERFLOW_COUNT.load(Ordering::Relaxed)
-                    );
-                }
             }
         }
     }

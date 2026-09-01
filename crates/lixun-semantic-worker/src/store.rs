@@ -176,6 +176,51 @@ impl VectorStore {
         Ok(did_work)
     }
 
+    /// Create or maintain the ANN index on each vector table. Without
+    /// one, LanceDB's `vector_search` is a brute-force O(N) scan per
+    /// query. Below `VECTOR_INDEX_MIN_ROWS` the flat scan is faster
+    /// than an index (and IVF training needs enough rows to be
+    /// meaningful), so small tables are left alone. When an index
+    /// already exists, freshly written rows are folded into it so
+    /// queries don't degrade to scanning an ever-growing delta.
+    pub async fn ensure_vector_indices(&self) -> Result<()> {
+        const VECTOR_INDEX_MIN_ROWS: usize = 10_000;
+        for (name, table) in [("text", &self.text), ("image", &self.image)] {
+            let rows = table
+                .count_rows(None)
+                .await
+                .with_context(|| format!("lancedb: count_rows({name})"))?;
+            if rows < VECTOR_INDEX_MIN_ROWS {
+                continue;
+            }
+            let indices = table
+                .list_indices()
+                .await
+                .with_context(|| format!("lancedb: list_indices({name})"))?;
+            let has_vector_index = indices
+                .iter()
+                .any(|idx| idx.columns.iter().any(|c| c == "vector"));
+            if has_vector_index {
+                table
+                    .optimize(OptimizeAction::Index(Default::default()))
+                    .await
+                    .with_context(|| format!("lancedb: optimize index {name}"))?;
+            } else {
+                tracing::info!(
+                    table = name,
+                    rows,
+                    "semantic: creating ANN vector index (brute-force scan retired)"
+                );
+                table
+                    .create_index(&["vector"], lancedb::index::Index::Auto)
+                    .execute()
+                    .await
+                    .with_context(|| format!("lancedb: create vector index {name}"))?;
+            }
+        }
+        Ok(())
+    }
+
     pub async fn delete(&self, doc_ids: &[String]) -> Result<()> {
         if doc_ids.is_empty() {
             return Ok(());

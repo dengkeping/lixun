@@ -54,7 +54,10 @@ pub async fn reindex_full(
         while let Some(batch) = batch_rx.recv().await {
             fs_count += batch.len();
             mutation_tx.send(Mutation::UpsertMany(batch)).await?;
-            let _ = mutation_tx.barrier().await?;
+            // Backpressure only: wait for the writer to ingest the batch,
+            // not for a commit — barrier() here would clamp throughput to
+            // one batch per COMMIT_MIN_INTERVAL while extractors sit idle.
+            mutation_tx.applied().await?;
         }
         walk_task.await??;
         fs_count
@@ -171,16 +174,17 @@ pub async fn run_incremental(
         while let Some(batch) = batch_rx.recv().await {
             fs_count += batch.len();
             mutation_tx.send(Mutation::UpsertMany(batch)).await?;
-            let _ = mutation_tx.barrier().await?;
+            // Backpressure only — see reindex_full for why not barrier().
+            mutation_tx.applied().await?;
         }
 
         let (returned_manifest, deleted_ids) = walk_task.await??;
         manifest = returned_manifest;
 
-        if !deleted_ids.is_empty() {
+        let had_deletes = !deleted_ids.is_empty();
+        if had_deletes {
             let del_count = deleted_ids.len();
             mutation_tx.send(Mutation::DeleteMany(deleted_ids)).await?;
-            let _ = mutation_tx.barrier().await?;
             tracing::info!(
                 "Filesystem incremental: +{} docs, -{} deleted",
                 fs_count,
@@ -188,6 +192,12 @@ pub async fn run_incremental(
             );
         } else if fs_count > 0 {
             tracing::info!("Filesystem incremental: +{} docs", fs_count);
+        }
+
+        if fs_count > 0 || had_deletes {
+            // One durable commit before manifest.save below, so the
+            // manifest never claims work the index hasn't persisted.
+            mutation_tx.commit_now().await?;
         }
 
         fs_count
@@ -245,7 +255,7 @@ async fn reindex_non_fs_from_registry(
             let _ = tx.send(r);
         });
         rx.await??;
-        mutation_tx.barrier().await?;
+        mutation_tx.applied().await?;
         let emitted = counter.load(Ordering::Relaxed) - before;
         tracing::info!(
             "Source instance {} reindexed ({} upserts)",

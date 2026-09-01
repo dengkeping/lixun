@@ -229,12 +229,17 @@ async fn run_one_session(
     /* Build (or rebind) the SemanticConnection. The first session
     creates it and installs into the stub crate; later sessions
     rebind only the writer channel so existing AnnHandle and
-    Broadcaster Arc clones keep working transparently. Phase 2
-    rebinds by constructing a fresh SemanticConnection — Phase 3
-    will revisit if reuse becomes important. */
+    Broadcaster Arc clones keep working transparently. The rebind
+    is NOT optional: the previous session's writer receiver died
+    with its socket, so a reused connection holding the old sender
+    would fail every send with "channel closed" until the daemon
+    itself restarts. */
     let (writer_tx, mut writer_rx) = mpsc::channel::<Cmd>(WRITER_QUEUE_CAPACITY);
     let conn = match existing_conn {
-        Some(c) => c,
+        Some(c) => {
+            c.rebind_writer(writer_tx.clone());
+            c
+        }
         None => {
             let c = SemanticConnection::new(writer_tx.clone());
             install_connection(c.clone());

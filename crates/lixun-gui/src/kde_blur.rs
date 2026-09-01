@@ -150,8 +150,17 @@ impl BlurController {
                 if !st.enabled {
                     return;
                 }
-                if let Some(old) = st.attachment.take() {
-                    old.detach();
+                // Layout fires several times per frame while the result
+                // list resizes. Re-creating the attachment each time
+                // meant a blocking registry roundtrip on the GTK main
+                // thread plus a blur unset/create churn per callback —
+                // enough sustained protocol traffic to stall KWin's main
+                // thread (observed as a whole-desktop freeze). Reuse the
+                // live attachment: same size is a no-op, a resize only
+                // swaps the blur region in place.
+                if let Some(att) = st.attachment.as_mut() {
+                    att.update_region(width, height);
+                    return;
                 }
                 match BlurAttachment::create(surface, width, height) {
                     Ok(Some(att)) => {
@@ -231,6 +240,10 @@ struct BlurAttachment {
     backend: BlurBackend,
     surface: WlSurface,
     conn: Connection,
+    compositor: WlCompositor,
+    qh: QueueHandle<RegistryState>,
+    width: i32,
+    height: i32,
     _queue: EventQueue<RegistryState>,
 }
 
@@ -322,6 +335,10 @@ impl BlurAttachment {
                     backend,
                     surface: wl_surface,
                     conn,
+                    compositor,
+                    qh,
+                    width,
+                    height,
                     _queue: queue,
                 }));
             }
@@ -402,8 +419,40 @@ impl BlurAttachment {
             backend: BlurBackend::KdeBlur { blur, manager },
             surface: wl_surface,
             conn,
+            compositor: protocol.compositor.clone(),
+            qh: protocol.qh.clone(),
+            width,
+            height,
             _queue: queue,
         }))
+    }
+
+    /// Refresh the blur region on the EXISTING attachment. No-op when
+    /// the size is unchanged; on resize this is one region swap + a
+    /// surface commit — no registry roundtrip, no blur unset/create
+    /// churn, nothing that can stall the compositor or the GTK main
+    /// thread the way full re-creation per layout callback did.
+    fn update_region(&mut self, width: i32, height: i32) {
+        if width == self.width && height == self.height {
+            return;
+        }
+        self.width = width;
+        self.height = height;
+        let region = self.compositor.create_region(&self.qh, ());
+        add_rounded_rect(&region, width, height, WINDOW_BORDER_RADIUS);
+        match &self.backend {
+            BlurBackend::ExtBackgroundEffect { effect, .. } => {
+                effect.set_blur_region(Some(&region));
+            }
+            BlurBackend::KdeBlur { blur, .. } => {
+                blur.set_region(Some(&region));
+                blur.commit();
+            }
+        }
+        region.destroy();
+        self.surface.commit();
+        let _ = self.conn.flush();
+        tracing::debug!("KDE blur region updated: {width}×{height}");
     }
 
     fn detach(self) {

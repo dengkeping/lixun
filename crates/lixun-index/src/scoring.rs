@@ -141,47 +141,6 @@ fn push_word_initials(word: &str, initials: &mut String) {
     }
 }
 
-/// Builds the token stream written to `title_prefixes` at ingest.
-///
-/// For each word W in `split_identifiers(title)` (i.e. after
-/// CamelCase + snake_case + punctuation splitting and lowercasing),
-/// emit every prefix of length 2..=min(W.len(), MAX_PREFIX_LEN).
-/// Length-1 prefixes are excluded: they flood the index with single-
-/// char postings that would match every 1-letter query. Length-12
-/// cap prevents unbounded growth on pathologically long names.
-///
-/// The resulting whitespace-separated string is tokenized by the
-/// `spotlight` tokenizer at index time, giving BM25 exact-token
-/// recall for short-prefix queries (Wave A bug #4).
-///
-/// Examples:
-/// - `"Firefox"` → `"fi fir fire firef firefo firefox"`
-/// - `"JSONParser"` → `"js jso json pa par pars parse parser"`
-/// - `""` or `"a"` → `""` (too short after min-length filter)
-#[must_use]
-pub fn compute_title_prefixes(title: &str) -> String {
-    const MIN_PREFIX_LEN: usize = 2;
-    const MAX_PREFIX_LEN: usize = 12;
-
-    let split = split_identifiers(title);
-    let norm = normalize_for_match(&split);
-    let mut out = String::new();
-    for word in norm.split_whitespace() {
-        let chars: Vec<char> = word.chars().collect();
-        let max_len = chars.len().min(MAX_PREFIX_LEN);
-        if max_len < MIN_PREFIX_LEN {
-            continue;
-        }
-        for len in MIN_PREFIX_LEN..=max_len {
-            if !out.is_empty() {
-                out.push(' ');
-            }
-            out.extend(chars[..len].iter());
-        }
-    }
-    out
-}
-
 /// Builds the token stream written to `title_initials` at ingest.
 ///
 /// Emits both per-word initials AND the concatenated whole-title
@@ -249,40 +208,6 @@ mod tests {
         for (title, expected) in cases {
             assert_eq!(acronym_initials(title), expected, "title: {title:?}");
         }
-    }
-
-    #[test]
-    fn title_prefixes_fixtures() {
-        let cases: &[(&str, &str)] = &[
-            ("Firefox", "fi fir fire firef firefo firefox"),
-            ("JSONParser", "js jso json pa par pars parse parser"),
-            (
-                "Visual Studio Code",
-                "vi vis visu visua visual st stu stud studi studio co cod code",
-            ),
-            ("", ""),
-            ("A", ""),
-            ("ab", "ab"),
-        ];
-
-        for (title, expected) in cases {
-            assert_eq!(compute_title_prefixes(title), *expected, "title: {title:?}");
-        }
-    }
-
-    #[test]
-    fn title_prefixes_max_length_cap() {
-        let got = compute_title_prefixes("configurationmanagerfactoryimpl");
-        let longest_token = got
-            .split_whitespace()
-            .max_by_key(|t| t.chars().count())
-            .unwrap();
-        assert_eq!(
-            longest_token.chars().count(),
-            12,
-            "MAX_PREFIX_LEN cap enforced; got longest token {longest_token:?} from {got:?}"
-        );
-        assert!(got.split_whitespace().any(|t| t == "configuratio"));
     }
 
     #[test]

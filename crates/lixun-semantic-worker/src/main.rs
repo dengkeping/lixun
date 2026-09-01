@@ -204,11 +204,20 @@ async fn main() -> Result<()> {
     let clip_text_embedder = Arc::new(Mutex::new(clip_text_embedder));
 
     let vectors_dir = data_root.join("vectors");
-    let store = Arc::new(
-        VectorStore::open(&vectors_dir, text_dim, image_dim)
-            .await
-            .with_context(|| format!("opening LanceDB at {}", vectors_dir.display()))?,
-    );
+    // Log open failures through tracing BEFORE returning: anyhow's
+    // stderr print races the supervisor killing the child once the
+    // socket reader exits, so without this the actual LanceDB error
+    // never reaches the daemon journal and the crash loop is opaque.
+    let store = match VectorStore::open(&vectors_dir, text_dim, image_dim).await {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            tracing::error!(
+                "FATAL: opening LanceDB at {} failed: {e:#}",
+                vectors_dir.display()
+            );
+            return Err(e).with_context(|| format!("opening LanceDB at {}", vectors_dir.display()));
+        }
+    };
 
     let journal_path = data_root.join("semantic-backfill.sqlite");
     let journal = Arc::new(Mutex::new(

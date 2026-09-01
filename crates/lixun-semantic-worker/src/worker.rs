@@ -18,6 +18,12 @@ pub const CHANNEL_IMAGE: &str = "image";
 
 const QUEUE_CAPACITY: usize = 4096;
 
+/// Embed sub-batch sizes: the embedder mutex is released between
+/// chunks so a query-time embed waits at most one chunk, not a whole
+/// flush window's batch.
+const EMBED_SUB_BATCH_TEXT: usize = 16;
+const EMBED_SUB_BATCH_IMAGE: usize = 8;
+
 #[derive(Debug)]
 pub enum EmbedJob {
     Upsert(UpsertedDoc),
@@ -169,14 +175,39 @@ impl WorkerThread {
         }
     }
 
+    /// True when the journal already holds an embedding for this doc at
+    /// the same mtime — a full reindex re-broadcasts every unchanged
+    /// doc, and re-running ONNX inference over the whole corpus is the
+    /// single most expensive no-op in the system.
+    fn already_embedded(&self, doc: &UpsertedDoc, channel: &str) -> bool {
+        self.journal
+            .lock()
+            .unwrap_or_else(|poisoned| {
+                tracing::warn!(
+                    "semantic embed worker: journal mutex poisoned; recovering inner guard"
+                );
+                poisoned.into_inner()
+            })
+            .is_current(&doc.doc_id, channel, doc.mtime)
+            .unwrap_or(false)
+    }
+
     fn handle_job(&mut self, job: EmbedJob) -> Result<()> {
         match job {
             EmbedJob::Upsert(doc) => match classify(&doc) {
                 Channel::Text => {
+                    if self.already_embedded(&doc, CHANNEL_TEXT) {
+                        tracing::trace!(doc_id = %doc.doc_id, "semantic embed worker: text embedding current, skipping");
+                        return Ok(());
+                    }
                     self.pending_text.push(doc);
                     Ok(())
                 }
                 Channel::Image => {
+                    if self.already_embedded(&doc, CHANNEL_IMAGE) {
+                        tracing::trace!(doc_id = %doc.doc_id, "semantic embed worker: image embedding current, skipping");
+                        return Ok(());
+                    }
                     self.pending_images.push(doc);
                     Ok(())
                 }
@@ -215,6 +246,17 @@ impl WorkerThread {
                 "semantic embed worker: compaction skipped, fragments below threshold"
             ),
             Err(e) => tracing::warn!("semantic embed worker: compaction failed: {e:#}"),
+        }
+        // Piggy-back ANN index maintenance on the same cadence: create
+        // the vector index once a table is big enough for brute-force
+        // KNN to hurt, and fold freshly written rows into an existing
+        // index so queries keep using it.
+        let store = self.store.clone();
+        if let Err(e) = self
+            .runtime
+            .block_on(async move { store.ensure_vector_indices().await })
+        {
+            tracing::warn!("semantic embed worker: vector index maintenance failed: {e:#}");
         }
     }
 
@@ -261,7 +303,7 @@ impl WorkerThread {
         if self.pending_text.is_empty() {
             return;
         }
-        let batch = std::mem::take(&mut self.pending_text);
+        let batch = dedup_by_doc_id(std::mem::take(&mut self.pending_text));
 
         let texts: Vec<String> = batch
             .iter()
@@ -279,24 +321,32 @@ impl WorkerThread {
         #[cfg(not(feature = "idle-eviction"))]
         let text_handle = self.text.clone();
 
-        let vectors = {
-            let mut t = text_handle.lock().unwrap_or_else(|poisoned| {
-                tracing::warn!(
-                    "semantic embed worker: text embedder mutex poisoned; recovering inner guard"
-                );
-                poisoned.into_inner()
-            });
-            match t.embed(texts) {
-                Ok(v) => v,
-                Err(e) => {
+        // Embed in sub-batches, taking the embedder mutex per chunk
+        // instead of for the whole batch: query-time embeds (the
+        // search path shares these sessions) then wait at most one
+        // sub-batch instead of the full flush.
+        let mut vectors = Vec::with_capacity(texts.len());
+        for chunk in texts.chunks(EMBED_SUB_BATCH_TEXT) {
+            let chunk_vectors = {
+                let mut t = text_handle.lock().unwrap_or_else(|poisoned| {
                     tracing::warn!(
-                        "semantic embed worker: text embed batch of {} failed: {e:#}",
-                        batch.len()
+                        "semantic embed worker: text embedder mutex poisoned; recovering inner guard"
                     );
-                    return;
+                    poisoned.into_inner()
+                });
+                match t.embed(chunk.to_vec()) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(
+                            "semantic embed worker: text embed batch of {} failed: {e:#}",
+                            batch.len()
+                        );
+                        return;
+                    }
                 }
-            }
-        };
+            };
+            vectors.extend(chunk_vectors);
+        }
 
         if vectors.len() != batch.len() {
             tracing::warn!(
@@ -332,7 +382,7 @@ impl WorkerThread {
                     poisoned.into_inner()
                 });
                 for doc in &batch {
-                    if let Err(e) = j.record(&doc.doc_id, CHANNEL_TEXT, now) {
+                    if let Err(e) = j.record(&doc.doc_id, CHANNEL_TEXT, now, doc.mtime) {
                         tracing::warn!(
                             doc_id = %doc.doc_id,
                             "semantic embed worker: journal record failed: {e:#}"
@@ -353,7 +403,7 @@ impl WorkerThread {
         if self.pending_images.is_empty() {
             return;
         }
-        let batch = std::mem::take(&mut self.pending_images);
+        let batch = dedup_by_doc_id(std::mem::take(&mut self.pending_images));
 
         let original_paths: Vec<std::path::PathBuf> = batch
             .iter()
@@ -415,24 +465,30 @@ impl WorkerThread {
         #[cfg(not(feature = "idle-eviction"))]
         let image_handle = self.image.clone();
 
-        let vectors = {
-            let mut img = image_handle.lock().unwrap_or_else(|poisoned| {
-                tracing::warn!(
-                    "semantic embed worker: image embedder mutex poisoned; recovering inner guard"
-                );
-                poisoned.into_inner()
-            });
-            match img.embed(paths_for_embed) {
-                Ok(v) => v,
-                Err(e) => {
+        // Sub-batched for the same reason as flush_text: keep the
+        // embedder mutex hold-time short so query embeds interleave.
+        let mut vectors = Vec::with_capacity(paths_for_embed.len());
+        for chunk in paths_for_embed.chunks(EMBED_SUB_BATCH_IMAGE) {
+            let chunk_vectors = {
+                let mut img = image_handle.lock().unwrap_or_else(|poisoned| {
                     tracing::warn!(
-                        "semantic embed worker: image embed batch of {} failed: {e:#}",
-                        batch.len()
+                        "semantic embed worker: image embedder mutex poisoned; recovering inner guard"
                     );
-                    return;
+                    poisoned.into_inner()
+                });
+                match img.embed(chunk.to_vec()) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(
+                            "semantic embed worker: image embed batch of {} failed: {e:#}",
+                            batch.len()
+                        );
+                        return;
+                    }
                 }
-            }
-        };
+            };
+            vectors.extend(chunk_vectors);
+        }
 
         if vectors.len() != batch.len() {
             tracing::warn!(
@@ -468,7 +524,7 @@ impl WorkerThread {
                     poisoned.into_inner()
                 });
                 for doc in &batch {
-                    if let Err(e) = j.record(&doc.doc_id, CHANNEL_IMAGE, now) {
+                    if let Err(e) = j.record(&doc.doc_id, CHANNEL_IMAGE, now, doc.mtime) {
                         tracing::warn!(
                             doc_id = %doc.doc_id,
                             "semantic embed worker: journal record failed: {e:#}"
@@ -484,6 +540,21 @@ impl WorkerThread {
             }
         }
     }
+}
+
+/// Collapse repeated upserts of the same doc within one flush window
+/// to the LAST occurrence (newest content). LanceDB's `merge_insert`
+/// rejects the whole batch when two source rows share a doc_id
+/// ("Ambiguous merge inserts are prohibited"), so one hot file that
+/// changed twice between flushes would otherwise poison every batch
+/// it lands in — and waste an embed per duplicate besides.
+fn dedup_by_doc_id(batch: Vec<UpsertedDoc>) -> Vec<UpsertedDoc> {
+    let mut by_id: std::collections::HashMap<String, UpsertedDoc> =
+        std::collections::HashMap::with_capacity(batch.len());
+    for doc in batch {
+        by_id.insert(doc.doc_id.clone(), doc);
+    }
+    by_id.into_values().collect()
 }
 
 fn classify(doc: &UpsertedDoc) -> Channel {
@@ -544,6 +615,7 @@ pub async fn start_backfill(
 
     let mut total = 0u64;
     let mut submitted = 0u64;
+    let mut skipped_errors = 0u64;
     for doc_id in all_ids {
         total += 1;
         /* Recover from poisoning instead of treating the lookup as
@@ -568,20 +640,32 @@ pub async fn start_backfill(
             continue;
         }
 
-        let hydrated = search
-            .hydrate_doc(&doc_id)
-            .await
-            .with_context(|| format!("backfill: hydrate {doc_id}"))?;
+        // Per-doc failures (callback timeout on one pathological path,
+        // transient IPC hiccup) must not abort the whole walk — skip
+        // and keep going; the doc stays journal-less and the next
+        // backfill retries it.
+        let hydrated = match search.hydrate_doc(&doc_id).await {
+            Ok(h) => h,
+            Err(e) => {
+                skipped_errors += 1;
+                tracing::warn!(doc_id = %doc_id, "backfill: hydrate failed, skipping: {e:#}");
+                continue;
+            }
+        };
         let Some((hit, _bd)) = hydrated else {
             continue;
         };
 
         let body = match hit.body.as_deref() {
             Some(b) if !b.trim().is_empty() => Some(b.to_string()),
-            _ => search
-                .get_body(&doc_id)
-                .await
-                .with_context(|| format!("backfill: get_body {doc_id}"))?,
+            _ => match search.get_body(&doc_id).await {
+                Ok(b) => b,
+                Err(e) => {
+                    skipped_errors += 1;
+                    tracing::warn!(doc_id = %doc_id, "backfill: get_body failed, skipping: {e:#}");
+                    continue;
+                }
+            },
         };
 
         let doc = UpsertedDoc {
@@ -609,6 +693,11 @@ pub async fn start_backfill(
         let _ = j.meta_set("last_backfill_submitted", &submitted.to_string());
     }
 
-    tracing::info!(total, submitted, "semantic backfill: enumeration complete");
+    tracing::info!(
+        total,
+        submitted,
+        skipped_errors,
+        "semantic backfill: enumeration complete"
+    );
     Ok((submitted, total))
 }

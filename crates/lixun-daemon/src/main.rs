@@ -995,6 +995,7 @@ async fn process_search_chunk(
                     frecency_mult: 1.0,
                     latch_mult: 1.0,
                     stage2_clamped: 1.0,
+                    lexical_fallback: false,
                     final_score: h.score,
                 });
             }
@@ -1025,6 +1026,17 @@ async fn process_search_chunk(
         }
 
         if phase == lixun_fusion::Phase::Final {
+            // Fan-out plugin hits do not share a score scale with
+            // BM25 × multiplier × stage-2 lexical scores. Contract: a
+            // fan-out plugin's score is a relative confidence in [0, 1],
+            // mapped onto the local result distribution (score of the
+            // current best hit). Claiming plugins (calculator, shell)
+            // are unaffected — they replace the result set wholesale.
+            let max_lexical_score = hits
+                .iter()
+                .map(|h| h.score)
+                .fold(0.0_f32, f32::max)
+                .max(1.0);
             let mut plugin_tasks = Vec::new();
             for entry in &registry.instances {
                 let plugin = entry.source.clone();
@@ -1056,10 +1068,13 @@ async fn process_search_chunk(
                 }));
             }
             for task in plugin_tasks {
-                let plugin_hits = match task.await {
+                let mut plugin_hits = match task.await {
                     Ok(h) => h,
                     Err(_) => continue,
                 };
+                for h in &mut plugin_hits {
+                    h.score = h.score.clamp(0.0, 1.0) * max_lexical_score;
+                }
                 if explain {
                     for h in &plugin_hits {
                         breakdowns.push(lixun_core::ScoreBreakdown {
@@ -1073,6 +1088,7 @@ async fn process_search_chunk(
                             frecency_mult: 1.0,
                             latch_mult: 1.0,
                             stage2_clamped: 1.0,
+                            lexical_fallback: false,
                             final_score: h.score,
                         });
                     }

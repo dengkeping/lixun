@@ -12,8 +12,8 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Weak};
 use tantivy::{
-    DocAddress, Index, IndexReader, IndexWriter, ReloadPolicy, Searcher, TantivyDocument, Term,
-    collector::{DocSetCollector, TopDocs},
+    DocAddress, DocSet, Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term,
+    collector::TopDocs,
     directory::MmapDirectory,
     doc,
     query::{BooleanQuery, BoostQuery, Occur, PhraseQuery, QueryParser, TermQuery},
@@ -35,7 +35,7 @@ use lixun_core::{
 };
 use normalize::normalize_for_match;
 
-const INDEX_VERSION: u32 = 11;
+const INDEX_VERSION: u32 = 12;
 const INDEX_VERSION_FILE: &str = "index_version.txt";
 
 /// Tantivy schema fields.
@@ -51,7 +51,6 @@ pub struct LixunSchema {
     pub title_exact: tantivy::schema::Field,
     pub title_terms: tantivy::schema::Field,
     pub title_initials: tantivy::schema::Field,
-    pub title_prefixes: tantivy::schema::Field,
     pub subtitle: tantivy::schema::Field,
     pub icon_name: tantivy::schema::Field,
     pub kind_label: tantivy::schema::Field,
@@ -90,6 +89,17 @@ impl LixunSchema {
         };
         let indexed_spotlight_text =
             || TextOptions::default().set_indexing_options(spotlight_indexing());
+        // Body is the one natural-language field: it gets the stemmed
+        // analyzer while name-like fields stay unstemmed (see tokenizer.rs).
+        let stored_stemmed_text = || {
+            TextOptions::default()
+                .set_indexing_options(
+                    TextFieldIndexing::default()
+                        .set_tokenizer("spotlight_stem")
+                        .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+                )
+                .set_stored()
+        };
 
         let id = builder.add_text_field("id", STRING | STORED);
         let category = builder.add_text_field("category", TEXT | STORED);
@@ -97,13 +107,14 @@ impl LixunSchema {
         let title_exact = builder.add_text_field("title_exact", STRING | STORED);
         let title_terms = builder.add_text_field("title_terms", indexed_spotlight_text());
         let title_initials = builder.add_text_field("title_initials", indexed_spotlight_text());
-        let title_prefixes = builder.add_text_field("title_prefixes", indexed_spotlight_text());
         let subtitle = builder.add_text_field("subtitle", STORED);
         let icon_name = builder.add_text_field("icon_name", STORED);
         let kind_label = builder.add_text_field("kind_label", STORED);
-        let body = builder.add_text_field("body", stored_spotlight_text());
+        let body = builder.add_text_field("body", stored_stemmed_text());
         let path = builder.add_text_field("path", stored_spotlight_text());
-        let mtime = builder.add_i64_field("mtime", STORED);
+        // FAST: recency scoring reads mtime from the columnar store
+        // instead of decoding the full stored document per hit.
+        let mtime = builder.add_i64_field("mtime", STORED | tantivy::schema::FAST);
         let size = builder.add_u64_field("size", STORED);
         let action = builder.add_text_field("action", STORED);
         let secondary_action = builder.add_text_field("secondary_action", STORED);
@@ -122,15 +133,14 @@ impl LixunSchema {
         // spotlight-tokenized full-text field to record term positions.
         // A tantivy upgrade that silently demotes the index option would
         // otherwise break ranking with no visible failure.
-        for (name, field) in [
-            ("title", title),
-            ("title_terms", title_terms),
-            ("title_initials", title_initials),
-            ("title_prefixes", title_prefixes),
-            ("body", body),
-            ("path", path),
-            ("sender", sender),
-            ("recipients", recipients),
+        for (name, field, expected_tokenizer) in [
+            ("title", title, "spotlight"),
+            ("title_terms", title_terms, "spotlight"),
+            ("title_initials", title_initials, "spotlight"),
+            ("body", body, "spotlight_stem"),
+            ("path", path, "spotlight"),
+            ("sender", sender, "spotlight"),
+            ("recipients", recipients, "spotlight"),
         ] {
             let entry = schema.get_field_entry(field);
             let tantivy::schema::FieldType::Str(text_opts) = entry.field_type() else {
@@ -145,8 +155,8 @@ impl LixunSchema {
                 indexing.index_option(),
             );
             anyhow::ensure!(
-                indexing.tokenizer() == "spotlight",
-                "schema invariant: field `{name}` must use the spotlight tokenizer (got {})",
+                indexing.tokenizer() == expected_tokenizer,
+                "schema invariant: field `{name}` must use the {expected_tokenizer} tokenizer (got {})",
                 indexing.tokenizer(),
             );
         }
@@ -160,7 +170,6 @@ impl LixunSchema {
                 title_exact,
                 title_terms,
                 title_initials,
-                title_prefixes,
                 subtitle,
                 icon_name,
                 kind_label,
@@ -198,6 +207,10 @@ pub struct LixunIndex {
     /// (Tantivy 0.26 contract), so dropping this would silently
     /// disable warming.
     _warmer: Arc<FastFieldWarmer>,
+    /// Bumped on every successful [`reload`]. Search-result caches key
+    /// on this so entries never outlive the segment generation they
+    /// were computed against.
+    reload_epoch: std::sync::atomic::AtomicU64,
 }
 
 impl LixunIndex {
@@ -271,6 +284,7 @@ impl LixunIndex {
                 ranking,
                 reader,
                 _warmer: warmer,
+                reload_epoch: std::sync::atomic::AtomicU64::new(0),
             },
             needs_rebuild,
         ))
@@ -289,7 +303,16 @@ impl LixunIndex {
     /// new generation. Called exactly once per writer commit from
     /// the indexer's post-commit hook.
     pub fn reload(&self) -> tantivy::Result<()> {
-        self.reader.reload()
+        self.reader.reload()?;
+        self.reload_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Monotonic counter of successful [`reload`] calls; cache key
+    /// component for result caches layered above this index.
+    pub fn reload_epoch(&self) -> u64 {
+        self.reload_epoch.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Upsert a document (delete by id, then insert).
@@ -313,7 +336,6 @@ impl LixunIndex {
             .unwrap_or_default();
         let title_split = tokenizer::split_identifiers(&doc.title);
         let title_initials_indexed = scoring::acronym_initials_indexed(&doc.title);
-        let title_prefixes_indexed = scoring::compute_title_prefixes(&doc.title);
 
         let mut tdoc = doc![
             s.id => doc.id.0.as_str(),
@@ -322,7 +344,6 @@ impl LixunIndex {
             s.title_exact => normalize_for_match(&doc.title).as_str(),
             s.title_terms => title_split.as_str(),
             s.title_initials => title_initials_indexed.as_str(),
-            s.title_prefixes => title_prefixes_indexed.as_str(),
             s.subtitle => doc.subtitle.as_str(),
             s.icon_name => doc.icon_name.as_deref().unwrap_or(""),
             s.kind_label => doc.kind_label.as_deref().unwrap_or(""),
@@ -406,13 +427,11 @@ impl LixunIndex {
         let s = &self.schema;
         let q_norm = normalize_for_match(&query.text);
         let now_secs = Utc::now().timestamp();
+        let limit = query.limit as usize;
 
         let query_obj =
-            build_search_query(&query.text, &self.index, s, &self.plugins, &self.ranking);
-        let top_docs = searcher.search(
-            &query_obj,
-            &TopDocs::with_limit(query.limit as usize).order_by_score(),
-        )?;
+            build_search_query(&query.text, &self.index, s, &self.plugins, &self.ranking, true);
+        let top_docs = searcher.search(&query_obj, &TopDocs::with_limit(limit).order_by_score())?;
 
         // Fast-path: exact title equality (bypasses BM25 IDF collapse).
         //
@@ -423,7 +442,9 @@ impl LixunIndex {
         // doc addresses into the candidate set; `exact_title_mult` then
         // fires naturally in the scoring loop below. Synthetic base score
         // for exact-only hits = max(top_docs) or 1.0 — keeps them
-        // comparable to BM25 hits after the multiplier chain.
+        // comparable to BM25 hits after the multiplier chain. Bounded by
+        // `limit`: many docs sharing one exact title (common filenames)
+        // must not turn the probe into a full-postings materialization.
         let max_top_score = top_docs
             .iter()
             .map(|(s, _)| *s)
@@ -433,9 +454,9 @@ impl LixunIndex {
             let term = Term::from_field_text(s.title_exact, &q_norm);
             let tq = TermQuery::new(term, IndexRecordOption::Basic);
             searcher
-                .search(&tq, &DocSetCollector)?
+                .search(&tq, &TopDocs::with_limit(limit).order_by_score())?
                 .into_iter()
-                .map(|addr| (max_top_score, addr))
+                .map(|(_, addr)| (max_top_score, addr))
                 .collect()
         } else {
             Vec::new()
@@ -449,13 +470,34 @@ impl LixunIndex {
             }
         }
 
-        // Coordination probe (Wave B T2): precompute the set of docs where
-        // every query token matches the title. v==q lookup is O(1) per hit.
-        let all_match_set = build_coord_all_match_set(&self.index, &searcher, s.title, &query.text)
-            .unwrap_or_default();
-        let q_tokens_count = tokenize_with_spotlight(&self.index, &query.text)
-            .map(|t| t.len())
-            .unwrap_or(0);
+        let q_tokens = tokenize_with_spotlight(&self.index, &query.text).unwrap_or_default();
+
+        // Conjunction-by-default is precision-first: one term with no
+        // (fuzzy-reachable) match empties the whole result set. When the
+        // AND pass leaves the page underfilled, refill from a disjunctive
+        // pass. Refill hits are FALLBACK tier: they rank strictly below
+        // full matches and are flagged in the breakdown so the hybrid
+        // fusion layer keeps them out of RRF standing — a page of docs
+        // that merely contain "of" must not crowd out semantic hits.
+        let mut fallback_addrs: HashSet<DocAddress> = HashSet::new();
+        if merged.len() < limit && q_tokens.len() >= 2 && !query_uses_operators(&query.text) {
+            let or_query = build_search_query(
+                &query.text,
+                &self.index,
+                s,
+                &self.plugins,
+                &self.ranking,
+                false,
+            );
+            let extra =
+                searcher.search(&or_query, &TopDocs::with_limit(limit).order_by_score())?;
+            for (score, addr) in extra {
+                if seen_addrs.insert(addr) {
+                    fallback_addrs.insert(addr);
+                    merged.push((score, addr));
+                }
+            }
+        }
 
         let mut results: Vec<(Hit, ScoreBreakdown)> = Vec::new();
         for (score, doc_address) in merged {
@@ -526,7 +568,7 @@ impl LixunIndex {
 
             let sender = stored_optional_text(&doc, s.sender);
             let recipients = stored_optional_text(&doc, s.recipients);
-            let body = stored_optional_text(&doc, s.body);
+            let body = stored_optional_text(&doc, s.body).map(truncate_hit_body);
 
             let source_instance = doc
                 .get_first(s.source_instance)
@@ -535,13 +577,26 @@ impl LixunIndex {
                 .to_string();
             let mime = stored_optional_text(&doc, s.mime);
 
-            let coord_mult =
-                if (2..=3).contains(&q_tokens_count) && all_match_set.contains(&doc_address) {
+            // Coordination (Wave B T2): reward docs whose title contains
+            // every query token. Checked per hit against the analyzed
+            // title — same tokenization as the index — instead of the old
+            // whole-index DocSetCollector probe, which materialized every
+            // matching doc address per query.
+            let coord_mult = if (2..=3).contains(&q_tokens.len()) {
+                let title_tokens: HashSet<String> =
+                    tokenize_with_spotlight(&self.index, &title)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .collect();
+                if q_tokens.iter().all(|t| title_tokens.contains(t)) {
                     1.0 + self.ranking.coordination_boost
-                        / (q_tokens_count as f32).powf(self.ranking.coordination_delta)
+                        / (q_tokens.len() as f32).powf(self.ranking.coordination_delta)
                 } else {
                     1.0
-                };
+                }
+            } else {
+                1.0
+            };
 
             let category_mult = self.ranking.multiplier_for(category);
             let exact_title_mult =
@@ -593,14 +648,23 @@ impl LixunIndex {
                 latch_mult: 1.0,
                 stage2_clamped: 1.0,
                 final_score,
+                lexical_fallback: fallback_addrs.contains(&doc_address),
             };
             results.push((hit, breakdown));
         }
 
+        // Full matches strictly outrank fallback partial matches; BM25
+        // score orders within each tier. A partial match with inflated
+        // term-frequency (a doc stuffed with one query word) must never
+        // beat a doc that matched the whole query.
         results.sort_by(|a, b| {
-            b.0.score
-                .partial_cmp(&a.0.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            (a.1.lexical_fallback as u8)
+                .cmp(&(b.1.lexical_fallback as u8))
+                .then(
+                    b.0.score
+                        .partial_cmp(&a.0.score)
+                        .unwrap_or(std::cmp::Ordering::Equal),
+                )
         });
         results.truncate(query.limit as usize);
 
@@ -613,23 +677,32 @@ impl LixunIndex {
         Ok(())
     }
 
-    /// All `id` values in the live index. O(N) over stored docs; intended for
-    /// cross-checking a manifest against the index, not the search hot path.
+    /// All `id` values in the live index. Walks the `id` field's term
+    /// dictionary per segment instead of decoding every stored document —
+    /// the term dict is a compact FST and postings are only touched to
+    /// confirm at least one live doc per term (delete filtering).
     pub fn all_doc_ids(&self) -> Result<HashSet<String>> {
         let reader = &self.reader;
         let searcher = reader.searcher();
         let mut out: HashSet<String> = HashSet::new();
-        for (segment_ord, segment_reader) in searcher.segment_readers().iter().enumerate() {
+        for segment_reader in searcher.segment_readers() {
+            let inverted = segment_reader.inverted_index(self.schema.id)?;
             let alive = segment_reader.alive_bitset();
-            for doc_id in 0..segment_reader.max_doc() {
-                if let Some(bitset) = alive
-                    && !bitset.is_alive(doc_id)
-                {
-                    continue;
+            let mut stream = inverted.terms().stream()?;
+            while stream.advance() {
+                let term_info = stream.value().clone();
+                let mut postings =
+                    inverted.read_postings_from_terminfo(&term_info, IndexRecordOption::Basic)?;
+                let mut doc = postings.doc();
+                let mut has_live = false;
+                while doc != tantivy::TERMINATED {
+                    if alive.is_none_or(|b| b.is_alive(doc)) {
+                        has_live = true;
+                        break;
+                    }
+                    doc = postings.advance();
                 }
-                let addr = tantivy::DocAddress::new(segment_ord as u32, doc_id);
-                let doc: TantivyDocument = searcher.doc(addr)?;
-                if let Some(id) = doc.get_first(self.schema.id).and_then(|v| v.as_str()) {
+                if has_live && let Ok(id) = std::str::from_utf8(stream.key()) {
                     out.insert(id.to_string());
                 }
             }
@@ -707,7 +780,7 @@ impl LixunIndex {
             .unwrap_or(false);
         let sender = stored_optional_text(&doc, s.sender);
         let recipients = stored_optional_text(&doc, s.recipients);
-        let body = stored_optional_text(&doc, s.body);
+        let body = stored_optional_text(&doc, s.body).map(truncate_hit_body);
         let source_instance = doc
             .get_first(s.source_instance)
             .and_then(|v| v.as_str())
@@ -745,8 +818,23 @@ impl LixunIndex {
             latch_mult: 1.0,
             stage2_clamped: 1.0,
             final_score: 0.0,
+            lexical_fallback: false,
         };
         Ok(Some((hit, breakdown)))
+    }
+
+    /// Batch variant of [`hydrate_doc_by_id`]: one call, one searcher,
+    /// preserving input order; ids with no live doc are skipped. Used by
+    /// the fusion layer to hydrate every ANN-only doc in a single
+    /// blocking hop instead of one round trip per doc.
+    pub fn hydrate_docs_by_ids(&self, ids: &[String]) -> Result<Vec<(Hit, ScoreBreakdown)>> {
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(pair) = self.hydrate_doc_by_id(id)? {
+                out.push(pair);
+            }
+        }
+        Ok(out)
     }
 
     /// Fetch the full `Document` by its stable `id`. Returns `Ok(None)`
@@ -976,12 +1064,33 @@ fn recreate_index_dir(index_dir: &Path, old_version: Option<String>) -> Result<(
     Ok(())
 }
 
+/// Minimum length of the trailing query token before the query-time
+/// prefix clause activates. Length-1 prefixes would walk enormous
+/// term-dictionary ranges on every keystroke; single letters are
+/// already served by `title_initials`.
+const MIN_QUERY_PREFIX_LEN: usize = 2;
+
+/// True when the query uses tantivy query-parser syntax (exclusion,
+/// phrase quotes, field scoping, boolean operators). Such queries
+/// express precise intent: the incremental-typing prefix clause and
+/// the disjunctive refill pass are both skipped so they cannot
+/// resurrect documents the operators excluded.
+fn query_uses_operators(text: &str) -> bool {
+    if text.contains('"') || text.contains(':') || text.contains('|') {
+        return true;
+    }
+    text.split_whitespace().any(|w| {
+        (w.len() > 1 && (w.starts_with('-') || w.starts_with('+'))) || w == "OR" || w == "AND"
+    })
+}
+
 fn build_search_query(
     text: &str,
     index: &tantivy::Index,
     s: &LixunSchema,
     plugins: &CompiledPluginSchema,
     ranking: &RankingConfig,
+    conjunctive: bool,
 ) -> Box<dyn tantivy::query::Query> {
     let text = text.trim();
     if text.is_empty() {
@@ -995,7 +1104,6 @@ fn build_search_query(
         s.title,
         s.title_terms,
         s.title_initials,
-        s.title_prefixes,
         s.body,
         s.path,
         s.sender,
@@ -1006,20 +1114,25 @@ fn build_search_query(
     }
 
     let mut parser = QueryParser::for_index(index, default_fields);
-    parser.set_conjunction_by_default();
+    if conjunctive {
+        parser.set_conjunction_by_default();
+    }
     parser.set_field_boost(s.title, 5.0);
     parser.set_field_boost(s.title_terms, 4.0);
     parser.set_field_boost(s.title_initials, 3.0);
-    parser.set_field_boost(s.title_prefixes, 2.5);
     parser.set_field_boost(s.sender, 3.0);
     parser.set_field_boost(s.recipients, 2.5);
     parser.set_field_boost(s.path, 1.5);
     parser.set_field_boost(s.body, 1.0);
+    // Fuzzy is TITLE-ONLY typo tolerance. On body it is relevance
+    // poison: the body vocabulary is so large that every query term has
+    // rare distance-1 neighbors ("photos"→"protos", "dogs"→"dos"/
+    // "logs"), and BM25 rewards exactly those spurious matches with
+    // high IDF. Sender/recipients are addresses — fuzzy-matching them
+    // surfaces the wrong person. Body recall for word variants comes
+    // from the stemmer instead ("dogs"/"dog" share a stem).
     parser.set_field_fuzzy(s.title, false, 1, true);
     parser.set_field_fuzzy(s.title_terms, false, 1, true);
-    parser.set_field_fuzzy(s.body, false, 1, true);
-    parser.set_field_fuzzy(s.sender, false, 1, true);
-    parser.set_field_fuzzy(s.recipients, false, 1, true);
 
     for (field, boost) in &plugins.default_query_fields {
         parser.set_field_boost(*field, *boost);
@@ -1034,29 +1147,83 @@ fn build_search_query(
     let Some(tokens) = tokenize_with_spotlight(index, &normalized_text) else {
         return parsed_query;
     };
-
-    if tokens.len() < 2 {
+    if tokens.is_empty() {
         return parsed_query;
     }
 
-    let make_phrase = |field: tantivy::schema::Field| -> Box<dyn tantivy::query::Query> {
-        let terms: Vec<Term> = tokens
+    // Operator queries keep strict parser semantics: the parsed query
+    // stays a Must gate and no recall clauses are added beside it.
+    let operators = query_uses_operators(text);
+
+    let mut clauses: Vec<(Occur, Box<dyn tantivy::query::Query>)> = vec![(
+        if operators { Occur::Must } else { Occur::Should },
+        parsed_query,
+    )];
+
+    // Query-time incremental-typing clause: the user is mid-word on the
+    // LAST token, so match it as a term prefix on the title fields while
+    // requiring the preceding tokens as full terms. Replaces the old
+    // index-time `title_prefixes` expansion (2..=12-char prefixes baked
+    // into postings), which bloated the index and could not complete
+    // words longer than 12 chars.
+    if !operators
+        && tokens
+            .last()
+            .is_some_and(|t| t.chars().count() >= MIN_QUERY_PREFIX_LEN)
+    {
+        let (last, head) = tokens.split_last().expect("tokens is non-empty");
+        let title_fields = [s.title, s.title_terms];
+        let mut incr: Vec<(Occur, Box<dyn tantivy::query::Query>)> = Vec::new();
+        for tok in head {
+            let per_field: Vec<(Occur, Box<dyn tantivy::query::Query>)> = title_fields
+                .iter()
+                .map(|f| {
+                    let tq = TermQuery::new(
+                        Term::from_field_text(*f, tok),
+                        IndexRecordOption::WithFreqs,
+                    );
+                    (Occur::Should, Box::new(tq) as Box<dyn tantivy::query::Query>)
+                })
+                .collect();
+            incr.push((Occur::Must, Box::new(BooleanQuery::new(per_field))));
+        }
+        let per_field_prefix: Vec<(Occur, Box<dyn tantivy::query::Query>)> = title_fields
             .iter()
-            .map(|t| Term::from_field_text(field, t))
+            .map(|f| {
+                let fq = tantivy::query::FuzzyTermQuery::new_prefix(
+                    Term::from_field_text(*f, last),
+                    0,
+                    true,
+                );
+                (Occur::Should, Box::new(fq) as Box<dyn tantivy::query::Query>)
+            })
             .collect();
-        let mut pq = PhraseQuery::new(terms);
-        pq.set_slop(ranking.proximity_slop);
-        Box::new(BoostQuery::new(Box::new(pq), ranking.proximity_boost))
-    };
+        incr.push((Occur::Must, Box::new(BooleanQuery::new(per_field_prefix))));
+        let incr_query: Box<dyn tantivy::query::Query> = Box::new(BoostQuery::new(
+            Box::new(BooleanQuery::new(incr)),
+            ranking.query_prefix_boost,
+        ));
+        clauses.push((Occur::Should, incr_query));
+    }
 
-    let title_phrase = make_phrase(s.title);
-    let title_terms_phrase = make_phrase(s.title_terms);
+    if tokens.len() >= 2 {
+        let make_phrase = |field: tantivy::schema::Field| -> Box<dyn tantivy::query::Query> {
+            let terms: Vec<Term> = tokens
+                .iter()
+                .map(|t| Term::from_field_text(field, t))
+                .collect();
+            let mut pq = PhraseQuery::new(terms);
+            pq.set_slop(ranking.proximity_slop);
+            Box::new(BoostQuery::new(Box::new(pq), ranking.proximity_boost))
+        };
+        clauses.push((Occur::Should, make_phrase(s.title)));
+        clauses.push((Occur::Should, make_phrase(s.title_terms)));
+    }
 
-    Box::new(BooleanQuery::new(vec![
-        (Occur::Must, parsed_query),
-        (Occur::Should, title_phrase),
-        (Occur::Should, title_terms_phrase),
-    ]))
+    if clauses.len() == 1 {
+        return clauses.pop().expect("one clause").1;
+    }
+    Box::new(BooleanQuery::new(clauses))
 }
 
 /// Tokenize `text` through the registered "spotlight" analyzer. Returns
@@ -1078,37 +1245,24 @@ fn tokenize_with_spotlight(index: &tantivy::Index, text: &str) -> Option<Vec<Str
     Some(out)
 }
 
-/// Build the coordination probe set: the set of `DocAddress` whose `title`
-/// field contains ALL query tokens (v == q). Per Wave B T2 formula we only
-/// activate in the regime `2 <= q <= 3`, so queries outside that range
-/// short-circuit to an empty set (no work, no allocation in the searcher).
-fn build_coord_all_match_set(
-    index: &tantivy::Index,
-    searcher: &Searcher,
-    title_field: tantivy::schema::Field,
-    text: &str,
-) -> Result<HashSet<DocAddress>> {
-    let Some(tokens) = tokenize_with_spotlight(index, text) else {
-        return Ok(HashSet::new());
-    };
-    if !(2..=3).contains(&tokens.len()) {
-        return Ok(HashSet::new());
+/// Byte ceiling for the `body` field carried inside a search `Hit`.
+/// Bodies can reach the 16 MB extraction cap (OCR, PDFs); shipping
+/// them through clone + serialize + IPC per keystroke is pure waste —
+/// consumers that need the full text (previews of local files) read
+/// it from disk, and gloda mail snippets are far below this ceiling.
+const MAX_HIT_BODY_BYTES: usize = 64 * 1024;
+
+fn truncate_hit_body(body: String) -> String {
+    if body.len() <= MAX_HIT_BODY_BYTES {
+        return body;
     }
-
-    let clauses: Vec<(Occur, Box<dyn tantivy::query::Query>)> = tokens
-        .iter()
-        .map(|tok| {
-            let tq = TermQuery::new(
-                Term::from_field_text(title_field, tok),
-                IndexRecordOption::Basic,
-            );
-            let boxed: Box<dyn tantivy::query::Query> = Box::new(tq);
-            (Occur::Should, boxed)
-        })
-        .collect();
-
-    let coord_q = BooleanQuery::with_minimum_required_clauses(clauses, tokens.len());
-    Ok(searcher.search(&coord_q, &DocSetCollector)?)
+    let mut cut = MAX_HIT_BODY_BYTES;
+    while !body.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let mut out = body;
+    out.truncate(cut);
+    out
 }
 
 #[cfg(test)]
@@ -1784,17 +1938,16 @@ mod tests {
         // Fields we register with the spotlight tokenizer + full-text
         // indexing. Must stay in lockstep with `LixunSchema::build_with_plugins`.
         let spotlight_fields = [
-            ("title", schema.title),
-            ("title_terms", schema.title_terms),
-            ("title_initials", schema.title_initials),
-            ("title_prefixes", schema.title_prefixes),
-            ("body", schema.body),
-            ("path", schema.path),
-            ("sender", schema.sender),
-            ("recipients", schema.recipients),
+            ("title", schema.title, "spotlight"),
+            ("title_terms", schema.title_terms, "spotlight"),
+            ("title_initials", schema.title_initials, "spotlight"),
+            ("body", schema.body, "spotlight_stem"),
+            ("path", schema.path, "spotlight"),
+            ("sender", schema.sender, "spotlight"),
+            ("recipients", schema.recipients, "spotlight"),
         ];
 
-        for (name, field) in spotlight_fields {
+        for (name, field, expected_tokenizer) in spotlight_fields {
             let entry = raw.get_field_entry(field);
             match entry.field_type() {
                 FieldType::Str(text_opts) => {
@@ -1809,8 +1962,8 @@ mod tests {
                     );
                     assert_eq!(
                         indexing.tokenizer(),
-                        "spotlight",
-                        "field `{name}` must use the spotlight tokenizer (got {})",
+                        expected_tokenizer,
+                        "field `{name}` must use the {expected_tokenizer} tokenizer (got {})",
                         indexing.tokenizer(),
                     );
                 }
@@ -2064,18 +2217,35 @@ mod tests {
 
     // ------- T3 stemmer tests (Wave B) -------
 
-    // Porter stem collision: both "running" (query) and "runs" (indexed) reduce
-    // to stem "run". Without the stemmer filter this query would miss the doc
-    // entirely since SimpleTokenizer + LowerCaser + AsciiFolding preserve
-    // distinct surface forms. Test guards against accidental removal of the
-    // stemmer from the tokenizer chain.
+    // Porter stem collision: both "running" (query) and "runs" (indexed
+    // in `body`) reduce to stem "run". The stemmer applies ONLY to the
+    // body field (`spotlight_stem`); name-like fields stay unstemmed so
+    // filenames and proper nouns are matched literally.
     #[test]
-    fn test_stem_equivalence_running_matches_runs() {
+    fn test_stem_equivalence_running_matches_runs_in_body() {
+        let doc = sample_document("fs:/tmp/f.txt", "notes", "marathon runs today");
+        let (_tmp, index) = create_index_with_docs(&[doc]);
+        let hits = search(&index, "running");
+        assert!(
+            !hits.is_empty(),
+            "stemmer must bridge 'running' -> 'runs' in body"
+        );
+        assert_eq!(hits[0].id.0, "fs:/tmp/f.txt");
+    }
+
+    // Titles are NOT stemmed: a title-only doc must not be surfaced by a
+    // morphological variant. This is the intentional counterpart to the
+    // body test above ("parsing" must not stem-match a title "pars…").
+    #[test]
+    fn test_title_is_not_stemmed() {
         let doc = sample_document("fs:/tmp/f.txt", "marathon runs today", "");
         let (_tmp, index) = create_index_with_docs(&[doc]);
         let hits = search(&index, "running");
-        assert!(!hits.is_empty(), "stemmer must bridge 'running' -> 'runs'");
-        assert_eq!(hits[0].id.0, "fs:/tmp/f.txt");
+        assert!(
+            hits.is_empty(),
+            "title field must be unstemmed; got {:?}",
+            hits.iter().map(|h| &h.id.0).collect::<Vec<_>>()
+        );
     }
 
     // Prefix path lives OUTSIDE the tantivy tokenizer (in
