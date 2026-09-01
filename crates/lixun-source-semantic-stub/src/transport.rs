@@ -39,7 +39,12 @@ impl std::error::Error for SemanticIpcError {}
 /// build time. Owns the writer mpsc and the request-correlation
 /// maps; cloning is cheap (reference counted).
 pub struct SemanticConnection {
-    writer: mpsc::Sender<Cmd>,
+    /// Sender feeding the CURRENT worker session's socket sink. Behind
+    /// a Mutex because the supervisor rebinds it on every worker
+    /// restart — the previous session's receiver died with its socket,
+    /// and a stale sender here meant every Embed forward failed with
+    /// "channel closed" forever after the first worker crash.
+    writer: Mutex<mpsc::Sender<Cmd>>,
     next_req_id: AtomicU64,
     pending_search: Mutex<HashMap<u64, oneshot::Sender<SearchReply>>>,
     pending_classify: Mutex<HashMap<u64, oneshot::Sender<ClassifyReply>>>,
@@ -49,7 +54,7 @@ pub struct SemanticConnection {
 impl SemanticConnection {
     pub fn new(writer: mpsc::Sender<Cmd>) -> Arc<Self> {
         Arc::new(Self {
-            writer,
+            writer: Mutex::new(writer),
             /* req_id 0 is reserved for fire-and-forget commands by the
             wire protocol; start the counter at 1 so we never collide. */
             next_req_id: AtomicU64::new(1),
@@ -63,8 +68,23 @@ impl SemanticConnection {
         self.next_req_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    pub fn writer(&self) -> &mpsc::Sender<Cmd> {
-        &self.writer
+    /// Clone of the current session's writer. Senders are cheap
+    /// (Arc-backed); holding the clone across a worker restart only
+    /// fails that one in-flight send, and the next call picks up the
+    /// rebound channel.
+    pub fn writer(&self) -> mpsc::Sender<Cmd> {
+        self.writer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Swap in the new session's writer after a worker restart.
+    pub fn rebind_writer(&self, writer: mpsc::Sender<Cmd>) {
+        *self
+            .writer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = writer;
     }
 
     pub fn register_search(&self, req_id: u64, tx: oneshot::Sender<SearchReply>) {

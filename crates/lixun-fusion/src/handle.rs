@@ -34,11 +34,6 @@ pub struct FusionChunk {
 pub struct HybridSearchHandle {
     inner: SearchHandle,
     ann: Option<Arc<dyn crate::ann::AnnHandle>>,
-    // Retained for API compatibility and future RRF mode toggle (see
-    // fused_search_streaming): callers configure k through `new()`, and re-
-    // enabling rrf::rrf_fuse can pull this back into the active path
-    // without a constructor break.
-    #[allow(dead_code)]
     rrf_k: f32,
     overfetch: usize,
 }
@@ -180,16 +175,20 @@ impl HybridSearchHandle {
             })
             .await;
 
-        // Phase 2: ANN in parallel (text + image), cancellable.
+        // Phase 2: ANN in parallel (text + image) plus query-modality
+        // classification, cancellable. Classification shares the CLIP
+        // query embedding with the image search (worker-side cache), so
+        // it adds no extra inference.
         let text_fut = ann.search_text(&query.text, ann_k);
         let image_fut = ann.search_image(&query.text, ann_k);
+        let classify_fut = ann.classify_query(&query.text);
 
-        let (text_res, image_res) = tokio::select! {
+        let (text_res, image_res, modality_res) = tokio::select! {
             _ = cancel.cancelled() => {
                 tracing::debug!(target: "lixun_fusion", "ANN cancelled, skipping Final chunk");
                 return Ok(());
             }
-            res = async { tokio::join!(text_fut, image_fut) } => res,
+            res = async { tokio::join!(text_fut, image_fut, classify_fut) } => res,
         };
 
         let text_hits = match text_res {
@@ -228,8 +227,14 @@ impl HybridSearchHandle {
             .map(|h| (h.doc_id.clone(), h.distance))
             .collect();
 
+        // Only FULL lexical matches carry RRF standing. Fallback-tier
+        // hits (disjunctive refill — partial matches) are page filler:
+        // letting them into the ranked list would hand half the fused
+        // page to docs that merely contain one query word, crowding out
+        // the semantic hits that actually answer the query.
         let bm25_ranked: Vec<(String, f32)> = lex_pairs
             .iter()
+            .filter(|(_, bd)| !bd.lexical_fallback)
             .map(|(h, bd)| (h.id.0.clone(), bd.final_score))
             .collect();
         let text_ranked: Vec<(String, f32)> = text_hits
@@ -241,13 +246,88 @@ impl HybridSearchHandle {
             .map(|h| (h.doc_id.clone(), h.distance))
             .collect();
 
-        let fused =
-            crate::rrf::rrf_fuse_3way(&bm25_ranked, &text_ranked, &image_ranked, self.rrf_k);
+        // Modality-aware channel weights. Text (also the fallback when
+        // the router is unavailable or errors) stays strictly neutral —
+        // canonical RRF — so a degraded worker never changes ranking.
+        // Image-intent queries lean the fusion toward CLIP image hits;
+        // Both leans mildly. No channel is ever zeroed.
+        let modality = modality_res.unwrap_or(lixun_mutation::Modality::Text);
+        let weights = match modality {
+            lixun_mutation::Modality::Image => (1.0, 0.8, 1.8),
+            lixun_mutation::Modality::Both => (1.0, 1.0, 1.3),
+            lixun_mutation::Modality::Text => (1.0, 1.0, 1.0),
+        };
+        tracing::debug!(
+            target: "lixun_fusion",
+            ?modality,
+            "fusion: query modality weights (bm25, text, image) = {:?}",
+            weights
+        );
+
+        let fused = crate::rrf::rrf_fuse_3way_weighted(
+            &bm25_ranked,
+            &text_ranked,
+            &image_ranked,
+            self.rrf_k,
+            weights,
+        );
+
+        // The RRF order is authoritative for the Final chunk, but downstream
+        // stage-2 (frecency/latch) multiplies `hit.score` and re-sorts, and
+        // plugin hits compete on the same scale. Raw RRF scores have a very
+        // flat dynamic range (~1/(k+rank)), which would let stage-2 dominate.
+        // Instead, map fused rank positions onto the BM25 final-score ladder:
+        // the hit RRF ranks #i gets the #i-th highest lexical score. Ordering
+        // follows RRF exactly while the score distribution stage-2 sees is
+        // identical to lexical-only mode.
+        // Fallback-tier scores are excluded: a partial match's inflated
+        // BM25 value must not become a rank slot's score, or the
+        // daemon's post-stage-2 re-sort would promote whatever lands on
+        // that slot right back up the page.
+        let mut ladder: Vec<f32> = lex_pairs
+            .iter()
+            .filter(|(_, bd)| !bd.lexical_fallback)
+            .map(|(_, bd)| bd.final_score)
+            .collect();
+        ladder.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        let score_for_rank = |pos: usize, rrf_score: f32| -> f32 {
+            if let Some(s) = ladder.get(pos) {
+                *s
+            } else if let Some(last) = ladder.last() {
+                // Past the lexical list: decay below the weakest BM25 score so
+                // appended ANN-only hits keep their relative RRF order.
+                last * 0.95_f32.powi((pos + 1 - ladder.len()) as i32)
+            } else {
+                // Pure-ANN result set: only relative order matters.
+                rrf_score
+            }
+        };
 
         let mut out: Vec<(lixun_core::Hit, lixun_core::ScoreBreakdown)> =
             Vec::with_capacity(target_limit);
 
-        for (doc_id, rrf_score) in fused.into_iter().take(target_limit) {
+        // Hydrate every ANN-only doc in ONE blocking hop up front —
+        // the per-doc hydrate_doc loop was N sequential spawn_blocking
+        // round trips.
+        let missing_ids: Vec<String> = fused
+            .iter()
+            .take(target_limit)
+            .filter(|(id, _)| !bm25_by_id.contains_key(id))
+            .map(|(id, _)| id.clone())
+            .collect();
+        let hydrated_by_id: HashMap<String, (lixun_core::Hit, lixun_core::ScoreBreakdown)> =
+            if missing_ids.is_empty() {
+                HashMap::new()
+            } else {
+                self.inner
+                    .hydrate_docs(missing_ids)
+                    .await?
+                    .into_iter()
+                    .map(|(h, bd)| (h.id.0.clone(), (h, bd)))
+                    .collect()
+            };
+
+        for (pos, (doc_id, rrf_score)) in fused.into_iter().take(target_limit).enumerate() {
             let in_bm25 = bm25_by_id.contains_key(&doc_id);
             let in_text_ann = text_hits.iter().any(|h| h.doc_id == doc_id);
             let in_image_ann = image_hits.iter().any(|h| h.doc_id == doc_id);
@@ -270,8 +350,8 @@ impl HybridSearchHandle {
             );
             let (mut hit, mut bd) = if let Some(pair) = bm25_by_id.get(&doc_id) {
                 pair.clone()
-            } else if let Some((hit, bd)) = self.inner.hydrate_doc(&doc_id).await? {
-                (hit, bd)
+            } else if let Some(pair) = hydrated_by_id.get(&doc_id) {
+                pair.clone()
             } else {
                 continue;
             };
@@ -288,10 +368,35 @@ impl HybridSearchHandle {
                 bd.frecency_mult = 1.0;
                 bd.latch_mult = 1.0;
                 bd.stage2_clamped = 1.0;
-                hit.score = 0.0;
-                bd.final_score = 0.0;
             }
+            let assigned = score_for_rank(pos, rrf_score);
+            hit.score = assigned;
+            bd.final_score = assigned;
             out.push((hit, bd));
+        }
+
+        // Pad the page with fallback-tier lexical hits only when fusion
+        // (strong lexical + ANN) could not fill it. They keep their own
+        // ladder positions after every fused hit, so they always render
+        // below the relevant results.
+        if out.len() < target_limit {
+            let in_out: std::collections::HashSet<&str> =
+                out.iter().map(|(h, _)| h.id.0.as_str()).collect();
+            let filler: Vec<(lixun_core::Hit, lixun_core::ScoreBreakdown)> = lex_pairs
+                .iter()
+                .filter(|(h, bd)| bd.lexical_fallback && !in_out.contains(h.id.0.as_str()))
+                .take(target_limit - out.len())
+                .cloned()
+                .collect();
+            // Decay below the weakest fused hit so filler stays at the
+            // bottom through the daemon's re-sort.
+            let floor = out.last().map(|(h, _)| h.score).unwrap_or(1.0);
+            for (i, (mut hit, mut bd)) in filler.into_iter().enumerate() {
+                let assigned = floor * 0.95_f32.powi(i as i32 + 1);
+                hit.score = assigned;
+                bd.final_score = assigned;
+                out.push((hit, bd));
+            }
         }
 
         let _ = tx

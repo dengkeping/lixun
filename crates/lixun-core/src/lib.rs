@@ -85,6 +85,12 @@ pub struct RankingConfig {
     // Guards (q<2, q>3, v<q, analyzer missing) collapse to 1.0 no-op.
     pub coordination_boost: f32,
     pub coordination_delta: f32,
+
+    // Weight of the query-time incremental-typing clause (the trailing
+    // query token matched as a term prefix on title/title_terms).
+    // Successor to the removed index-time `title_prefixes` field, which
+    // carried a 2.5 field boost.
+    pub query_prefix_boost: f32,
 }
 
 impl Default for RankingConfig {
@@ -110,6 +116,7 @@ impl Default for RankingConfig {
             proximity_boost: 1.8,
             coordination_boost: 1.2,
             coordination_delta: 0.5,
+            query_prefix_boost: 2.5,
         }
     }
 }
@@ -397,6 +404,12 @@ pub struct ScoreBreakdown {
     pub latch_mult: f32,
     pub stage2_clamped: f32,
     pub final_score: f32,
+    /// True when this hit came from the disjunctive (OR) refill pass —
+    /// a partial match found only because the conjunctive query left
+    /// the page underfilled. Partial matches rank strictly below full
+    /// matches and carry no standing in hybrid rank fusion (they are
+    /// page filler, not relevance evidence).
+    pub lexical_fallback: bool,
 }
 
 /// Inline calculator result (for Spotlight-style "2+2 = 4" display).

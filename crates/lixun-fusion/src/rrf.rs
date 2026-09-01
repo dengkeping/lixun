@@ -36,19 +36,35 @@ pub fn rrf_fuse_3way(
     image_ann: &[(String, f32)],
     k: f32,
 ) -> Vec<(String, f32)> {
+    rrf_fuse_3way_weighted(bm25, text_ann, image_ann, k, (1.0, 1.0, 1.0))
+}
+
+/// Weighted RRF: each list's reciprocal-rank contribution is scaled by
+/// its weight `(w_bm25, w_text, w_image)`. Weights of 1.0 reduce to
+/// canonical RRF. Used to lean the fusion toward the image channel when
+/// the query router classifies the query as image-intent ("photos of
+/// dogs") without ever zeroing out the other evidence streams.
+pub fn rrf_fuse_3way_weighted(
+    bm25: &[(String, f32)],
+    text_ann: &[(String, f32)],
+    image_ann: &[(String, f32)],
+    k: f32,
+    weights: (f32, f32, f32),
+) -> Vec<(String, f32)> {
+    let (w_bm25, w_text, w_image) = weights;
     let mut fused: HashMap<&str, f32> =
         HashMap::with_capacity(bm25.len() + text_ann.len() + image_ann.len());
     for (pos, (doc_id, _)) in bm25.iter().enumerate() {
         let rank = (pos + 1) as f32; // RRF ranks are 1-based
-        *fused.entry(doc_id.as_str()).or_insert(0.0) += 1.0 / (k + rank);
+        *fused.entry(doc_id.as_str()).or_insert(0.0) += w_bm25 / (k + rank);
     }
     for (pos, (doc_id, _)) in text_ann.iter().enumerate() {
         let rank = (pos + 1) as f32;
-        *fused.entry(doc_id.as_str()).or_insert(0.0) += 1.0 / (k + rank);
+        *fused.entry(doc_id.as_str()).or_insert(0.0) += w_text / (k + rank);
     }
     for (pos, (doc_id, _)) in image_ann.iter().enumerate() {
         let rank = (pos + 1) as f32;
-        *fused.entry(doc_id.as_str()).or_insert(0.0) += 1.0 / (k + rank);
+        *fused.entry(doc_id.as_str()).or_insert(0.0) += w_image / (k + rank);
     }
     let mut out: Vec<(String, f32)> = fused
         .into_iter()
