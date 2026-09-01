@@ -15,7 +15,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
+
+use lixun_ipc::SemanticWorkerState;
 
 use anyhow::{Context, Result, anyhow};
 use futures::{SinkExt, StreamExt};
@@ -26,6 +29,41 @@ use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tokio_util::codec::Framed;
+
+/// Live worker state exposed to `Response::Status` (F6). Written by
+/// [`supervise`] / [`set_worker_state`], read by the daemon's Status
+/// handler. Encoded as a u8 because the supervisor loop and the IPC
+/// handler live on different tasks; `SemanticWorkerState::Disabled`
+/// (0) is the boot default until someone reports otherwise.
+static WORKER_STATE: AtomicU8 = AtomicU8::new(0);
+
+fn encode_state(s: SemanticWorkerState) -> u8 {
+    match s {
+        SemanticWorkerState::Disabled => 0,
+        SemanticWorkerState::NotFound => 1,
+        SemanticWorkerState::Starting => 2,
+        SemanticWorkerState::Downloading => 3,
+        SemanticWorkerState::Ready => 4,
+        SemanticWorkerState::Backoff => 5,
+    }
+}
+
+/// Record the current worker state for Status reporting.
+pub fn set_worker_state(s: SemanticWorkerState) {
+    WORKER_STATE.store(encode_state(s), Ordering::Relaxed);
+}
+
+/// Read the current worker state for Status reporting.
+pub fn worker_state() -> SemanticWorkerState {
+    match WORKER_STATE.load(Ordering::Relaxed) {
+        1 => SemanticWorkerState::NotFound,
+        2 => SemanticWorkerState::Starting,
+        3 => SemanticWorkerState::Downloading,
+        4 => SemanticWorkerState::Ready,
+        5 => SemanticWorkerState::Backoff,
+        _ => SemanticWorkerState::Disabled,
+    }
+}
 
 const HANDSHAKE_ACCEPT_TIMEOUT: Duration = Duration::from_secs(10);
 const HANDSHAKE_REPLY_TIMEOUT: Duration = Duration::from_secs(15);
@@ -90,6 +128,7 @@ pub async fn supervise(worker_path: PathBuf) {
     let mut backoff = MIN_BACKOFF;
     let mut conn: Option<Arc<SemanticConnection>> = None;
     loop {
+        set_worker_state(SemanticWorkerState::Starting);
         let socket_path = socket_dir.join(format!(
             "semantic-{}-{}.sock",
             std::process::id(),
@@ -128,6 +167,7 @@ pub async fn supervise(worker_path: PathBuf) {
         }
 
         let _ = std::fs::remove_file(&socket_path);
+        set_worker_state(SemanticWorkerState::Backoff);
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(MAX_BACKOFF);
     }
@@ -219,6 +259,7 @@ async fn run_one_session(
                 worker_version = %worker_version,
                 "semantic worker handshake ok"
             );
+            set_worker_state(SemanticWorkerState::Ready);
         }
         other => {
             kill_child(&mut child).await;

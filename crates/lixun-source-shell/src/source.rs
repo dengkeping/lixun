@@ -73,6 +73,8 @@ impl ShellSource {
             source_instance: ctx.instance_id.to_string(),
             row_menu: RowMenuDef::empty(),
             mime: None,
+            timestamp: None,
+            size: None,
         }
     }
 
@@ -122,6 +124,8 @@ impl ShellSource {
             source_instance: ctx.instance_id.to_string(),
             row_menu: RowMenuDef::empty(),
             mime: None,
+            timestamp: None,
+            size: None,
         }]
     }
 
@@ -152,6 +156,8 @@ impl ShellSource {
             source_instance: ctx.instance_id.to_string(),
             row_menu: RowMenuDef::empty(),
             mime: None,
+            timestamp: None,
+            size: None,
         }]
     }
 }

@@ -1,0 +1,75 @@
+/* Embedded stylesheet for the preview window (P3).
+   Compiled in via include_str! and registered at
+   STYLE_PROVIDER_PRIORITY_APPLICATION, below the user override at
+   APPLICATION + 1 (install_user_css in lixun-preview) — mirroring the
+   launcher's provider stack (lixun-gui style_manager.rs).
+
+   The palette re-declares the same `--lixun-*` custom-property
+   defaults as the launcher's embedded sheet so a user override or
+   matugen-style palette that redefines the tokens recolours both
+   windows consistently. Unlike the launcher, the preview is a plain
+   xdg-toplevel with no compositor blur attach, so the surface is
+   opaque rather than glass. */
+
+#lixun-preview-root {
+    --lixun-primary:               #4b8dff;
+    --lixun-on-primary:            #ffffff;
+    --lixun-primary-container:     #2a4d8f;
+    --lixun-on-primary-container:  #d6e3ff;
+    --lixun-surface:               #1c1c20;
+    --lixun-on-surface:            #f0f0f4;
+    --lixun-on-surface-variant:    #a8a8b2;
+    --lixun-outline:               #7b7b86;
+    --lixun-outline-variant:       #4a4a55;
+    --lixun-error:                 #ff6b6b;
+    --lixun-on-error:              #ffffff;
+
+    background-color: var(--lixun-surface);
+    color: var(--lixun-on-surface);
+}
+
+/* Header: hairline separator below title/subtitle/badge row. The
+   outer margins are set in code (build_window_skeleton); padding
+   here only covers the separator's breathing room. */
+#lixun-preview-header {
+    padding-bottom: 8px;
+    border-bottom: 1px solid alpha(var(--lixun-outline-variant), 0.6);
+}
+
+#lixun-preview-title {
+    font-size: 12pt;
+    font-weight: 600;
+    color: var(--lixun-on-surface);
+}
+
+#lixun-preview-subtitle {
+    font-size: 9pt;
+    color: var(--lixun-on-surface-variant);
+}
+
+/* Plugin badge: small rounded pill, quiet by design. */
+#lixun-preview-plugin-badge {
+    font-size: 8pt;
+    padding: 2px 8px;
+    border-radius: 99px;
+    background-color: alpha(var(--lixun-primary), 0.18);
+    border: 1px solid alpha(var(--lixun-primary), 0.30);
+    color: var(--lixun-on-primary-container);
+}
+
+#lixun-preview-open-btn {
+    color: var(--lixun-on-surface-variant);
+}
+
+#lixun-preview-open-btn:hover {
+    color: var(--lixun-on-surface);
+}
+
+/* Keyboard-hint strip pinned under the content area (P7). Dimmed
+   and small so it reads as chrome, not content. */
+#lixun-preview-hints {
+    font-size: 8pt;
+    padding: 4px 16px 6px 16px;
+    color: alpha(var(--lixun-on-surface-variant), 0.85);
+    border-top: 1px solid alpha(var(--lixun-outline-variant), 0.4);
+}

@@ -35,10 +35,12 @@ use gtk::gio::ApplicationFlags;
 use gtk::glib;
 use gtk::prelude::*;
 use lixun_core::Hit;
-use lixun_ipc::preview::{PreviewCommand, PreviewEvent, read_frame_sync, write_frame_sync};
+use lixun_ipc::preview::{
+    PreviewCommand, PreviewEvent, ScrollDirection, read_frame_sync, write_frame_sync,
+};
 use lixun_preview::{
-    PreviewPlugin, PreviewPluginCfg, SizingPreference, UPDATE_UNSUPPORTED, install_user_css,
-    select_plugin,
+    PreviewPlugin, PreviewPluginCfg, ScrollRequest, SizingPreference, UPDATE_UNSUPPORTED,
+    install_user_css, select_plugin,
 };
 
 use lixun_preview_bundle as _;
@@ -52,6 +54,22 @@ const DEFAULT_WIDTH: i32 = 960;
 const DEFAULT_HEIGHT: i32 = 720;
 const MIN_WIDTH: i32 = 600;
 const MIN_HEIGHT: i32 = 400;
+
+/// Gap between the layer-shell preview surface and the right monitor
+/// edge. Mirrored by the launcher's slide math
+/// (`lixun-gui/src/preview_layout.rs::PREVIEW_EDGE_MARGIN`) — the
+/// two processes never exchange layout decisions, they only agree on
+/// the same arithmetic.
+const PREVIEW_EDGE_MARGIN: i32 = 16;
+
+/// Launcher width floor for the fits-beside predicate. Mirrors
+/// `lixun-gui/src/preview_layout.rs::LAUNCHER_MIN_WIDTH`.
+const LAUNCHER_MIN_WIDTH: i32 = 480;
+
+/// Per-side breathing room the launcher needs inside the left
+/// column. Mirrors
+/// `lixun-gui/src/preview_layout.rs::LAUNCHER_COLUMN_GAP`.
+const LAUNCHER_COLUMN_GAP: i32 = 16;
 
 /// How long the preview process stays warm after the user dismisses
 /// the preview (Escape, Space, or daemon-driven Close). Mirrors the
@@ -129,6 +147,9 @@ struct PreviewState {
     vbox: RefCell<Option<gtk::Box>>,
     header_box: RefCell<Option<gtk::Box>>,
     content_scroll: RefCell<Option<gtk::ScrolledWindow>>,
+    /// Bottom keyboard-hint strip (P7), rebuilt per `ShowOrUpdate`
+    /// from the active plugin's `capabilities()`.
+    hints_label: RefCell<Option<gtk::Label>>,
     /// Active 60s self-quit timer. Replaced (after cancellation) on
     /// every `ShowOrUpdate` and (re)scheduled on every Close /
     /// Escape / Space / launch. Storing the `SourceId` is the only
@@ -155,6 +176,16 @@ struct PreviewState {
     launcher_monitor: RefCell<Option<String>>,
     launcher_rect: Cell<Option<(i32, i32, i32, i32)>>,
     launcher_hidden_by_us: Cell<bool>,
+    /// True when the window was initialized as a layer-shell surface:
+    /// `[gui] preview_placement = "overlay"` AND
+    /// `gtk4_layer_shell::is_supported()` at skeleton build time.
+    /// False in the default window-managed placement (and when
+    /// "overlay" is configured without runtime layer-shell support,
+    /// which degrades to window-managed behaviour). Selects the
+    /// side-by-side visibility logic in
+    /// `update_launcher_visibility`, and gates every `gtk_layer_*`
+    /// call so none ever runs against a plain toplevel window.
+    layer_shell_active: Cell<bool>,
 }
 
 fn main() -> Result<()> {
@@ -273,6 +304,13 @@ fn push_standalone_command(tx: &async_channel::Sender<InboundMsg>, path: PathBuf
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.to_string_lossy().into_owned());
     let mime = mime_guess_from_path(&path);
+    let meta = std::fs::metadata(&path).ok();
+    let timestamp = meta
+        .as_ref()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64);
+    let size = meta.as_ref().map(|m| m.len());
 
     let hit = Hit {
         id: DocId("standalone".into()),
@@ -291,6 +329,8 @@ fn push_standalone_command(tx: &async_channel::Sender<InboundMsg>, path: PathBuf
         source_instance: String::new(),
         row_menu: Default::default(),
         mime,
+        timestamp,
+        size,
     };
 
     let _ = tx.send_blocking(InboundMsg::Cmd(PreviewCommand::ShowOrUpdate {
@@ -533,6 +573,21 @@ fn handle_command(
                 imp.clear();
             }
         }
+        PreviewCommand::Scroll {
+            epoch: _,
+            direction,
+            pages,
+        } => {
+            // Idempotent view mutation — applied regardless of epoch
+            // (a stale scroll can at worst nudge the same document;
+            // gating it would drop legitimate keystrokes racing a
+            // selection change). Does NOT touch current_epoch.
+            let request = match direction {
+                ScrollDirection::Up => ScrollRequest::PageUp,
+                ScrollDirection::Down => ScrollRequest::PageDown,
+            };
+            scroll_content(state, request, pages);
+        }
         PreviewCommand::LauncherGeometry {
             monitor,
             x,
@@ -551,7 +606,7 @@ fn handle_command(
             state.launcher_monitor.replace(Some(monitor));
             state.launcher_rect.set(Some((x, y, w, h)));
             if let Some(window) = state.window.borrow().as_ref() {
-                check_overlap_and_hide_launcher(state, window, outbound_tx);
+                update_launcher_visibility(state, window, outbound_tx, gui_cfg);
             } else {
                 tracing::debug!("preview: LauncherGeometry received but window not yet created");
             }
@@ -594,7 +649,7 @@ fn show_or_update(
         gtk::gdk::Display::default().ok_or_else(|| anyhow::anyhow!("no default GDK display"))?;
 
     if state.window.borrow().is_none() {
-        build_window_skeleton(app, state, &display, outbound_tx)?;
+        build_window_skeleton(app, state, &display, outbound_tx, gui_cfg)?;
     }
 
     // Recompute monitor + cap on every command. Per Oracle: the
@@ -603,7 +658,7 @@ fn show_or_update(
     let (w_max, h_max) = apply_monitor_and_cap(state, &display, requested_monitor, gui_cfg);
 
     apply_sizing(state, plugin.sizing(), w_max, h_max);
-    rebuild_header(state, hit, &plugin_id, app, Rc::clone(&plugin), outbound_tx);
+    rebuild_header(state, hit, app, Rc::clone(&plugin), outbound_tx);
 
     let same_plugin = state
         .current_plugin_id
@@ -684,16 +739,35 @@ fn show_or_update(
 
     *state.current_hit.borrow_mut() = Some(hit.clone());
 
+    update_hints(state, &plugin, hit);
+
     if let Some(window) = state.window.borrow().as_ref() {
         window.set_visible(true);
         window.present();
+        // Land initial keyboard focus on the CONTENT, not the
+        // header's Open button (P7): plugin-wired keys (PgUp/PgDn,
+        // zoom, search) are dead until focus reaches the widget
+        // they're attached to. Fall back to the outer scroll
+        // container when the plugin widget refuses focus.
+        let focused = state
+            .current_widget
+            .borrow()
+            .as_ref()
+            .map(|w| w.grab_focus())
+            .unwrap_or(false);
+        if !focused
+            && let Some(scroll) = state.content_scroll.borrow().as_ref()
+        {
+            scroll.grab_focus();
+        }
         try_apply_pending_parent(state, window);
         {
             let state_clone = state.clone();
             let window_clone = window.clone();
             let outbound_clone = outbound_tx.clone();
+            let gui_cfg_clone = Rc::clone(gui_cfg);
             glib::timeout_add_local_once(std::time::Duration::from_millis(100), move || {
-                check_overlap_and_hide_launcher(&state_clone, &window_clone, &outbound_clone);
+                update_launcher_visibility(&state_clone, &window_clone, &outbound_clone, &gui_cfg_clone);
             });
         }
     }
@@ -707,29 +781,44 @@ fn show_or_update(
     Ok(())
 }
 
-/// Build the persistent xdg-toplevel window skeleton: ApplicationWindow,
+/// Build the persistent preview window skeleton: ApplicationWindow,
 /// vbox, header_box, content_scroll. Called once per process
 /// lifetime; subsequent commands mutate the existing widgets.
 ///
-/// The preview is a regular xdg-toplevel (not a layer-shell surface).
-/// Stacking above the launcher is achieved via xdg-foreign-v2:
-/// the launcher exports its toplevel handle, the daemon forwards it
-/// as `PreviewCommand::SetParent`, and the preview imports it and
-/// calls `set_parent_of` so the compositor stacks the preview as a
-/// child of the launcher. See Phase 1 in
-/// the rich-quicklook design notes for Phase 1.
+/// Surface role — `[gui] preview_placement`:
 ///
-/// Keyboard focus: under layer-shell we used `KeyboardMode::None` to
-/// keep the preview keyboard-passive. xdg-toplevel has no equivalent
-/// API; instead we rely on `set_can_focus(false)` plus the launcher
-/// retaining its own `KeyboardMode::OnDemand` focus. The launcher's
-/// existing keymap dispatches `PreviewCommand::Hide`/`Close` for the
-/// user-visible close paths.
+/// * `"window"` (default): a normal decorated xdg-toplevel. The WM
+///   owns placement, stacking, and dragging (the decoration is the
+///   drag handle); users can pin placement with WM rules targeting
+///   app-id `app.lixun.preview` (set via the `GtkApplication` id;
+///   title "Lixun Preview"). Tradeoff: the launcher is an
+///   overlay-layer surface and always stacks above the preview where
+///   they overlap — the launcher tucks against the left screen edge
+///   during preview mode to minimise that overlap, and the
+///   pre-existing xdg-foreign `SetParent` path keeps working here.
+/// * `"overlay"` with runtime layer-shell support: joins the
+///   launcher's `Layer::Overlay` (Wayland stacks that layer above
+///   every xdg-toplevel), anchored to the RIGHT monitor edge (small
+///   margin; Top/Bottom unanchored so the compositor centers the
+///   surface vertically); the launcher centers itself in the left
+///   column (lixun-gui's `slide_for_preview`) and the two surfaces
+///   sit side by side deterministically. `"overlay"` without
+///   layer-shell support degrades to the `"window"` behaviour.
+///
+/// Keyboard (overlay): `KeyboardMode::OnDemand` keeps the seat with
+/// the launcher when the preview maps — arrow-scrub keeps flowing
+/// through the launcher's selection→preview pipeline — while a user
+/// who clicks into the preview can still use its internal keys (PDF
+/// search, zoom). In window mode the WM may focus the preview; the
+/// capture-phase controller relays Up/Down as `NavKey` and closes on
+/// Escape/Space, so both mode's close paths stay
+/// `PreviewCommand::Hide`/`Close` driven from the launcher keymap.
 fn build_window_skeleton(
     app: &gtk::Application,
     state: &Rc<PreviewState>,
     display: &gtk::gdk::Display,
     outbound_tx: &async_channel::Sender<PreviewEvent>,
+    gui_cfg: &Rc<lixun_config::GuiConfig>,
 ) -> Result<()> {
     let window = gtk::ApplicationWindow::builder()
         .application(app)
@@ -742,6 +831,55 @@ fn build_window_skeleton(
         .build();
     window.set_widget_name("lixun-preview-root");
 
+    // Overlay placement (opt-in): only another Overlay layer
+    // surface can render beside (rather than under) the launcher's
+    // Overlay layer surface. The default window-managed placement
+    // deliberately skips ALL layer-shell setup so the WM owns the
+    // window. See the docstring above for the full rationale.
+    let layer_shell = matches!(
+        gui_cfg.preview_placement,
+        lixun_config::PreviewPlacement::Overlay
+    ) && gtk4_layer_shell::is_supported();
+    if layer_shell {
+        use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
+        window.init_layer_shell();
+        window.set_namespace(Some("lixun-preview"));
+        window.set_layer(Layer::Overlay);
+        window.set_anchor(Edge::Right, true);
+        window.set_margin(Edge::Right, PREVIEW_EDGE_MARGIN);
+        window.set_keyboard_mode(KeyboardMode::OnDemand);
+        // Layer surfaces get no compositor decorations, and a CSD
+        // titlebar inside the overlay would only waste pixels. The
+        // close affordances are Escape/Space (launcher keymap plus
+        // the capture-phase controller installed below).
+        window.set_decorated(false);
+    } else {
+        // Window-managed placement: pin a stable Wayland app-id so
+        // users can target the preview with WM rules (placement,
+        // floating, size) as documented in docs/config.example.toml.
+        // GTK4 would otherwise fall back to the process name;
+        // setting it explicitly keeps the contract independent of
+        // how the binary was invoked. Realize-time is the earliest
+        // point the GDK toplevel exists, and it precedes the first
+        // map — which is when compositors read the app-id. The
+        // downcast quietly skips non-Wayland backends (X11 uses
+        // WM_CLASS from the process name instead).
+        window.connect_realize(|w| {
+            if let Some(surface) = w.surface()
+                && let Ok(toplevel) = surface.downcast::<gdk4_wayland::WaylandToplevel>()
+            {
+                toplevel.set_application_id(APP_ID);
+            }
+        });
+    }
+    state.layer_shell_active.set(layer_shell);
+
+    // Embedded stylesheet first (APPLICATION priority), then the
+    // user's ~/.config/lixun/style.css above it (APPLICATION + 1,
+    // inside install_user_css) — the same layering the launcher's
+    // style_manager uses. Before this the preview shipped with
+    // stock light-grey GTK next to the dark launcher (P3).
+    install_embedded_css(display);
     install_user_css(display);
 
     let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -755,19 +893,55 @@ fn build_window_skeleton(
 
     let content_scroll = gtk::ScrolledWindow::new();
     content_scroll.set_widget_name("lixun-preview-content");
+    // Focusable so the post-mount content focus (P7) has a landing
+    // spot even when a plugin's widget itself refuses focus; a
+    // focused ScrolledWindow also gets native keyboard scrolling.
+    content_scroll.set_focusable(true);
     vbox.append(&content_scroll);
+
+    // Keyboard-hint strip (P7): populated per ShowOrUpdate from the
+    // plugin's capability flags; sits below the content area.
+    let hints = gtk::Label::new(None);
+    hints.set_widget_name("lixun-preview-hints");
+    hints.set_halign(gtk::Align::Start);
+    hints.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    vbox.append(&hints);
+
     window.set_child(Some(&vbox));
 
     install_close_controllers(&window, app, state, outbound_tx);
 
     *state.header_box.borrow_mut() = Some(header_box);
     *state.content_scroll.borrow_mut() = Some(content_scroll);
+    *state.hints_label.borrow_mut() = Some(hints);
     *state.vbox.borrow_mut() = Some(vbox);
     *state.window.borrow_mut() = Some(window);
     Ok(())
 }
 
+/// Register the compiled-in stylesheet at the base APPLICATION
+/// priority. The user override (install_user_css) and any theme sit
+/// above it, so every rule here is a default, not a mandate.
+fn install_embedded_css(display: &gtk::gdk::Display) {
+    const EMBEDDED_STYLESHEET: &str = include_str!("../style.css");
+    let provider = gtk::CssProvider::new();
+    provider.load_from_string(EMBEDDED_STYLESHEET);
+    gtk::style_context_add_provider_for_display(
+        display,
+        &provider,
+        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
+}
+
 fn try_apply_pending_parent(state: &Rc<PreviewState>, window: &gtk::ApplicationWindow) {
+    // A layer surface carries no xdg_toplevel role, so importing an
+    // xdg-foreign parent handle for it would be a protocol error.
+    // The daemon does not send SetParent while the launcher itself
+    // is a layer surface, so this guard is belt-and-suspenders for
+    // the xdg-toplevel fallback path only.
+    if state.layer_shell_active.get() {
+        return;
+    }
     let handle = match state.parent_handle.borrow().clone() {
         Some(h) => h,
         None => return,
@@ -795,106 +969,156 @@ fn try_apply_pending_parent(state: &Rc<PreviewState>, window: &gtk::ApplicationW
         }
 }
 
-fn check_overlap_and_hide_launcher(
+/// Pure predicate for [`update_launcher_visibility`] (layer-shell
+/// mode): can the launcher stay on screen beside a right-anchored
+/// preview surface? The left column spans everything left of the
+/// preview (which sits [`PREVIEW_EDGE_MARGIN`] short of the right
+/// monitor edge); the launcher fits when that column holds its
+/// width — floored at [`LAUNCHER_MIN_WIDTH`] so a bogus small
+/// measurement cannot approve a hopeless column — plus
+/// [`LAUNCHER_COLUMN_GAP`] on each side.
+///
+/// Must stay arithmetic-identical to the launcher's own slide
+/// predicate (`lixun-gui/src/preview_layout.rs`,
+/// `launcher_fits_column` over `left_column_width`): the launcher
+/// slides into the left column exactly when this returns true, and
+/// we soft-hide it exactly when this returns false. The decision
+/// depends only on widths — never on positions — so the launcher's
+/// post-slide geometry report cannot flip the answer and oscillate.
+fn launcher_fits_beside(monitor_w: i32, launcher_w: i32, preview_w: i32) -> bool {
+    if monitor_w <= 0 || preview_w <= 0 {
+        return false;
+    }
+    let column_w = monitor_w - preview_w - PREVIEW_EDGE_MARGIN;
+    column_w >= launcher_w.max(LAUNCHER_MIN_WIDTH) + 2 * LAUNCHER_COLUMN_GAP
+}
+
+/// Decide whether the launcher can stay visible while this preview
+/// is mapped, and ask the daemon to soft-hide it when it cannot.
+/// No-op while the preview window itself is hidden.
+///
+/// Overlay placement (layer-shell active): the preview hugs the
+/// RIGHT monitor edge, so the launcher survives exactly when it fits
+/// in the remaining left column ([`launcher_fits_beside`]); the
+/// launcher slides itself into that column with the same math. A
+/// launcher on a different monitor always stays visible. When the
+/// column is too narrow, `visible=false` routes through
+/// `GuiCommand::SoftHide`, which preserves the launcher's preview
+/// session; every close path (`Close`/`Hide`/close-request/
+/// Escape/Space) restores visibility via `launcher_hidden_by_us`,
+/// backstopped by the daemon's Closed → `GuiCommand::Show` dispatch.
+///
+/// Window-managed placement (default): the WM owns the preview's
+/// position, which a Wayland client cannot observe, so no
+/// fits-beside statement is possible and the launcher's visibility
+/// is NEVER touched from here. Residual launcher-over-preview
+/// overlap is the documented tradeoff of this mode — the preview is
+/// freely draggable, and the launcher tucks against the left edge
+/// while preview mode is active (lixun-gui slide).
+fn update_launcher_visibility(
     state: &Rc<PreviewState>,
     window: &gtk::ApplicationWindow,
     outbound_tx: &async_channel::Sender<PreviewEvent>,
+    gui_cfg: &Rc<lixun_config::GuiConfig>,
 ) {
-    let launcher_monitor = state.launcher_monitor.borrow();
-    let Some(launcher_mon) = launcher_monitor.as_ref() else {
-        tracing::debug!("check_overlap: no launcher monitor");
+    if !window.is_visible() {
         return;
-    };
-    let Some((lx, ly, lw, lh)) = state.launcher_rect.get() else {
-        tracing::debug!("check_overlap: no launcher rect");
-        return;
-    };
+    }
 
-    let display = gtk::gdk::Display::default().expect("no default display");
-    let surface = match window.surface() {
-        Some(s) => s,
-        None => {
-            tracing::debug!("check_overlap: no preview surface");
-            return;
+    let hide_if_visible = |reason: &str| {
+        if !state.launcher_hidden_by_us.get() {
+            tracing::info!("visibility: soft-hiding launcher ({reason})");
+            let _ = outbound_tx.send_blocking(PreviewEvent::SetLauncherVisible { visible: false });
+            state.launcher_hidden_by_us.set(true);
         }
     };
-    let monitor = match display.monitor_at_surface(&surface) {
-        Some(m) => m,
-        None => {
-            tracing::debug!("check_overlap: no monitor for preview surface");
-            return;
-        }
-    };
-    let preview_mon = match monitor.connector() {
-        Some(c) => c.to_string(),
-        None => {
-            tracing::debug!("check_overlap: no connector for preview monitor");
-            return;
-        }
-    };
-
-    tracing::debug!(
-        "check_overlap: launcher_mon={} preview_mon={} launcher=({},{},{}x{})",
-        launcher_mon,
-        preview_mon,
-        lx,
-        ly,
-        lw,
-        lh
-    );
-
-    if preview_mon != *launcher_mon {
-        tracing::debug!("check_overlap: different monitors, restoring launcher if hidden");
+    let restore_if_hidden = |reason: &str| {
         if state.launcher_hidden_by_us.get() {
+            tracing::info!("visibility: restoring launcher ({reason})");
             let _ = outbound_tx.send_blocking(PreviewEvent::SetLauncherVisible { visible: true });
             state.launcher_hidden_by_us.set(false);
         }
-        return;
-    }
-
-    use gtk::prelude::*;
-    let bounds = match window.compute_bounds(window) {
-        Some(b) => b,
-        None => {
-            tracing::debug!("check_overlap: compute_bounds returned None, skipping");
-            return;
-        }
     };
-    let px = bounds.x() as i32;
-    let py = bounds.y() as i32;
-    let pw = bounds.width() as i32;
-    let ph = bounds.height() as i32;
 
-    tracing::debug!(
-        "check_overlap: same monitor, preview allocation=({},{},{}x{})",
-        px,
-        py,
-        pw,
-        ph
-    );
-
-    if pw <= 0 || ph <= 0 || lw <= 0 || lh <= 0 {
-        tracing::debug!("check_overlap: zero size, skipping");
+    if !state.layer_shell_active.get() {
+        // Window-managed placement: never touch launcher visibility
+        // (see docstring). `launcher_hidden_by_us` stays false in
+        // this mode, so the close-path restores are no-ops too.
         return;
     }
 
-    let overlaps = !(px + pw <= lx || lx + lw <= px || py + ph <= ly || ly + lh <= py);
+    let launcher_monitor = state.launcher_monitor.borrow();
+    let Some(launcher_mon) = launcher_monitor.as_ref() else {
+        tracing::debug!("visibility: no launcher monitor yet");
+        return;
+    };
+    let Some((_lx, _ly, lw, _lh)) = state.launcher_rect.get() else {
+        tracing::debug!("visibility: no launcher rect yet");
+        return;
+    };
 
+    let Some(display) = gtk::gdk::Display::default() else {
+        tracing::debug!("visibility: no default display");
+        return;
+    };
+    let Some(surface) = window.surface() else {
+        tracing::debug!("visibility: no preview surface");
+        return;
+    };
+    let Some(monitor) = display.monitor_at_surface(&surface) else {
+        tracing::debug!("visibility: no monitor for preview surface");
+        return;
+    };
+    let Some(preview_mon) = monitor.connector().map(|c| c.to_string()) else {
+        tracing::debug!("visibility: no connector for preview monitor");
+        return;
+    };
+
+    if preview_mon != *launcher_mon {
+        restore_if_hidden("different monitors");
+        return;
+    }
+
+    let mon_w = monitor.geometry().width();
+    // Reason about the wider of (a) the width the launcher predicted
+    // from the shared config when it decided whether to slide and
+    // (b) the width the plugin actually rendered. Using only (b)
+    // would let a narrow FitToContent render approve a column the
+    // launcher never slid into (it predicted a wider preview and
+    // skipped the slide), leaving the centered launcher overlapping
+    // the preview; using only (a) would miss a plugin whose minimum
+    // content forced the surface wider than configured.
+    let pw = surface
+        .width()
+        .max(configured_preview_width(mon_w, gui_cfg));
+    let fits = launcher_fits_beside(mon_w, lw, pw);
     tracing::debug!(
-        "check_overlap: overlaps={} hidden_by_us={}",
-        overlaps,
+        "visibility: monitor_w={} launcher_w={} preview_w={} fits={} hidden_by_us={}",
+        mon_w,
+        lw,
+        pw,
+        fits,
         state.launcher_hidden_by_us.get()
     );
-
-    if overlaps && !state.launcher_hidden_by_us.get() {
-        tracing::info!("check_overlap: hiding launcher (overlap detected)");
-        let _ = outbound_tx.send_blocking(PreviewEvent::SetLauncherVisible { visible: false });
-        state.launcher_hidden_by_us.set(true);
-    } else if !overlaps && state.launcher_hidden_by_us.get() {
-        tracing::info!("check_overlap: restoring launcher (no overlap)");
-        let _ = outbound_tx.send_blocking(PreviewEvent::SetLauncherVisible { visible: true });
-        state.launcher_hidden_by_us.set(false);
+    if fits {
+        restore_if_hidden("launcher fits beside the preview");
+    } else {
+        hide_if_visible("left column too narrow for the launcher");
     }
+}
+
+/// Width the preview claims on a monitor `monitor_w` logical pixels
+/// wide: the configured percent of the monitor, capped by
+/// `preview_max_width_px`, floored at [`MIN_WIDTH`]. Kept as a named
+/// helper because the launcher predicts this exact number for its
+/// slide math (`lixun-gui/src/preview_layout.rs`,
+/// `predicted_preview_width`) and [`update_launcher_visibility`]
+/// must reason about the same width the launcher predicted, not just
+/// whatever the current plugin happened to render.
+fn configured_preview_width(monitor_w: i32, gui_cfg: &lixun_config::GuiConfig) -> i32 {
+    (monitor_w * i32::from(gui_cfg.preview_width_percent) / 100)
+        .min(gui_cfg.preview_max_width_px)
+        .max(MIN_WIDTH)
 }
 
 fn apply_monitor_and_cap(
@@ -904,14 +1128,26 @@ fn apply_monitor_and_cap(
     gui_cfg: &Rc<lixun_config::GuiConfig>,
 ) -> (i32, i32) {
     let window_ref = state.window.borrow();
-    let Some(_window) = window_ref.as_ref() else {
+    let Some(window) = window_ref.as_ref() else {
         return (MIN_WIDTH, MIN_HEIGHT);
     };
     if let Some(monitor) = pick_monitor(display, requested) {
+        // Layer surfaces belong to an output: bind the surface to
+        // the launcher's monitor so the right-edge anchor lands on
+        // the screen the launcher slid over on. Guarded on the
+        // layer-shell path — gtk_layer_* setters must never run
+        // against the xdg-toplevel fallback window — and on an
+        // actual output change: gtk4-layer-shell remaps a mapped
+        // surface on set_monitor, and remapping on every
+        // ShowOrUpdate would flicker the preview during arrow-scrub.
+        if state.layer_shell_active.get() {
+            use gtk4_layer_shell::LayerShell;
+            if window.monitor().as_ref() != Some(&monitor) {
+                window.set_monitor(Some(&monitor));
+            }
+        }
         let geometry = monitor.geometry();
-        let w = (geometry.width() * i32::from(gui_cfg.preview_width_percent) / 100)
-            .min(gui_cfg.preview_max_width_px)
-            .max(MIN_WIDTH);
+        let w = configured_preview_width(geometry.width(), gui_cfg);
         let h = (geometry.height() * i32::from(gui_cfg.preview_height_percent) / 100)
             .min(gui_cfg.preview_max_height_px)
             .max(MIN_HEIGHT);
@@ -960,7 +1196,6 @@ fn apply_sizing(state: &Rc<PreviewState>, sizing: SizingPreference, w_max: i32, 
 fn rebuild_header(
     state: &Rc<PreviewState>,
     hit: &Hit,
-    plugin_id: &str,
     app: &gtk::Application,
     plugin: Rc<dyn PreviewPlugin>,
     outbound_tx: &async_channel::Sender<PreviewEvent>,
@@ -1015,7 +1250,9 @@ fn rebuild_header(
         header.append(&open_btn);
     }
 
-    let plugin_badge = gtk::Label::new(Some(plugin_id));
+    // Humanized plugin name (falls back to the raw id via the trait
+    // default); the host renders it verbatim and never branches on it.
+    let plugin_badge = gtk::Label::new(Some(plugin.display_name()));
     plugin_badge.set_widget_name("lixun-preview-plugin-badge");
     header.append(&plugin_badge);
 }
@@ -1132,6 +1369,27 @@ fn install_close_controllers(
                 close_via_keyboard(&state_for_key, &app_for_key, &outbound_for_keyclose);
                 glib::Propagation::Stop
             }
+            // Arrow keys are result-scrub, not content navigation
+            // (P1 keyboard continuity): while the preview toplevel
+            // holds the seat keyboard, relay Up/Down to the daemon
+            // as NavKey so the launcher moves its selection and the
+            // 50 ms selection→preview pipeline updates this window.
+            // Capture phase on purpose — no plugin widget may steal
+            // the scrub keys.
+            "Up" | "KP_Up" => {
+                let _ = outbound_for_key.send_blocking(PreviewEvent::NavKey {
+                    epoch: state_for_key.current_epoch.get(),
+                    delta: -1,
+                });
+                glib::Propagation::Stop
+            }
+            "Down" | "KP_Down" => {
+                let _ = outbound_for_key.send_blocking(PreviewEvent::NavKey {
+                    epoch: state_for_key.current_epoch.get(),
+                    delta: 1,
+                });
+                glib::Propagation::Stop
+            }
             "Return" | "KP_Enter" => {
                 // Enter inside preview: launch the current hit via
                 // the plugin, same as the Open button. Previously
@@ -1193,6 +1451,101 @@ fn install_close_controllers(
         schedule_idle(&state_for_close, &app_for_close);
         glib::Propagation::Stop
     });
+
+    // Bubble-phase paging fallthrough (P7/P11): runs only when the
+    // focused widget did NOT consume the key, so plugins with their
+    // own PgUp/PgDn wiring (paginated viewers) keep first claim and
+    // everything else still pages the outer scroll container.
+    let page_key = gtk::EventControllerKey::new();
+    page_key.set_propagation_phase(gtk::PropagationPhase::Bubble);
+    let state_for_page = Rc::clone(state);
+    page_key.connect_key_pressed(move |_, keyval, _keycode, _state| {
+        let sym = keyval.name().map(|g| g.to_string()).unwrap_or_default();
+        match sym.as_str() {
+            "Page_Up" | "KP_Page_Up" => {
+                scroll_content(&state_for_page, ScrollRequest::PageUp, 1);
+                glib::Propagation::Stop
+            }
+            "Page_Down" | "KP_Page_Down" => {
+                scroll_content(&state_for_page, ScrollRequest::PageDown, 1);
+                glib::Propagation::Stop
+            }
+            _ => glib::Propagation::Proceed,
+        }
+    });
+    window.add_controller(page_key);
+}
+
+/// Apply a page-scroll to the current preview content (P11). The
+/// active plugin gets first refusal through its `scroll` hook (the
+/// only route for `OwnsScroll` widgets); on `false` the host drives
+/// its own outer ScrolledWindow by `pages` viewport-heights, clamped
+/// to the adjustment bounds.
+fn scroll_content(state: &Rc<PreviewState>, request: ScrollRequest, pages: u32) {
+    let handled = {
+        let plugin = state.current_plugin.borrow();
+        let widget = state.current_widget.borrow();
+        match (plugin.as_ref(), widget.as_ref()) {
+            (Some(plugin), Some(widget)) => plugin.scroll(widget, request, pages),
+            _ => false,
+        }
+    };
+    if handled {
+        return;
+    }
+    let scroll_ref = state.content_scroll.borrow();
+    let Some(scroll) = scroll_ref.as_ref() else {
+        return;
+    };
+    if !scroll.is_visible() {
+        // OwnsScroll mount: the outer container is hidden and empty;
+        // nothing generic left to move.
+        return;
+    }
+    let adj = scroll.vadjustment();
+    let delta = adj.page_size() * f64::from(pages);
+    let target = match request {
+        ScrollRequest::PageUp => adj.value() - delta,
+        ScrollRequest::PageDown => adj.value() + delta,
+    };
+    adj.set_value(clamp_scroll_value(
+        target,
+        adj.lower(),
+        adj.upper(),
+        adj.page_size(),
+    ));
+}
+
+/// Clamp a prospective vadjustment value to the scrollable range.
+/// GtkAdjustment does this internally too; duplicated as a pure
+/// function so the paging math is unit-testable headlessly.
+fn clamp_scroll_value(target: f64, lower: f64, upper: f64, page_size: f64) -> f64 {
+    target.clamp(lower, (upper - page_size).max(lower))
+}
+
+/// Rebuild the bottom hint strip from the active plugin's declared
+/// capabilities (P7). Capability flags only — never plugin identity.
+fn update_hints(state: &Rc<PreviewState>, plugin: &Rc<dyn PreviewPlugin>, hit: &Hit) {
+    let Some(hints) = state.hints_label.borrow().clone() else {
+        return;
+    };
+    let caps = plugin.capabilities();
+    let owns_scroll = matches!(plugin.sizing(), SizingPreference::OwnsScroll);
+    let mut parts: Vec<&str> = vec!["\u{2191}\u{2193} results"];
+    if caps.paginated || !owns_scroll {
+        parts.push("PgUp/PgDn pages");
+    }
+    if caps.zoomable {
+        parts.push("Ctrl\u{b1} zoom");
+    }
+    if caps.text_search {
+        parts.push("Ctrl+F search");
+    }
+    if plugin.can_launch(hit) {
+        parts.push("\u{21b5} open");
+    }
+    parts.push("Esc close");
+    hints.set_text(&parts.join(" \u{b7} "));
 }
 
 /// Mint an xdg-activation token from the seat keyboard the preview
@@ -1256,5 +1609,50 @@ fn schedule_idle(state: &Rc<PreviewState>, app: &gtk::Application) {
 fn cancel_idle(state: &Rc<PreviewState>) {
     if let Some(id) = state.idle_source.borrow_mut().take() {
         id.remove();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{clamp_scroll_value, launcher_fits_beside};
+
+    #[test]
+    fn fits_beside_mirrors_launcher_slide_math() {
+        // 1920 monitor, 50% preview (960): column = 944 holds a
+        // 720 launcher plus 16px gaps on both sides.
+        assert!(launcher_fits_beside(1920, 720, 960));
+        // 1366 laptop panel, 683 preview: column = 667 < 720 + 32.
+        assert!(!launcher_fits_beside(1366, 720, 683));
+    }
+
+    #[test]
+    fn fits_beside_floors_launcher_width() {
+        // A 100px launcher reading clamps to the 480 floor: the
+        // column must still hold 480 + 2x16.
+        assert!(!launcher_fits_beside(1000, 100, 500)); // column 484
+        assert!(launcher_fits_beside(1090, 100, 550)); // column 524
+    }
+
+    #[test]
+    fn fits_beside_rejects_degenerate_sizes() {
+        assert!(!launcher_fits_beside(0, 720, 960));
+        assert!(!launcher_fits_beside(1920, 720, 0));
+        assert!(!launcher_fits_beside(-1, 720, 960));
+    }
+
+    #[test]
+    fn scroll_clamp_stays_within_range() {
+        // Page down past the end clamps to upper - page_size.
+        assert_eq!(clamp_scroll_value(950.0, 0.0, 1000.0, 100.0), 900.0);
+        // Page up past the start clamps to lower.
+        assert_eq!(clamp_scroll_value(-40.0, 0.0, 1000.0, 100.0), 0.0);
+        // In-range value passes through.
+        assert_eq!(clamp_scroll_value(300.0, 0.0, 1000.0, 100.0), 300.0);
+    }
+
+    #[test]
+    fn scroll_clamp_handles_content_shorter_than_viewport() {
+        // upper - page_size would be negative; clamp to lower.
+        assert_eq!(clamp_scroll_value(50.0, 0.0, 80.0, 100.0), 0.0);
     }
 }

@@ -14,8 +14,8 @@ use crate::actions::{
 };
 use crate::factory::{cached_hit_by_id, synthetic_history_hits, update_results, with_cached_hits};
 use crate::ipc::{
-    IpcClient, current_monitor_connector, dispatch_click_pair, request_search_history,
-    send_preview_request,
+    IpcClient, current_monitor_connector, dispatch_click_pair, fetch_search_history_async,
+    send_preview_request, send_preview_scroll,
 };
 use crate::status::StatusBar;
 use crate::window::{CategoryChips, LauncherController};
@@ -191,6 +191,11 @@ pub(crate) fn install_keyboard_handler(
     // returns Proceed so GtkText IM still receives printable text input.
     let key_controller = gtk::EventControllerKey::new();
     key_controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+    // Live handle to the O3 shortcuts overlay while it is up. Owned
+    // here because the keymap is its only opener and dismisser; the
+    // popover's connect_closed clears it (window.rs).
+    let shortcuts_overlay: std::rc::Rc<std::cell::RefCell<Option<gtk::Popover>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
     key_controller.connect_key_pressed(clone!(
         #[strong]
         selection,
@@ -210,6 +215,8 @@ pub(crate) fn install_keyboard_handler(
         controller,
         #[strong]
         status_bar,
+        #[strong]
+        shortcuts_overlay,
         move |_, key, _keycode, state| {
             let entry_focus = entry_has_focus(&entry, &window);
             let printable = is_printable_key(key, state);
@@ -236,6 +243,65 @@ pub(crate) fn install_keyboard_handler(
                 )
             {
                 return glib::signal::Propagation::Proceed;
+            }
+            // O3 modality: while the shortcuts overlay is visible,
+            // the next key closes it. Escape/?/F1 are consumed as a
+            // pure "close" (Escape must NOT fall through to the
+            // launcher-hide branch below); every other key falls
+            // through to its normal meaning after the close, so Down
+            // navigates and letters type into the entry. The popover
+            // holds no grab (see show_shortcuts_overlay), so all keys
+            // arrive here. Clone out of the RefCell before popdown():
+            // popdown fires connect_closed, which mutably borrows the
+            // slot to clear it.
+            let overlay = shortcuts_overlay.borrow().clone();
+            if let Some(p) = overlay {
+                if p.is_visible() {
+                    p.popdown();
+                    if matches!(
+                        key,
+                        gtk::gdk::Key::Escape | gtk::gdk::Key::question | gtk::gdk::Key::F1
+                    ) {
+                        return glib::signal::Propagation::Stop;
+                    }
+                } else {
+                    // Stale handle (e.g. the launcher was hidden with
+                    // the overlay up): just release it.
+                    shortcuts_overlay.borrow_mut().take();
+                }
+            }
+            // P11: while a preview is on screen, PgUp/PgDn (and
+            // Shift+Space page-back, mirroring Quick Look) page the
+            // preview content without moving focus into its window.
+            // Dispatched before every other branch so Shift+Space is
+            // not mistaken for a printable key (which would dismiss
+            // the preview below). Keys are fixed, not rebindable —
+            // they only exist inside preview mode.
+            if controller.preview_mode_active() {
+                let page = match key {
+                    gtk::gdk::Key::Page_Down | gtk::gdk::Key::KP_Page_Down => Some(true),
+                    gtk::gdk::Key::Page_Up | gtk::gdk::Key::KP_Page_Up => Some(false),
+                    gtk::gdk::Key::space
+                        if mods_match_exact(gtk::gdk::ModifierType::SHIFT_MASK, state) =>
+                    {
+                        Some(false)
+                    }
+                    _ => None,
+                };
+                if let Some(down) = page {
+                    send_preview_scroll(down, 1);
+                    return glib::signal::Propagation::Stop;
+                }
+            }
+            // O3: shortcuts overlay on F1 (always) and ? (only while
+            // the query is empty — with text present, "?" stays
+            // typeable). Lists the RESOLVED keybindings so user
+            // rebinds display truthfully.
+            if key == gtk::gdk::Key::F1
+                || (key == gtk::gdk::Key::question && entry.text().is_empty())
+            {
+                crate::window::show_shortcuts_overlay(&entry, &keybindings, &shortcuts_overlay);
+                return glib::signal::Propagation::Stop;
             }
             // quick_look_alt (default <Ctrl>space) opens Quick Look on
             // the selected row even while the entry owns focus. The
@@ -684,23 +750,38 @@ pub(crate) fn install_keyboard_handler(
         move |_, key, _keycode, state| {
             tracing::info!("gui: ENTRY key_controller fired key={:?}", key.name());
             if accel_matches(&keybindings.history_up, key, state) && entry.text().is_empty() {
-                let queries = request_search_history(10);
-                if queries.is_empty() {
-                    return glib::signal::Propagation::Stop;
-                }
-                let hits = synthetic_history_hits(&queries);
-                update_results(&model, &selection, &hits, None);
-                selection.set_selected(0);
-                list_view.scroll_to(0, gtk::ListScrollFlags::NONE, None);
-                status_bar.hide();
-                // The list_view/scrolled are hidden by default on
-                // empty-entry state (window.rs:455). Force them
-                // visible here, otherwise the synthetic history
-                // hits are loaded into the model silently and the
-                // user sees nothing.
-                chips_container.set_visible(true);
-                scrolled.set_visible(true);
-                scrolled.set_vexpand(false);
+                // K8b: the history round-trip used to block the GTK
+                // main thread inside this key handler for up to its
+                // 500 ms socket timeout. Route it through the same
+                // worker-thread + main-loop-callback pattern as the
+                // search path; the callback re-checks that the entry
+                // is still empty so a late reply never clobbers a
+                // query the user started typing meanwhile.
+                let entry = entry.clone();
+                let model = model.clone();
+                let selection = selection.clone();
+                let list_view = list_view.clone();
+                let status_bar = std::rc::Rc::clone(&status_bar);
+                let chips_container = chips_container.clone();
+                let scrolled = scrolled.clone();
+                fetch_search_history_async(10, move |queries| {
+                    if queries.is_empty() || !entry.text().is_empty() {
+                        return;
+                    }
+                    let hits = synthetic_history_hits(&queries);
+                    update_results(&model, &selection, &hits, None);
+                    selection.set_selected(0);
+                    list_view.scroll_to(0, gtk::ListScrollFlags::NONE, None);
+                    status_bar.hide();
+                    // The list_view/scrolled are hidden by default on
+                    // empty-entry state (window.rs:455). Force them
+                    // visible here, otherwise the synthetic history
+                    // hits are loaded into the model silently and the
+                    // user sees nothing.
+                    chips_container.set_visible(true);
+                    scrolled.set_visible(true);
+                    scrolled.set_vexpand(false);
+                });
                 glib::signal::Propagation::Stop
             } else {
                 glib::signal::Propagation::Proceed

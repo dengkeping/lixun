@@ -1,0 +1,18 @@
+[package]
+name = "lixun-preview-info"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lixun-core = { path = "../lixun-core" }
+lixun-preview = { path = "../lixun-preview" }
+anyhow.workspace = true
+chrono.workspace = true
+inventory.workspace = true
+tracing.workspace = true
+gtk.workspace = true
+
+[lib]
+name = "lixun_preview_info"
+path = "src/lib.rs"

@@ -508,6 +508,7 @@ impl App {
             reindex_in_progress,
             reindex_started,
             ocr,
+            ..
         } = status
         {
             self.indexed_docs = indexed_docs;

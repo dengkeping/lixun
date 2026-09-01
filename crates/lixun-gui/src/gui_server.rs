@@ -117,6 +117,15 @@ fn dispatch(controller: &LauncherController, cmd: GuiCommand) -> GuiResponse {
                 visible: controller.is_visible(),
             }
         }
+        GuiCommand::SoftHide => GuiResponse::Ok {
+            visible: controller.soft_hide(),
+        },
+        GuiCommand::PreviewNav { delta } => {
+            controller.preview_nav(delta);
+            GuiResponse::Ok {
+                visible: controller.is_visible(),
+            }
+        }
     }
 }
 

@@ -40,6 +40,7 @@
 
 use gdk4_wayland::prelude::WaylandSurfaceExtManual;
 use gtk::prelude::*;
+use lixun_config::BlurMode;
 use std::cell::RefCell;
 use std::ops::RangeInclusive;
 use std::rc::Rc;
@@ -122,22 +123,32 @@ pub struct BlurController {
 }
 
 struct ControllerState {
-    enabled: bool,
+    mode: BlurMode,
     attachment: Option<BlurAttachment>,
+}
+
+impl ControllerState {
+    fn wants_blur(&self) -> bool {
+        self.mode.wants_blur()
+    }
 }
 
 impl BlurController {
     /// Build a controller for `window` and wire up the realise/hide
     /// hooks. The compositor attach happens lazily on the first
     /// `GdkSurface::layout` after realise, gated on the current
-    /// `enabled` flag.
-    pub fn new(window: &gtk::ApplicationWindow, initial_enabled: bool) -> Self {
+    /// blur mode (V2b): `Off` never attaches and keeps the no-blur
+    /// fill; `Auto` attaches and falls back to the no-blur fill when
+    /// no protocol is found (Hyprland layerrule excepted);
+    /// `Compositor` attaches opportunistically but NEVER forces the
+    /// no-blur class — the operator asserted compositor-side blur.
+    pub fn new(window: &gtk::ApplicationWindow, initial_mode: BlurMode) -> Self {
         let state = Rc::new(RefCell::new(ControllerState {
-            enabled: initial_enabled,
+            mode: initial_mode,
             attachment: None,
         }));
 
-        apply_no_blur_class(window, !initial_enabled);
+        apply_no_blur_class(window, !initial_mode.wants_blur());
 
         let state_layout = Rc::clone(&state);
         window.connect_realize(move |w| {
@@ -151,9 +162,10 @@ impl BlurController {
                     return;
                 }
                 let mut st = state_inner.borrow_mut();
-                if !st.enabled {
+                if !st.wants_blur() {
                     return;
                 }
+                let mode = st.mode;
                 // Layout fires several times per frame while the result
                 // list resizes. Re-creating the attachment each time
                 // meant a blocking registry roundtrip on the GTK main
@@ -177,8 +189,11 @@ impl BlurController {
                         // legible over the raw backdrop. Hyprland is
                         // exempt — it blurs layer surfaces via a
                         // compositor-side layerrule without either
-                        // protocol.
-                        if should_force_no_blur(std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE"))
+                        // protocol — and so is `blur = "compositor"`,
+                        // where the operator asserts compositor-side
+                        // blur that we cannot detect.
+                        if mode == BlurMode::Auto
+                            && should_force_no_blur(std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE"))
                             && let Some(win) = window_weak.upgrade()
                         {
                             apply_no_blur_class(&win, true);
@@ -204,19 +219,18 @@ impl BlurController {
         }
     }
 
-    /// Switch blur on or off at runtime. When turning off, drops the
-    /// current compositor attachment (which calls `unset` on the blur
-    /// manager) and adds the `lixun-no-blur` CSS class. When turning
-    /// on, removes the class and asks GTK to redraw — the next
-    /// `GdkSurface::layout` will re-attach the protocol. If the window
-    /// has not been realised yet, the toggle simply records the new
-    /// flag and the realise path picks it up.
-    pub fn set_enabled(&self, enabled: bool) {
+    /// Switch the blur mode at runtime. `Off` drops the current
+    /// compositor attachment (which calls `unset` on the blur
+    /// manager) and adds the `lixun-no-blur` CSS class. `Auto` /
+    /// `Compositor` remove the class and re-attach — the next
+    /// `GdkSurface::layout` covers the not-yet-realised case.
+    pub fn set_mode(&self, mode: BlurMode) {
         let mut st = self.state.borrow_mut();
-        if st.enabled == enabled {
+        if st.mode == mode {
             return;
         }
-        st.enabled = enabled;
+        st.mode = mode;
+        let enabled = mode.wants_blur();
         if !enabled && let Some(att) = st.attachment.take() {
             att.detach();
         }
@@ -241,8 +255,11 @@ impl BlurController {
                         // toggle just removed, keeping the panel legible.
                         // Hyprland is exempt — it blurs layer surfaces via
                         // a compositor-side layerrule without either
-                        // protocol.
-                        if should_force_no_blur(std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE")) {
+                        // protocol — and `Compositor` mode never forces
+                        // the fallback (operator asserts external blur).
+                        if mode == BlurMode::Auto
+                            && should_force_no_blur(std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE"))
+                        {
                             apply_no_blur_class(&self.window, true);
                         }
                     }

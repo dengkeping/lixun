@@ -4,7 +4,10 @@ use anyhow::{Context, Result};
 use bytes::{BufMut, BytesMut};
 use clap::{Arg, ArgMatches, Command};
 use lixun_core::SystemImpact;
-use lixun_ipc::{ImpactProfileWire, PROTOCOL_VERSION, Phase, Request, Response};
+use lixun_ipc::{
+    DaemonInfo, HotkeyStatus, ImpactProfileWire, PROTOCOL_VERSION, Phase, Request, Response,
+    SemanticStatus,
+};
 use lixun_mutation::CliVerb;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -804,19 +807,22 @@ fn handle_response(resp: Response, ocr_only: bool) {
             reindex_in_progress,
             reindex_started,
             ocr,
+            semantic,
+            hotkey,
+            daemon,
         } => {
             if ocr_only {
                 print!("{}", format_ocr_block(ocr.as_ref()));
                 return;
             }
             println!("Indexed documents: {}", indexed_docs);
-            println!("Last reindex: {:?}", last_reindex);
+            println!("Last reindex: {}", format_opt_datetime(last_reindex.as_ref()));
             println!("Errors: {}", errors);
             if reindex_in_progress {
-                let started = reindex_started
-                    .map(|t| t.to_rfc3339())
-                    .unwrap_or_else(|| "unknown".into());
-                println!("Reindex: RUNNING (started {})", started);
+                println!(
+                    "Reindex: RUNNING (started {})",
+                    format_opt_datetime(reindex_started.as_ref())
+                );
             }
             if let Some(w) = watcher {
                 println!(
@@ -838,6 +844,13 @@ fn handle_response(resp: Response, ocr_only: bool) {
                     format_bytes(m.vm_size_bytes),
                     format_bytes(m.vm_swap_bytes),
                 );
+            }
+            print!("{}", format_daemon_block(daemon.as_ref()));
+            if let Some(line) = format_semantic_line(semantic.as_ref()) {
+                println!("{}", line);
+            }
+            if let Some(line) = format_hotkey_line(hotkey.as_ref()) {
+                println!("{}", line);
             }
         }
         Response::Visibility { visible } => {
@@ -861,10 +874,79 @@ fn handle_response(resp: Response, ocr_only: bool) {
         }
         // CLI is single-shot; supersede never happens, so this is defensive.
         Response::Cancelled { .. } => {}
+        // Recents is a GUI-only request; defensive routing guard.
+        Response::Recents { .. } => {
+            eprintln!("Error: recents response routed to built-in handler");
+        }
         Response::Error(msg) => {
             eprintln!("Error: {}", msg);
         }
     }
+}
+
+/// "never" for `None`, RFC3339 otherwise. Replaces the old
+/// debug-formatted `Some(2026-…)`/`None` output (O8).
+fn format_opt_datetime(dt: Option<&chrono::DateTime<chrono::Utc>>) -> String {
+    match dt {
+        Some(dt) => dt.to_rfc3339(),
+        None => "never".to_string(),
+    }
+}
+
+/// Config identity, registered plugin list, and startup warnings
+/// (O2/O8). Empty string when the daemon predates the field.
+fn format_daemon_block(daemon: Option<&DaemonInfo>) -> String {
+    let Some(d) = daemon else {
+        return String::new();
+    };
+    let mut out = String::new();
+    match &d.config_path {
+        Some(path) => out.push_str(&format!("Config: {}\n", path)),
+        None => out.push_str("Config: defaults (no file)\n"),
+    }
+    if let Some(err) = &d.config_error {
+        out.push_str(&format!(
+            "  ! config failed to parse; running on defaults: {}\n",
+            err
+        ));
+    }
+    if d.plugins.is_empty() {
+        out.push_str("Plugins: none registered\n");
+    } else {
+        out.push_str(&format!("Plugins: {}\n", d.plugins.join(", ")));
+    }
+    for w in &d.startup_warnings {
+        out.push_str(&format!("  ! {}\n", w));
+    }
+    out
+}
+
+/// One-line semantic availability (F6). `None` when the daemon
+/// predates the field — the caller omits the line entirely.
+fn format_semantic_line(semantic: Option<&SemanticStatus>) -> Option<String> {
+    let s = semantic?;
+    Some(if s.enabled {
+        format!("Semantic: on ({})", s.state)
+    } else {
+        "Semantic: off".to_string()
+    })
+}
+
+/// One-line hotkey listener state (O7).
+fn format_hotkey_line(hotkey: Option<&HotkeyStatus>) -> Option<String> {
+    let h = hotkey?;
+    let backend = h.backend.as_deref();
+    Some(if h.bound {
+        format!(
+            "Hotkey: {} via {} (bound)",
+            h.trigger,
+            backend.unwrap_or("unknown backend")
+        )
+    } else if let Some(err) = &h.error {
+        format!("Hotkey: {} — FAILED: {}", h.trigger, err)
+    } else {
+        format!("Hotkey: {} (starting)", h.trigger)
+    })
 }
 
 fn format_ocr_block(ocr: Option<&lixun_ipc::OcrStats>) -> String {
@@ -908,7 +990,111 @@ fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lixun_ipc::OcrStats;
+    use lixun_ipc::{OcrStats, SemanticWorkerState};
+
+    #[test]
+    fn format_opt_datetime_none_is_never() {
+        assert_eq!(format_opt_datetime(None), "never");
+    }
+
+    #[test]
+    fn format_opt_datetime_some_is_rfc3339() {
+        let dt = chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let out = format_opt_datetime(Some(&dt));
+        assert!(out.starts_with("2023-"), "expected RFC3339, got {out}");
+        assert!(!out.contains("Some"), "debug formatting leaked: {out}");
+    }
+
+    #[test]
+    fn format_daemon_block_defaults_and_plugins() {
+        let d = DaemonInfo {
+            config_path: None,
+            config_error: None,
+            plugins: vec!["builtin:fs".into(), "calc.0".into()],
+            startup_warnings: vec![],
+        };
+        let out = format_daemon_block(Some(&d));
+        assert!(out.contains("Config: defaults (no file)"));
+        assert!(out.contains("Plugins: builtin:fs, calc.0"));
+    }
+
+    #[test]
+    fn format_daemon_block_error_and_warnings() {
+        let d = DaemonInfo {
+            config_path: Some("/home/u/.config/lixun/config.toml".into()),
+            config_error: Some("expected `]` at line 3".into()),
+            plugins: vec![],
+            startup_warnings: vec!["plugin 'x' failed to build and was skipped: bad path".into()],
+        };
+        let out = format_daemon_block(Some(&d));
+        assert!(out.contains("Config: /home/u/.config/lixun/config.toml"));
+        assert!(out.contains("! config failed to parse; running on defaults: expected `]`"));
+        assert!(out.contains("Plugins: none registered"));
+        assert!(out.contains("! plugin 'x' failed to build"));
+    }
+
+    #[test]
+    fn format_daemon_block_absent_field_is_empty() {
+        assert_eq!(format_daemon_block(None), "");
+    }
+
+    #[test]
+    fn format_semantic_line_states() {
+        assert_eq!(format_semantic_line(None), None);
+        let on = SemanticStatus {
+            enabled: true,
+            state: SemanticWorkerState::Ready,
+        };
+        assert_eq!(format_semantic_line(Some(&on)).unwrap(), "Semantic: on (ready)");
+        let missing = SemanticStatus {
+            enabled: true,
+            state: SemanticWorkerState::NotFound,
+        };
+        assert_eq!(
+            format_semantic_line(Some(&missing)).unwrap(),
+            "Semantic: on (worker binary not found)"
+        );
+        let off = SemanticStatus {
+            enabled: false,
+            state: SemanticWorkerState::Disabled,
+        };
+        assert_eq!(format_semantic_line(Some(&off)).unwrap(), "Semantic: off");
+    }
+
+    #[test]
+    fn format_hotkey_line_states() {
+        assert_eq!(format_hotkey_line(None), None);
+        let bound = HotkeyStatus {
+            backend: Some("portal".into()),
+            trigger: "Super+space".into(),
+            bound: true,
+            error: None,
+        };
+        assert_eq!(
+            format_hotkey_line(Some(&bound)).unwrap(),
+            "Hotkey: Super+space via portal (bound)"
+        );
+        let failed = HotkeyStatus {
+            backend: Some("portal".into()),
+            trigger: "Super+space".into(),
+            bound: false,
+            error: Some("portal unavailable".into()),
+        };
+        assert_eq!(
+            format_hotkey_line(Some(&failed)).unwrap(),
+            "Hotkey: Super+space — FAILED: portal unavailable"
+        );
+        let probing = HotkeyStatus {
+            backend: None,
+            trigger: "Super+space".into(),
+            bound: false,
+            error: None,
+        };
+        assert_eq!(
+            format_hotkey_line(Some(&probing)).unwrap(),
+            "Hotkey: Super+space (starting)"
+        );
+    }
 
     #[test]
     fn format_ocr_block_reports_disabled_when_none() {

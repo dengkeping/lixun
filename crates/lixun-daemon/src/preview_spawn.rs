@@ -175,8 +175,9 @@ pub struct PreviewSpawner {
     /// to preview as `PreviewCommand::ShowOrUpdate { epoch }`.
     /// Daemon-authoritative: every mutation path must generate a
     /// fresh epoch so preview-side debouncing can reliably drop
-    /// stale async work.
-    epoch: AtomicU64,
+    /// stale async work. `Arc` so the supervisor task can compare
+    /// a `PreviewEvent::Error` epoch against the current one.
+    epoch: Arc<AtomicU64>,
     /// Nonce mixer used to pick unique socket paths across
     /// consecutive cold starts. `preview_socket_path` takes a
     /// `u32` tag; we combine daemon pid, a per-spawn counter,
@@ -194,7 +195,7 @@ impl PreviewSpawner {
         Self {
             state: Arc::new(Mutex::new(PreviewLifecycle::default())),
             gui_control,
-            epoch: AtomicU64::new(0),
+            epoch: Arc::new(AtomicU64::new(0)),
             spawn_counter: AtomicU64::new(0),
             cached_launcher_geometry: Arc::new(Mutex::new(None)),
         }
@@ -320,6 +321,31 @@ impl PreviewSpawner {
                     *state = PreviewLifecycle::Dead;
                 }
                 Ok(())
+            }
+        }
+    }
+
+    /// Forward a launcher-relayed page request to the live preview
+    /// (P11). Uses the CURRENT epoch — scrolling does not change
+    /// content, so bumping would spuriously invalidate in-flight
+    /// renders. No-ops unless a preview is `Ready`.
+    pub async fn scroll(&self, down: bool, pages: u32) {
+        let epoch = self.epoch.load(Ordering::Relaxed);
+        let direction = if down {
+            lixun_ipc::preview::ScrollDirection::Down
+        } else {
+            lixun_ipc::preview::ScrollDirection::Up
+        };
+        let mut state = self.state.lock().await;
+        if let PreviewLifecycle::Ready { cmd_tx, .. } = &mut *state {
+            let cmd = PreviewCommand::Scroll {
+                epoch,
+                direction,
+                pages,
+            };
+            if send_or_drop(cmd_tx, cmd) {
+                tracing::warn!("preview_spawn: writer channel closed during scroll");
+                *state = PreviewLifecycle::Dead;
             }
         }
     }
@@ -515,6 +541,7 @@ impl PreviewSpawner {
     fn spawn_supervisor_task(&self, pid: u32, socket_path: PathBuf) {
         let state_arc = Arc::clone(&self.state);
         let gui_control = Arc::clone(&self.gui_control);
+        let epoch_arc = Arc::clone(&self.epoch);
         tokio::spawn(async move {
             // Stage 1: connect with backoff. Preview binds its
             // listener within ~tens of ms of process spawn; we
@@ -751,6 +778,25 @@ impl PreviewSpawner {
                             epoch,
                             msg
                         );
+                        // A failed build for the CURRENT epoch leaves
+                        // the launcher wedged in phantom preview mode:
+                        // nothing appeared, yet `preview_mode_active`
+                        // stays set and the first Escape is eaten (P2).
+                        // Restore the launcher's state; stale-epoch
+                        // errors (user already scrubbed on) are
+                        // log-only, the newer dispatch owns the UI.
+                        if epoch == epoch_arc.load(Ordering::Relaxed)
+                            && let Err(e) = gui_control
+                                .dispatch(GuiCommand::ExitPreviewMode {
+                                    activation_token: None,
+                                })
+                                .await
+                        {
+                            tracing::warn!(
+                                "preview_spawn: dispatch ExitPreviewMode after Error failed: {}",
+                                e
+                            );
+                        }
                     }
                     PreviewEvent::ParentLost => {
                         tracing::debug!(
@@ -758,16 +804,39 @@ impl PreviewSpawner {
                             pid
                         );
                     }
+                    PreviewEvent::NavKey { epoch, delta } => {
+                        tracing::debug!(
+                            "preview_spawn: pid={} NavKey epoch={} delta={}",
+                            pid,
+                            epoch,
+                            delta
+                        );
+                        if let Err(e) = gui_control
+                            .dispatch(GuiCommand::PreviewNav { delta })
+                            .await
+                        {
+                            tracing::warn!(
+                                "preview_spawn: dispatch PreviewNav failed: {}",
+                                e
+                            );
+                        }
+                    }
                     PreviewEvent::SetLauncherVisible { visible } => {
                         tracing::debug!(
                             "preview_spawn: pid={} SetLauncherVisible visible={}",
                             pid,
                             visible
                         );
+                        // `Hide` resets the launcher's
+                        // `preview_mode_active` flag — which kills the
+                        // arrow-scrub selection pipeline mid-preview
+                        // (P1). A genuinely covering preview needs the
+                        // launcher unmapped WITHOUT ending the preview
+                        // session, so route through `SoftHide`.
                         let cmd = if visible {
                             GuiCommand::Show
                         } else {
-                            GuiCommand::Hide
+                            GuiCommand::SoftHide
                         };
                         tracing::debug!("preview_spawn: pid={} dispatching {:?} to GUI", pid, cmd);
                         if let Err(e) = gui_control.dispatch(cmd).await {
@@ -944,6 +1013,8 @@ mod tests {
             source_instance: String::new(),
             row_menu: lixun_core::RowMenuDef::empty(),
             mime: None,
+            timestamp: None,
+            size: None,
         }
     }
 

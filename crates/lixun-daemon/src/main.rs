@@ -11,8 +11,8 @@ use chrono::Utc;
 use futures::StreamExt;
 use lixun_ipc::gui::{GuiCommand, GuiResponse};
 use lixun_ipc::{
-    ImpactProfileWire, PROTOCOL_VERSION_BINARY, PROTOCOL_VERSION_LEGACY, Request, Response,
-    socket_path,
+    DaemonInfo, ImpactProfileWire, PROTOCOL_VERSION_BINARY, PROTOCOL_VERSION_LEGACY, Request,
+    Response, SemanticStatus, socket_path,
 };
 use lixun_sources::QueryContext;
 use std::os::unix::io::AsRawFd;
@@ -61,6 +61,45 @@ struct IndexStats {
     last_reindex: Option<chrono::DateTime<Utc>>,
     reindex_in_progress: bool,
     reindex_started: Option<chrono::DateTime<Utc>>,
+}
+
+/// Startup facts the daemon computes once and serves on every
+/// `Request::Status` (O2/O8/F6): which config file is in effect (or
+/// why it fell back to defaults), which plugin instances registered,
+/// non-fatal startup warnings, and whether semantic search is
+/// config-enabled. Plugin names are the generic instance ids from
+/// registration — the daemon names no plugin (AGENTS.md §1).
+#[derive(Debug, Default)]
+struct RuntimeInfo {
+    config_path: Option<String>,
+    config_error: Option<String>,
+    startup_warnings: Vec<String>,
+    plugins: Vec<String>,
+    semantic_enabled: bool,
+}
+
+impl RuntimeInfo {
+    /// Wire blocks for `Response::Status`.
+    fn status_extras(
+        &self,
+    ) -> (
+        Option<SemanticStatus>,
+        Option<lixun_ipc::HotkeyStatus>,
+        Option<DaemonInfo>,
+    ) {
+        let semantic = SemanticStatus {
+            enabled: self.semantic_enabled,
+            state: lixun_daemon::semantic_supervisor::worker_state(),
+        };
+        let hotkey = hotkeys::status_snapshot();
+        let daemon = DaemonInfo {
+            config_path: self.config_path.clone(),
+            config_error: self.config_error.clone(),
+            plugins: self.plugins.clone(),
+            startup_warnings: self.startup_warnings.clone(),
+        };
+        (Some(semantic), Some(hotkey), Some(daemon))
+    }
 }
 
 /// Map a transport `Result<GuiResponse>` to the daemon's public
@@ -271,7 +310,10 @@ fn main() -> Result<()> {
 
     let _lock = try_single_instance()?;
 
-    let config = config::Config::load()?;
+    // A config typo must not kill the daemon (and with it the global
+    // hotkey): fall back to built-in defaults and carry the parse
+    // error into Response::Status for the CLI/GUI to surface (O2).
+    let (config, config_error) = config::Config::load_or_default();
     let initial_profile = config.resolved_profile();
     let profile_swap: Arc<ArcSwap<lixun_core::ImpactProfile>> =
         Arc::new(ArcSwap::from_pointee(initial_profile.clone()));
@@ -293,11 +335,12 @@ fn main() -> Result<()> {
         .enable_all()
         .build()?;
 
-    rt.block_on(async_main(config, profile, profile_swap))
+    rt.block_on(async_main(config, config_error, profile, profile_swap))
 }
 
 async fn async_main(
     config: config::Config,
+    config_error: Option<String>,
     profile: Arc<lixun_core::ImpactProfile>,
     profile_swap: Arc<ArcSwap<lixun_core::ImpactProfile>>,
 ) -> Result<()> {
@@ -378,28 +421,44 @@ async fn async_main(
     worker does run, we spawn the supervisor before plugin
     registration so the stub factory finds an installed connection
     at build time. */
-    if lixun_daemon::semantic_supervisor::should_spawn(config.plugin_sections.get("semantic")) {
+    let semantic_enabled =
+        lixun_daemon::semantic_supervisor::should_spawn(config.plugin_sections.get("semantic"));
+    if semantic_enabled {
         match lixun_daemon::semantic_supervisor::probe_worker_binary() {
             Some(path) => {
                 tracing::info!(
                     worker = %path.display(),
                     "semantic worker probed, supervisor starting"
                 );
+                lixun_daemon::semantic_supervisor::set_worker_state(
+                    lixun_ipc::SemanticWorkerState::Starting,
+                );
                 tokio::spawn(lixun_daemon::semantic_supervisor::supervise(path));
             }
             None => {
-                tracing::info!("semantic worker binary not found, semantic plugin will be no-op");
+                // The operator asked for semantic search; silently
+                // degrading to BM25-only at info level hid the
+                // problem (F6). State is also served via Status.
+                tracing::warn!(
+                    "semantic worker binary not found, semantic search degraded to BM25-only \
+                     (install lixun-semantic-worker or set LIXUN_SEMANTIC_WORKER)"
+                );
+                lixun_daemon::semantic_supervisor::set_worker_state(
+                    lixun_ipc::SemanticWorkerState::NotFound,
+                );
             }
         }
     } else {
         tracing::info!("semantic disabled in config, worker not spawned");
     }
 
+    let mut startup_warnings: Vec<String> = Vec::new();
     register_plugin_sources(
         &mut registry,
         config,
         &sources_state_dir,
         Arc::clone(&profile),
+        &mut startup_warnings,
     )?;
 
     let index_path = config.state_dir.join("index");
@@ -472,6 +531,21 @@ async fn async_main(
     }
 
     let registry = Arc::new(registry);
+
+    let runtime_info = Arc::new(RuntimeInfo {
+        config_path: {
+            let (path, exists) = config::Config::user_config_path();
+            exists.then(|| path.display().to_string())
+        },
+        config_error,
+        startup_warnings,
+        plugins: registry
+            .instances
+            .iter()
+            .map(|e| e.instance_id.clone())
+            .collect(),
+        semantic_enabled,
+    });
 
     // Build the IPC-facing search surface. When a plugin advertises
     // an ANN handle this becomes a `HybridSearchHandle` running RRF
@@ -706,9 +780,10 @@ async fn async_main(
                 let client_ocr_queue = ocr_queue.clone();
                 let client_ocr_worker_stats = Arc::clone(&ocr_worker_stats);
                 let client_profile_swap = Arc::clone(&profile_swap);
+                let client_runtime_info = Arc::clone(&runtime_info);
 
                 tokio::spawn(async move {
-                    if let Err(e) = handle_client(stream, search, mutation_tx, frecency, query_latch, query_log, stats, gui_control, preview_spawner, shared_config, client_sources, client_registry, client_ocr_queue, client_ocr_worker_stats, client_profile_swap).await {
+                    if let Err(e) = handle_client(stream, search, mutation_tx, frecency, query_latch, query_log, stats, gui_control, preview_spawner, shared_config, client_sources, client_registry, client_ocr_queue, client_ocr_worker_stats, client_profile_swap, client_runtime_info).await {
                         tracing::debug!("Client error: {}", e);
                     }
                 });
@@ -1324,6 +1399,7 @@ async fn handle_client(
     ocr_queue: Option<Arc<lixun_extract::ocr_queue::OcrQueue>>,
     ocr_worker_stats: Arc<lixun_indexer::ocr_tick::OcrWorkerStats>,
     profile_swap: Arc<ArcSwap<lixun_core::ImpactProfile>>,
+    runtime_info: Arc<RuntimeInfo>,
 ) -> anyhow::Result<()> {
     let (mut stream_read, stream_write) = tokio::io::split(stream);
 
@@ -1509,6 +1585,7 @@ async fn handle_client(
                         }
                     });
                     let s = stats.read().await;
+                    let (semantic, hotkey, daemon) = runtime_info.status_extras();
                     Response::Status {
                         indexed_docs: s.indexed_docs,
                         last_reindex: s.last_reindex,
@@ -1523,6 +1600,9 @@ async fn handle_client(
                             &ocr_worker_stats,
                             OCR_MAX_ATTEMPTS,
                         ),
+                        semantic,
+                        hotkey,
+                        daemon,
                     }
                 };
                 if write_tx.send(resp).await.is_err() {
@@ -1531,6 +1611,7 @@ async fn handle_client(
             }
             Request::Status => {
                 let s = stats.read().await;
+                let (semantic, hotkey, daemon) = runtime_info.status_extras();
                 let resp = Response::Status {
                     indexed_docs: s.indexed_docs,
                     last_reindex: s.last_reindex,
@@ -1545,6 +1626,9 @@ async fn handle_client(
                         &ocr_worker_stats,
                         OCR_MAX_ATTEMPTS,
                     ),
+                    semantic,
+                    hotkey,
+                    daemon,
                 };
                 if write_tx.send(resp).await.is_err() {
                     break;
@@ -1669,6 +1753,44 @@ async fn handle_client(
                     .collect();
                 let resp = Response::ClaimedPrefixes(prefixes);
                 if write_tx.send(resp).await.is_err() {
+                    break;
+                }
+            }
+            Request::Recents { limit } => {
+                // Empty-launcher "Recent" section (O4): rank the
+                // frecency store, then hydrate the ids back into
+                // presentable Hits. Over-fetch 2x because deleted
+                // docs no longer hydrate; hydration preserves input
+                // order so the frecency ranking survives.
+                let limit = limit.min(config.max_results) as usize;
+                let now = chrono::Utc::now().timestamp();
+                let ids = {
+                    let frec = frecency.read().await;
+                    frec.top_docs(now, limit.saturating_mul(2))
+                };
+                let mut hits: Vec<lixun_core::Hit> = match fusion.hydrate_docs(ids).await {
+                    Ok(pairs) => pairs.into_iter().map(|(h, _)| h).collect(),
+                    Err(e) => {
+                        tracing::debug!("recents: hydrate failed: {:#}", e);
+                        Vec::new()
+                    }
+                };
+                hits.truncate(limit);
+                for hit in hits.iter_mut() {
+                    if hit.source_instance.is_empty() {
+                        continue;
+                    }
+                    if let Some(menu) = registry.row_menu_for(&hit.source_instance) {
+                        hit.row_menu = menu;
+                    }
+                }
+                if write_tx.send(Response::Recents { hits }).await.is_err() {
+                    break;
+                }
+            }
+            Request::PreviewScroll { down, pages } => {
+                preview_spawner.scroll(down, pages).await;
+                if write_tx.send(Response::Ok).await.is_err() {
                     break;
                 }
             }
@@ -1799,6 +1921,7 @@ fn register_plugin_sources(
     config: &config::Config,
     state_dir_root: &std::path::Path,
     impact: Arc<lixun_core::ImpactProfile>,
+    startup_warnings: &mut Vec<String>,
 ) -> anyhow::Result<()> {
     let factories = plugin_factories();
     let mut known_sections: std::collections::HashSet<&'static str> =
@@ -1832,9 +1955,21 @@ fn register_plugin_sources(
             None if factory.default_enabled() => &empty_section,
             None => continue,
         };
-        let instances = factory
-            .build(raw, &ctx)
-            .map_err(|e| anyhow::anyhow!("plugin factory '{}' failed to build: {}", section, e))?;
+        // A malformed plugin section must not abort the whole daemon
+        // (O2): skip that plugin, keep everything else running, and
+        // surface the error through Response::Status.
+        let instances = match factory.build(raw, &ctx) {
+            Ok(instances) => instances,
+            Err(e) => {
+                let msg = format!(
+                    "plugin '{}' failed to build and was skipped: {}",
+                    section, e
+                );
+                tracing::warn!("config: {msg}");
+                startup_warnings.push(msg);
+                continue;
+            }
+        };
         let count = instances.len();
         for inst in instances {
             registry.register(inst.instance_id, state_dir_root, inst.source);
@@ -2144,6 +2279,8 @@ mod tests {
             source_instance: String::new(),
             row_menu: lixun_core::RowMenuDef::empty(),
             mime: None,
+            timestamp: None,
+            size: None,
         }
     }
 

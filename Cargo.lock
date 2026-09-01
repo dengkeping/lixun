@@ -5501,6 +5501,7 @@ version = "0.7.0"
 dependencies = [
  "anyhow",
  "async-channel",
+ "chrono",
  "criterion",
  "dirs 5.0.1",
  "gdk4-wayland",
@@ -5513,6 +5514,7 @@ dependencies = [
  "lixun-core",
  "lixun-ipc",
  "lixun-preview",
+ "md5",
  "notify",
  "opener",
  "serde_json",
@@ -5520,6 +5522,7 @@ dependencies = [
  "toml_edit 0.22.27",
  "tracing",
  "tracing-subscriber",
+ "unicode-normalization",
  "wayland-client",
  "wayland-protocols",
  "wayland-protocols-plasma",
@@ -5669,6 +5672,7 @@ dependencies = [
  "gdk4-wayland",
  "glib",
  "gtk4",
+ "gtk4-layer-shell",
  "inventory",
  "libc",
  "lixun-config",
@@ -5696,6 +5700,7 @@ dependencies = [
  "lixun-preview-email",
  "lixun-preview-folder",
  "lixun-preview-image",
+ "lixun-preview-info",
  "lixun-preview-office",
  "lixun-preview-pdf",
  "lixun-preview-text",
@@ -5746,6 +5751,7 @@ name = "lixun-preview-image"
 version = "0.7.0"
 dependencies = [
  "anyhow",
+ "async-channel",
  "gdk-pixbuf",
  "gdk4",
  "gio",
@@ -5753,6 +5759,19 @@ dependencies = [
  "inventory",
  "lixun-core",
  "lixun-image-decode",
+ "lixun-preview",
+ "tracing",
+]
+
+[[package]]
+name = "lixun-preview-info"
+version = "0.7.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "gtk4",
+ "inventory",
+ "lixun-core",
  "lixun-preview",
  "tracing",
 ]

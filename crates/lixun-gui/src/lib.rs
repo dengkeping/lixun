@@ -15,6 +15,7 @@ mod ipc;
 mod kde_blur;
 mod keymap;
 mod launcher_position;
+mod preview_layout;
 mod reaper;
 mod status;
 mod style_manager;

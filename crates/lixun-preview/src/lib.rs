@@ -107,6 +107,17 @@ pub struct PreviewCapabilities {
     pub zoomable: bool,
 }
 
+/// Host-relayed page-scroll request; see [`PreviewPlugin::scroll`].
+///
+/// Defined here (not in `lixun-ipc`) so the trait crate stays free
+/// of IPC dependencies: the preview host translates the wire-level
+/// scroll command into this plugin-facing type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollRequest {
+    PageUp,
+    PageDown,
+}
+
 /// A format plugin that renders a preview widget for a hit AND
 /// owns the launch semantics for hits in its domain.
 ///
@@ -128,6 +139,14 @@ pub struct PreviewCapabilities {
 pub trait PreviewPlugin: Send + Sync + 'static {
     fn id(&self) -> &'static str;
 
+    /// Human-readable name for the host's plugin badge. Defaults to
+    /// the raw `id()`; plugins should override with a capitalised
+    /// short noun ("PDF", "Image", "Code") — the host renders it
+    /// verbatim and never branches on it.
+    fn display_name(&self) -> &'static str {
+        self.id()
+    }
+
     fn match_score(&self, hit: &Hit) -> u32;
 
     /// Declared sizing strategy; see `SizingPreference`.
@@ -146,6 +165,19 @@ pub trait PreviewPlugin: Send + Sync + 'static {
     /// MUST NOT branch on plugin id (AGENTS.md §1 hard-modularity).
     fn capabilities(&self) -> PreviewCapabilities {
         PreviewCapabilities::default()
+    }
+
+    /// Handle a host-relayed page-scroll request (PgUp/PgDn typed in
+    /// the launcher while preview mode is active, or unconsumed page
+    /// keys inside the preview window). `widget` is the widget this
+    /// plugin returned from `build`. Return `true` when the request
+    /// was applied; the default `false` tells the host to fall back
+    /// to driving its own outer `ScrolledWindow` — which only exists
+    /// for non-`OwnsScroll` plugins, so `OwnsScroll` plugins that
+    /// want keyboard paging MUST override this. Must be cheap and
+    /// synchronous (adjustment math, page-turn call); no I/O.
+    fn scroll(&self, _widget: &gtk::Widget, _request: ScrollRequest, _pages: u32) -> bool {
+        false
     }
 
     fn build(&self, hit: &Hit, cfg: &PreviewPluginCfg<'_>) -> anyhow::Result<gtk::Widget>;
@@ -373,6 +405,8 @@ mod tests {
             secondary_action: None,
             source_instance: String::new(),
             row_menu: lixun_core::RowMenuDef::empty(),
+            timestamp: None,
+            size: None,
         }
     }
 

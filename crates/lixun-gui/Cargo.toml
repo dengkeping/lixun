@@ -26,6 +26,15 @@ zbus = { version = "5", default-features = false, features = ["async-io", "block
 opener = "0.8"
 async-channel = "2"
 libc = "0.2"
+chrono.workspace = true
+# Freedesktop thumbnail-cache keys are MD5 digests of the file URI
+# (R1). md5 0.8 is already in the workspace graph via the RAW decode
+# stack, so this adds no new external dependency.
+md5 = "0.8"
+# Same diacritic folding as the index tokenizer (NFKD + strip
+# combining marks) so match highlighting agrees with what actually
+# matched (R2). Already in the graph via lixun-index.
+unicode-normalization = { workspace = true }
 lixun-config = { path = "../lixun-config" }
 lixun-preview = { path = "../lixun-preview" }
 

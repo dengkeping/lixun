@@ -62,6 +62,19 @@ impl StatusBar {
         }
     }
 
+    /// Screen-reader announcement for a state transition (A1). The
+    /// status bar swaps label widgets silently — Orca users get no
+    /// signal that a search finished empty, errored, or copied —
+    /// so every state change routes through `announce()` (gtk 4.14
+    /// API, enabled via the pinned v4_16 feature) at Medium priority.
+    fn announce(&self, message: &str) {
+        gtk::prelude::AccessibleExt::announce(
+            &self.revealer,
+            message,
+            gtk::AccessibleAnnouncementPriority::Medium,
+        );
+    }
+
     /// Shared chassis for the spinner states (loading, slow search,
     /// indexing): spinner + label, revealed.
     fn show_spinner(&self, text: &str) {
@@ -74,6 +87,7 @@ impl StatusBar {
         self.content.append(&label);
         self.revealer.set_visible(true);
         self.revealer.set_reveal_child(true);
+        self.announce(text);
     }
 
     pub(crate) fn show_loading(&self) {
@@ -123,20 +137,30 @@ impl StatusBar {
         self.content.append(&button);
         self.revealer.set_visible(true);
         self.revealer.set_reveal_child(true);
+        self.announce("Search daemon isn't responding");
     }
 
     pub(crate) fn show_empty(&self, query: &str) {
+        self.show_empty_with_note(query, None);
+    }
+
+    /// Empty state with an optional trailing annotation line — used
+    /// by the zero-hit path to disclose that semantic search is
+    /// configured but its worker is down (F6), so "No results" is not
+    /// mistaken for an authoritative full-index answer.
+    pub(crate) fn show_empty_with_note(&self, query: &str, note: Option<&str>) {
         self.clear();
         let text = if query.is_empty() {
             "No results".to_string()
         } else {
             format!("No results for \u{201C}{}\u{201D}", query)
         };
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         let label = gtk::Label::new(Some(&text));
         add_css_class(&label, "lixun-status-label");
         label.set_hexpand(true);
         label.set_halign(gtk::Align::Start);
-        self.content.append(&label);
+        row.append(&label);
 
         if !query.is_empty() {
             let button = gtk::Button::with_label("Search the web");
@@ -145,8 +169,43 @@ impl StatusBar {
             button.connect_clicked(move |_| {
                 open_web_search(&q);
             });
-            self.content.append(&button);
+            row.append(&button);
         }
+
+        let column = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        column.set_hexpand(true);
+        column.append(&row);
+        let mut announced = text.clone();
+        if let Some(note) = note {
+            let note_label = gtk::Label::new(Some(note));
+            add_css_class(&note_label, "lixun-status-label");
+            add_css_class(&note_label, "lixun-status-note");
+            note_label.set_halign(gtk::Align::Start);
+            note_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            column.append(&note_label);
+            announced.push_str(". ");
+            announced.push_str(note);
+        }
+        self.content.append(&column);
+        self.revealer.set_visible(true);
+        self.revealer.set_reveal_child(true);
+        self.announce(&announced);
+    }
+
+    /// Persistent dimmed key-hint line shown while results are
+    /// visible (O3): built by the caller from the LIVE resolved
+    /// keybindings so user rebinds display truthfully. Unlike the
+    /// other states it is not announced — it is passive chrome, and
+    /// announcing it after every result render would spam readers.
+    pub(crate) fn show_hints(&self, hints: &str) {
+        self.clear();
+        let label = gtk::Label::new(Some(hints));
+        add_css_class(&label, "lixun-status-label");
+        add_css_class(&label, "lixun-status-hints");
+        label.set_hexpand(true);
+        label.set_halign(gtk::Align::Start);
+        label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        self.content.append(&label);
         self.revealer.set_visible(true);
         self.revealer.set_reveal_child(true);
     }
@@ -169,6 +228,7 @@ impl StatusBar {
         self.content.append(&label);
         self.revealer.set_visible(true);
         self.revealer.set_reveal_child(true);
+        self.announce(message);
     }
 
     // Calculator results are presented as a normal hit row (the
@@ -188,6 +248,7 @@ impl StatusBar {
         self.content.append(&label);
         self.revealer.set_visible(true);
         self.revealer.set_reveal_child(true);
+        self.announce(message);
 
         let shown_at = self.epoch.get();
         let epoch = std::rc::Rc::clone(&self.epoch);

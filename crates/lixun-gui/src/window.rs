@@ -146,6 +146,7 @@ pub(crate) struct LauncherController {
     entry: gtk::Entry,
     chips: std::rc::Rc<CategoryChips>,
     selection: gtk::SingleSelection,
+    list_view: gtk::ListView,
     scrolled: gtk::ScrolledWindow,
     status: std::rc::Rc<StatusBar>,
     model: gtk::StringList,
@@ -193,6 +194,12 @@ pub(crate) struct LauncherController {
     /// the preview process lifecycle, the launcher is source of
     /// truth for "should we still be live-previewing at all".
     preview_mode_active: std::rc::Rc<std::cell::Cell<bool>>,
+    /// `[gui] show_recents`: render the daemon's frecency hits when
+    /// the launcher opens on an empty query (O4).
+    show_recents_enabled: bool,
+    /// Pre-rendered key-hint line for the idle/results footer (O3),
+    /// built once from the resolved keybindings.
+    hint_line: String,
     /// Pending debounce for selection-driven preview updates. 50ms
     /// per Oracle compromise: short enough that the user sees the
     /// preview track their arrows, long enough that holding an
@@ -203,6 +210,32 @@ pub(crate) struct LauncherController {
     /// protects against races we don't debounce out — this is a
     /// belt-and-suspenders design (Oracle #10).
     preview_debounce: std::rc::Rc<std::cell::RefCell<Option<glib::SourceId>>>,
+    /// Pre-slide layer-shell position, saved while preview mode holds
+    /// the launcher out of the preview's way (left-edge tuck in
+    /// window-managed placement, centered in the left column in
+    /// overlay placement — see `slide_for_preview`). `None` when not
+    /// slid.
+    /// Restored verbatim on preview exit and NEVER written to the
+    /// persistent per-monitor position store — the slide is a
+    /// transient layout, not a user preference. (A Super+drag during
+    /// preview mode still persists its own position for future cold
+    /// starts, but exit restores the pre-slide layout for this
+    /// session.)
+    preview_slide_saved: std::cell::RefCell<Option<crate::preview_layout::SavedSlidePosition>>,
+    /// `[gui] preview_width_percent` from the shared daemon config,
+    /// used with `preview_max_width_px` to predict the width the
+    /// preview surface will claim (the preview process derives its
+    /// width from the same config fields — see `apply_monitor_and_cap`
+    /// in `lixun-preview-bin`).
+    preview_width_percent: u8,
+    /// `[gui] preview_max_width_px` companion cap for the prediction.
+    preview_max_width_px: i32,
+    /// Slide target resolved once at build from
+    /// `[gui] preview_placement` and runtime layer-shell support:
+    /// `WindowManaged` tucks the launcher against the left edge,
+    /// `OverlayColumn` centers it in the column beside the
+    /// right-anchored overlay preview.
+    slide_mode: crate::preview_layout::SlideMode,
 }
 
 impl LauncherController {
@@ -261,6 +294,13 @@ impl LauncherController {
             }
         }
 
+        // Empty launcher: no session to restore — offer the user's
+        // recent hits instead of a dead pane (O4). Spotlight shows
+        // Recents; the window may open tall when they exist.
+        if self.entry.text().is_empty() && self.model.n_items() == 0 {
+            self.maybe_show_recents();
+        }
+
         self.window.remove_css_class("lixun-hiding");
         // Reduced motion: skip the CSS motion class (and its removal
         // timer below) entirely when the desktop disables animations.
@@ -307,15 +347,15 @@ impl LauncherController {
     /// (Escape, focus-loss, toggle-off, preview-open, preview-close).
     /// Does NOT exit the process; only `quit()` does.
     pub(crate) fn hide(&self) -> bool {
-        self.cancel_preview_debounce();
-        // Reset the flag WITHOUT dismissing the preview: the daemon
-        // routes its overlap-unmap (preview_spawn.rs
-        // SetLauncherVisible(false)) through `GuiCommand::Hide` →
-        // here, and sending PreviewHide on that path would tear down
-        // the very preview that asked us to unmap. User-driven
-        // dismissals go through `toggle`/`clear_and_hide`, which call
-        // `dismiss_active_preview` first.
-        self.preview_mode_active.set(false);
+        // Reset the flag WITHOUT dismissing the preview: sending
+        // PreviewHide on this path would tear down a preview that is
+        // still wanted (user-driven dismissals go through
+        // `toggle`/`clear_and_hide`, which call
+        // `dismiss_active_preview` first). Routed through the
+        // `set_preview_mode_active` funnel so the preview-mode slide
+        // is restored (and the preview debounce cancelled) exactly
+        // like every other exit path.
+        self.set_preview_mode_active(false);
         self.persist_session();
         self.animate_hide();
         false
@@ -342,7 +382,9 @@ impl LauncherController {
     fn dismiss_active_preview(&self) {
         if self.preview_mode_active.get() {
             crate::ipc::send_preview_hide_request();
-            self.preview_mode_active.set(false);
+            // Funnel through the setter so the preview-mode slide is
+            // restored alongside the flag reset.
+            self.set_preview_mode_active(false);
         }
     }
 
@@ -363,6 +405,85 @@ impl LauncherController {
                 w.remove_css_class("lixun-hiding");
             }
         });
+    }
+
+    /// Idle "Recent" section (O4): when the launcher shows with an
+    /// empty query (fresh open, or the user cleared it), ask the
+    /// daemon for its frecency-ranked hits and render them through
+    /// the normal results path. Epoch-guarded: any keystroke bumps
+    /// the session epoch and the reply is dropped. The rows carry a
+    /// "Recent" kind label; ranking (top_hit) is not applied — the
+    /// frecency order IS the ranking.
+    pub(crate) fn maybe_show_recents(&self) {
+        const RECENTS_LIMIT: u32 = 8;
+        if !self.show_recents_enabled || !self.entry.text().is_empty() {
+            return;
+        }
+        let epoch = self.session_epoch.load(Ordering::SeqCst);
+        let session_epoch = Arc::clone(&self.session_epoch);
+        let entry = self.entry.clone();
+        let model = self.model.clone();
+        let selection = self.selection.clone();
+        let filter = self.filter.clone();
+        let scrolled = self.scrolled.clone();
+        let status = std::rc::Rc::clone(&self.status);
+        let hints = self.hint_line.clone();
+        crate::ipc::fetch_recents_async(RECENTS_LIMIT, move |mut hits| {
+            if session_epoch.load(Ordering::SeqCst) != epoch || !entry.text().is_empty() {
+                return;
+            }
+            if hits.is_empty() {
+                return;
+            }
+            for h in &mut hits {
+                h.kind_label = Some("Recent".into());
+            }
+            update_results(&model, &selection, &hits, None);
+            filter.changed(gtk::FilterChange::Different);
+            if selection.n_items() > 0 {
+                selection.set_selected(0);
+            }
+            scrolled.set_visible(true);
+            scrolled.set_vexpand(false);
+            status.show_hints(&hints);
+        });
+    }
+
+    /// Soft-hide WITHOUT leaving preview mode (`GuiCommand::SoftHide`,
+    /// P1): unmap the launcher while a preview window genuinely needs
+    /// its screen area, but keep `preview_mode_active` — and with it
+    /// the selection→preview pipeline — alive so `PreviewNav` relays
+    /// keep scrubbing results. The regular `hide()` remains the
+    /// dismissal path and continues to reset preview mode.
+    pub(crate) fn soft_hide(&self) -> bool {
+        self.persist_session();
+        self.animate_hide();
+        false
+    }
+
+    /// Apply a relayed preview navigation key (`GuiCommand::PreviewNav`,
+    /// P1 keyboard continuity): move the result selection by `delta`
+    /// rows through the same selection model as local arrow keys, so
+    /// the debounced selection→preview fan-out re-fires. Clamped to
+    /// the filtered list bounds; no-op without results.
+    pub(crate) fn preview_nav(&self, delta: i32) {
+        let n = self.selection.n_items();
+        if n == 0 {
+            return;
+        }
+        let current = self.selection.selected();
+        let base = if current == gtk::INVALID_LIST_POSITION {
+            0
+        } else {
+            current as i64 + i64::from(delta)
+        };
+        let target = base.clamp(0, i64::from(n) - 1) as u32;
+        if target != current {
+            self.selection.set_selected(target);
+            self.user_selected_override.set(true);
+            self.list_view
+                .scroll_to(target, gtk::ListScrollFlags::NONE, None);
+        }
     }
 
     /// Flip visibility. Single source of truth for service-mode toggle:
@@ -414,11 +535,121 @@ impl LauncherController {
         self.user_selected_override.set(true);
     }
 
+    /// Single funnel for preview-mode transitions. Every enter path
+    /// (keymap `quick_look` / `quick_look_alt`) and every exit path
+    /// (keymap Escape/typing/launch, `dismiss_active_preview`,
+    /// `hide`, `GuiCommand::ExitPreviewMode`, the daemon's
+    /// preview-error path) goes through here, which is what lets the
+    /// slide-beside-preview layout stay balanced: enter slides the
+    /// launcher into the left column, exit restores the exact saved
+    /// position. Both legs are idempotent — the saved-position slot
+    /// guards re-entry, so a repeated `true` cannot re-save a slid
+    /// position and a repeated `false` cannot double-restore.
     pub(crate) fn set_preview_mode_active(&self, active: bool) {
         self.preview_mode_active.set(active);
-        if !active {
+        if active {
+            self.slide_for_preview();
+        } else {
             self.cancel_preview_debounce();
+            self.restore_preview_slide();
         }
+    }
+
+    /// Slide the launcher out of the incoming preview's way. Saves
+    /// the current anchors/margins first so `restore_preview_slide`
+    /// can put them back exactly. The target depends on `slide_mode`
+    /// ([`crate::preview_layout::slide_left_margin`]):
+    ///
+    /// * `WindowManaged` (`[gui] preview_placement = "window"`, the
+    ///   default): tuck against the left screen edge. The WM owns
+    ///   the preview's placement, so with typical centered placement
+    ///   this minimises the initial overlap; any residue is
+    ///   user-recoverable by dragging the preview.
+    /// * `OverlayColumn` (`"overlay"` with layer-shell): center in
+    ///   the left column beside the right-anchored overlay preview.
+    ///   When the column is too narrow the slide is skipped
+    ///   entirely: the preview process applies the same fits
+    ///   predicate to the geometry we report and soft-hides the
+    ///   launcher instead (`PreviewEvent::SetLauncherVisible(false)`
+    ///   → `GuiCommand::SoftHide`), which preserves preview mode.
+    fn slide_for_preview(&self) {
+        use gtk4_layer_shell::{Edge, LayerShell};
+        if self.preview_slide_saved.borrow().is_some() {
+            return; // already slid
+        }
+        // Use the monitor the launcher surface actually occupies —
+        // the same one `current_monitor_connector` reports to the
+        // daemon for the preview request, so the slide math and the
+        // preview surface agree on the output. Pointer-monitor
+        // fallback only for the unrealized-surface edge case.
+        let monitor = self
+            .window
+            .surface()
+            .and_then(|s| gtk::prelude::WidgetExt::display(&self.window).monitor_at_surface(&s))
+            .or_else(pick_current_monitor);
+        let Some(monitor) = monitor else {
+            return;
+        };
+        let mon_w = monitor.geometry().width();
+        let (launcher_w, _) = window_size(&self.window);
+        let preview_w = crate::preview_layout::predicted_preview_width(
+            mon_w,
+            self.preview_width_percent,
+            self.preview_max_width_px,
+        );
+        let Some(target_left) =
+            crate::preview_layout::slide_left_margin(self.slide_mode, mon_w, launcher_w, preview_w)
+        else {
+            tracing::info!(
+                "gui: preview slide skipped (mode={:?} mon_w={} launcher_w={} preview_w={})",
+                self.slide_mode,
+                mon_w,
+                launcher_w,
+                preview_w
+            );
+            return;
+        };
+        *self.preview_slide_saved.borrow_mut() =
+            Some(crate::preview_layout::SavedSlidePosition {
+                left_anchored: self.window.is_anchor(Edge::Left),
+                left: self.window.margin(Edge::Left),
+                top: self.window.margin(Edge::Top),
+            });
+        self.window.set_anchor(Edge::Left, true);
+        self.window.set_margin(Edge::Left, target_left);
+        tracing::info!(
+            "gui: preview slide → left={} (mode={:?} mon_w={} launcher_w={} preview_w={})",
+            target_left,
+            self.slide_mode,
+            mon_w,
+            launcher_w,
+            preview_w
+        );
+        // Tell the daemon (and through it the preview process) where
+        // the launcher now sits, so the preview's fits-beside check
+        // runs against the slid rect.
+        report_launcher_geometry(&self.window);
+    }
+
+    /// Undo `slide_for_preview`: restore the exact anchors/margins
+    /// saved at slide time. No-op when the launcher never slid (the
+    /// column was too narrow, or preview mode never activated).
+    /// Deliberately does not touch the persistent position store.
+    fn restore_preview_slide(&self) {
+        use gtk4_layer_shell::{Edge, LayerShell};
+        let Some(saved) = self.preview_slide_saved.borrow_mut().take() else {
+            return;
+        };
+        self.window.set_anchor(Edge::Left, saved.left_anchored);
+        self.window.set_margin(Edge::Left, saved.left);
+        self.window.set_margin(Edge::Top, saved.top);
+        tracing::info!(
+            "gui: preview slide restored (left_anchored={} left={} top={})",
+            saved.left_anchored,
+            saved.left,
+            saved.top
+        );
+        report_launcher_geometry(&self.window);
     }
 
     pub(crate) fn preview_mode_active(&self) -> bool {
@@ -821,6 +1052,131 @@ fn apply_validated_placement(window: &gtk::ApplicationWindow, monitor: &gtk::gdk
     }
 }
 
+/// Live semantic availability as last reported by the daemon (F6):
+/// `(config_enabled, human state label, worker_ready)`. Shared
+/// between the startup status fetch, the zero-hit refresh, and the
+/// settings menu so the menu label reflects worker health, not
+/// config-section presence.
+pub(crate) type SemanticUiState = std::rc::Rc<std::cell::RefCell<Option<(bool, String, bool)>>>;
+
+/// Human display for an accel string, via GTK's own formatter so the
+/// footer/tooltip text matches user rebinds ("<Ctrl>c" → "Ctrl+C").
+/// Falls back to the raw string when unparseable.
+fn accel_display(accel: &str) -> String {
+    match gtk::accelerator_parse(accel) {
+        Some((key, mods)) => gtk::accelerator_get_label(key, mods).to_string(),
+        None => accel.to_string(),
+    }
+}
+
+/// Persistent dimmed key-hint footer (O3), built from the LIVE
+/// resolved keybindings so user rebinds display truthfully.
+fn build_hint_line(kb: &lixun_config::Keybindings) -> String {
+    format!(
+        "{} Open · {} Reveal · {} Preview · {} Copy · ? Shortcuts",
+        accel_display(&kb.primary_action),
+        accel_display(&kb.secondary_action),
+        accel_display(&kb.quick_look),
+        accel_display(&kb.copy),
+    )
+}
+
+/// Rotating idle placeholder hints (O3). Built from the daemon's
+/// claimed prefixes so plugin-owned prefixes appear without the GUI
+/// naming any plugin (hard-modularity: the strings come from the
+/// generic ClaimedPrefixes fetch).
+fn build_placeholder_hints(claimed_prefixes: &[String]) -> Vec<String> {
+    let mut hints = vec![
+        "Search\u{2026}".to_string(),
+        "Space previews · Ctrl+1\u{2026}4 filters".to_string(),
+        "? shows shortcuts".to_string(),
+    ];
+    for p in claimed_prefixes {
+        hints.push(format!("Type {p} for instant answers"));
+    }
+    hints
+}
+
+/// Shortcuts overlay (O3): a popover listing every RESOLVED
+/// keybinding so user rebinds display truthfully. Opened from ? (on
+/// an empty entry) and F1 via the keymap; calling it again while the
+/// popover is up toggles it closed.
+///
+/// CRITICAL: the popover must NOT take the default autohide grab. An
+/// xdg_popup grab moves keyboard focus to the popup surface, which
+/// fires the launcher's `focus_ctrl.connect_leave` → `hide()`, and
+/// the popover dies with its unmapped parent — "cheatsheet flashes,
+/// then both windows disappear". With `autohide(false)` there is no
+/// grab: focus never leaves the entry, typing keeps working, and the
+/// keymap owns dismissal (any key closes it; Escape/?/F1 close-only).
+/// Real focus loss (clicking another app) still hides the launcher
+/// normally, unmapping the popover with it — the Spotlight contract.
+pub(crate) fn show_shortcuts_overlay(
+    entry: &gtk::Entry,
+    kb: &lixun_config::Keybindings,
+    slot: &std::rc::Rc<std::cell::RefCell<Option<gtk::Popover>>>,
+) {
+    // Toggle: a second ?/F1 while the overlay is up closes it.
+    let existing = slot.borrow().clone();
+    if let Some(p) = existing {
+        p.popdown();
+        return;
+    }
+    let rows: [(&str, String); 13] = [
+        ("Open", accel_display(&kb.primary_action)),
+        ("Secondary action", accel_display(&kb.secondary_action)),
+        ("Quick Look", accel_display(&kb.quick_look)),
+        ("Quick Look (from entry)", accel_display(&kb.quick_look_alt)),
+        ("Copy", accel_display(&kb.copy)),
+        ("Next result", accel_display(&kb.next_result)),
+        ("Previous result", accel_display(&kb.previous_result)),
+        ("Next category", accel_display(&kb.next_category)),
+        ("Previous category", accel_display(&kb.previous_category)),
+        ("Filter: all", accel_display(&kb.filter_all)),
+        ("History", accel_display(&kb.history_up)),
+        ("Reset position", accel_display(&kb.reset_gui_position)),
+        ("Close", accel_display(&kb.close)),
+    ];
+    let grid = gtk::Grid::new();
+    grid.set_row_spacing(4);
+    grid.set_column_spacing(24);
+    grid.set_margin_top(10);
+    grid.set_margin_bottom(10);
+    grid.set_margin_start(14);
+    grid.set_margin_end(14);
+    for (i, (name, accel)) in rows.iter().enumerate() {
+        let name_label = gtk::Label::new(Some(name));
+        name_label.set_halign(gtk::Align::Start);
+        add_css_class(&name_label, "lixun-subtitle");
+        let accel_label = gtk::Label::new(Some(accel));
+        accel_label.set_halign(gtk::Align::End);
+        add_css_class(&accel_label, "lixun-shortcut-accel");
+        grid.attach(&name_label, 0, i as i32, 1, 1);
+        grid.attach(&accel_label, 1, i as i32, 1, 1);
+    }
+    let popover = gtk::Popover::new();
+    popover.set_child(Some(&grid));
+    popover.set_parent(entry);
+    // No grab — see the docstring. The keymap dismisses on any key.
+    popover.set_autohide(false);
+    add_css_class(&popover, "lixun-shortcuts");
+    let rect = gtk::gdk::Rectangle::new(0, entry.height(), 1, 1);
+    popover.set_pointing_to(Some(&rect));
+    // On close: release the keymap's slot, re-assert entry focus, and
+    // unparent on idle so repeated openings do not accumulate
+    // orphaned popovers under the entry.
+    let slot_for_closed = std::rc::Rc::clone(slot);
+    let entry_for_closed = entry.clone();
+    popover.connect_closed(move |p| {
+        slot_for_closed.borrow_mut().take();
+        entry_for_closed.grab_focus();
+        let p = p.clone();
+        glib::idle_add_local_once(move || p.unparent());
+    });
+    *slot.borrow_mut() = Some(popover.clone());
+    popover.popup();
+}
+
 /// Resolved path of the user config the settings-menu toggles edit.
 fn user_config_path() -> std::path::PathBuf {
     dirs::config_dir()
@@ -873,18 +1229,30 @@ fn write_config_document(doc: &toml_edit::DocumentMut, status_bar: &StatusBar) -
 /// affordances show the identical menu. Toggle state is spelled out
 /// as text ("On"/"Off") — a colour-only indicator is invisible to
 /// colourblind users.
-fn popup_settings_menu(entry: &gtk::Entry, semantic_enabled: bool, ocr_enabled: bool) {
+fn popup_settings_menu(
+    entry: &gtk::Entry,
+    semantic_live: &SemanticUiState,
+    semantic_configured: bool,
+    ocr_enabled: bool,
+) {
     let menu = gtk::PopoverMenu::from_model(None::<&gtk::gio::MenuModel>);
     let menu_model = gtk::gio::Menu::new();
 
     menu_model.append(Some("Relaunch Daemon"), Some("app.relaunch"));
 
-    let semantic_label = if semantic_enabled {
-        "Semantic Search: On"
-    } else {
-        "Semantic Search: Off"
+    // Label from LIVE daemon status when available (F6): config-
+    // section presence used to claim "On" even when the operator
+    // wrote `enabled = false` or the worker crashed. Fall back to
+    // the config-derived guess only while no Status reply has
+    // arrived yet.
+    let semantic_label = match &*semantic_live.borrow() {
+        Some((true, _, true)) => "Semantic Search: On".to_string(),
+        Some((true, state, false)) => format!("Semantic Search: On ({state})"),
+        Some((false, _, _)) => "Semantic Search: Off".to_string(),
+        None if semantic_configured => "Semantic Search: On".to_string(),
+        None => "Semantic Search: Off".to_string(),
     };
-    menu_model.append(Some(semantic_label), Some("app.toggle-semantic"));
+    menu_model.append(Some(&semantic_label), Some("app.toggle-semantic"));
 
     let ocr_label = if ocr_enabled { "OCR: On" } else { "OCR: Off" };
     menu_model.append(Some(ocr_label), Some("app.toggle-ocr"));
@@ -917,15 +1285,23 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
     // ). Must be set after init_layer_shell and before the surface
     // is realized; gtk4-layer-shell 0.8 takes Option<&str>.
     window.set_namespace(Some("lixun-gui"));
-    // Overlay keeps the launcher above ordinary toplevels; the preview
-    // xdg-toplevel still renders above per compositor stacking rules,
-    // and fcitx5 popups resolve above by the standard above-overlay rule.
+    // Overlay keeps the launcher above ordinary toplevels; fcitx5
+    // popups resolve above by the standard above-overlay rule. NOTE:
+    // the overlay layer also stacks above EVERY xdg-toplevel — so a
+    // WM-managed preview window (`[gui] preview_placement =
+    // "window"`, the default) renders UNDER this surface wherever
+    // the two overlap. That is the documented tradeoff of the
+    // draggable preview mode; the launcher slides toward the left
+    // edge during preview mode to minimise the overlap, and
+    // `preview_placement = "overlay"` puts the preview on this same
+    // layer (anchored to the RIGHT edge) for a deterministic
+    // side-by-side layout instead (see `slide_for_preview`).
     //
     // xdg-foreign-v2 transient parenting is intentionally NOT wired:
     // the protocol restricts zxdg_exporter_v2.export_toplevel to
     // xdg_toplevel surfaces, and wlroots/Mutter/KWin reject layer_surface
     // with invalid_surface. Parenting is cosmetic (window-switcher
-    // grouping) — preview already draws above the launcher via stacking.
+    // grouping) and moot now that both surfaces share the Overlay layer.
     // Request::PreviewSetParent remains in the IPC for a future
     // xdg_toplevel launcher mode.
     window.set_layer(gtk4_layer_shell::Layer::Overlay);
@@ -1007,6 +1383,7 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
         daemon_config.gui.theme.as_deref(),
         daemon_config.gui.matugen.enabled,
         daemon_config.gui.matugen.colors_path.clone(),
+        daemon_config.gui.opacity,
     );
 
     // Spawn the live-reload pipeline: a notify watcher posts
@@ -1047,7 +1424,8 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
                             Ok(cfg) => {
                                 let theme = cfg.gui.theme.as_deref();
                                 style_manager.apply_theme(theme);
-                                blur.set_enabled(cfg.gui.blur);
+                                style_manager.set_surface_opacity(cfg.gui.opacity);
+                                blur.set_mode(cfg.gui.blur);
                                 let new_theme_css = style_manager.resolver.active_css_path(theme);
                                 let new_colors_css = cfg.gui.matugen.colors_path.clone();
                                 if new_theme_css != current_theme_css
@@ -1124,6 +1502,9 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
         .build();
     entry.set_widget_name("lixun-entry");
     add_css_class(&entry, "lixun-entry");
+    // A1: name the search field for assistive tech — the composite
+    // GtkEntry exposes no label of its own.
+    entry.update_property(&[gtk::accessible::Property::Label("Search")]);
 
     let logo_light = gtk::gdk::Texture::from_bytes(&glib::Bytes::from_static(LOGO_LIGHT_SVG))
         .inspect_err(|e| tracing::warn!("failed to decode embedded light logo: {}", e))
@@ -1168,7 +1549,16 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
         });
     }
 
-    let semantic_enabled = daemon_config.plugin_sections.contains_key("semantic");
+    // "Configured" is a config-file guess used only until the first
+    // live Status reply lands in `semantic_ui` (F6): section presence
+    // alone claimed On even for `enabled = false` or a dead worker.
+    let semantic_configured = daemon_config
+        .plugin_sections
+        .get("semantic")
+        .and_then(|v| v.get("enabled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let semantic_ui: SemanticUiState = std::rc::Rc::new(std::cell::RefCell::new(None));
     let ocr_enabled = daemon_config.ocr.enabled;
     let max_results = daemon_config.max_results;
 
@@ -1176,18 +1566,25 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
     // the logo area (x < 60) and a plain click on the logo icon
     // itself (the icon is activatable above).
     let entry_for_menu = entry.clone();
+    let semantic_ui_for_gesture = std::rc::Rc::clone(&semantic_ui);
     let gesture = gtk::GestureClick::new();
     gesture.set_button(3);
     gesture.connect_pressed(move |_gesture, _n_press, x, _y| {
         if x < 60.0 {
-            popup_settings_menu(&entry_for_menu, semantic_enabled, ocr_enabled);
+            popup_settings_menu(
+                &entry_for_menu,
+                &semantic_ui_for_gesture,
+                semantic_configured,
+                ocr_enabled,
+            );
         }
     });
     entry.add_controller(gesture);
 
+    let semantic_ui_for_icon = std::rc::Rc::clone(&semantic_ui);
     entry.connect_icon_press(move |entry, pos| {
         if pos == gtk::EntryIconPosition::Primary {
-            popup_settings_menu(entry, semantic_enabled, ocr_enabled);
+            popup_settings_menu(entry, &semantic_ui_for_icon, semantic_configured, ocr_enabled);
         }
     });
 
@@ -1282,6 +1679,8 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
         ))
         .build();
     list_view.set_widget_name("lixun-results");
+    // A1: name the results surface for assistive tech.
+    list_view.update_property(&[gtk::accessible::Property::Label("Search results")]);
     scrolled.set_child(Some(&list_view));
 
     chips.wire_toggle({
@@ -1300,6 +1699,85 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
         std::rc::Rc::new(std::cell::RefCell::new(None));
     let claimed_prefixes: std::rc::Rc<Vec<String>> = std::rc::Rc::new(fetch_claimed_prefixes());
     tracing::info!("gui: fetched claimed_prefixes={:?}", claimed_prefixes);
+
+    // Startup daemon-status fetch (off the main thread): primes the
+    // live semantic state for the settings menu (F6) and surfaces a
+    // daemon-side config parse error that would otherwise stay
+    // journal-only (O2 — the daemon now survives a bad config on
+    // built-in defaults and reports the error via Status).
+    {
+        let semantic_ui = std::rc::Rc::clone(&semantic_ui);
+        let status_for_startup = std::rc::Rc::clone(&status_bar);
+        crate::ipc::fetch_daemon_status_async(move |snap| {
+            if let Some(snap) = snap {
+                *semantic_ui.borrow_mut() = snap.semantic.clone();
+                if let Some(err) = snap.config_error {
+                    status_for_startup
+                        .show_error(&format!("Config error \u{2014} using defaults: {err}"));
+                }
+            }
+        });
+    }
+
+    // Rotating idle placeholder (O3): cycle discoverability hints
+    // through the entry's placeholder while the query is empty. The
+    // placeholder only paints on an empty entry, so rotation while
+    // text is present is invisible by construction; we still skip
+    // the churn in that case.
+    {
+        let hints = build_placeholder_hints(&claimed_prefixes);
+        let entry_for_hints = entry.clone();
+        let idx = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        glib::timeout_add_seconds_local(4, move || {
+            if entry_for_hints.text().is_empty() {
+                idx.set((idx.get() + 1) % hints.len());
+                entry_for_hints.set_placeholder_text(Some(&hints[idx.get()]));
+            }
+            glib::ControlFlow::Continue
+        });
+    }
+
+    // A1: announce the SETTLED selection to screen readers. Focus
+    // stays parked on the entry while arrows move the selection, so
+    // Orca never hears the cursor move; announce() (v4_16 API) fills
+    // that gap. Debounced 150 ms so holding an arrow key announces
+    // the landing row, not every intermediate one.
+    {
+        let announce_debounce: std::rc::Rc<std::cell::RefCell<Option<glib::SourceId>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let list_view_for_announce = list_view.clone();
+        selection.connect_selected_notify(move |sel| {
+            let idx = sel.selected();
+            if idx == gtk::INVALID_LIST_POSITION {
+                return;
+            }
+            let Some(doc_id) = sel
+                .item(idx)
+                .and_then(|o| o.downcast::<gtk::StringObject>().ok())
+                .map(|s| s.string().to_string())
+            else {
+                return;
+            };
+            if let Some(id) = announce_debounce.borrow_mut().take() {
+                id.remove();
+            }
+            let list_view = list_view_for_announce.clone();
+            let slot = std::rc::Rc::clone(&announce_debounce);
+            let id = glib::timeout_add_local_once(Duration::from_millis(150), move || {
+                *slot.borrow_mut() = None;
+                crate::factory::with_cached_hits(|hits| {
+                    if let Some(hit) = hits.iter().find(|h| h.id.0 == doc_id) {
+                        gtk::prelude::AccessibleExt::announce(
+                            &list_view,
+                            &hit.title,
+                            gtk::AccessibleAnnouncementPriority::Medium,
+                        );
+                    }
+                });
+            });
+            *announce_debounce.borrow_mut() = Some(id);
+        });
+    }
     let last_query: std::rc::Rc<std::cell::RefCell<String>> =
         std::rc::Rc::new(std::cell::RefCell::new(String::new()));
     let just_showed_until: std::rc::Rc<std::cell::Cell<Instant>> =
@@ -1318,11 +1796,27 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
     let preview_debounce: std::rc::Rc<std::cell::RefCell<Option<glib::SourceId>>> =
         std::rc::Rc::new(std::cell::RefCell::new(None));
 
+    // Resolve the preview-mode slide target once: overlay placement
+    // needs runtime layer-shell support (the preview process makes
+    // the same `is_supported` check in its own build path, so the
+    // two agree); everything else — including a configured
+    // "overlay" on a compositor without layer-shell — behaves as
+    // the WM-managed default.
+    let slide_mode = if daemon_config.gui.preview_placement
+        == lixun_config::PreviewPlacement::Overlay
+        && gtk4_layer_shell::is_supported()
+    {
+        crate::preview_layout::SlideMode::OverlayColumn
+    } else {
+        crate::preview_layout::SlideMode::WindowManaged
+    };
+
     let controller = std::rc::Rc::new(LauncherController {
         window: window.clone(),
         entry: entry.clone(),
         chips: std::rc::Rc::clone(&chips_rc),
         selection: selection.clone(),
+        list_view: list_view.clone(),
         scrolled: scrolled.clone(),
         status: std::rc::Rc::clone(&status_bar),
         model: model.clone(),
@@ -1333,12 +1827,18 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
         just_showed_until: std::rc::Rc::clone(&just_showed_until),
         filter: filter.clone(),
         cached_session: std::rc::Rc::clone(&cached_session),
+        show_recents_enabled: daemon_config.gui.show_recents,
+        hint_line: build_hint_line(&daemon_config.keybindings),
         ipc: ipc.clone(),
         is_restoring: std::rc::Rc::clone(&is_restoring),
         user_selected_override: std::rc::Rc::clone(&user_selected_override),
         searching_indicator: std::rc::Rc::clone(&searching_indicator),
         preview_mode_active: std::rc::Rc::clone(&preview_mode_active),
         preview_debounce: std::rc::Rc::clone(&preview_debounce),
+        preview_slide_saved: std::cell::RefCell::new(None),
+        preview_width_percent: daemon_config.gui.preview_width_percent,
+        preview_max_width_px: daemon_config.gui.preview_max_width_px,
+        slide_mode,
     });
 
     let close_action = gio::SimpleAction::new("close-launcher", None);
@@ -1405,7 +1905,7 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
     app.add_action(&relaunch_action);
 
     let toggle_semantic_action = gio::SimpleAction::new("toggle-semantic", None);
-    let semantic_current = daemon_config.plugin_sections.contains_key("semantic");
+    let semantic_current = semantic_configured;
     let status_for_semantic = std::rc::Rc::clone(&status_bar);
     toggle_semantic_action.connect_activate(move |_, _| {
         let Some(mut doc) = load_config_document(&status_for_semantic) else {
@@ -1479,6 +1979,8 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
         std::rc::Rc::clone(&user_selected_override),
         std::rc::Rc::clone(&searching_indicator),
         std::rc::Rc::clone(&loading_timer),
+        build_hint_line(&daemon_config.keybindings),
+        std::rc::Rc::clone(&semantic_ui),
     );
 
     // Drain the icon-loader's ready channel on the GTK main loop.
@@ -1521,6 +2023,7 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
         });
     }
 
+    let controller_for_empty = std::rc::Rc::clone(&controller);
     install_entry_handler(
         &entry,
         ipc.clone(),
@@ -1538,6 +2041,7 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
         std::rc::Rc::clone(&loading_timer),
         std::rc::Rc::clone(&claimed_prefixes),
         max_results,
+        std::rc::Rc::new(move || controller_for_empty.maybe_show_recents()),
     );
 
     crate::keymap::install_keyboard_handler(
@@ -1864,9 +2368,20 @@ fn install_response_handler(
     user_selected_override: std::rc::Rc<std::cell::Cell<bool>>,
     searching_indicator: std::rc::Rc<std::cell::Cell<bool>>,
     loading_timer: std::rc::Rc<std::cell::RefCell<Option<glib::SourceId>>>,
+    results_hint_line: String,
+    semantic_ui: SemanticUiState,
 ) {
     let pending_hits = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
     let last_epoch = std::rc::Rc::new(std::cell::Cell::new(0u64));
+    // F3: pending render timer for the Initial (BM25-only) chunk. In
+    // semantic mode the Final waits on embedding + ANN + fusion;
+    // deliberately buffering Initial made keystroke→results latency
+    // equal embedding time. If the Final hasn't landed ~100 ms after
+    // Initial, render the provisional hits (epoch-guarded); the
+    // Final re-renders with the fused ranking when it arrives. Fast
+    // lexical queries beat the timer and keep their single rebuild.
+    let initial_timer: std::rc::Rc<std::cell::RefCell<Option<glib::SourceId>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
     // Zero-hit path: cached daemon Status sample plus a latch that
     // stops fetch threads from stacking up while one round-trip is
     // still in flight (see `present_zero_hit_status`).
@@ -1913,6 +2428,77 @@ fn install_response_handler(
                             );
                             *pending_hits.borrow_mut() = hits;
                             searching_indicator.set(true);
+
+                            if let Some(id) = initial_timer.borrow_mut().take() {
+                                id.remove();
+                            }
+                            let pending = std::rc::Rc::clone(&pending_hits);
+                            let session_epoch_t = Arc::clone(&session_epoch);
+                            let model_t = model.clone();
+                            let filter_t = filter.clone();
+                            let selection_t = selection.clone();
+                            let list_view_t = list_view.clone();
+                            let chips_t = chips_container.clone();
+                            let scrolled_t = scrolled.clone();
+                            let override_t = std::rc::Rc::clone(&user_selected_override);
+                            let timer_slot = std::rc::Rc::clone(&initial_timer);
+                            let id = glib::timeout_add_local_once(
+                                Duration::from_millis(100),
+                                move || {
+                                    *timer_slot.borrow_mut() = None;
+                                    if session_epoch_t.load(Ordering::SeqCst) != epoch {
+                                        return;
+                                    }
+                                    let hits = pending.borrow().clone();
+                                    if hits.is_empty() {
+                                        return;
+                                    }
+                                    tracing::debug!(
+                                        "gui: provisional render of {} Initial hits epoch={}",
+                                        hits.len(),
+                                        epoch
+                                    );
+                                    let prior = override_t.get().then(|| {
+                                        let idx = selection_t.selected();
+                                        selection_t.item(idx).and_then(|obj| {
+                                            obj.downcast::<gtk::StringObject>()
+                                                .ok()
+                                                .map(|s| s.string().to_string())
+                                        })
+                                    }).flatten();
+                                    // No top-hit nomination on Initial —
+                                    // hero styling waits for the Final.
+                                    let plan = compute_render_plan(&hits, None);
+                                    update_results(&model_t, &selection_t, &plan.hits, None);
+                                    filter_t.changed(gtk::FilterChange::Different);
+                                    let new_idx = prior
+                                        .as_deref()
+                                        .and_then(|want| {
+                                            (0..selection_t.n_items()).find(|&i| {
+                                                selection_t
+                                                    .item(i)
+                                                    .and_then(|o| {
+                                                        o.downcast::<gtk::StringObject>().ok()
+                                                    })
+                                                    .map(|s| s.string() == want)
+                                                    .unwrap_or(false)
+                                            })
+                                        })
+                                        .unwrap_or(0);
+                                    if selection_t.n_items() > 0 {
+                                        selection_t.set_selected(new_idx);
+                                        list_view_t.scroll_to(
+                                            new_idx,
+                                            gtk::ListScrollFlags::NONE,
+                                            None,
+                                        );
+                                    }
+                                    chips_t.set_visible(true);
+                                    scrolled_t.set_visible(true);
+                                    scrolled_t.set_vexpand(false);
+                                },
+                            );
+                            *initial_timer.borrow_mut() = Some(id);
                         }
                         lixun_ipc::Phase::Final => {
                             tracing::debug!(
@@ -1921,6 +2507,11 @@ fn install_response_handler(
                                 hits.len(),
                                 claimed
                             );
+                            // Final wins: never let the provisional
+                            // Initial render fire after it.
+                            if let Some(id) = initial_timer.borrow_mut().take() {
+                                id.remove();
+                            }
                             if let Some(id) = loading_timer.borrow_mut().take() {
                                 id.remove();
                             }
@@ -2012,6 +2603,7 @@ fn install_response_handler(
                                         &session_epoch,
                                         &index_status_cache,
                                         &index_status_inflight,
+                                        &semantic_ui,
                                     );
                                     selection.set_selected(gtk::INVALID_LIST_POSITION);
                                 } else {
@@ -2025,7 +2617,10 @@ fn install_response_handler(
                                 let list_has_rows = !plan.hits.is_empty();
                                 scrolled.set_visible(list_has_rows);
                                 scrolled.set_vexpand(false);
-                                status.hide();
+                                // O3: replace the collapsed footer with
+                                // the persistent dimmed key hints while
+                                // results are on screen.
+                                status.show_hints(&results_hint_line);
                             }
                         }
                     }
@@ -2036,6 +2631,9 @@ fn install_response_handler(
                         continue;
                     }
                     if let Some(id) = loading_timer.borrow_mut().take() {
+                        id.remove();
+                    }
+                    if let Some(id) = initial_timer.borrow_mut().take() {
                         id.remove();
                     }
                     pending_hits.borrow_mut().clear();
@@ -2065,7 +2663,20 @@ fn install_response_handler(
 
 /// Cached daemon Status sample for the zero-hit path: when it was
 /// fetched and what it said (`None` payload = fetch failed).
-type IndexStatusSnapshot = (Instant, Option<(u64, bool)>);
+type IndexStatusSnapshot = (Instant, Option<crate::ipc::DaemonStatusSnapshot>);
+
+/// The empty-state semantic note (F6): shown when the operator has
+/// `[semantic] enabled = true` but the worker is not `Ready`, so a
+/// zero-hit result is honestly labelled as degraded rather than
+/// authoritative.
+fn semantic_down_note(semantic: &Option<(bool, String, bool)>) -> Option<String> {
+    match semantic {
+        Some((true, state, false)) => {
+            Some(format!("Semantic search unavailable ({state})"))
+        }
+        _ => None,
+    }
+}
 
 /// Decide the status-bar presentation for a genuine zero-hit Final.
 ///
@@ -2075,6 +2686,7 @@ type IndexStatusSnapshot = (Instant, Option<(u64, bool)>);
 /// whether a reindex is running (sampled off the main thread over a
 /// one-shot socket with a 500 ms read bound, cached for ~5 s) and
 /// show indexing progress instead of the empty state.
+#[allow(clippy::too_many_arguments)]
 fn present_zero_hit_status(
     q: &str,
     claimed: bool,
@@ -2083,6 +2695,7 @@ fn present_zero_hit_status(
     session_epoch: &Arc<AtomicU64>,
     cache: &std::rc::Rc<std::cell::RefCell<Option<IndexStatusSnapshot>>>,
     fetch_inflight: &std::rc::Rc<std::cell::Cell<bool>>,
+    semantic_ui: &SemanticUiState,
 ) {
     // Claimed queries (shell `>`, calculator `=`) are answered by
     // their plugin, not the index — a reindex is irrelevant to them.
@@ -2095,35 +2708,51 @@ fn present_zero_hit_status(
     let cached = cache
         .borrow()
         .as_ref()
-        .and_then(|(at, st)| (at.elapsed() < INDEX_STATUS_TTL).then_some(*st));
+        .and_then(|(at, st)| (at.elapsed() < INDEX_STATUS_TTL).then_some(st.clone()));
     match cached {
-        Some(Some((docs, true))) => status.show_indexing(docs),
-        Some(_) => status.show_empty(q),
+        Some(Some(st)) if st.reindex_in_progress => status.show_indexing(st.indexed_docs),
+        Some(st) => {
+            // Definitive empty state; append the semantic-degraded
+            // note when the worker is configured but down (F6).
+            let note = st.as_ref().and_then(|s| semantic_down_note(&s.semantic));
+            status.show_empty_with_note(q, note.as_deref());
+        }
         None => {
             // Show the empty state immediately; upgrade to the
-            // indexing state when (and only if) the daemon reports a
-            // reindex in progress and the session hasn't moved on.
+            // indexing state (or annotate semantic degradation) when
+            // the daemon replies and the session hasn't moved on.
             status.show_empty(q);
             if fetch_inflight.get() {
                 return;
             }
             fetch_inflight.set(true);
-            let (tx, rx) = async_channel::bounded::<Option<(u64, bool)>>(1);
+            let (tx, rx) = async_channel::bounded::<Option<crate::ipc::DaemonStatusSnapshot>>(1);
             std::thread::spawn(move || {
-                let _ = tx.send_blocking(crate::ipc::request_index_status());
+                let _ = tx.send_blocking(crate::ipc::request_daemon_status());
             });
             let cache = std::rc::Rc::clone(cache);
             let fetch_inflight = std::rc::Rc::clone(fetch_inflight);
             let status = std::rc::Rc::clone(status);
             let session_epoch = Arc::clone(session_epoch);
+            let semantic_ui = std::rc::Rc::clone(semantic_ui);
+            let q = q.to_string();
             glib::spawn_future_local(async move {
                 let st = rx.recv().await.ok().flatten();
                 fetch_inflight.set(false);
-                *cache.borrow_mut() = Some((Instant::now(), st));
-                if let Some((docs, true)) = st
-                    && epoch == session_epoch.load(Ordering::SeqCst)
-                {
-                    status.show_indexing(docs);
+                *cache.borrow_mut() = Some((Instant::now(), st.clone()));
+                if let Some(st) = &st {
+                    // Keep the settings menu's semantic label fresh.
+                    *semantic_ui.borrow_mut() = st.semantic.clone();
+                }
+                if epoch != session_epoch.load(Ordering::SeqCst) {
+                    return;
+                }
+                if let Some(st) = st {
+                    if st.reindex_in_progress {
+                        status.show_indexing(st.indexed_docs);
+                    } else if let Some(note) = semantic_down_note(&st.semantic) {
+                        status.show_empty_with_note(&q, Some(&note));
+                    }
                 }
             });
         }
@@ -2148,6 +2777,7 @@ fn install_entry_handler(
     loading_timer: std::rc::Rc<std::cell::RefCell<Option<glib::SourceId>>>,
     claimed_prefixes: std::rc::Rc<Vec<String>>,
     max_results: u32,
+    on_empty_query: std::rc::Rc<dyn Fn()>,
 ) {
     tracing::info!("gui: install_entry_handler called, registering connect_changed");
     entry.connect_changed(move |e| {
@@ -2221,6 +2851,10 @@ fn install_entry_handler(
             scrolled.set_visible(false);
             scrolled.set_vexpand(false);
             status.hide();
+            // O4: a cleared query returns to the idle state, which
+            // now offers the frecency "Recent" section (epoch-guarded
+            // inside; a keystroke supersedes the fetch).
+            on_empty_query();
             return;
         }
 
@@ -2436,6 +3070,8 @@ mod tests {
             source_instance: String::new(),
             row_menu: lixun_core::RowMenuDef::empty(),
             mime: None,
+            timestamp: None,
+            size: None,
         }
     }
 

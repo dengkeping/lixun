@@ -308,6 +308,8 @@ mod tests {
             source_instance: "semantic".into(),
             row_menu: RowMenuDef::empty(),
             mime: None,
+            timestamp: None,
+            size: None,
         }
     }
 

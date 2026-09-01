@@ -172,6 +172,28 @@ pub enum PreviewCommand {
         w: i32,
         h: i32,
     },
+    /// Scroll the visible preview content without moving keyboard
+    /// focus into the preview window (P11). Sent by the daemon when
+    /// the launcher relays PgUp/PgDn (and Shift+Space) while
+    /// `preview_mode_active`. For plugins whose widget lives inside
+    /// the host's outer `ScrolledWindow` (Wrap sizing) the host
+    /// drives that window's vadjustment by `pages` viewport-heights;
+    /// plugins that own their scrolling (OwnsScroll) receive the
+    /// request through the `PreviewPlugin::scroll` hook instead.
+    Scroll {
+        epoch: u64,
+        direction: ScrollDirection,
+        /// Number of viewport-heights (or plugin pages) to move.
+        pages: u32,
+    },
+}
+
+/// Direction for [`PreviewCommand::Scroll`]. Plugin-agnostic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScrollDirection {
+    Up,
+    Down,
 }
 
 /// Preview → daemon. Spawn handshake, completion notifications,
@@ -232,6 +254,13 @@ pub enum PreviewEvent {
     /// remedy is to unmap the launcher for the duration of an
     /// overlapping preview session.
     SetLauncherVisible { visible: bool },
+    /// A result-navigation key (Up/Down arrow) pressed while the
+    /// preview toplevel holds the seat keyboard (P1 keyboard
+    /// continuity). The daemon relays it to the launcher as
+    /// `GuiCommand::PreviewNav` so arrow-scrub keeps working even
+    /// though the compositor routes key events to the preview.
+    /// `delta` is +1 for "next result", -1 for "previous result".
+    NavKey { epoch: u64, delta: i32 },
 }
 
 /// Length-prefixed JSON codec parameterised by what each side
@@ -483,6 +512,8 @@ mod tests {
             source_instance: String::new(),
             row_menu: RowMenuDef::empty(),
             mime: None,
+            timestamp: None,
+            size: None,
         }
     }
 

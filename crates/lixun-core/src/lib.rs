@@ -380,6 +380,17 @@ pub struct Hit {
     /// worker backfill to classify documents into text/image/skip channels.
     #[serde(default)]
     pub mime: Option<String>,
+    /// Best-effort modification time (Unix seconds). Populated from the
+    /// index's stored `mtime` during hydration; `None` when the source
+    /// never recorded one (mtime 0 is treated as unknown, matching the
+    /// recency-scoring sentinel). Trailing `#[serde(default)]` field so
+    /// v4 JSON peers that predate it keep decoding.
+    #[serde(default)]
+    pub timestamp: Option<i64>,
+    /// Size in bytes of the underlying object, when known. Same
+    /// hydration + compat contract as [`Hit::timestamp`].
+    #[serde(default)]
+    pub size: Option<u64>,
 }
 
 /// Per-hit score breakdown (Wave B T6) — carries the raw multipliers

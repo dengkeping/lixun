@@ -576,6 +576,7 @@ impl LixunIndex {
                 .unwrap_or("")
                 .to_string();
             let mime = stored_optional_text(&doc, s.mime);
+            let size = doc.get_first(s.size).and_then(|value| value.as_u64());
 
             // Coordination (Wave B T2): reward docs whose title contains
             // every query token. Checked per hit against the analyzed
@@ -635,6 +636,11 @@ impl LixunIndex {
                 source_instance,
                 row_menu: lixun_core::RowMenuDef::empty(),
                 mime,
+                // mtime 0 is the "never recorded" sentinel throughout the
+                // index (it also neutralises recency); surface unknown as
+                // None so clients don't render 1970 dates.
+                timestamp: (mtime != 0).then_some(mtime),
+                size: size.filter(|&v| v != 0),
             };
             let breakdown = ScoreBreakdown {
                 tantivy: score,
@@ -787,6 +793,11 @@ impl LixunIndex {
             .unwrap_or("")
             .to_string();
         let mime = stored_optional_text(&doc, s.mime);
+        let mtime = doc
+            .get_first(s.mtime)
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let size = doc.get_first(s.size).and_then(|v| v.as_u64());
 
         let hit = Hit {
             id: lixun_core::DocId(id_str),
@@ -805,6 +816,8 @@ impl LixunIndex {
             source_instance,
             row_menu: lixun_core::RowMenuDef::empty(),
             mime,
+            timestamp: (mtime != 0).then_some(mtime),
+            size: size.filter(|&v| v != 0),
         };
         let breakdown = ScoreBreakdown {
             tantivy: 0.0,

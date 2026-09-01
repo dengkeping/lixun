@@ -240,6 +240,85 @@ pub struct OcrStats {
     pub last_drain_at: Option<i64>,
 }
 
+/// Live state of the out-of-process semantic worker, as tracked by
+/// the daemon's supervisor. `Disabled` covers "not configured";
+/// `NotFound` means `[semantic] enabled = true` but the worker
+/// binary could not be located; `Backoff` means the last session
+/// crashed/exited and the supervisor is waiting out its restart
+/// backoff. `Downloading` is reserved for a future model-download
+/// progress report; current supervisors never emit it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum SemanticWorkerState {
+    #[default]
+    Disabled,
+    NotFound,
+    Starting,
+    Downloading,
+    Ready,
+    Backoff,
+}
+
+impl std::fmt::Display for SemanticWorkerState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            SemanticWorkerState::Disabled => "disabled",
+            SemanticWorkerState::NotFound => "worker binary not found",
+            SemanticWorkerState::Starting => "starting",
+            SemanticWorkerState::Downloading => "downloading model",
+            SemanticWorkerState::Ready => "ready",
+            SemanticWorkerState::Backoff => "crashed, restarting with backoff",
+        };
+        f.write_str(s)
+    }
+}
+
+/// Semantic-search availability block for `Response::Status`.
+/// `enabled` reflects the operator's `[semantic] enabled` config
+/// value; `state` reflects the worker process's live health. The
+/// two disagree exactly when the feature silently degraded to
+/// BM25-only (enabled=true, state != Ready) — which is the case
+/// the GUI/CLI must surface instead of hiding.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SemanticStatus {
+    pub enabled: bool,
+    pub state: SemanticWorkerState,
+}
+
+/// Global-hotkey listener state for `Response::Status`. `backend`
+/// is the listener implementation that ended up in charge
+/// ("kglobalaccel", "portal"), `None` while probing or when the
+/// listener task never got that far. `trigger` echoes the
+/// configured accelerator; `bound` is true once the backend
+/// confirmed the binding; `error` carries the failure string that
+/// previously only reached the journal.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct HotkeyStatus {
+    pub backend: Option<String>,
+    pub trigger: String,
+    pub bound: bool,
+    pub error: Option<String>,
+}
+
+/// Daemon self-description block for `Response::Status`: which
+/// config file (if any) is in effect, whether it failed to parse
+/// (the daemon then runs on built-in defaults instead of dying —
+/// see `config_error`), which plugin instances registered, and any
+/// non-fatal startup warnings (e.g. a malformed plugin instance
+/// that was skipped). Plugin names are the generic instance ids
+/// reported at registration; the wire schema names no plugin.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DaemonInfo {
+    /// Resolved config path. `None` when no file exists and the
+    /// daemon runs on pure defaults.
+    pub config_path: Option<String>,
+    /// Parse error that made the daemon fall back to defaults.
+    pub config_error: Option<String>,
+    /// Registered plugin/source instance ids, registration order.
+    pub plugins: Vec<String>,
+    /// Non-fatal startup warnings worth surfacing to the operator.
+    pub startup_warnings: Vec<String>,
+}
+
 /// The oldest protocol version this build can negotiate with.
 ///
 /// Bumped to 4 alongside [`PROTOCOL_VERSION`]: v4 redesigns the search
@@ -402,6 +481,21 @@ pub enum Request {
     /// this on startup to skip the "Searching…" spinner for claimed
     /// queries, which respond in <10ms and would only flash visibly.
     ClaimedPrefixes,
+    /// Ask the daemon for the user's most-frequently/recently used
+    /// hits, resolved from the frecency store back into full `Hit`s
+    /// via index hydration. The GUI renders these as the "Recent"
+    /// section of the empty launcher (O4). Appended at the end of
+    /// the enum so existing variants keep their wire identity.
+    Recents { limit: u32 },
+    /// Page the currently-shown preview without moving keyboard
+    /// focus into the preview window (P11). Sent by the launcher
+    /// while `preview_mode_active` on PgUp/PgDn (and Shift+Space
+    /// page-back); the daemon forwards it to the warm preview
+    /// process as [`preview::PreviewCommand::Scroll`] using the
+    /// CURRENT preview epoch (scrolling does not change content, so
+    /// no epoch bump). Appended at the end of the enum so existing
+    /// variants keep their wire identity.
+    PreviewScroll { down: bool, pages: u32 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -458,6 +552,16 @@ pub enum Response {
         reindex_started: Option<DateTime<Utc>>,
         #[serde(default)]
         ocr: Option<OcrStats>,
+        /// Semantic worker availability (F6). `None` from daemons
+        /// that predate the field.
+        #[serde(default)]
+        semantic: Option<SemanticStatus>,
+        /// Global-hotkey listener state (O7).
+        #[serde(default)]
+        hotkey: Option<HotkeyStatus>,
+        /// Daemon config/plugin self-description (O2/O8).
+        #[serde(default)]
+        daemon: Option<DaemonInfo>,
     },
     Visibility {
         visible: bool,
@@ -492,6 +596,12 @@ pub enum Response {
         #[serde(default)]
         persisted: bool,
     },
+    /// Reply to [`Request::Recents`]: top frecency hits, best first.
+    /// Hits are fully hydrated (icon, action, timestamp/size) so the
+    /// GUI renders them through the normal result path. Appended at
+    /// the end of the enum so existing variants keep their wire
+    /// identity.
+    Recents { hits: Vec<Hit> },
 }
 
 /// Serde-friendly mirror of [`lixun_core::ImpactProfile`]. Lives in
@@ -958,6 +1068,8 @@ mod tests {
             source_instance: String::new(),
             row_menu: lixun_core::RowMenuDef::empty(),
             mime: None,
+            timestamp: None,
+            size: None,
         }
     }
 
@@ -1163,6 +1275,9 @@ mod tests {
             reindex_in_progress: false,
             reindex_started: None,
             ocr: None,
+            semantic: None,
+            hotkey: None,
+            daemon: None,
         };
         let resp_bytes = encode_response_for_version(PROTOCOL_VERSION_LEGACY, &resp)
             .expect("v5 daemon honours negotiated v4 for response");
