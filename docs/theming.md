@@ -121,8 +121,14 @@ that builds result rows lives in
   disabled (config `[gui] blur = false`) or the compositor does not
   support `org_kde_kwin_blur`. Use this to raise the background
   opacity so the surface stays legible without compositor blur.
-- `.lixun-showing` / `.lixun-hiding` — applied for 150 ms / 120 ms
-  during fade-slide animations.
+- `.lixun-showing` / `.lixun-hiding` — applied for 120 ms during the
+  fade-slide animations (both directions; the duration matches the
+  class-removal timer in `window.rs`).
+- `.lixun-light` — toggled on the root `window` when the freedesktop
+  appearance portal reports a light colour scheme. The built-in theme
+  swaps the `--lixun-*` palette and flips its white-alpha overlays to
+  black-alpha under this class; prefix your own rules with
+  `.lixun-light` for light-only styling.
 - `window`, `window.background`, `.background`, `#lixun-root` — must
   stay fully transparent so `.lixun-window`'s rounded corners
   actually round. The default theme uses
@@ -139,6 +145,15 @@ that builds result rows lives in
   placeholder text colour. Set `opacity: 1` so it is not faded.
 - `.lixun-entry image` — the search icon. `-gtk-icon-size` controls
   its rendered size.
+
+### Category filter chips
+
+- `#lixun-chips` / `.lixun-chips` — the horizontal `Box` holding the
+  category filter chips, between the entry and the results list.
+- `.lixun-chip` — each chip (a `ToggleButton`). The built-in theme
+  styles them as outlined pills; `:checked` marks the active filter
+  and takes an accent tint (`alpha(var(--lixun-primary), 0.25)`),
+  `:hover` a faint neutral backdrop.
 
 ### Results list
 
@@ -173,18 +188,31 @@ specificity trap section below.
 - `.lixun-hit:hover` — hover state.
 - `.lixun-top-hit` — added to the row that holds the keyboard
   selection cursor. **This is your selection cue**, not
-  `listview row:selected`. It tracks arrow-key navigation.
-- `.lixun-top-hit-hero` — added to row 0 when the daemon identifies
-  a confident top hit for the current query. May stack with
-  `.lixun-top-hit` on the same row.
+  `listview row:selected`. It tracks arrow-key navigation. The
+  built-in theme paints it as an accent-tinted fill
+  (`alpha(var(--lixun-primary), 0.15)`) plus an inset left accent
+  bar (`box-shadow: inset 3px 0 0 0 var(--lixun-primary)`), with a
+  bolder (not bigger) title. Keep its box model identical to
+  `.lixun-hit` when you restyle it — see step 7 below.
+- `.lixun-top-hit-hero` — added to **row 0 of the results list**
+  when the daemon identifies a confident Top Hit for the current
+  query. There is no separate hero container widget: the hero *is*
+  row 0, styled as a card (neutral fill plus a
+  `var(--lixun-outline-variant)` border). It may stack with
+  `.lixun-top-hit` on the same row, in which case the hero card
+  keeps its fill and the selection contributes the accent bar.
 
 ### Row labels
 
 - `.lixun-title` — the primary line of each result.
 - `.lixun-subtitle` — the secondary line.
 - `.lixun-kind` — the right-aligned kind/category label.
-- `.lixun-top-hit .lixun-title`, `.lixun-top-hit-hero .lixun-title`
-  — bigger title on the selected row.
+- `.lixun-top-hit-hero .lixun-title` — bigger title on the hero row
+  (safe: the hero row is row 0 and has its own height).
+- `.lixun-top-hit .lixun-title` — the selected row's title. The
+  built-in theme bumps `font-weight` to 600 here, **not**
+  `font-size`: a size bump changes the row's natural height and
+  clips the last visible row (see step 7 below).
 
 ### Status bar
 
@@ -194,9 +222,18 @@ specificity trap section below.
 - `.lixun-status-action` and `.lixun-status-action:hover` — the
   action button at the right of the status bar.
 
-### Context menu
+### Popovers (context menu, Get Info)
 
-- `popover.menu` — outer chrome.
+- `popover > contents` (and `popover > arrow`) — the surface GTK4
+  actually paints for a plain `gtk::Popover`, e.g. the Get Info
+  popover. The built-in theme paints it near-opaque
+  (`alpha(var(--lixun-surface), 0.95)`) with an explicit
+  `var(--lixun-on-surface)` foreground. Popups never receive the
+  compositor blur region, so never give them the window's glass
+  alpha — a half-transparent popup over arbitrary desktop content
+  is unreadable.
+- `popover.menu` — right-click context menu outer chrome
+  (near-opaque for the same reason).
 - `popover.menu contents` — inner container.
 - `popover.menu modelbutton` and `:hover` — individual menu rows.
 
@@ -257,12 +294,16 @@ higher-specificity selector elsewhere — usually `#lixun-hit`.
 4. Make `scrolledwindow`, `listview` transparent.
 5. Stomp `listview row, listview row:selected*` flat.
 6. Style `.lixun-hit` and `.lixun-hit:hover`.
-7. Style `.lixun-top-hit` and `.lixun-top-hit-hero`. This is the
-   selection cue — make it visible without changing the row's box
-   model (keep `padding` identical to `.lixun-hit`, paint the
-   accent with `background-color` and optionally a `box-shadow:
-   inset 2px 0 0 0 <accent>` left bar). Changing padding breaks
-   ListView's cached row height.
+7. Style `.lixun-top-hit` and `.lixun-top-hit-hero`. `.lixun-top-hit`
+   is the selection cue — make it visible without changing the row's
+   box model: keep `padding` identical to `.lixun-hit`, add no
+   border, and paint the accent with `background-color` plus a
+   `box-shadow: inset 3px 0 0 0 <accent>` left bar (this is exactly
+   what the built-in theme ships as its default). An inset
+   box-shadow paints inside the border box and never affects layout;
+   changing padding, borders, or `font-size` on the selected row
+   breaks ListView's cached row height and clips the last visible
+   row.
 8. Style `.lixun-title`, `.lixun-subtitle`, `.lixun-kind`.
 9. Style the status bar (`.lixun-status*`) and the popover menu.
 10. Optionally style `.lixun-window.lixun-no-blur` with a higher
@@ -319,22 +360,22 @@ resolves against the matugen palette automatically.
 
 ### What gets coloured
 
-The built-in stylesheet consumes eleven Material You tokens, all
+The built-in stylesheet declares eleven Material You tokens, all
 prefixed with `--lixun-` to keep clear of GTK's Adwaita tokens
 (`--accent-color`, `--window-bg-color`, …):
 
 | Token | Used by |
 |-------|---------|
-| `--lixun-primary` | search caret, status-action background and border |
-| `--lixun-on-primary-container` | status-action text |
+| `--lixun-primary` | search caret, selection fill and inset accent bar, chip `:checked` tint and border, status-action background and border |
+| `--lixun-on-primary-container` | status-action text, chip `:checked` text |
 | `--lixun-primary-container` | (reserved) |
 | `--lixun-on-primary` | (reserved) |
 | `--lixun-surface` | window and popover background |
-| `--lixun-on-surface` | titles, entry text, status-bar calc text |
-| `--lixun-on-surface-variant` | subtitles, status-bar label |
-| `--lixun-outline` | placeholder text, kind label |
-| `--lixun-outline-variant` | (reserved) |
-| `--lixun-error` | (reserved) |
+| `--lixun-on-surface` | titles, entry text, popover text, status-bar calc text |
+| `--lixun-on-surface-variant` | subtitles, kind label, chip text, status-bar label |
+| `--lixun-outline` | placeholder text |
+| `--lixun-outline-variant` | hero-card border, chip border |
+| `--lixun-error` | failed-launch status text |
 | `--lixun-on-error` | (reserved) |
 
 The matugen template emits the full 52-token Material You core set,
@@ -438,8 +479,9 @@ you actually want to change.
   exact `input_path` and `output_path` shown above. Matugen's
   `--verbose` flag prints every template it renders.
 - **`colors.css` exists but the launcher does not pick it up** —
-  confirm `matugen` under `[gui]` is `true` (or absent, which means
-  `true`). Then tail the journal:
+  confirm `matugen` under `[gui]` is set to `true`. The default is
+  `false` (matugen integration is opt-in), so an absent key means
+  the layer is not registered at all. Then tail the journal:
   ```sh
   journalctl --user -u lixund.service -f -o cat | grep -i colors
   ```

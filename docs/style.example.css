@@ -1,44 +1,87 @@
-/* ~/.config/lixun/style.css
+/* ~/.config/lixun/style.css — example user override
  *
  * Copy this file to the path above and edit. Lixun loads it at GUI
  * startup with priority APPLICATION+1, so every declaration here
- * overrides the built-in theme. Restart the daemon to pick up changes:
+ * overrides the built-in theme. Changes apply LIVE: the style
+ * watcher reloads the file within ~80 ms of every save — no
+ * restart, no SIGHUP.
  *
- *     systemctl --user restart lixund
+ * This file is deliberately NOT a copy of the built-in stylesheet.
+ * The override layer is for small permanent deltas; copying the
+ * whole built-in theme here would also copy its fallback
+ * `--lixun-*` token declarations and shadow the matugen palette
+ * layer. Keep it short: write only the rules you want to change.
+ * The built-in reference lives at `crates/lixun-gui/style.css`.
  *
- * Selector reference (launcher only; preview window will ship in G2
- * and its selectors will be documented there):
+ * ----- Design tokens ------------------------------------------------
  *
- *   #lixun-root            - the window itself (layer-shell surface)
- *   #lixun-entry           - the search text entry
- *   #lixun-chips           - category-filter chip container (Box)
- *   .lixun-chip            - each chip (ToggleButton)
+ * GTK4 >= 4.16 fully supports CSS custom properties, and the whole
+ * theme is driven by `--lixun-*` tokens declared on `window, popover`
+ * (Material You names: --lixun-primary, --lixun-surface,
+ * --lixun-on-surface, --lixun-on-surface-variant, --lixun-outline,
+ * --lixun-outline-variant, --lixun-error, ...). Prefer
+ * `var(--lixun-*)` over hardcoded colours in your overrides: rules
+ * written against tokens are recoloured automatically when matugen
+ * regenerates the palette, hardcoded literals opt out of it.
+ *
+ * ----- Selector reference (launcher) --------------------------------
+ *
+ *   #lixun-root            - the window itself (layer-shell surface);
+ *                            must stay transparent (rounded corners)
+ *   .lixun-window          - the visible glass surface
+ *   .lixun-window.lixun-no-blur
+ *                          - added when compositor blur is off or
+ *                            unavailable; built-in raises the surface
+ *                            alpha to 0.92 here (0.70 with blur)
+ *   window.lixun-light / .lixun-light
+ *                          - toggled on the root window when the
+ *                            desktop reports a light colour scheme;
+ *                            prefix rules with `.lixun-light` for
+ *                            light-only overrides
+ *   #lixun-entry           - the search text entry (.lixun-entry)
+ *   .lixun-entry image     - the search icon
+ *   .lixun-entry placeholder - placeholder text
+ *   #lixun-chips           - category-filter chip container (Box,
+ *                            class .lixun-chips)
+ *   .lixun-chip            - each chip (ToggleButton); `:checked` is
+ *                            the active filter, `:hover` applies too
  *   #lixun-results-scroll  - scrolled window wrapping the result list
+ *                            (class .lixun-results)
  *   #lixun-results         - the result ListView itself
- *   #lixun-hit             - each result row (Box); also has class .lixun-hit
- *   .lixun-hit             - class form of the row, useful for state
- *                            selectors like `.lixun-hit:focus-within`
- *   .lixun-top-hit         - toggled onto the currently selected row
- *                            (our "hero" card frame; selection indicator)
- *   #lixun-hero            - container Box for the structural Top Hit
- *                            hero region above the results list (hidden
- *                            when no confident Top Hit is selected)
- *   .lixun-top-hit-hero    - class on the hero row itself; sibling of
- *                            `.lixun-top-hit` (structural hero region
- *                            vs. stateful selected-row indicator)
+ *   #lixun-hit             - each result row (Box); also has class
+ *                            .lixun-hit — use the CLASS in overrides,
+ *                            the ID out-specifies everything (see
+ *                            docs/theming.md, "specificity trap")
+ *   .lixun-top-hit         - the selection cursor; toggled onto the
+ *                            currently selected row and moves with
+ *                            arrow keys. Built-in styles it as an
+ *                            accent-tinted fill + inset left accent
+ *                            bar. KEEP ITS BOX MODEL IDENTICAL to
+ *                            .lixun-hit (same padding, no border) or
+ *                            the last visible row clips
+ *   .lixun-top-hit-hero    - added to ROW 0 of the results list when
+ *                            the daemon identifies a confident Top
+ *                            Hit. There is NO separate hero container
+ *                            widget: the hero IS row 0, and it can
+ *                            carry .lixun-top-hit at the same time
  *   .lixun-title           - row title label
  *   .lixun-subtitle        - row subtitle / path label
  *   .lixun-kind            - right-aligned category badge
  *   #lixun-status          - bottom status bar (Revealer)
- *   #lixun-status-inner    - inner content box of the status bar
- *   .lixun-status          - class on the inner box (same node)
+ *   #lixun-status-inner    - inner content box (class .lixun-status)
  *   .lixun-status-label    - muted text inside status bar
  *   .lixun-status-error    - failed-launch message (with .lixun-status-label)
  *   .lixun-status-calc     - calculator result display
  *   .lixun-status-action   - action buttons in status bar (web search,
  *                            copy, etc.)
- *   .lixun-showing         - applied to #lixun-root while fading in
- *   .lixun-hiding          - applied to #lixun-root while fading out
+ *   popover > contents     - plain popovers (Get Info); near-opaque
+ *                            on purpose — popups never receive the
+ *                            compositor blur region, so never give
+ *                            them the glass alpha
+ *   popover.menu           - right-click context menu chrome
+ *   popover.menu modelbutton - individual menu rows
+ *   .lixun-showing         - applied to #lixun-root while fading in (120 ms)
+ *   .lixun-hiding          - applied to #lixun-root while fading out (120 ms)
  *
  * Native GTK4 selectors (row, listview, button, label, entry) still
  * work if you need finer control. Inspect the live widget tree with
@@ -46,282 +89,78 @@
  *     GTK_DEBUG=interactive lixun-gui
  */
 
-/* Lixun — Spotlight-like launcher for Linux. Dark translucent theme. */
-
-/* ----- Design tokens (GTK supports @define-color; CSS custom properties
-   are only partially honored by GtkCssProvider, so we use hardcoded values
-   below but group them visually for maintainability). ----- */
-
-/* ----- Main window -----
- *
- * The default theme aims for a "liquid glass" look. The base tint is
- * deliberately translucent (alpha ~0.35) so that compositor-side blur
- * can show through. On KDE Plasma 6 the GUI auto-binds the
- * `org_kde_kwin_blur` protocol and KWin blurs the wallpaper / windows
- * underneath. On Hyprland, add to your config:
- *
- *     layerrule = blur, lixun-gui
- *     layerrule = ignorealpha 0.5, lixun-gui
- *
- * Other compositors (sway, niri, GNOME) gracefully degrade to plain
- * translucency — still readable, just no blurred backdrop.
- *
- * If you prefer a fully opaque window (no blur, no see-through), bump
- * the base alpha back up to 0.92 or 1.0 and drop the gradient overlay.
- */
-.lixun-window {
-    background:
-        linear-gradient(180deg,
-                        rgba(255, 255, 255, 0.035) 0%,
-                        rgba(255, 255, 255, 0)    50%),
-        rgba(28, 28, 32, 0.35);
-    border-radius: 14px;
-    border: 0.5px solid rgba(255, 255, 255, 0.12);
-    box-shadow: 0 24px 64px rgba(0, 0, 0, 0.55),
-                0 8px 16px  rgba(0, 0, 0, 0.40),
-                inset 0 1px 0 rgba(255, 255, 255, 0.06);
-}
-
-/* ----- Search entry ----- */
-.lixun-entry {
-    font-size: 24px;
-    font-weight: 300;
-    padding: 12px 16px;
-    background-color: transparent;
-    color: #f0f0f4;
-    caret-color: #4b8dff;
-    border: none;
-    border-radius: 10px;
-}
-
-.lixun-entry:focus,
-.lixun-entry:focus-within {
-    outline: none;
-    box-shadow: inset 0 -1px 0 rgba(75, 141, 255, 0.6);
-}
-
-.lixun-entry placeholder {
-    color: #7b7b86;
-}
-
-/* ----- Results container ----- */
-.lixun-results {
-    background-color: transparent;
-    border-top: 1px solid rgba(255, 255, 255, 0.04);
-    padding-top: 4px;
-    min-height: 320px;
-}
-
-/* ----- Hit row ----- */
-.lixun-hit {
-    padding: 8px 12px;
-    border-radius: 10px;
-    transition: background-color 0.12s ease;
-}
-
-.lixun-hit:hover {
-    background-color: rgba(255, 255, 255, 0.04);
-}
-
-/* Selection indicator = hero frame only (see `.lixun-top-hit` below).
-   Neutralise every GTK theme fill on the selected row so the hero
-   frame is the sole visual cue. The theme (Breeze, Adwaita, etc.)
-   aggressively paints `row:selected`; we stomp it at three layers. */
-listview row,
-listview row:selected,
-listview row:selected:focus,
-listview row:selected:hover {
-    background-color: transparent;
-    background-image: none;
-}
-
-/* Keyboard focus ring: neutral white so it stacks cleanly on top of
-   the hero frame without competing for color attention. */
-row:focus-within .lixun-hit,
-.lixun-hit:focus-within {
-    outline: 2px solid rgba(255, 255, 255, 0.55);
-    outline-offset: -2px;
-}
-
-/* Hero (top-hit) row: card-like elevation. The row factory toggles
-   `.lixun-top-hit` onto the selected item only, so this class is
-   itself the selection indicator. */
-.lixun-top-hit {
-    padding: 12px 14px;
-    background-color: rgba(255, 255, 255, 0.04);
-    border: 1px solid rgba(255, 255, 255, 0.12);
-}
-
-/* Structural Top Hit hero region. `.lixun-top-hit-hero` is a
-   standalone widget rendered ABOVE the scrollable results list
-   when the daemon identifies a confident Top Hit; `.lixun-top-hit`
-   above is the stateful selection indicator painted on the
-   currently-selected list row. Both can be visible at once and
-   are styled independently on purpose. */
-.lixun-top-hit-hero {
-    padding: 12px 14px;
-    background-color: rgba(255, 255, 255, 0.06);
-    border: 1px solid rgba(255, 255, 255, 0.14);
-    border-radius: 10px;
-    margin-bottom: 4px;
-}
-
-.lixun-top-hit-hero .lixun-title {
-    font-size: 16px;
-}
-
-/* ----- Title / subtitle / kind ----- */
-.lixun-title {
-    font-weight: 500;
-    color: #f0f0f4;
-    font-size: 14px;
-}
-
-.lixun-top-hit .lixun-title {
-    font-size: 16px;
-}
-
-.lixun-subtitle {
-    color: #a8a8b2;
-    font-size: 11px;
-}
-
-.lixun-kind {
-    color: #7b7b86;
-    font-size: 10px;
-    font-weight: 500;
-    margin-right: 4px;
-}
-
-/* ----- Status bar ----- */
-.lixun-status {
-    padding: 6px 10px;
-    border-top: 1px solid rgba(255, 255, 255, 0.05);
-    border-radius: 0 0 10px 10px;
-    margin-top: 4px;
-}
-
-.lixun-status-label {
-    color: #a8a8b2;
-    font-size: 12px;
-}
-
-/* Must come after .lixun-status-label — both are applied to the same widget. */
-.lixun-status-error {
-    color: #ff6b6b;
-    font-weight: 500;
-}
-
-.lixun-status-calc {
-    color: #f0f0f4;
-    font-size: 14px;
-    font-weight: 500;
-    font-family: ui-monospace, "JetBrains Mono", monospace;
-}
-
-.lixun-status-action {
-    background-color: rgba(75, 141, 255, 0.22);
-    color: #f0f0f4;
-    border: 1px solid rgba(75, 141, 255, 0.35);
-    border-radius: 6px;
-    padding: 2px 10px;
-    font-size: 11px;
-}
-
-.lixun-status-action:hover {
-    background-color: rgba(75, 141, 255, 0.35);
-}
-
-/* ----- Show / hide transitions ----- */
-@keyframes lixun-fade-slide-in {
-    from {
-        opacity: 0;
-        transform: translateY(-8px) scale(0.98);
-    }
-    to {
-        opacity: 1;
-        transform: translateY(0) scale(1);
-    }
-}
-
-@keyframes lixun-fade-slide-out {
-    from {
-        opacity: 1;
-        transform: translateY(0) scale(1);
-    }
-    to {
-        opacity: 0;
-        transform: translateY(-8px) scale(0.98);
-    }
-}
-
-.lixun-showing {
-    animation: lixun-fade-slide-in 150ms ease-out;
-}
-
-.lixun-hiding {
-    animation: lixun-fade-slide-out 120ms ease-in;
-}
-
 /* =============================================================== *
- *  Common customisations — uncomment and tweak to taste.           *
- *  None of the rules below are loaded by default; they are just    *
- *  recipes for common user tweaks.                                 *
+ *  Common customisations — uncomment and tweak to taste.          *
+ *  None of the rules below are active as shipped; they are        *
+ *  recipes for common user tweaks. Save the file and the change   *
+ *  is live within ~80 ms.                                         *
  * =============================================================== */
 
-/* ----- Light theme ----------------------------------------------- *
-#lixun-root {
-    background: rgba(250, 250, 252, 0.96);
-    border: 1px solid rgba(0, 0, 0, 0.08);
-    box-shadow: 0 24px 64px rgba(0, 0, 0, 0.18),
-                0 8px 16px rgba(0, 0, 0, 0.10);
-}
-#lixun-entry {
-    color: #1d1d22;
-    caret-color: #4b8dff;
-}
-.lixun-title { color: #1d1d22; }
-.lixun-subtitle { color: #5c5c66; }
-.lixun-kind { color: #8a8a94; }
-.lixun-top-hit {
-    background-color: rgba(0, 0, 0, 0.04);
-    border-color: rgba(0, 0, 0, 0.10);
-}
-.lixun-hit:hover { background-color: rgba(0, 0, 0, 0.04); }
-.lixun-hit:focus-within, row:focus-within .lixun-hit {
-    outline-color: rgba(75, 141, 255, 0.55);
+/* ----- Swap the accent colour everywhere (purple) ---------------- *
+ * Redeclaring the token recolours the caret, selection fill and
+ * accent bar, checked chips, and status-bar action buttons in one
+ * go. (If matugen is enabled its palette still wins — it loads
+ * above this file on purpose.)
+window, popover {
+    --lixun-primary: #a36bff;
 }
 */
 
-/* ----- Alternate accent (purple) --------------------------------- *
-#lixun-entry {
-    caret-color: #a36bff;
+/* ----- More opaque window (less glass) --------------------------- *
+.lixun-window {
+    background: alpha(var(--lixun-surface), 0.92);
 }
-#lixun-entry:focus,
-#lixun-entry:focus-within {
-    box-shadow: inset 0 -1px 0 rgba(163, 107, 255, 0.7);
+*/
+
+/* ----- Fully opaque when blur is unavailable --------------------- *
+.lixun-window.lixun-no-blur {
+    background: var(--lixun-surface);
 }
-.lixun-status-action {
-    background-color: rgba(163, 107, 255, 0.22);
-    border-color: rgba(163, 107, 255, 0.35);
+*/
+
+/* ----- Quieter selection cursor ---------------------------------- *
+ * Keep padding identical to .lixun-hit and paint with background /
+ * box-shadow only — a border or padding change breaks ListView's
+ * cached row height and clips the last visible row.
+.lixun-top-hit {
+    background-color: alpha(var(--lixun-primary), 0.08);
+    box-shadow: inset 2px 0 0 0 var(--lixun-primary);
 }
-.lixun-status-action:hover {
-    background-color: rgba(163, 107, 255, 0.35);
+*/
+
+/* ----- Chip accent ----------------------------------------------- *
+.lixun-chip:checked {
+    background-color: alpha(var(--lixun-primary), 0.40);
+    color: var(--lixun-on-primary-container);
 }
 */
 
 /* ----- Bigger text (accessibility / 4K displays) ----------------- *
-#lixun-entry        { font-size: 28px; padding: 16px 20px; }
-.lixun-title        { font-size: 16px; }
-.lixun-top-hit .lixun-title { font-size: 18px; }
-.lixun-subtitle     { font-size: 13px; }
-.lixun-kind         { font-size: 12px; }
-.lixun-status-label { font-size: 14px; }
+ * Font sizes are in pt so GTK's Large Text / xft-dpi scaling
+ * already multiplies them; only override if you want MORE than the
+ * system-wide factor.
+.lixun-entry            { font-size: 21pt; }
+.lixun-title            { font-size: 12pt; }
+.lixun-top-hit-hero .lixun-title { font-size: 13.5pt; }
+.lixun-subtitle         { font-size: 9.75pt; }
+.lixun-kind             { font-size: 9pt; }
+.lixun-status-label     { font-size: 10.5pt; }
 */
 
 /* ----- Tighter / denser rows ------------------------------------- *
-.lixun-hit          { padding: 4px 10px; }
-.lixun-top-hit      { padding: 8px 12px; }
+ * Keep .lixun-hit and .lixun-top-hit padding IDENTICAL (BUG-6:
+ * ListView measures row height once; a selected row that grows
+ * clips the last visible row).
+.lixun-hit     { padding: 4px 10px; }
+.lixun-top-hit { padding: 4px 10px; }
+*/
+
+/* ----- Light-mode-only tweaks ------------------------------------ *
+ * .lixun-light is toggled on the root window from the freedesktop
+ * appearance portal; prefix any rule with it for light-only styling.
+.lixun-light .lixun-window {
+    border: 0.5px solid rgba(0, 0, 0, 0.25);
+}
 */
 
 /* ----- Disable entrance / exit animation ------------------------- *
