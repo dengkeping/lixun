@@ -32,6 +32,8 @@ fn result_hit(calc: Calculation, ctx: &QueryContext) -> Hit {
         source_instance: ctx.instance_id.to_string(),
         row_menu: RowMenuDef::empty(),
         mime: None,
+        timestamp: None,
+        size: None,
     }
 }
 
@@ -79,6 +81,8 @@ impl IndexerSource for CalculatorSource {
                 source_instance: ctx.instance_id.to_string(),
                 row_menu: RowMenuDef::empty(),
                 mime: None,
+                timestamp: None,
+                size: None,
             }];
         }
         let Some(calc) = detect::detect(expr) else {
@@ -99,6 +103,8 @@ impl IndexerSource for CalculatorSource {
                 source_instance: ctx.instance_id.to_string(),
                 row_menu: RowMenuDef::empty(),
                 mime: None,
+                timestamp: None,
+                size: None,
             }];
         };
 

@@ -225,6 +225,16 @@ fn parse_profiles_ini_selected(tb_path: &std::path::Path, content: &str) -> Opti
     None
 }
 
+/// Convert a Gloda `messages.date` value to Unix seconds. Gloda
+/// stores PRTime — MICROSECONDS since the Unix epoch (see
+/// Thunderbird's gloda datastore schema; the test fixture below
+/// mirrors the real `messages` table with its `date INTEGER`
+/// column). `NULL` and nonsense negative values collapse to 0,
+/// the index-wide "no mtime recorded" sentinel.
+fn gloda_date_to_unix_secs(date_us: Option<i64>) -> i64 {
+    date_us.map(|us| (us / 1_000_000).max(0)).unwrap_or(0)
+}
+
 /// Query messages from a Gloda connection. Extracted for testability against
 /// an in-memory rusqlite `Connection` seeded with the real Gloda schema.
 pub fn query_messages(
@@ -234,7 +244,7 @@ pub fn query_messages(
 ) -> rusqlite::Result<Vec<Document>> {
     let mut stmt = conn.prepare(
         "SELECT m.id, m.messageKey, m.headerMessageID, \
-                mt.c1subject, mt.c3author, mt.c4recipients, mt.c0body \
+                mt.c1subject, mt.c3author, mt.c4recipients, mt.c0body, m.date \
          FROM messages m \
          LEFT JOIN messagesText_content mt ON m.id = mt.docid \
          WHERE m.id > ? AND m.deleted = 0 \
@@ -251,12 +261,14 @@ pub fn query_messages(
             row.get::<_, Option<String>>(4)?,
             row.get::<_, Option<String>>(5)?,
             row.get::<_, Option<String>>(6)?,
+            row.get::<_, Option<i64>>(7)?,
         ))
     })?;
 
     let mut docs = Vec::new();
     for row in rows {
-        let (id, message_key, header_message_id, subject, author, recipients, body_opt) = row?;
+        let (id, message_key, header_message_id, subject, author, recipients, body_opt, date_us) =
+            row?;
 
         let header_id = header_message_id
             .filter(|s| !s.is_empty())
@@ -277,7 +289,10 @@ pub fn query_messages(
             kind_label: Some("Email".into()),
             body: body_opt.filter(|s| !s.is_empty()),
             path: format!("thunderbird:{}", id),
-            mtime: 0,
+            // Real message dates feed both the GUI's relative-date
+            // column and the recency ranking multiplier that a
+            // hardcoded 0 used to neutralise (R4).
+            mtime: gloda_date_to_unix_secs(date_us),
             size: 0,
             action: Action::OpenUri {
                 uri: format!("mid:{}", message_id),
@@ -497,8 +512,8 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         setup_schema(&conn);
         conn.execute(
-            "INSERT INTO messages (id, messageKey, headerMessageID, deleted, conversationID) \
-             VALUES (1, 42, '<abc@example.com>', 0, 0)",
+            "INSERT INTO messages (id, messageKey, headerMessageID, deleted, conversationID, date) \
+             VALUES (1, 42, '<abc@example.com>', 0, 0, 1735689600000000)",
             [],
         )
         .unwrap();
@@ -512,6 +527,9 @@ mod tests {
         let docs = query_messages(&conn, 0, 1000).unwrap();
         assert_eq!(docs.len(), 1);
         let d = &docs[0];
+        // Gloda stores PRTime microseconds; Document.mtime is Unix
+        // seconds (2025-01-01T00:00:00Z here).
+        assert_eq!(d.mtime, 1_735_689_600);
         assert_eq!(d.title, "Hello");
         assert_eq!(d.subtitle, "alice@test");
         assert_eq!(d.sender.as_deref(), Some("alice@test"));
@@ -578,6 +596,19 @@ mod tests {
         assert_eq!(docs.len(), 1);
         assert_eq!(docs[0].title, "(no subject)");
         assert!(docs[0].body.is_none());
+        // No date inserted → NULL → the 0 "unknown" sentinel.
+        assert_eq!(docs[0].mtime, 0);
+    }
+
+    #[test]
+    fn test_gloda_date_conversion_microseconds_to_seconds() {
+        assert_eq!(gloda_date_to_unix_secs(None), 0);
+        assert_eq!(gloda_date_to_unix_secs(Some(0)), 0);
+        assert_eq!(gloda_date_to_unix_secs(Some(1_735_689_600_000_000)), 1_735_689_600);
+        // Sub-second remainder truncates toward the floor.
+        assert_eq!(gloda_date_to_unix_secs(Some(1_735_689_600_999_999)), 1_735_689_600);
+        // Nonsense negative PRTime collapses to the unknown sentinel.
+        assert_eq!(gloda_date_to_unix_secs(Some(-5_000_000)), 0);
     }
 
     #[test]

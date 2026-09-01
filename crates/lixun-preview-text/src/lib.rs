@@ -251,6 +251,8 @@ mod tests {
             source_instance: String::new(),
             row_menu: lixun_core::RowMenuDef::empty(),
             mime: mime.map(str::to_string),
+            timestamp: None,
+            size: None,
         }
     }
 
@@ -317,6 +319,8 @@ mod tests {
             source_instance: String::new(),
             row_menu: lixun_core::RowMenuDef::empty(),
             mime: None,
+            timestamp: None,
+            size: None,
         };
         assert_eq!(TextPreview.match_score(&hit), 0);
     }

@@ -441,6 +441,8 @@ mod tests {
             source_instance: String::new(),
             row_menu: lixun_core::RowMenuDef::empty(),
             mime: None,
+            timestamp: None,
+            size: None,
         }
     }
 
@@ -471,6 +473,8 @@ mod tests {
             source_instance: String::new(),
             row_menu: lixun_core::RowMenuDef::empty(),
             mime: None,
+            timestamp: None,
+            size: None,
         };
         assert_eq!(EmailPreview.match_score(&hit), 60);
     }
@@ -506,6 +510,8 @@ mod tests {
             source_instance: String::new(),
             row_menu: lixun_core::RowMenuDef::empty(),
             mime: None,
+            timestamp: None,
+            size: None,
         };
         assert_eq!(EmailPreview.match_score(&hit), 0);
     }
@@ -574,6 +580,8 @@ mod tests {
             source_instance: String::new(),
             row_menu: lixun_core::RowMenuDef::empty(),
             mime: None,
+            timestamp: None,
+            size: None,
         };
         assert!(
             EmailPreview.match_score(&hit) >= 60,

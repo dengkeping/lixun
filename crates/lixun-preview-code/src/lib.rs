@@ -36,6 +36,7 @@ use gtk::prelude::*;
 use lixun_core::{Action, Hit};
 use lixun_preview::{PreviewPlugin, PreviewPluginCfg, PreviewPluginEntry, SizingPreference};
 use syntect::easy::HighlightLines;
+use gtk::prelude::IsA;
 use syntect::highlighting::{Style, Theme, ThemeSet};
 use syntect::parsing::{SyntaxReference, SyntaxSet};
 use syntect::util::LinesWithEndings;
@@ -144,6 +145,12 @@ impl PreviewPlugin for CodePreview {
         scroll.set_vscrollbar_policy(gtk::PolicyType::Automatic);
         scroll.set_child(Some(&label));
         scroll.add_css_class("lixun-preview-code-scroll");
+        // The highlight spans carry only FOREGROUND colors; without
+        // the theme's own background the default (dark) theme reads
+        // grey-on-white on light desktops (P3). Paint the pane with
+        // the syntect theme's background + default foreground so the
+        // palette is always self-consistent.
+        apply_theme_colors(&scroll, theme);
         // See preview-text for the natural-width rationale. Code
         // floor is the same as text because Pango's width_chars
         // already sets a 100-char horizontal request; the min_content
@@ -210,6 +217,65 @@ fn resolve_theme_name<'a>(cfg: &'a PreviewPluginCfg<'_>, set: &'a ThemeSet) -> &
         );
     }
     DEFAULT_THEME
+}
+
+/// CSS painting the syntect theme's background + default foreground,
+/// keyed by a class name derived from the two colors. Pure so the
+/// rule generation is unit-testable without GTK.
+fn theme_css_rule(theme: &Theme) -> Option<(String, String)> {
+    let bg = theme.settings.background?;
+    let class = format!(
+        "lixun-preview-code-theme-{:02x}{:02x}{:02x}{:02x}",
+        bg.r, bg.g, bg.b, bg.a
+    );
+    let mut body = format!(
+        "background-color: rgba({},{},{},{:.3});",
+        bg.r,
+        bg.g,
+        bg.b,
+        f64::from(bg.a) / 255.0
+    );
+    if let Some(fg) = theme.settings.foreground {
+        body.push_str(&format!(
+            " color: rgba({},{},{},{:.3});",
+            fg.r,
+            fg.g,
+            fg.b,
+            f64::from(fg.a) / 255.0
+        ));
+    }
+    let css = format!(".{class} {{ {body} }}");
+    Some((class, css))
+}
+
+/// Attach the theme's palette to `widget` via a display-wide provider
+/// registered once per distinct theme background (the preview process
+/// renders one code pane at a time; the registry stays tiny). Uses
+/// `style_context_add_provider_for_display` — the non-deprecated
+/// GTK4 path — instead of the per-widget StyleContext API.
+fn apply_theme_colors(widget: &impl IsA<gtk::Widget>, theme: &Theme) {
+    use std::cell::RefCell;
+    use std::collections::HashSet;
+    thread_local! {
+        static REGISTERED: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+    }
+    let Some((class, css)) = theme_css_rule(theme) else {
+        return;
+    };
+    REGISTERED.with(|reg| {
+        if reg.borrow_mut().insert(class.clone()) {
+            let provider = gtk::CssProvider::new();
+            provider.load_from_string(&css);
+            if let Some(display) = gtk::gdk::Display::default() {
+                gtk::style_context_add_provider_for_display(
+                    &display,
+                    &provider,
+                    gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+                );
+            }
+        }
+    });
+    widget.add_css_class(&class);
 }
 
 fn name_as_static_ref<'a>(set: &'a ThemeSet, wanted: &str) -> &'a str {
@@ -285,6 +351,8 @@ mod tests {
             source_instance: String::new(),
             row_menu: lixun_core::RowMenuDef::empty(),
             mime: None,
+            timestamp: None,
+            size: None,
         }
     }
 
@@ -331,6 +399,8 @@ mod tests {
             source_instance: String::new(),
             row_menu: lixun_core::RowMenuDef::empty(),
             mime: None,
+            timestamp: None,
+            size: None,
         };
         assert_eq!(CodePreview.match_score(&hit), 0);
     }
@@ -408,5 +478,21 @@ mod tests {
         let set = ThemeSet::load_defaults();
         let cfg = PreviewPluginCfg::none();
         assert_eq!(resolve_theme_name(&cfg, &set), DEFAULT_THEME);
+    }
+
+    #[test]
+    fn theme_css_rule_paints_background_and_foreground() {
+        let set = ThemeSet::load_defaults();
+        // The shipped default theme must produce a background rule —
+        // that's the whole P3 fix (no more grey-on-white).
+        let (class, css) = theme_css_rule(&set.themes[DEFAULT_THEME])
+            .expect("default theme declares a background");
+        assert!(class.starts_with("lixun-preview-code-theme-"));
+        assert!(css.contains("background-color: rgba("));
+        assert!(css.contains(" color: rgba("), "default foreground applied");
+        assert!(css.starts_with(&format!(".{class} ")));
+        // Same theme → same class (provider registry key is stable).
+        let (class2, _) = theme_css_rule(&set.themes[DEFAULT_THEME]).unwrap();
+        assert_eq!(class, class2);
     }
 }

@@ -140,6 +140,8 @@ pub(crate) fn synthetic_history_hits(queries: &[String]) -> Vec<Hit> {
             source_instance: String::new(),
             row_menu: lixun_core::RowMenuDef::empty(),
             mime: None,
+            timestamp: None,
+            size: None,
         })
         .collect()
 }
@@ -223,11 +225,134 @@ fn display_path_subtitle(subtitle: &str, home: Option<&std::path::Path>) -> Stri
     dir.display().to_string()
 }
 
-fn hit_file_path(hit: &Hit) -> Option<std::path::PathBuf> {
+pub(crate) fn hit_file_path(hit: &Hit) -> Option<std::path::PathBuf> {
     match &hit.action {
         Action::OpenFile { path } | Action::ShowInFileManager { path } => Some(path.clone()),
         _ => None,
     }
+}
+
+/// Humanized byte size for the Get Info popover and mail rows (R4).
+/// Decimal units, one fractional digit above KB.
+pub(crate) fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    if bytes < 1000 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1000.0 && unit < UNITS.len() - 1 {
+        value /= 1000.0;
+        unit += 1;
+    }
+    format!("{value:.1} {}", UNITS[unit])
+}
+
+/// Compact relative age ("2d ago") for the row's right-hand column
+/// (R4). Coarse on purpose — the exact timestamp lives in the row
+/// tooltip and the Get Info popover.
+pub(crate) fn relative_age(ts: i64, now: i64) -> String {
+    let secs = (now - ts).max(0);
+    if secs < 60 {
+        "now".to_string()
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h ago", secs / 3600)
+    } else if secs < 30 * 86_400 {
+        format!("{}d ago", secs / 86_400)
+    } else if secs < 365 * 86_400 {
+        format!("{}mo ago", secs / (30 * 86_400))
+    } else {
+        format!("{}y ago", secs / (365 * 86_400))
+    }
+}
+
+/// Absolute local timestamp for tooltips / Get Info.
+fn absolute_date(ts: i64) -> Option<String> {
+    use chrono::TimeZone;
+    chrono::Local
+        .timestamp_opt(ts, 0)
+        .single()
+        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+}
+
+/// Fold a string the way the index tokenizer does (NFKD + strip
+/// U+0300..=U+036F combining marks + lowercase), keeping a map from
+/// each folded char back to the ORIGINAL byte range it came from, so
+/// highlight spans land on the right bytes of the displayed text
+/// even across diacritics and multi-char lowercasing (R2).
+fn fold_with_map(text: &str) -> (String, Vec<(u32, u32)>) {
+    use unicode_normalization::UnicodeNormalization;
+    let mut folded = String::with_capacity(text.len());
+    let mut map: Vec<(u32, u32)> = Vec::with_capacity(text.len());
+    for (start, ch) in text.char_indices() {
+        let end = start + ch.len_utf8();
+        for dc in ch.nfkd() {
+            if matches!(dc, '\u{0300}'..='\u{036F}') {
+                continue;
+            }
+            for lc in dc.to_lowercase() {
+                folded.push(lc);
+                map.push((start as u32, end as u32));
+            }
+        }
+    }
+    (folded, map)
+}
+
+/// Byte ranges of `text` (in ORIGINAL bytes) matching any
+/// whitespace-separated token of `query`, case- and
+/// diacritic-insensitively. Overlapping/duplicate ranges may occur;
+/// Pango tolerates overlapping attributes, so no merge pass.
+pub(crate) fn highlight_ranges(text: &str, query: &str) -> Vec<(u32, u32)> {
+    let (folded, map) = fold_with_map(text);
+    let mut out = Vec::new();
+    for token in query.split_whitespace() {
+        let (needle, _) = fold_with_map(token);
+        if needle.is_empty() {
+            continue;
+        }
+        let mut from = 0usize;
+        while let Some(pos) = folded[from..].find(&needle) {
+            let start = from + pos;
+            let end = start + needle.len();
+            // Translate folded BYTE offsets to folded CHAR indices to
+            // read the map.
+            let start_char = folded[..start].chars().count();
+            let end_char = start_char + folded[start..end].chars().count();
+            if let (Some(&(s, _)), Some(&(_, e))) =
+                (map.get(start_char), map.get(end_char.saturating_sub(1)))
+            {
+                out.push((s, e));
+            }
+            from = end;
+        }
+    }
+    out
+}
+
+/// Apply (or clear) bold match-highlight attributes on a row label
+/// for the current query (R2). Always sets attributes so recycled
+/// rows never carry a stale highlight.
+fn apply_highlight(label: &gtk::Label, displayed_text: &str, query: &str) {
+    let ranges = if query.trim().is_empty() {
+        Vec::new()
+    } else {
+        highlight_ranges(displayed_text, query)
+    };
+    if ranges.is_empty() {
+        label.set_attributes(None);
+        return;
+    }
+    let attrs = gtk::pango::AttrList::new();
+    for (start, end) in ranges {
+        let mut attr = gtk::pango::AttrInt::new_weight(gtk::pango::Weight::Bold);
+        attr.set_start_index(start);
+        attr.set_end_index(end);
+        attrs.insert(attr);
+    }
+    label.set_attributes(Some(&attrs));
 }
 
 fn populate_info_popover_body(vbox: &gtk::Box, hit: &Hit) {
@@ -251,6 +376,25 @@ fn populate_info_popover_body(vbox: &gtk::Box, hit: &Hit) {
         kind_label.set_xalign(0.0);
         add_css_class(&kind_label, "lixun-subtitle");
         vbox.append(&kind_label);
+    }
+
+    // R4: metadata rows from the hit's hydrated index fields.
+    let meta_row = |text: String| {
+        let label = gtk::Label::new(Some(&text));
+        label.set_xalign(0.0);
+        add_css_class(&label, "lixun-subtitle");
+        vbox.append(&label);
+    };
+    if let Some(ts) = hit.timestamp
+        && let Some(date) = absolute_date(ts)
+    {
+        meta_row(format!("Modified: {date}"));
+    }
+    if let Some(size) = hit.size {
+        meta_row(format!("Size: {}", human_size(size)));
+    }
+    if let Some(path) = hit_file_path(hit) {
+        meta_row(format!("Where: {}", path.display()));
     }
 }
 
@@ -521,12 +665,14 @@ pub(crate) fn create_list_factory(
         let notify_state = Rc::clone(&state);
         let notify_right_click_popover = right_click_popover.clone();
         let notify_secondary = secondary.clone();
+        let notify_entry = setup_entry.clone();
         list_item.connect_notify_local(Some("item"), move |list_item, _| {
             on_item_notify(
                 list_item,
                 &notify_state,
                 &notify_right_click_popover,
                 &notify_secondary,
+                &notify_entry,
             );
         });
 
@@ -585,6 +731,7 @@ fn on_item_notify(
     state: &Rc<RefCell<RowState>>,
     right_click_popover: &gtk::PopoverMenu,
     secondary: &gio::SimpleAction,
+    entry: &gtk::Entry,
 ) {
     let Some(row) = list_item.child().and_downcast::<gtk::Box>() else {
         return;
@@ -616,11 +763,16 @@ fn on_item_notify(
                 .and_then(|c| c.next_sibling())
                 .and_downcast::<gtk::Box>()
                 .expect("text_box");
+            let query = entry.text().to_string();
             let title = text_box
                 .first_child()
                 .and_downcast::<gtk::Label>()
                 .expect("title");
             title.set_text(&hit.title);
+            // R2: embolden the query's matches so body-only hits stop
+            // looking unrelated. Folding mirrors the index tokenizer
+            // (NFKD + strip combining marks + lowercase).
+            apply_highlight(&title, &hit.title, &query);
 
             let subtitle = title
                 .next_sibling()
@@ -633,14 +785,15 @@ fn on_item_notify(
             // the row tooltip. Non-path subtitles (mail authors,
             // "Recent search") keep the plain end-ellipsized text.
             if hit.subtitle.starts_with('/') {
-                subtitle.set_text(&display_path_subtitle(
-                    &hit.subtitle,
-                    dirs::home_dir().as_deref(),
-                ));
+                let displayed =
+                    display_path_subtitle(&hit.subtitle, dirs::home_dir().as_deref());
+                subtitle.set_text(&displayed);
+                apply_highlight(&subtitle, &displayed, &query);
                 subtitle.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
                 row.set_tooltip_text(Some(&hit.subtitle));
             } else {
                 subtitle.set_text(&hit.subtitle);
+                apply_highlight(&subtitle, &hit.subtitle, &query);
                 subtitle.set_ellipsize(gtk::pango::EllipsizeMode::End);
                 row.set_tooltip_text(None);
             }
@@ -653,7 +806,32 @@ fn on_item_notify(
                 .kind_label
                 .clone()
                 .unwrap_or_else(|| category_kind_fallback(&hit.category).to_string());
-            kind.set_text(&kind_text);
+            // R4: mail and attachment rows show WHEN over WHAT — the
+            // relative date replaces the kind label (which moves to
+            // the label's tooltip; the full metadata lives in Get
+            // Info). Generic: keyed on category + timestamp presence.
+            let mail_like = matches!(hit.category, Category::Mail | Category::Attachment);
+            match hit.timestamp {
+                Some(ts) if mail_like => {
+                    let now = chrono::Utc::now().timestamp();
+                    kind.set_text(&relative_age(ts, now));
+                    kind.set_tooltip_text(Some(&kind_text));
+                }
+                _ => {
+                    kind.set_text(&kind_text);
+                    kind.set_tooltip_text(None);
+                }
+            }
+
+            // A1: expose the whole row to assistive tech. Selection
+            // moves while focus stays on the entry, so the label is
+            // the only thing Orca can read per row.
+            let mut accessible_label =
+                format!("{}, {}, {}", hit.title, hit.subtitle, kind_text);
+            if is_top_hit_doc(&doc_id) {
+                accessible_label.push_str(", Top Hit");
+            }
+            row.update_property(&[gtk::accessible::Property::Label(&accessible_label)]);
 
             // Cache-aware menu swap: only call `set_menu_model`
             // when this row's menu_key differs from the new hit's
@@ -853,6 +1031,52 @@ mod tests {
     fn display_path_subtitle_root_and_no_home() {
         assert_eq!(display_path_subtitle("/", None), "/");
         assert_eq!(display_path_subtitle("/home/user/a.txt", None), "/home/user");
+    }
+
+    #[test]
+    fn human_size_formats_units() {
+        assert_eq!(human_size(0), "0 B");
+        assert_eq!(human_size(999), "999 B");
+        assert_eq!(human_size(1000), "1.0 KB");
+        assert_eq!(human_size(1_234_000), "1.2 MB");
+        assert_eq!(human_size(5_000_000_000), "5.0 GB");
+    }
+
+    #[test]
+    fn relative_age_buckets() {
+        let now = 1_000_000_000i64;
+        assert_eq!(relative_age(now - 30, now), "now");
+        assert_eq!(relative_age(now - 120, now), "2m ago");
+        assert_eq!(relative_age(now - 7_200, now), "2h ago");
+        assert_eq!(relative_age(now - 2 * 86_400, now), "2d ago");
+        assert_eq!(relative_age(now - 70 * 86_400, now), "2mo ago");
+        assert_eq!(relative_age(now - 800 * 86_400, now), "2y ago");
+        // Future timestamps clamp to "now", never negative ages.
+        assert_eq!(relative_age(now + 500, now), "now");
+    }
+
+    #[test]
+    fn highlight_ranges_case_insensitive() {
+        let ranges = highlight_ranges("Quarterly Report", "rep");
+        assert_eq!(ranges, vec![(10, 13)]);
+    }
+
+    #[test]
+    fn highlight_ranges_diacritic_folded() {
+        // Query without accents must land on the accented bytes,
+        // mirroring the index tokenizer's folding.
+        let text = "R\u{e9}sum\u{e9}.pdf";
+        let ranges = highlight_ranges(text, "resume");
+        assert_eq!(ranges.len(), 1);
+        let (s, e) = ranges[0];
+        assert_eq!(&text.as_bytes()[s as usize..e as usize], "R\u{e9}sum\u{e9}".as_bytes());
+    }
+
+    #[test]
+    fn highlight_ranges_multiple_tokens_and_misses() {
+        let ranges = highlight_ranges("alpha beta gamma", "beta zzz");
+        assert_eq!(ranges, vec![(6, 10)]);
+        assert!(highlight_ranges("anything", "").is_empty());
     }
 
     #[test]

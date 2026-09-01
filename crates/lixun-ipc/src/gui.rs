@@ -57,6 +57,21 @@ pub enum GuiCommand {
     /// closing preview. `None` on the launch/pid-exit paths where
     /// the launcher is hidden rather than refocused.
     ExitPreviewMode { activation_token: Option<String> },
+    /// Hide the launcher window WITHOUT resetting the launcher's
+    /// `preview_mode_active` flag (P1). Used for the rare case where
+    /// a preview window genuinely must cover the launcher's screen
+    /// area: the launcher unmaps but the preview session — and with
+    /// it the arrow-scrub selection handler — stays live, so
+    /// `PreviewNav` relays keep working and the next `Show` resumes
+    /// the session in place. Plain `Hide` remains the dismissal
+    /// path and continues to clear preview mode.
+    SoftHide,
+    /// Relay of `PreviewEvent::NavKey`: move the launcher's result
+    /// selection by `delta` rows (+1 next, -1 previous) while the
+    /// preview toplevel holds the seat keyboard. The launcher applies
+    /// it through the same selection path as local arrow keys, which
+    /// re-arms the debounced selection→preview pipeline.
+    PreviewNav { delta: i32 },
 }
 
 /// Response from the GUI to a `GuiCommand`.

@@ -23,6 +23,113 @@ const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
 /// legacy values are not honoured and are removed from the raw
 /// document before the unknown-key sweep so they do not leak into
 /// [`Config::plugin_sections`].
+/// Known keys per built-in section, used by the warn-and-continue
+/// unknown-key sweep in [`Config::from_toml_str`] (O2). `[preview]`
+/// is absent on purpose: its unknown keys are per-plugin sections
+/// preserved verbatim in `PreviewConfig::plugin_sections`.
+const KNOWN_SECTION_KEYS: &[(&str, &[&str])] = &[
+    (
+        "core",
+        &[
+            "roots",
+            "exclude",
+            "exclude_regex",
+            "max_file_size_mb",
+            "extractor_timeout_secs",
+            "max_results",
+        ],
+    ),
+    (
+        "gui",
+        &[
+            "width_percent",
+            "height_percent",
+            "max_width_px",
+            "max_height_px",
+            "preview_width_percent",
+            "preview_height_percent",
+            "preview_max_width_px",
+            "preview_max_height_px",
+            "preview_placement",
+            "blur",
+            "opacity",
+            "show_recents",
+            "theme",
+            "matugen",
+            "matugen_colors_path",
+        ],
+    ),
+    (
+        "ranking",
+        &[
+            "apps",
+            "files",
+            "mail",
+            "attachments",
+            "prefix_boost",
+            "acronym_boost",
+            "recency_weight",
+            "recency_tau_days",
+            "frecency_alpha",
+            "latch_weight",
+            "latch_cap",
+            "total_multiplier_cap",
+            "top_hit_min_confidence",
+            "top_hit_min_margin",
+            "strong_latch_threshold",
+        ],
+    ),
+    (
+        "keybindings",
+        &[
+            "close",
+            "primary_action",
+            "secondary_action",
+            "copy",
+            "quick_look",
+            "quick_look_alt",
+            "history_up",
+            "next_result",
+            "previous_result",
+            "next_category",
+            "previous_category",
+            "filter_all",
+            "filter_apps",
+            "filter_files",
+            "filter_mail",
+            "filter_attachments",
+            "global_toggle",
+            "reset_gui_position",
+        ],
+    ),
+    (
+        "extract",
+        &[
+            "cache_max_mb",
+            "cache_sweep_interval_secs",
+            "extractor_max_decompress_mb",
+        ],
+    ),
+    (
+        "ocr",
+        &[
+            "enabled",
+            "languages",
+            "max_pages_per_pdf",
+            "min_image_side_px",
+            "timeout_secs",
+            "worker_interval_secs",
+            "jobs_per_tick",
+            "adaptive_throttle",
+            "max_cpu_pressure_avg10",
+            "nice_level",
+            "io_class_idle",
+            "content_filter",
+        ],
+    ),
+    ("impact", &["level", "follow_battery", "on_battery_level"]),
+];
+
 const LEGACY_TOP_LEVEL_KEYS: &[&str] = &[
     "roots",
     "exclude",
@@ -47,11 +154,12 @@ struct ConfigToml {
 /// root list, substring and regex excludes, the extraction file-size
 /// cap, the extractor timeout, and the search result-count cap. Every
 /// field is optional so an absent or partially-populated table falls
-/// back to [`Config::default`] piecewise. `deny_unknown_fields` so
-/// typos inside `[core]` surface as parse errors instead of silently
-/// dropping into the plugin-sections sweep.
+/// back to [`Config::default`] piecewise. Unknown keys inside `[core]`
+/// are warned about (not hard errors) by the uniform unknown-key sweep
+/// in [`Config::from_toml_str`] — a typo must never take the whole
+/// daemon down (O2).
 #[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 struct CoreToml {
     roots: Option<Vec<String>>,
     exclude: Option<Vec<String>>,
@@ -134,7 +242,20 @@ struct GuiToml {
     preview_height_percent: Option<u8>,
     preview_max_width_px: Option<i32>,
     preview_max_height_px: Option<i32>,
-    blur: Option<bool>,
+    /// How the preview window is placed: `"window"` (default) for a
+    /// normal WM-managed toplevel, `"overlay"` for a compositor-
+    /// overlay layer surface pinned beside the launcher. See
+    /// [`PreviewPlacement`].
+    preview_placement: Option<PreviewPlacement>,
+    blur: Option<BlurToml>,
+    /// Launcher surface alpha in the blur-on state, `0.0..=1.0`
+    /// (clamped). Threaded into the style pipeline as the
+    /// `--lixun-surface-alpha` custom property. Default 0.70 —
+    /// the value the shipped stylesheet uses.
+    opacity: Option<f64>,
+    /// Show the frecency-derived "Recent" section when the launcher
+    /// opens with an empty query (O4). Default true.
+    show_recents: Option<bool>,
     theme: Option<String>,
     /// Matugen integration toggle. Mapped to [`GuiMatugenConfig::enabled`]
     /// on the resolved side. Absent or missing leaves the default
@@ -434,6 +555,91 @@ pub struct Config {
     pub plugin_sections: BTreeMap<String, toml::Value>,
 }
 
+/// Background-blur policy for the launcher surface (V2b).
+///
+/// * `Auto` — probe for a compositor blur protocol (KDE/Plasma blur,
+///   Hyprland layerrule detection via `HYPRLAND_INSTANCE_SIGNATURE`);
+///   fall back to the opaque no-blur skin when none is found.
+/// * `Compositor` — the operator asserts compositor-side blur is
+///   configured (e.g. a Hyprland `layerrule = blur`); the GUI keeps
+///   the translucent skin and never forces the no-blur class, even
+///   when it cannot detect a blur protocol itself.
+/// * `Off` — no blur attach, opaque no-blur skin.
+///
+/// Wire back-compat: `blur = true` parses as `Auto`, `blur = false`
+/// as `Off`, alongside the string forms `"auto" | "compositor" |
+/// "off"`.
+/// Shipped stylesheet surface alpha; `[gui] opacity` defaults to it.
+pub const DEFAULT_SURFACE_OPACITY: f64 = 0.70;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BlurMode {
+    #[default]
+    Auto,
+    Compositor,
+    Off,
+}
+
+impl BlurMode {
+    /// Whether any blur attach should be attempted at all.
+    pub fn wants_blur(&self) -> bool {
+        !matches!(self, BlurMode::Off)
+    }
+}
+
+/// Parse-side mirror of [`BlurMode`]: accepts the legacy bool and
+/// the tri-state string. Untagged so both spellings coexist.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(untagged)]
+enum BlurToml {
+    Legacy(bool),
+    Mode(BlurModeStr),
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum BlurModeStr {
+    Auto,
+    Compositor,
+    Off,
+}
+
+impl From<BlurToml> for BlurMode {
+    fn from(t: BlurToml) -> Self {
+        match t {
+            BlurToml::Legacy(true) => BlurMode::Auto,
+            BlurToml::Legacy(false) => BlurMode::Off,
+            BlurToml::Mode(BlurModeStr::Auto) => BlurMode::Auto,
+            BlurToml::Mode(BlurModeStr::Compositor) => BlurMode::Compositor,
+            BlurToml::Mode(BlurModeStr::Off) => BlurMode::Off,
+        }
+    }
+}
+
+/// `[gui] preview_placement` — who owns the preview window's
+/// position and stacking.
+///
+/// * `Window` (default): the preview is a normal WM-managed
+///   xdg-toplevel — freely draggable, tileable, and targetable by
+///   WM rules (app-id `app.lixun.preview`). Tradeoff: the launcher
+///   is an overlay-layer surface and always stacks above the
+///   preview wherever the two overlap; the launcher tucks against
+///   the left screen edge during preview mode to minimise the
+///   initial overlap.
+/// * `Overlay`: the preview joins the launcher's compositor-overlay
+///   layer, anchored beside it at the right screen edge. Deterministic
+///   side-by-side layout; recommended on tiling compositors
+///   (sway/Hyprland) where a normal window would get tiled on every
+///   preview open. Requires layer-shell support at runtime; without
+///   it the GUI behaves as `Window`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PreviewPlacement {
+    #[default]
+    Window,
+    Overlay,
+}
+
 /// Launcher + preview window sizing policy. Percentages are of the
 /// monitor the window opens on (resolved at window-build time).
 /// Percent values outside 10-95 are clamped.
@@ -455,7 +661,14 @@ pub struct GuiConfig {
     pub preview_height_percent: u8,
     pub preview_max_width_px: i32,
     pub preview_max_height_px: i32,
-    pub blur: bool,
+    /// Preview window placement mode. See [`PreviewPlacement`].
+    pub preview_placement: PreviewPlacement,
+    pub blur: BlurMode,
+    /// Surface alpha for the blur-on state, `0.0..=1.0`. See
+    /// `[gui] opacity`.
+    pub opacity: f64,
+    /// Render the "Recent" (frecency) section on an empty query.
+    pub show_recents: bool,
     /// Active theme. Looked up as `${config_dir}/lixun/themes/<name>/style.css`.
     /// When `None` the GUI falls back to the built-in stylesheet embedded at
     /// compile time from `crates/lixun-gui/style.css` (plus the optional
@@ -506,11 +719,18 @@ impl Default for GuiConfig {
             height_percent: 60,
             max_width_px: 900,
             max_height_px: 800,
-            preview_width_percent: 80,
-            preview_height_percent: 80,
-            preview_max_width_px: 2000,
-            preview_max_height_px: 1400,
-            blur: true,
+            // Spotlight parity (P1): the preview opens beside the
+            // launcher at roughly half the monitor width instead of
+            // covering 80% of the screen, so launcher + results stay
+            // visible and arrow-scrub is reachable during preview.
+            preview_width_percent: 50,
+            preview_height_percent: 70,
+            preview_max_width_px: 1400,
+            preview_max_height_px: 1200,
+            preview_placement: PreviewPlacement::default(),
+            blur: BlurMode::Auto,
+            opacity: DEFAULT_SURFACE_OPACITY,
+            show_recents: true,
             theme: None,
             matugen: GuiMatugenConfig::default(),
         }
@@ -689,6 +909,33 @@ impl Config {
         Self::from_toml_str(&content)
     }
 
+    /// Resolved path of the user config file, plus whether it exists
+    /// on disk. Exposed so hosts (daemon status, CLI) can report which
+    /// file is in effect vs. "defaults (no file)".
+    pub fn user_config_path() -> (PathBuf, bool) {
+        let path = config_dir().join("lixun/config.toml");
+        let exists = path.exists();
+        (path, exists)
+    }
+
+    /// Load the config, falling back to built-in defaults instead of
+    /// failing when the file is unreadable or does not parse (O2): a
+    /// config typo must degrade search defaults, never kill the
+    /// daemon — and with it the global hotkey. Returns the config
+    /// plus the load error string (if any) so the daemon can carry it
+    /// into `Response::Status` for the CLI/GUI to surface.
+    pub fn load_or_default() -> (Self, Option<String>) {
+        match Self::load() {
+            Ok(cfg) => (cfg, None),
+            Err(e) => {
+                let (path, _) = Self::user_config_path();
+                let msg = format!("config: {} failed to load: {e:#}", path.display());
+                tracing::error!("{msg}; continuing with built-in defaults");
+                (Self::default(), Some(msg))
+            }
+        }
+    }
+
     pub fn from_toml_str(content: &str) -> Result<Self> {
         let mut cfg = Self::default();
         let parsed: ConfigToml = toml::from_str(content)?;
@@ -846,8 +1093,25 @@ impl Config {
             if let Some(v) = gui.preview_max_height_px {
                 cfg.gui.preview_max_height_px = v.max(400);
             }
+            if let Some(v) = gui.preview_placement {
+                cfg.gui.preview_placement = v;
+            }
             if let Some(v) = gui.blur {
-                cfg.gui.blur = v;
+                cfg.gui.blur = v.into();
+            }
+            if let Some(v) = gui.opacity {
+                let clamped = v.clamp(0.0, 1.0);
+                if (clamped - v).abs() > f64::EPSILON {
+                    tracing::warn!(
+                        "[gui].opacity = {} out of 0.0..=1.0, clamped to {}",
+                        v,
+                        clamped
+                    );
+                }
+                cfg.gui.opacity = clamped;
+            }
+            if let Some(v) = gui.show_recents {
+                cfg.gui.show_recents = v;
             }
             if let Some(theme) = gui.theme {
                 let trimmed = theme.trim();
@@ -948,6 +1212,23 @@ impl Config {
         let known_preview: HashSet<&'static str> = KNOWN_PREVIEW_KEYS.iter().copied().collect();
         let raw: toml::Value = toml::from_str(content)?;
         if let toml::Value::Table(mut top) = raw {
+            // Uniform warn-and-continue unknown-key sweep (O2): a
+            // misspelled key inside any built-in section is reported
+            // once and ignored, matching the legacy-top-level-key
+            // pattern below. Previously `[core]` hard-errored via
+            // deny_unknown_fields while `[gui]`/`[ranking]` silently
+            // dropped typos.
+            for (section, known_keys) in KNOWN_SECTION_KEYS {
+                if let Some(toml::Value::Table(table)) = top.get(*section) {
+                    for key in table.keys() {
+                        if !known_keys.contains(&key.as_str()) {
+                            tracing::warn!(
+                                "config: unknown key `{key}` in [{section}]; ignored. Typo?"
+                            );
+                        }
+                    }
+                }
+            }
             if let Some(toml::Value::Table(preview_table)) = top.remove("preview") {
                 for (key, value) in preview_table {
                     if known_preview.contains(key.as_str()) {
@@ -1105,6 +1386,60 @@ fn state_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blur_tristate_parses_bool_and_strings() {
+        // Legacy booleans keep working (V2b back-compat).
+        let cfg = Config::from_toml_str("[gui]\nblur = true\n").unwrap();
+        assert_eq!(cfg.gui.blur, BlurMode::Auto);
+        let cfg = Config::from_toml_str("[gui]\nblur = false\n").unwrap();
+        assert_eq!(cfg.gui.blur, BlurMode::Off);
+        let cfg = Config::from_toml_str("[gui]\nblur = \"auto\"\n").unwrap();
+        assert_eq!(cfg.gui.blur, BlurMode::Auto);
+        let cfg = Config::from_toml_str("[gui]\nblur = \"compositor\"\n").unwrap();
+        assert_eq!(cfg.gui.blur, BlurMode::Compositor);
+        let cfg = Config::from_toml_str("[gui]\nblur = \"off\"\n").unwrap();
+        assert_eq!(cfg.gui.blur, BlurMode::Off);
+        assert!(BlurMode::Compositor.wants_blur());
+        assert!(!BlurMode::Off.wants_blur());
+    }
+
+    #[test]
+    fn gui_opacity_defaults_and_clamps() {
+        let cfg = Config::default();
+        assert!((cfg.gui.opacity - DEFAULT_SURFACE_OPACITY).abs() < 1e-9);
+        let cfg = Config::from_toml_str("[gui]\nopacity = 0.5\n").unwrap();
+        assert!((cfg.gui.opacity - 0.5).abs() < 1e-9);
+        let cfg = Config::from_toml_str("[gui]\nopacity = 1.5\n").unwrap();
+        assert!((cfg.gui.opacity - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn show_recents_defaults_true_and_parses() {
+        assert!(Config::default().gui.show_recents);
+        let cfg = Config::from_toml_str("[gui]\nshow_recents = false\n").unwrap();
+        assert!(!cfg.gui.show_recents);
+    }
+
+    #[test]
+    fn unknown_keys_warn_and_continue_everywhere() {
+        // O2: a typo in ANY built-in section must not abort the parse
+        // (the old [core] deny_unknown_fields hard-errored).
+        let cfg = Config::from_toml_str(
+            "[core]\nmax_resuls = 10\n[gui]\nwidht_percent = 30\n[ranking]\ntypo = 1\n",
+        )
+        .expect("typos must warn, not error");
+        // The misspelled keys are ignored; defaults survive.
+        assert_eq!(cfg.max_results, Config::default().max_results);
+        assert_eq!(cfg.gui.width_percent, Config::default().gui.width_percent);
+    }
+
+    #[test]
+    fn from_toml_str_still_rejects_syntax_errors() {
+        // Structural TOML damage is a parse error (the daemon then
+        // falls back to defaults via load_or_default).
+        assert!(Config::from_toml_str("[core\nroots = 3").is_err());
+    }
 
     #[test]
     fn strong_latch_threshold_defaults_to_three() {

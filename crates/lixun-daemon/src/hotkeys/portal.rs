@@ -73,6 +73,7 @@ pub(super) async fn run(
 
     bind_shortcut_with_retry(&conn, &session_handle, &preferred_trigger).await?;
     tracing::info!("hotkeys: shortcut '{}' bound", preferred_trigger);
+    super::update_status(|st| st.bound = true);
 
     super::hyprland_bind::try_register(&preferred_trigger).await;
 

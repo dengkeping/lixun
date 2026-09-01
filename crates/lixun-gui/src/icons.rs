@@ -124,8 +124,24 @@ struct TextureCache {
     map: RwLock<HashMap<IconKey, Option<gdk::Texture>>>,
 }
 
+/// How the worker should turn a cache key into pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoadKind {
+    /// The key's string is an absolute path to an icon-sized image
+    /// (e.g. a `.desktop`-declared icon file). Decoded with a
+    /// downscale-to-request so a stray large file never becomes a
+    /// full-size texture.
+    IconFile,
+    /// The key's string is an absolute path to a PHOTO the row
+    /// should thumbnail (R1): try the freedesktop thumbnail cache
+    /// first (`$XDG_CACHE_HOME/thumbnails/{large,normal}/<md5 of
+    /// file URI>.png` per the spec), fall back to a downscaled
+    /// direct decode of the image itself.
+    ImageThumb,
+}
+
 static TEXTURE_CACHE: OnceLock<Arc<TextureCache>> = OnceLock::new();
-static REQUEST_TX: OnceLock<mpsc::Sender<IconKey>> = OnceLock::new();
+static REQUEST_TX: OnceLock<mpsc::Sender<(IconKey, LoadKind)>> = OnceLock::new();
 static READY_RX: OnceLock<async_channel::Receiver<IconKey>> = OnceLock::new();
 
 fn texture_cache() -> &'static Arc<TextureCache> {
@@ -133,7 +149,7 @@ fn texture_cache() -> &'static Arc<TextureCache> {
         let cache = Arc::new(TextureCache {
             map: RwLock::new(HashMap::new()),
         });
-        let (req_tx, req_rx) = mpsc::channel::<IconKey>();
+        let (req_tx, req_rx) = mpsc::channel::<(IconKey, LoadKind)>();
         let (rdy_tx, rdy_rx) = async_channel::unbounded::<IconKey>();
         // Order matters: set the sinks BEFORE spawning the worker
         // so that callers racing the worker can always enqueue.
@@ -151,22 +167,26 @@ fn texture_cache() -> &'static Arc<TextureCache> {
 
 fn icon_loader_loop(
     cache: Arc<TextureCache>,
-    req_rx: mpsc::Receiver<IconKey>,
+    req_rx: mpsc::Receiver<(IconKey, LoadKind)>,
     ready_tx: async_channel::Sender<IconKey>,
 ) {
-    while let Ok(key) = req_rx.recv() {
+    while let Ok((key, kind)) = req_rx.recv() {
         // De-dupe: another request may already have populated this
         // slot between enqueue and dispatch.
         if cache.map.read().unwrap().contains_key(&key) {
             continue;
         }
-        let (name, _size, _scale) = &key;
+        let (name, size, scale) = &key;
         let texture = if PathBuf::from(name).is_absolute() {
             // Only absolute paths are loaded here. Theme icons
             // resolve on the main thread via `IconTheme::lookup_icon`
             // because the theme handle is not `Send` and the lookup
             // itself does no disk I/O (deferred to paint time).
-            gdk::Texture::from_filename(name).ok()
+            let px = size * scale;
+            match kind {
+                LoadKind::IconFile => load_scaled_texture(std::path::Path::new(name), px),
+                LoadKind::ImageThumb => load_photo_thumbnail(std::path::Path::new(name), px),
+            }
         } else {
             None
         };
@@ -175,6 +195,44 @@ fn icon_loader_loop(
         // shutdown; we don't unwrap.
         let _ = ready_tx.send_blocking(key);
     }
+}
+
+/// Decode `path` downscaled to at most `px` on the long edge and
+/// upload as a texture. `from_file_at_scale` reads the image header
+/// and decodes at target size, so a 40-megapixel JPEG never becomes
+/// a full-resolution texture on the row-icon path (R1).
+fn load_scaled_texture(path: &std::path::Path, px: i32) -> Option<gdk::Texture> {
+    let pixbuf = gtk::gdk_pixbuf::Pixbuf::from_file_at_scale(path, px, px, true).ok()?;
+    Some(gdk::Texture::for_pixbuf(&pixbuf))
+}
+
+/// Freedesktop thumbnail spec lookup key: hex MD5 of the file's
+/// canonical `file://` URI (gio produces the same percent-encoding
+/// the spec mandates).
+fn thumbnail_hash(path: &std::path::Path) -> String {
+    let uri = gtk::gio::File::for_path(path).uri();
+    format!("{:x}", md5::compute(uri.as_bytes()))
+}
+
+/// Resolve a photo's row icon (R1): reuse the desktop's existing
+/// thumbnail cache when a thumbnailer already produced one, else
+/// decode the photo itself, downscaled. Runs on the loader thread.
+fn load_photo_thumbnail(path: &std::path::Path, px: i32) -> Option<gdk::Texture> {
+    let hash = thumbnail_hash(path);
+    if let Some(cache_dir) = dirs::cache_dir() {
+        for bucket in ["large", "normal"] {
+            let thumb = cache_dir
+                .join("thumbnails")
+                .join(bucket)
+                .join(format!("{hash}.png"));
+            if thumb.exists()
+                && let Some(tex) = load_scaled_texture(&thumb, px)
+            {
+                return Some(tex);
+            }
+        }
+    }
+    load_scaled_texture(path, px)
 }
 
 /// Receiver for `(name, size, scale)` keys whose textures have
@@ -191,7 +249,7 @@ pub(crate) fn icon_ready_rx() -> async_channel::Receiver<IconKey> {
         .clone()
 }
 
-fn lookup_cached_texture(path: &std::path::Path, size: i32) -> Option<gdk::Paintable> {
+fn lookup_cached_texture(path: &std::path::Path, size: i32, kind: LoadKind) -> Option<gdk::Paintable> {
     let key: IconKey = (path.to_string_lossy().into_owned(), size, 1);
     {
         let map = texture_cache().map.read().unwrap();
@@ -207,13 +265,42 @@ fn lookup_cached_texture(path: &std::path::Path, size: i32) -> Option<gdk::Paint
     // The next bind — provoked by the icon-ready receiver, or by
     // a natural re-render — will see the populated slot.
     if let Some(tx) = REQUEST_TX.get() {
-        let _ = tx.send(key);
+        let _ = tx.send((key, kind));
     }
     None
 }
 
 pub(crate) fn resolve_icon(hit: &Hit, size: i32) -> Option<gdk::Paintable> {
     let theme = icon_theme()?;
+
+    // R1: an image-content search engine must not render every photo
+    // as the same generic icon. For hits whose (generic) MIME says
+    // image/* and whose action points at a real file, the row icon
+    // IS the photo — desktop thumbnail cache first, downscaled
+    // direct decode as fallback, loaded off the main thread through
+    // the existing texture worker. Keying on MIME keeps the host
+    // plugin-agnostic (AGENTS.md §1).
+    if hit.mime.as_deref().is_some_and(|m| m.starts_with("image/"))
+        && let Some(path) = crate::factory::hit_file_path(hit)
+        && path.is_absolute()
+    {
+        let key: IconKey = (path.to_string_lossy().into_owned(), size, 1);
+        if let Some(cached) = PAINTABLE_CACHE.with(|c| c.borrow().get(&key).cloned()) {
+            if let Some(paintable) = cached {
+                return Some(paintable);
+            }
+            // Known-bad photo: fall through to the normal icon flow.
+        } else if let Some(paintable) = lookup_cached_texture(&path, size, LoadKind::ImageThumb) {
+            PAINTABLE_CACHE.with(|c| {
+                c.borrow_mut().insert(key, Some(paintable.clone()));
+            });
+            return Some(paintable);
+        }
+        // Miss on this pass (load enqueued) or known-bad: continue
+        // to icon_name / category fallback below. Known-bad is
+        // recorded in the texture cache, so the enqueue is a cheap
+        // no-op on subsequent binds.
+    }
 
     if let Some(name) = hit.icon_name.as_deref() {
         let key: IconKey = (name.to_string(), size, 1);
@@ -224,7 +311,7 @@ pub(crate) fn resolve_icon(hit: &Hit, size: i32) -> Option<gdk::Paintable> {
 
         let p = std::path::Path::new(name);
         let resolved = if p.is_absolute() {
-            lookup_cached_texture(p, size)
+            lookup_cached_texture(p, size, LoadKind::IconFile)
         } else {
             lookup_theme_icon(&theme, name, size)
         };

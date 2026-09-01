@@ -353,24 +353,63 @@ global_toggle = "Super+space"
 # max_width_px = 900
 # max_height_px = 800
 
-# Preview window percentages (separate from launcher — preview shows
-# full documents and media, so 80/80 is a sensible default).
-# preview_width_percent = 80
-# preview_height_percent = 80
+# Preview window percentages (separate from launcher). Defaults
+# 50/70: roughly half the monitor, Spotlight-style, so the launcher
+# and its result list stay visible beside the preview and arrow-key
+# scrubbing keeps working during Quick Look.
+# preview_width_percent = 50
+# preview_height_percent = 70
 
-# Preview caps. Default 2000×1400 — Quick Look-style ceiling that
+# Preview caps. Default 1400×1200 — Quick Look-style ceiling that
 # stops preview from being unreadably large on big monitors.
-# preview_max_width_px = 2000
-# preview_max_height_px = 1400
+# preview_max_width_px = 1400
+# preview_max_height_px = 1200
+
+# Preview window placement. Two modes:
+#   "window"  (default) — the preview is a normal window managed by
+#             your compositor/WM: freely draggable, tileable, and
+#             targetable by window rules (match app-id
+#             "app.lixun.preview"; title "Lixun Preview").
+#             Tradeoff: the launcher is a compositor-overlay
+#             surface, so it always stacks ABOVE the preview where
+#             the two overlap — while a preview is open the launcher
+#             tucks against the left screen edge to stay out of the
+#             way, and you can drag the preview anywhere.
+#   "overlay" — the preview joins the launcher's compositor-overlay
+#             layer, pinned beside it at the right screen edge:
+#             a fixed side-by-side layout, not draggable.
+#             Recommended on tiling compositors (sway/Hyprland)
+#             where a normal window would get tiled on every
+#             preview open. Requires layer-shell support at
+#             runtime; without it lixun behaves as "window".
+# preview_placement = "window"
+
+# Show the "Recent" section (your most-used results, ranked by the
+# daemon's frecency store) when the launcher opens with an empty
+# query. Default true.
+# show_recents = true
 
 # ============================================================
 # Theming
 # ============================================================
 #
-# Ask the compositor to blur the region behind the translucent window.
-# KWin and Hyprland implement a blur protocol; on compositors without
-# one (sway, niri, GNOME) the flag is a no-op. Default true.
-# blur = true
+# Background blur behind the translucent window. Tri-state:
+#   "auto"       — probe for a compositor blur protocol (KWin/Plasma;
+#                  Hyprland is detected via its layerrule mechanism);
+#                  fall back to an opaque fill when none is found.
+#   "compositor" — you assert compositor-side blur is configured
+#                  (e.g. a Hyprland `layerrule = blur, lixun-gui`);
+#                  the translucent skin is kept even when no blur
+#                  protocol can be detected.
+#   "off"        — no blur, opaque fill.
+# The legacy booleans still parse: true = "auto", false = "off".
+# Default "auto".
+# blur = "auto"
+
+# Launcher surface alpha in the blur-on state, 0.0–1.0. The shipped
+# stylesheet uses 0.70; lower is glassier (needs strong compositor
+# blur to stay legible), higher is more opaque.
+# opacity = 0.70
 
 # Named theme: loads ~/.config/lixun/themes/<name>/style.css instead of
 # the built-in stylesheet. Empty or absent = built-in style (plus the

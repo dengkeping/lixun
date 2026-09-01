@@ -48,6 +48,9 @@ use lixun_preview_archive as _;
 #[cfg(feature = "folder")]
 use lixun_preview_folder as _;
 
+#[cfg(feature = "info")]
+use lixun_preview_info as _;
+
 #[cfg(test)]
 mod tests {
     use lixun_core::{Action, Category, DocId, Hit};
@@ -73,6 +76,8 @@ mod tests {
             secondary_action: None,
             source_instance: String::new(),
             row_menu: lixun_core::RowMenuDef::empty(),
+            timestamp: None,
+            size: None,
         }
     }
 
@@ -100,6 +105,8 @@ mod tests {
             secondary_action: None,
             source_instance: String::new(),
             row_menu: lixun_core::RowMenuDef::empty(),
+            timestamp: None,
+            size: None,
         }
     }
 
@@ -115,6 +122,21 @@ mod tests {
         );
     }
 
+    /// P2 contract: the catch-all info plugin means Space always
+    /// previews SOMETHING. App/launch hits used to fall through
+    /// `select_plugin` entirely, which left the launcher wedged in
+    /// phantom preview mode (host bailed before rebuilding the
+    /// header, error was log-only).
+    #[cfg(feature = "info")]
+    #[test]
+    fn non_file_hits_route_to_the_info_card() {
+        let picked = lixun_preview::select_plugin(&non_file_hit())
+            .expect("with `info` enabled every hit must match some plugin");
+        assert_eq!(picked.id(), "info");
+    }
+
+    /// Without the catch-all, the old fall-through behaviour holds.
+    #[cfg(not(feature = "info"))]
     #[test]
     fn non_file_hits_do_not_match_any_registered_plugin() {
         assert!(

@@ -89,6 +89,10 @@ window.background,
    white is the second specular cue — together they produce the
    "carved out of glass" silhouette without needing a backdrop-filter
    (which GTK4 doesn't support anyway). */
+/* The 0.70 surface alpha below is the shipped default; a user-set
+   `[gui] opacity` generates an override provider that re-declares
+   this background with the configured alpha (see
+   style_manager.rs::surface_opacity_css). */
 .lixun-window {
     background:
         linear-gradient(180deg,
@@ -301,6 +305,24 @@ listview row:selected:hover {
 .lixun-status-label {
     color: var(--lixun-on-surface-variant);
     font-size: 9pt;
+}
+
+/* Dimmed persistent key-hint footer shown while results are visible
+   (O3), and the secondary annotation line under the empty state
+   (F6 semantic-degraded note). Both are passive chrome: quieter
+   than the primary status label, never animated. */
+.lixun-status-hints,
+.lixun-status-note {
+    color: var(--lixun-outline);
+    font-size: 7.5pt;
+}
+
+/* Shortcuts overlay (O3): accel column uses a slightly emphasized
+   monospace-ish treatment so key chords read as keys. */
+.lixun-shortcut-accel {
+    color: var(--lixun-on-surface);
+    font-size: 8.25pt;
+    font-weight: 600;
 }
 
 /* Applied alongside .lixun-status-label, so it must come after it to win on

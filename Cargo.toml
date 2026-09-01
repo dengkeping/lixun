@@ -26,6 +26,7 @@ members = [
     "crates/lixun-preview-bin",
     "crates/lixun-preview-text",
     "crates/lixun-preview-image",
+    "crates/lixun-preview-info",
     "crates/lixun-preview-pdf",
     "crates/lixun-preview-code",
     "crates/lixun-preview-email",

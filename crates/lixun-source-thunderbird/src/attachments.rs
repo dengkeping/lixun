@@ -121,7 +121,10 @@ impl ThunderbirdAttachmentsSource {
                         kind_label,
                         body,
                         path: part.mbox_path.to_string_lossy().to_string(),
-                        mtime: 0,
+                        // Parent message date (R4): drives the GUI's
+                        // relative-date column and the recency ranking
+                        // multiplier. 0 = header absent/unparseable.
+                        mtime: part.date.unwrap_or(0),
                         size: part.part_body_length,
                         action: Action::OpenEmbedded {
                             container: part.mbox_path.clone(),
@@ -379,6 +382,34 @@ mod tests {
                 "expected no secondary when Message-ID header absent, got {:?}",
                 attachment.secondary_action
             );
+        });
+    }
+
+    #[test]
+    fn attachment_mtime_comes_from_parent_message_date() {
+        // Holds HOME_LOCK — see test_thunderbird_attachments_source_integration.
+        with_isolated_cache(|_cache_root| {
+            let dir = tempdir().unwrap();
+            let profile = dir.path();
+            let inbox_dir = profile.join("Mail").join("Local Folders");
+            std::fs::create_dir_all(&inbox_dir).unwrap();
+
+            let body = base64::engine::general_purpose::STANDARD.encode("payload");
+            let mbox = format!(
+                "From alice@example.com Fri Nov 01 10:00:00 2024\nFrom: alice@example.com\nSubject: Dated mail\nDate: Fri, 01 Nov 2024 10:00:00 +0000\nMessage-ID: <dated-att@example.com>\nContent-Type: multipart/mixed; boundary=\"BB\"\nMIME-Version: 1.0\n\n--BB\nContent-Type: text/plain\n\nhi\n--BB\nContent-Type: text/plain; name=\"a.txt\"\nContent-Disposition: attachment; filename=\"a.txt\"\nContent-Transfer-Encoding: base64\n\n{body}\n--BB--\n"
+            );
+            std::fs::write(inbox_dir.join("Inbox"), mbox).unwrap();
+
+            let source =
+                ThunderbirdAttachmentsSource::new(profile.to_path_buf(), 100 * 1024 * 1024);
+            let docs = source.index_all().unwrap();
+            let attachment = docs
+                .iter()
+                .find(|d| matches!(d.category, Category::Attachment))
+                .expect("attachment document present");
+            // 2024-11-01T10:00:00Z from the parent Date header (R4).
+            assert_eq!(attachment.mtime, 1_730_455_200);
+            assert!(attachment.size > 0, "size carries the part byte length");
         });
     }
 

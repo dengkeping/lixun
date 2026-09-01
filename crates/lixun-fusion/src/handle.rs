@@ -148,6 +148,16 @@ impl HybridSearchHandle {
         self.inner.hydrate_doc(doc_id).await
     }
 
+    /// Batch hydration passthrough: one searcher, input order
+    /// preserved, dead ids skipped. Used by the daemon's `Recents`
+    /// handler to resolve frecency doc ids into presentable hits.
+    pub async fn hydrate_docs(
+        &self,
+        doc_ids: Vec<String>,
+    ) -> Result<Vec<(lixun_core::Hit, lixun_core::ScoreBreakdown)>> {
+        self.inner.hydrate_docs(doc_ids).await
+    }
+
     async fn fused_search_streaming(
         &self,
         query: &lixun_core::Query,

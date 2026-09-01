@@ -62,11 +62,40 @@ const EMBEDDED_STYLESHEET: &str = include_str!("../style.css");
 pub(crate) struct StyleManager {
     #[allow(dead_code)]
     embedded_provider: gtk::CssProvider,
+    /// `[gui] opacity` override layer (A4b): a generated rule that
+    /// re-declares `.lixun-window`'s blur-on background with the
+    /// configured surface alpha. Registered at the SAME priority as
+    /// the embedded sheet but AFTER it, so it wins by order while
+    /// every higher layer (user/theme/matugen) and every
+    /// higher-specificity rule (`.lixun-no-blur`, `.lixun-light`)
+    /// still override it. Empty (a true no-op) while the configured
+    /// value equals the shipped default, so default installs carry
+    /// zero risk of divergence from style.css.
+    opacity_provider: gtk::CssProvider,
     theme_provider: gtk::CssProvider,
     user_provider: gtk::CssProvider,
     colors_provider: Option<gtk::CssProvider>,
     colors_path: PathBuf,
     pub resolver: ThemeResolver,
+}
+
+/// Generated CSS for a non-default `[gui] opacity`. Mirrors the
+/// `.lixun-window` background declaration in `style.css` with the
+/// alpha swapped; `None` for the default value (no override needed).
+fn surface_opacity_css(opacity: f64) -> Option<String> {
+    if (opacity - lixun_config::DEFAULT_SURFACE_OPACITY).abs() < 0.001 {
+        return None;
+    }
+    let alpha = opacity.clamp(0.0, 1.0);
+    Some(format!(
+        ".lixun-window {{\n\
+         \x20   background:\n\
+         \x20       linear-gradient(180deg,\n\
+         \x20           rgba(255, 255, 255, 0.035) 0%,\n\
+         \x20           rgba(255, 255, 255, 0.0)  50%),\n\
+         \x20       alpha(var(--lixun-surface), {alpha});\n\
+         }}\n"
+    ))
 }
 
 impl StyleManager {
@@ -85,6 +114,7 @@ impl StyleManager {
         theme: Option<&str>,
         matugen_enabled: bool,
         matugen_colors_path: PathBuf,
+        surface_opacity: f64,
     ) -> Self {
         let config_dir = dirs::config_dir().unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
         let resolver = ThemeResolver::new(config_dir);
@@ -94,6 +124,17 @@ impl StyleManager {
         gtk::style_context_add_provider_for_display(
             display,
             &embedded_provider,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+
+        // Same priority as embedded, registered after it: equal-
+        // priority providers apply in registration order, so this
+        // wins over the embedded rule it mirrors without outranking
+        // the user/theme/matugen layers (see field docs).
+        let opacity_provider = gtk::CssProvider::new();
+        gtk::style_context_add_provider_for_display(
+            display,
+            &opacity_provider,
             gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
 
@@ -125,6 +166,7 @@ impl StyleManager {
 
         let manager = Self {
             embedded_provider,
+            opacity_provider,
             theme_provider,
             user_provider,
             colors_provider,
@@ -132,10 +174,20 @@ impl StyleManager {
             resolver,
         };
 
+        manager.set_surface_opacity(surface_opacity);
         manager.apply_theme(theme);
         manager.reload_user_css();
         manager.reload_colors_css();
         manager
+    }
+
+    /// Apply (or clear) the `[gui] opacity` override (A4b). Called at
+    /// install and on every config live-reload.
+    pub fn set_surface_opacity(&self, opacity: f64) {
+        match surface_opacity_css(opacity) {
+            Some(css) => self.opacity_provider.load_from_string(&css),
+            None => self.opacity_provider.load_from_string(""),
+        }
     }
 
     /// Swap the theme layer to point at `theme`'s `style.css`. When
@@ -197,6 +249,7 @@ impl StyleManager {
     }
 
     /// The matugen colours path the manager is currently watching.
+    // (see also the surface_opacity tests at the bottom of the file)
     /// Used by the style watcher to subscribe to the right file even
     /// when the user has overridden `Config::gui.matugen.colors_path`.
     ///
@@ -206,5 +259,29 @@ impl StyleManager {
     #[allow(dead_code)]
     pub fn colors_path(&self) -> &std::path::Path {
         &self.colors_path
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::surface_opacity_css;
+
+    #[test]
+    fn default_opacity_generates_no_override() {
+        assert!(surface_opacity_css(lixun_config::DEFAULT_SURFACE_OPACITY).is_none());
+        assert!(surface_opacity_css(0.7004).is_none());
+    }
+
+    #[test]
+    fn custom_opacity_generates_window_rule() {
+        let css = surface_opacity_css(0.5).expect("override expected");
+        assert!(css.contains(".lixun-window"));
+        assert!(css.contains("alpha(var(--lixun-surface), 0.5)"));
+    }
+
+    #[test]
+    fn out_of_range_opacity_is_clamped() {
+        let css = surface_opacity_css(1.7).expect("override expected");
+        assert!(css.contains("alpha(var(--lixun-surface), 1)"));
     }
 }

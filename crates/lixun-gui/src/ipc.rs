@@ -368,57 +368,15 @@ pub(crate) fn send_record_query(q: &str) {
     send_request_fire_and_forget(&Request::RecordQuery { q: q.to_string() });
 }
 
-pub(crate) fn request_search_history(limit: u32) -> Vec<String> {
+/// One-shot request/response round-trip over a fresh connection with
+/// a 500 ms read bound. Shared core of every side-channel fetch
+/// (history, status, recents, claimed prefixes): a wedged or
+/// restarting daemon must degrade to "no data", never hang a caller.
+/// Blocking — run on a worker thread unless the call site tolerates
+/// up to ~500 ms (startup-only fetches).
+fn one_shot_request(req: &Request) -> Option<Response> {
     let sock = socket_path();
-    let Some(buf) = encode_frame(&Request::SearchHistory { limit }) else {
-        return Vec::new();
-    };
-
-    let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&sock) else {
-        return Vec::new();
-    };
-    // This round-trip runs on the GTK main thread (Up-arrow key
-    // handler). A wedged or restarting daemon must degrade to "no
-    // history", never freeze the launcher on an unbounded read —
-    // same 500 ms bound as `fetch_claimed_prefixes`. (A proper
-    // async request path is a later refactor.)
-    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
-    if stream.write_all(&buf).is_err() {
-        return Vec::new();
-    }
-
-    let mut header = [0u8; 4];
-    if stream.read_exact(&mut header).is_err() {
-        return Vec::new();
-    }
-    let resp_len = u32::from_be_bytes(header) as usize;
-    if resp_len < 2 {
-        return Vec::new();
-    }
-    let mut version_buf = [0u8; 2];
-    if stream.read_exact(&mut version_buf).is_err() {
-        return Vec::new();
-    }
-    let resp_version = u16::from_be_bytes(version_buf);
-    let mut resp_buf = vec![0u8; resp_len - 2];
-    if stream.read_exact(&mut resp_buf).is_err() {
-        return Vec::new();
-    }
-    match lixun_ipc::decode_response(resp_version, &resp_buf) {
-        Ok(Response::Queries(qs)) => qs,
-        _ => Vec::new(),
-    }
-}
-
-/// One-shot `Request::Status` round-trip. Returns
-/// `(indexed_docs, reindex_in_progress)`, or `None` on any transport
-/// or decode failure. Same 500 ms read bound as
-/// `request_search_history`, but callers run this on a worker thread
-/// (never the GTK main thread): the zero-hit path uses it to tell
-/// "nothing matches" apart from "the index is still being built".
-pub(crate) fn request_index_status() -> Option<(u64, bool)> {
-    let sock = socket_path();
-    let buf = encode_frame(&Request::Status)?;
+    let buf = encode_frame(req)?;
     let mut stream = std::os::unix::net::UnixStream::connect(&sock).ok()?;
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
     stream.write_all(&buf).ok()?;
@@ -426,7 +384,7 @@ pub(crate) fn request_index_status() -> Option<(u64, bool)> {
     let mut header = [0u8; 4];
     stream.read_exact(&mut header).ok()?;
     let resp_len = u32::from_be_bytes(header) as usize;
-    if resp_len < 2 {
+    if !(2..=lixun_ipc::MAX_FRAME_LEN).contains(&resp_len) {
         return None;
     }
     let mut version_buf = [0u8; 2];
@@ -434,14 +392,110 @@ pub(crate) fn request_index_status() -> Option<(u64, bool)> {
     let resp_version = u16::from_be_bytes(version_buf);
     let mut resp_buf = vec![0u8; resp_len - 2];
     stream.read_exact(&mut resp_buf).ok()?;
-    match lixun_ipc::decode_response(resp_version, &resp_buf) {
-        Ok(Response::Status {
+    lixun_ipc::decode_response(resp_version, &resp_buf).ok()
+}
+
+/// Run `fetch` on a worker thread and deliver its result back on the
+/// GTK main loop. The standard pattern for keeping one-shot daemon
+/// round-trips off the main thread (K8b): `std::thread` + bounded
+/// `async_channel` + `glib::spawn_future_local`, mirroring
+/// `start_ipc_thread`'s boundary. Must be called from the main
+/// thread (the delivery future is spawned on the default
+/// MainContext).
+fn fetch_async<T: Send + 'static>(
+    fetch: impl FnOnce() -> T + Send + 'static,
+    on_done: impl FnOnce(T) + 'static,
+) {
+    let (tx, rx) = async_channel::bounded::<T>(1);
+    std::thread::spawn(move || {
+        let _ = tx.send_blocking(fetch());
+    });
+    glib::spawn_future_local(async move {
+        if let Ok(value) = rx.recv().await {
+            on_done(value);
+        }
+    });
+}
+
+pub(crate) fn request_search_history(limit: u32) -> Vec<String> {
+    match one_shot_request(&Request::SearchHistory { limit }) {
+        Some(Response::Queries(qs)) => qs,
+        _ => Vec::new(),
+    }
+}
+
+/// Async wrapper for [`request_search_history`]: the blocking 500 ms
+/// round-trip runs on a worker thread; `on_done` runs back on the
+/// GTK main loop (K8b — the Up-arrow history fetch must never stall
+/// the key handler).
+pub(crate) fn fetch_search_history_async(limit: u32, on_done: impl FnOnce(Vec<String>) + 'static) {
+    fetch_async(move || request_search_history(limit), on_done);
+}
+
+/// Fetch the daemon's frecency-backed recent hits (O4) off the main
+/// thread; `on_done` runs on the GTK main loop with the hydrated
+/// hits (empty on transport failure or an older daemon).
+pub(crate) fn fetch_recents_async(limit: u32, on_done: impl FnOnce(Vec<Hit>) + 'static) {
+    fetch_async(
+        move || match one_shot_request(&Request::Recents { limit }) {
+            Some(Response::Recents { hits }) => hits,
+            _ => Vec::new(),
+        },
+        on_done,
+    );
+}
+
+/// Everything the GUI wants from one `Request::Status` round-trip:
+/// the zero-hit indexing check plus the live semantic/config health
+/// the daemon now reports (F6/O2).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DaemonStatusSnapshot {
+    pub(crate) indexed_docs: u64,
+    pub(crate) reindex_in_progress: bool,
+    /// `Some((config_enabled, human state label, worker_ready))`
+    /// when the daemon reports the semantic block.
+    pub(crate) semantic: Option<(bool, String, bool)>,
+    /// Config parse error the daemon fell back to defaults over.
+    pub(crate) config_error: Option<String>,
+}
+
+/// One-shot `Request::Status` round-trip (500 ms bound). Blocking —
+/// callers run this on a worker thread (never the GTK main thread).
+pub(crate) fn request_daemon_status() -> Option<DaemonStatusSnapshot> {
+    match one_shot_request(&Request::Status) {
+        Some(Response::Status {
             indexed_docs,
             reindex_in_progress,
+            semantic,
+            daemon,
             ..
-        }) => Some((indexed_docs, reindex_in_progress)),
+        }) => Some(DaemonStatusSnapshot {
+            indexed_docs,
+            reindex_in_progress,
+            semantic: semantic.map(|s| {
+                (
+                    s.enabled,
+                    s.state.to_string(),
+                    s.state == lixun_ipc::SemanticWorkerState::Ready,
+                )
+            }),
+            config_error: daemon.and_then(|d| d.config_error),
+        }),
         _ => None,
     }
+}
+
+/// Async wrapper for [`request_daemon_status`].
+pub(crate) fn fetch_daemon_status_async(
+    on_done: impl FnOnce(Option<DaemonStatusSnapshot>) + 'static,
+) {
+    fetch_async(request_daemon_status, on_done);
+}
+
+/// Fire-and-forget preview page request (P11): the daemon forwards
+/// it to the warm preview process as `PreviewCommand::Scroll`.
+pub(crate) fn send_preview_scroll(down: bool, pages: u32) {
+    send_request_fire_and_forget(&Request::PreviewScroll { down, pages });
 }
 
 pub(crate) fn dispatch_click_pair(doc_id: &str, query: &str) {
@@ -480,37 +534,8 @@ fn send_request_fire_and_forget(req: &Request) {
 }
 
 pub(crate) fn fetch_claimed_prefixes() -> Vec<String> {
-    use std::io::Read;
-    let sock = socket_path();
-    let Some(buf) = encode_frame(&Request::ClaimedPrefixes) else {
-        return Vec::new();
-    };
-    let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&sock) else {
-        return Vec::new();
-    };
-    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
-    if std::io::Write::write_all(&mut stream, &buf).is_err() {
-        return Vec::new();
-    }
-    let mut header = [0u8; 4];
-    if stream.read_exact(&mut header).is_err() {
-        return Vec::new();
-    }
-    let resp_len = u32::from_be_bytes(header) as usize;
-    if resp_len < 2 {
-        return Vec::new();
-    }
-    let mut version_buf = [0u8; 2];
-    if stream.read_exact(&mut version_buf).is_err() {
-        return Vec::new();
-    }
-    let resp_version = u16::from_be_bytes(version_buf);
-    let mut body = vec![0u8; resp_len - 2];
-    if stream.read_exact(&mut body).is_err() {
-        return Vec::new();
-    }
-    match lixun_ipc::decode_response(resp_version, &body) {
-        Ok(Response::ClaimedPrefixes(p)) => p,
+    match one_shot_request(&Request::ClaimedPrefixes) {
+        Some(Response::ClaimedPrefixes(p)) => p,
         _ => Vec::new(),
     }
 }

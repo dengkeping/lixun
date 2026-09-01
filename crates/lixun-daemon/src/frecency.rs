@@ -134,11 +134,52 @@ impl FrecencyStore {
     pub fn mult(&self, doc_id: &str, now: i64, alpha: f32) -> f32 {
         1.0 + alpha * self.raw(doc_id, now)
     }
+
+    /// Doc ids ranked by raw frecency, best first, capped at `limit`.
+    /// Backs `Request::Recents` (O4): the empty-launcher "Recent"
+    /// section is the user's most-frequently/recently opened hits.
+    /// Zero-score entries (all visits aged out) are skipped.
+    pub fn top_docs(&self, now: i64, limit: usize) -> Vec<String> {
+        let mut scored: Vec<(f32, &String)> = self
+            .records
+            .keys()
+            .map(|id| (self.raw(id, now), id))
+            .filter(|(score, _)| *score > 0.0)
+            .collect();
+        scored.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.cmp(b.1))
+        });
+        scored.truncate(limit);
+        scored.into_iter().map(|(_, id)| id.clone()).collect()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn top_docs_ranks_by_raw_frecency_and_caps() {
+        let mut store = FrecencyStore::default();
+        let now = 1_000_000i64;
+        store.record_click("doc:cold", now - 100 * 86_400);
+        for _ in 0..3 {
+            store.record_click("doc:hot", now - 10);
+        }
+        store.record_click("doc:warm", now - 10);
+        let top = store.top_docs(now, 2);
+        assert_eq!(top, vec!["doc:hot".to_string(), "doc:warm".to_string()]);
+        let all = store.top_docs(now, 10);
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[2], "doc:cold");
+    }
+
+    #[test]
+    fn top_docs_empty_store_is_empty() {
+        assert!(FrecencyStore::default().top_docs(0, 5).is_empty());
+    }
     use tempfile::tempdir;
 
     const DAY: i64 = SECONDS_PER_DAY;

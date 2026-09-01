@@ -50,6 +50,10 @@ pub struct MboxPart {
     pub mime: String,
     pub encoding: PartEncoding,
     pub subject: Option<String>,
+    /// Parent message `Date:` header as Unix seconds (R4). `None`
+    /// when the header is absent or unparseable; the attachment
+    /// source then falls back to the 0 "unknown" mtime sentinel.
+    pub date: Option<i64>,
 }
 
 pub fn find_headers_end(bytes: &[u8]) -> Option<usize> {
@@ -183,6 +187,13 @@ pub fn parse_mbox_parts_from_bytes(bytes: &[u8], path: &Path) -> Result<Vec<Mbox
                 .to_string()
         });
         let subject = parsed.headers.get_first_value("Subject");
+        // Headers are already parsed for Message-ID/Subject; reading
+        // Date is the same cost. `mailparse::dateparse` yields Unix
+        // seconds directly.
+        let date = parsed
+            .headers
+            .get_first_value("Date")
+            .and_then(|v| mailparse::dateparse(&v).ok());
         let mut part_index = 0;
         let mut ctx = WalkContext {
             msg_slice: message_bytes,
@@ -190,6 +201,7 @@ pub fn parse_mbox_parts_from_bytes(bytes: &[u8], path: &Path) -> Result<Vec<Mbox
             mbox_path: path,
             message_id: &message_id,
             subject: &subject,
+            date,
             part_index: &mut part_index,
             results: &mut results,
         };
@@ -220,6 +232,7 @@ struct WalkContext<'a> {
     mbox_path: &'a Path,
     message_id: &'a Option<String>,
     subject: &'a Option<String>,
+    date: Option<i64>,
     part_index: &'a mut usize,
     results: &'a mut Vec<MboxPart>,
 }
@@ -251,6 +264,7 @@ fn walk_parts(part: &mailparse::ParsedMail<'_>, ctx: &mut WalkContext<'_>) {
                 mime: part.ctype.mimetype.clone(),
                 encoding,
                 subject: ctx.subject.clone(),
+                date: ctx.date,
             });
             *ctx.part_index += 1;
         }
@@ -568,6 +582,25 @@ mod tests {
         assert!(input.len() > 200);
         let out = sanitize_filename(&input);
         assert!(out.len() <= 200);
+    }
+
+    #[test]
+    fn test_parse_date_header_to_unix_seconds() {
+        let fixture = b"From alice@example.com Fri Nov 01 10:00:00 2024\nFrom: alice@example.com\nSubject: Dated\nDate: Fri, 01 Nov 2024 10:00:00 +0000\nMessage-ID: <dated@example.com>\nContent-Type: multipart/mixed; boundary=\"BB\"\nMIME-Version: 1.0\n\n--BB\nContent-Type: text/plain\n\nhi\n--BB\nContent-Type: text/plain; name=\"a.txt\"\nContent-Disposition: attachment; filename=\"a.txt\"\nContent-Transfer-Encoding: base64\n\naGk=\n--BB--\n";
+        let (_dir, path) = write_fixture("dated", fixture);
+        let parts = parse_mbox_parts(&path).unwrap();
+        assert_eq!(parts.len(), 1);
+        // 2024-11-01T10:00:00Z
+        assert_eq!(parts[0].date, Some(1_730_455_200));
+    }
+
+    #[test]
+    fn test_parse_missing_date_header_is_none() {
+        let fixture = base64_pdf_fixture("\n");
+        let (_dir, path) = write_fixture("inbox", &fixture);
+        let parts = parse_mbox_parts(&path).unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].date, None);
     }
 
     #[test]

@@ -25,6 +25,8 @@ fn make_hits(count: usize) -> Vec<Hit> {
             source_instance: "fs".to_string(),
             row_menu: lixun_core::RowMenuDef::empty(),
             mime: None,
+            timestamp: None,
+            size: None,
         })
         .collect()
 }
@@ -70,6 +72,8 @@ fn make_hits_with_icons(count: usize) -> Vec<Hit> {
                 source_instance: "fs".to_string(),
                 row_menu: lixun_core::RowMenuDef::empty(),
                 mime: None,
+                timestamp: None,
+                size: None,
             }
         })
         .collect()

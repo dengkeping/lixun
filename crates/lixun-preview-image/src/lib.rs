@@ -10,6 +10,15 @@
 //! A footer label under the `Picture` shows the intrinsic
 //! dimensions and on-disk file size so the user does not need to
 //! alt-tab to a file manager to check "how big is this".
+//!
+//! Decode pipeline (P4): `build()` must return within the trait's
+//! ≤50 ms budget, so raster decoding — including multi-second RAW
+//! develops — runs on a worker thread and lands in the widget tree
+//! via crossfade, mirroring the office plugin's spinner→content
+//! pattern. Files above `preview.max_file_size_mb` are refused up
+//! front with a "too large" placeholder, and oversized decodes are
+//! downscaled to [`MAX_DECODE_DIM`] so a 60-megapixel JPEG never
+//! becomes a full-resolution GPU texture.
 
 use std::cell::Cell;
 use std::path::Path;
@@ -43,6 +52,13 @@ const VECTOR_EXTENSIONS: &[&str] = &["svg"];
 /// small fractional values per event, so this stays modest to keep panning
 /// smooth rather than jumpy.
 const SCROLL_PAN_STEP: f64 = 12.0;
+
+/// Longest texture side handed to GTK after decode. Chosen as ~2x a
+/// typical preview viewport (config caps the preview window at
+/// 1400 px wide) so moderate zoom-in stays sharp while a full-res
+/// photo doesn't allocate a phone-camera-sized GPU texture. The
+/// footer still reports the intrinsic dimensions.
+const MAX_DECODE_DIM: u32 = 2560;
 
 pub struct ImagePreview;
 
@@ -78,7 +94,7 @@ impl PreviewPlugin for ImagePreview {
         }
     }
 
-    fn build(&self, hit: &Hit, _cfg: &PreviewPluginCfg<'_>) -> anyhow::Result<gtk::Widget> {
+    fn build(&self, hit: &Hit, cfg: &PreviewPluginCfg<'_>) -> anyhow::Result<gtk::Widget> {
         let path = match &hit.action {
             Action::OpenFile { path } | Action::ShowInFileManager { path } => path.clone(),
             _ => anyhow::bail!("image plugin: hit has no openable path"),
@@ -90,93 +106,249 @@ impl PreviewPlugin for ImagePreview {
             .map(str::to_ascii_lowercase)
             .unwrap_or_default();
 
-        let mut intrinsic: Option<(i32, i32)> = None;
-
-        let scroll = gtk::ScrolledWindow::new();
-        scroll.set_hscrollbar_policy(gtk::PolicyType::Automatic);
-        scroll.set_vscrollbar_policy(gtk::PolicyType::Automatic);
-        scroll.set_hexpand(true);
-        scroll.set_vexpand(true);
-        // Honour the canvas' own natural size so an oversized image overflows the
-        // viewport and the scrollbars (hence panning) become active.
-        scroll.set_propagate_natural_width(true);
-        scroll.set_propagate_natural_height(true);
+        // Size gate first (P4): decoding a multi-hundred-MB file —
+        // raster, RAW, or a giant animated gif — freezes the window
+        // and blows the memory budget. Refuse with an actionable
+        // placeholder instead.
+        let file_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        if exceeds_size_cap(file_size, cfg.max_file_size_mb) {
+            tracing::info!(
+                "image: {:?} is {} — over preview.max_file_size_mb={}, refusing decode",
+                path,
+                human_bytes(file_size),
+                cfg.max_file_size_mb
+            );
+            return Ok(too_large_widget(file_size));
+        }
 
         let is_vector = VECTOR_EXTENSIONS.iter().any(|&e| e == ext);
         let is_animated = ANIMATED_EXTENSIONS.iter().any(|&e| e == ext);
 
-        let decoded_texture = if is_vector || is_animated {
-            None
-        } else {
-            decode_texture(&path, &mut intrinsic)
-        };
-
-        let mut toolbar: Option<gtk::Widget> = None;
-
-        if let Some(texture) = decoded_texture {
-            let canvas = ImageCanvas::new();
-            canvas.set_texture(&texture);
-            canvas.add_css_class("lixun-preview-image");
-            canvas.set_focusable(true);
-            canvas.set_can_focus(true);
-            wire_canvas_gestures(&canvas, &scroll);
-            toolbar = Some(build_image_toolbar(&canvas, &scroll));
-            scroll.set_child(Some(&canvas));
-        } else {
-            let picture = gtk::Picture::new();
-            picture.set_content_fit(gtk::ContentFit::Contain);
-            picture.set_can_shrink(true);
-            picture.set_hexpand(true);
-            picture.set_vexpand(true);
-            picture.add_css_class("lixun-preview-image");
-
-            if is_vector {
-                picture.set_filename(Some(&path));
-            } else if is_animated {
-                let media = gtk::MediaFile::for_filename(&path);
-                media.set_loop(true);
-                media.play();
-                picture.set_paintable(Some(&media));
-            } else {
-                picture.set_filename(Some(&path));
-            }
-            scroll.set_child(Some(&picture));
+        // Vector + animated formats keep the GTK-native pipeline:
+        // librsvg / MediaFile load lazily and scale on their own.
+        if is_vector || is_animated {
+            tracing::info!("image: rendered {:?} ext={} (gtk-native path)", path, ext);
+            return Ok(build_fallback_view(&path, is_vector, is_animated));
         }
 
-        let footer = gtk::Label::new(Some(&format_footer(&path, intrinsic)));
-        footer.set_xalign(0.0);
-        footer.set_margin_top(4);
-        footer.set_margin_bottom(8);
-        footer.set_margin_start(16);
-        footer.set_margin_end(16);
-        footer.add_css_class("lixun-preview-image-footer");
+        // Raster path (P4): spinner placeholder now, decode on a
+        // worker thread, crossfade the canvas in when it lands.
+        // Office-plugin pattern: worker thread + async_channel +
+        // spawn_local, weak ref guarded so a disposed/replaced
+        // widget is never touched.
+        let stack = gtk::Stack::new();
+        stack.set_hexpand(true);
+        stack.set_vexpand(true);
+        stack.set_transition_type(gtk::StackTransitionType::Crossfade);
+        stack.set_transition_duration(150);
+        stack.add_css_class("lixun-preview-image-container");
+        stack.add_named(&build_placeholder(), Some("loading"));
+        stack.set_visible_child_name("loading");
 
-        let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        if let Some(toolbar) = &toolbar {
-            vbox.append(toolbar);
-        }
-        vbox.append(&scroll);
-        vbox.append(&footer);
-        vbox.add_css_class("lixun-preview-image-container");
+        let (tx, rx) = async_channel::bounded::<DecodeOutcome>(1);
+        let decode_path = path.clone();
+        std::thread::spawn(move || {
+            let outcome = decode_scaled(&decode_path).map_err(|e| format!("{e:#}"));
+            let _ = tx.send_blocking(outcome);
+        });
 
-        tracing::info!(
-            "image: rendered {:?} ext={} intrinsic={:?}",
-            path,
-            ext,
-            intrinsic
-        );
+        let stack_weak = stack.downgrade();
+        let done_path = path.clone();
+        glib::MainContext::default().spawn_local(async move {
+            let Ok(outcome) = rx.recv().await else {
+                return;
+            };
+            let Some(stack) = stack_weak.upgrade() else {
+                return;
+            };
+            let rendered = match outcome {
+                Ok((texture, intrinsic)) => {
+                    tracing::info!(
+                        "image: rendered {:?} intrinsic={:?} (async)",
+                        done_path,
+                        intrinsic
+                    );
+                    build_canvas_view(&done_path, &texture, intrinsic)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "image: texture decode failed for {:?} ({}), falling back to Picture::set_filename",
+                        done_path,
+                        e
+                    );
+                    build_fallback_view(&done_path, false, false)
+                }
+            };
+            stack.add_named(&rendered, Some("rendered"));
+            stack.set_visible_child_name("rendered");
+        });
 
-        Ok(vbox.upcast())
+        Ok(stack.upcast())
     }
 }
 
-/// Decode `path` into a GPU texture, recording its intrinsic size.
-/// Returns `None` (and logs) when decoding fails, so the caller can
-/// fall back to GTK's own loader via `Picture::set_filename`.
-fn decode_texture(path: &Path, intrinsic: &mut Option<(i32, i32)>) -> Option<gdk::Texture> {
+/// Worker-thread decode result: texture + intrinsic (pre-downscale)
+/// dimensions, or a display-ready error string.
+type DecodeOutcome = Result<(gdk::Texture, (i32, i32)), String>;
+
+/// Spinner shown while the worker thread decodes. Same shape as the
+/// office plugin's conversion placeholder.
+fn build_placeholder() -> gtk::Widget {
+    let vbox = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    vbox.set_halign(gtk::Align::Center);
+    vbox.set_valign(gtk::Align::Center);
+    vbox.set_hexpand(true);
+    vbox.set_vexpand(true);
+
+    let spinner = gtk::Spinner::new();
+    spinner.set_size_request(48, 48);
+    spinner.start();
+    vbox.append(&spinner);
+
+    let label = gtk::Label::new(Some("Loading image…"));
+    label.add_css_class("lixun-preview-image-loading");
+    vbox.append(&label);
+
+    vbox.upcast()
+}
+
+/// Centered refusal for files over `preview.max_file_size_mb`.
+fn too_large_widget(file_size: u64) -> gtk::Widget {
+    let vbox = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    vbox.set_halign(gtk::Align::Center);
+    vbox.set_valign(gtk::Align::Center);
+    vbox.set_hexpand(true);
+    vbox.set_vexpand(true);
+    vbox.add_css_class("lixun-preview-image-container");
+
+    let label = gtk::Label::new(Some("Too large to preview — press Enter to open"));
+    label.add_css_class("lixun-preview-image-toolarge");
+    vbox.append(&label);
+
+    let size = gtk::Label::new(Some(&human_bytes(file_size)));
+    size.add_css_class("lixun-preview-image-footer");
+    vbox.append(&size);
+
+    vbox.upcast()
+}
+
+/// Assemble the zoomable canvas view (toolbar + scroll + footer) for
+/// an already-decoded texture. Runs on the main thread after the
+/// worker finishes.
+fn build_canvas_view(path: &Path, texture: &gdk::Texture, intrinsic: (i32, i32)) -> gtk::Widget {
+    let scroll = gtk::ScrolledWindow::new();
+    scroll.set_hscrollbar_policy(gtk::PolicyType::Automatic);
+    scroll.set_vscrollbar_policy(gtk::PolicyType::Automatic);
+    scroll.set_hexpand(true);
+    scroll.set_vexpand(true);
+    // Honour the canvas' own natural size so an oversized image overflows the
+    // viewport and the scrollbars (hence panning) become active.
+    scroll.set_propagate_natural_width(true);
+    scroll.set_propagate_natural_height(true);
+
+    let canvas = ImageCanvas::new();
+    canvas.set_texture(texture);
+    canvas.add_css_class("lixun-preview-image");
+    canvas.set_focusable(true);
+    canvas.set_can_focus(true);
+    wire_canvas_gestures(&canvas, &scroll);
+    let toolbar = build_image_toolbar(&canvas, &scroll);
+    scroll.set_child(Some(&canvas));
+
+    let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    vbox.append(&toolbar);
+    vbox.append(&scroll);
+    vbox.append(&build_footer(path, Some(intrinsic)));
+    vbox.upcast()
+}
+
+/// GTK-native fallback view: `Picture` for vectors/decode failures,
+/// `MediaFile` for animated formats.
+fn build_fallback_view(path: &Path, is_vector: bool, is_animated: bool) -> gtk::Widget {
+    let scroll = gtk::ScrolledWindow::new();
+    scroll.set_hscrollbar_policy(gtk::PolicyType::Automatic);
+    scroll.set_vscrollbar_policy(gtk::PolicyType::Automatic);
+    scroll.set_hexpand(true);
+    scroll.set_vexpand(true);
+    scroll.set_propagate_natural_width(true);
+    scroll.set_propagate_natural_height(true);
+
+    let picture = gtk::Picture::new();
+    picture.set_content_fit(gtk::ContentFit::Contain);
+    picture.set_can_shrink(true);
+    picture.set_hexpand(true);
+    picture.set_vexpand(true);
+    picture.add_css_class("lixun-preview-image");
+
+    if is_animated {
+        let media = gtk::MediaFile::for_filename(path);
+        media.set_loop(true);
+        media.play();
+        picture.set_paintable(Some(&media));
+    } else {
+        // Vectors and decode-failure fallbacks both go through
+        // GTK's own loader.
+        let _ = is_vector;
+        picture.set_filename(Some(path));
+    }
+    scroll.set_child(Some(&picture));
+
+    let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    vbox.append(&scroll);
+    vbox.append(&build_footer(path, None));
+    vbox.add_css_class("lixun-preview-image-container");
+    vbox.upcast()
+}
+
+fn build_footer(path: &Path, intrinsic: Option<(i32, i32)>) -> gtk::Label {
+    let footer = gtk::Label::new(Some(&format_footer(path, intrinsic)));
+    footer.set_xalign(0.0);
+    footer.set_margin_top(4);
+    footer.set_margin_bottom(8);
+    footer.set_margin_start(16);
+    footer.set_margin_end(16);
+    footer.add_css_class("lixun-preview-image-footer");
+    footer
+}
+
+/// True when the on-disk size exceeds the configured preview cap.
+/// `max_mb == 0` is treated as "no limit" so an explicit opt-out
+/// keeps working.
+fn exceeds_size_cap(size_bytes: u64, max_mb: u64) -> bool {
+    max_mb != 0 && size_bytes > max_mb.saturating_mul(1024 * 1024)
+}
+
+/// Downscale target within `max_dim`, aspect preserved. `None` when
+/// the image already fits — the caller then skips the resample.
+fn scaled_target(w: u32, h: u32, max_dim: u32) -> Option<(u32, u32)> {
+    let longest = w.max(h);
+    if longest <= max_dim || longest == 0 {
+        return None;
+    }
+    let scale = f64::from(max_dim) / f64::from(longest);
+    let sw = ((f64::from(w) * scale).round() as u32).max(1);
+    let sh = ((f64::from(h) * scale).round() as u32).max(1);
+    Some((sw, sh))
+}
+
+/// Decode `path` into a GPU texture on a WORKER thread, downscaled
+/// to [`MAX_DECODE_DIM`] on its longest side, returning the texture
+/// plus the image's intrinsic (pre-downscale) dimensions for the
+/// footer. `gdk::Texture` is upstream-marked `Send + Sync`
+/// (immutable refcounted GObject) so constructing it off the main
+/// thread and shipping it across the channel is sound — the GUI's
+/// icon loader relies on the same property.
+fn decode_scaled(path: &Path) -> anyhow::Result<(gdk::Texture, (i32, i32))> {
     #[cfg(feature = "image-decode")]
-    let result: anyhow::Result<gdk::Texture> = (|| {
+    {
         let img = lixun_image_decode::decode_to_dynamic_image(path)?;
+        let intrinsic = (img.width() as i32, img.height() as i32);
+        let img = match scaled_target(img.width(), img.height(), MAX_DECODE_DIM) {
+            // `thumbnail` = fast integer-box sampling; fine for a
+            // preview pane, much cheaper than Lanczos on a photo.
+            Some((tw, th)) => img.thumbnail(tw, th),
+            None => img,
+        };
         let width = img.width() as i32;
         let height = img.height() as i32;
         let rgba = img.to_rgba8();
@@ -188,28 +360,35 @@ fn decode_texture(path: &Path, intrinsic: &mut Option<(i32, i32)>) -> Option<gdk
             &bytes,
             (width * 4) as usize,
         );
-        *intrinsic = Some((width, height));
-        Ok(texture.upcast())
-    })();
+        Ok((texture.upcast(), intrinsic))
+    }
 
     #[cfg(not(feature = "image-decode"))]
-    let result: anyhow::Result<gdk::Texture> = gdk::Texture::from_filename(path)
-        .map(|texture| {
-            *intrinsic = Some((texture.width(), texture.height()));
-            texture
-        })
-        .map_err(Into::into);
-
-    match result {
-        Ok(texture) => Some(texture),
-        Err(e) => {
-            tracing::warn!(
-                "image: texture decode failed for {:?} ({}), falling back to Picture::set_filename",
-                path,
-                e
-            );
-            None
-        }
+    {
+        use gdk_pixbuf::Pixbuf;
+        // Header-only probe for the intrinsic size, then a decoder-
+        // side downscale so oversized files never materialise at
+        // full resolution.
+        let intrinsic = Pixbuf::file_info(path)
+            .map(|(_, w, h)| (w, h))
+            .unwrap_or((0, 0));
+        let needs_scale = scaled_target(
+            intrinsic.0.max(0) as u32,
+            intrinsic.1.max(0) as u32,
+            MAX_DECODE_DIM,
+        )
+        .is_some();
+        let pixbuf = if needs_scale {
+            Pixbuf::from_file_at_scale(path, MAX_DECODE_DIM as i32, MAX_DECODE_DIM as i32, true)?
+        } else {
+            Pixbuf::from_file(path)?
+        };
+        let intrinsic = if intrinsic == (0, 0) {
+            (pixbuf.width(), pixbuf.height())
+        } else {
+            intrinsic
+        };
+        Ok((gdk::Texture::for_pixbuf(&pixbuf), intrinsic))
     }
 }
 
@@ -583,6 +762,8 @@ mod tests {
             source_instance: String::new(),
             row_menu: lixun_core::RowMenuDef::empty(),
             mime: mime.map(str::to_string),
+            timestamp: None,
+            size: None,
         }
     }
 
@@ -641,6 +822,8 @@ mod tests {
             source_instance: String::new(),
             row_menu: lixun_core::RowMenuDef::empty(),
             mime: None,
+            timestamp: None,
+            size: None,
         };
         assert_eq!(ImagePreview.match_score(&hit), 0);
     }
@@ -652,6 +835,32 @@ mod tests {
             ImagePreview.match_score(&hit) > 50,
             "image plugin must win the png extension even if the mime is wrong"
         );
+    }
+
+    #[test]
+    fn size_cap_gate() {
+        // 1 MiB cap: exactly at the cap passes, one byte over fails.
+        assert!(!exceeds_size_cap(1024 * 1024, 1));
+        assert!(exceeds_size_cap(1024 * 1024 + 1, 1));
+        // 0 = no limit.
+        assert!(!exceeds_size_cap(u64::MAX, 0));
+    }
+
+    #[test]
+    fn scaled_target_preserves_aspect_and_skips_small() {
+        // Within bounds: no resample.
+        assert_eq!(scaled_target(800, 600, 2560), None);
+        assert_eq!(scaled_target(2560, 2560, 2560), None);
+        // Oversized landscape: longest side pinned, aspect kept.
+        let (w, h) = scaled_target(5120, 2560, 2560).unwrap();
+        assert_eq!(w, 2560);
+        assert_eq!(h, 1280);
+        // Oversized portrait.
+        let (w, h) = scaled_target(1000, 10000, 2500).unwrap();
+        assert_eq!(h, 2500);
+        assert_eq!(w, 250);
+        // Degenerate zero never panics.
+        assert_eq!(scaled_target(0, 0, 2560), None);
     }
 
     #[test]

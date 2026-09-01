@@ -108,6 +108,7 @@ pub(super) async fn run(
         preferred_trigger,
         bound
     );
+    super::update_status(|st| st.bound = true);
 
     let component_path: OwnedObjectPath = root
         .call("getComponent", &(COMPONENT_UNIQUE,))
