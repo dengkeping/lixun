@@ -10,7 +10,7 @@ This document lists the Success Criteria from `.local/plans/spotlight-parity.md`
 | SC-3 | "chrm" matches "Chrome" (fuzzy) | `tests/it: spotlight_fuzzy_single_edit_typo` (firefox/firfox) + `lixun-index: test_search_fuzzy_typo` |
 | SC-4 | "my report" AND-semantics | `tests/it: spotlight_and_semantics_default` + `lixun-index: test_search_and_default` |
 | SC-5 | "-draft" excludes | `tests/it: spotlight_not_operator_excludes` + `lixun-index: test_search_not_operator` |
-| SC-6 | "2+2" → "4" | `tests/it: calculator_detects_arithmetic` + 25 tests in `lixun-index::calculator` |
+| SC-6 | "2+2" → "4" | `lixun-source-calculator` detect tests (`src/detect.rs`, e.g. `detect_evaluates_basic_arithmetic`) |
 | SC-7 | "sqrt(16)+pi" | `lixun-index::calculator::tests::detect_evaluates_function_and_constant` |
 | SC-20 | Typing feels instant | event-driven debounce (80 ms single cancelable timeout) replaces 40 ms polling |
 | SC-21 | 110 + 25 new tests green | `cargo test --workspace` |
@@ -43,7 +43,7 @@ Walk through:
 - [ ] **SC-8** (drag-out) — select a File row, drag onto Desktop/Files; file copies
 - [ ] **SC-9** (right-click menu) — right-click File row; popover shows Open/Reveal/Copy path/Quick Look/Get Info
 - [ ] **SC-10** (Space Quick Look) — select File row, press Space; gnome-sushi or xdg-open launches
-- [ ] **SC-11** (Ctrl+1..4) — press Ctrl+2 (Apps chip); list narrows to apps
+- [ ] **SC-11** (Ctrl+1..4) — press Ctrl+1 (Apps chip); list narrows to apps
 - [ ] **SC-12** (Ctrl+↓) — in mixed list, Ctrl+↓ jumps to first row of next category
 - [ ] **SC-13** (↑ history) — with empty entry, press ↑; last queries appear; Enter on one replaces entry text
 - [ ] **SC-14** (active monitor) — with two monitors, move pointer to secondary; toggle → window on secondary

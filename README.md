@@ -1,6 +1,6 @@
 # Lixun 利寻
 
-[![version](https://img.shields.io/badge/version-0.6.0-blue)](https://github.com/dengkeping/lixun/releases)
+[![version](https://img.shields.io/badge/version-0.7.0-blue)](https://github.com/dengkeping/lixun/releases)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-green)](#license)
 [![platform](https://img.shields.io/badge/platform-Linux-lightgrey)]()
 [![rust](https://img.shields.io/badge/rust-2024-orange)](https://www.rust-lang.org/)
@@ -69,9 +69,9 @@ git clone https://github.com/dengkeping/lixun.git
 cd lixun
 cargo build --workspace --release
 cp target/release/{lixun-cli,lixund,lixun-gui,lixun-preview} /tmp/lixun-arch-tarball/
-tar -C /tmp/lixun-arch-tarball -czf packaging/arch/lixun-0.6.0-x86_64.tar.gz .
+tar -C /tmp/lixun-arch-tarball -czf packaging/arch/lixun-0.7.0-x86_64.tar.gz .
 cd packaging/arch && makepkg -f
-sudo pacman -U lixun-bin-0.6.0-1-x86_64.pkg.tar.zst
+sudo pacman -U lixun-bin-0.7.0-1-x86_64.pkg.tar.zst
 systemctl --user enable --now lixund.service
 ```
 
@@ -135,9 +135,12 @@ Lance/Arrow staging during backfill. See [Semantic search](#semantic-search).
 
 ### Bind the global hotkey
 
-Lixun uses the **XDG GlobalShortcuts portal** (works on KDE Plasma 6+, GNOME,
-Hyprland, etc). On first run it registers a request for `Super+space`;
-accept it in the portal dialog, or configure your compositor directly:
+Lixun uses the **XDG GlobalShortcuts portal** (works on KDE Plasma 6+,
+Hyprland, and other compositors that ship the portal). GNOME is currently
+out of scope: the launcher window needs `wlr-layer-shell`, which
+GNOME / Mutter does not implement (see the roadmap's compositor matrix).
+On first run lixun registers a request for `Super+space`; accept it in the
+portal dialog, or configure your compositor directly:
 
 ```toml
 # ~/.config/lixun/config.toml
@@ -146,6 +149,14 @@ global_toggle = "Super+space"
 ```
 
 If the portal rejects the binding, write it in spec form: `LOGO+space`.
+
+On compositors without the GlobalShortcuts portal (sway, niri, older
+wlroots builds), bind `lixun-cli toggle` manually in your compositor
+config. sway example:
+
+```
+bindsym $mod+space exec lixun-cli toggle
+```
 
 ### Command-line usage
 
@@ -176,110 +187,30 @@ mkdir -p ~/.config/lixun
 cp docs/config.example.toml ~/.config/lixun/config.toml
 ```
 
-Annotated config showing all supported sections:
+A short taste of the schema — indexer knobs live under `[core]`:
 
 ```toml
-# Top-level settings
-max_file_size_mb = 50          # Files larger than this indexed by name only
+[core]
+max_results = 30               # Result cap shared by GUI and CLI
+max_file_size_mb = 50          # Larger files are indexed by name only
 extractor_timeout_secs = 15    # Per-extractor timeout (pdftotext, etc.)
-
-exclude = [".thunderbird", "target", "node_modules"]   # substring excludes
+exclude = [".thunderbird"]     # Substring excludes (added to defaults)
 exclude_regex = ['\.sqlite-wal$', '/target/(debug|release)/']
-
-[ranking]
-apps = 1.3                     # Category score multipliers
-files = 1.2
-mail = 1.0
-attachments = 0.9
-prefix_boost = 1.4             # Title prefix match boost
-acronym_boost = 1.25           # D4 acronym/initials boost
-recency_weight = 0.2           # Recency bonus weight
-recency_tau_days = 30.0        # Recency decay horizon
-frecency_alpha = 0.1           # Frecency multiplier weight
-latch_weight = 0.5             # Query-latch weight
-latch_cap = 3.0                # Latch multiplier cap
-total_multiplier_cap = 6.0     # Stage-2 multiplier ceiling
-top_hit_min_confidence = 0.6   # Hero row confidence threshold
-top_hit_min_margin = 1.3       # Hero row margin threshold
-strong_latch_threshold = 3     # "Strong" latch click count
 
 [keybindings]
 global_toggle = "Super+space"
-close = "Escape"
-primary_action = "Return"
-secondary_action = "<Shift>Return"
-copy = "<Ctrl>c"
-quick_look = "space"
-
-[gui]
-width_percent = 40             # Window width (% of monitor)
-height_percent = 60            # Window height (% of monitor)
-max_width_px = 900             # Absolute pixel caps
-max_height_px = 800
-preview_width_percent = 80     # Preview pane dimensions
-preview_height_percent = 80
-preview_max_width_px = 2000
-preview_max_height_px = 1400
-
-[preview]
-enabled = true
-default_format = "auto"        # "auto" or force a plugin id
-max_file_size_mb = 200         # Preview limit (separate from extraction)
-
-# ─── Source plugins (presence of section = plugin loaded) ─────────────
-
-[[maildir]]                    # One instance per [[maildir]] block
-id = "personal"
-paths = ["~/Mail/INBOX", "~/Mail/Archive"]
-open_cmd = ["neomutt", "-f", "{folder}"]
-
-[thunderbird]
-enabled = true
-gloda_batch_size = 2500        # Tick batch: smaller = lower memory, slower catch-up
-attachments = true             # Index mbox attachments (reindex-on-demand only)
-# profile = "/path/to/thunderbird/XXX.profile"   # override auto-detect
-
-[calculator]                   # Empty section enables the plugin
-
-[shell]
-# working_dir = "~"            # Working directory for shell commands
-# strict_mode = false          # Block risky commands (sudo, rm -rf, etc.)
-
-[extract]
-cache_max_mb = 500             # Extraction cache LRU cap
-cache_sweep_interval_secs = 600
-
-[ocr]
-enabled = false
-# languages = ["eng", "rus"]   # Auto-derived from $LANG when omitted
-# max_pages_per_pdf = 20
-# min_image_side_px = 200
-# timeout_secs = 30
-# worker_interval_secs = 60
-# jobs_per_tick = 10
-# adaptive_throttle = false
-# max_cpu_pressure_avg10 = 10.0
-# nice_level = 19
-# io_class_idle = false
 
 [semantic]
-enabled = false                # Requires the lixun-semantic-worker sidecar binary
-text_model = "bge-small-en-v1.5"
-image_model = "clip-vit-b-32"
-batch_size = 32
-flush_ms = 2000
-min_image_side_px = 300
-backfill_on_start = false
-rrf_k = 60.0
-cache_subdir = "fastembed"
-
-[impact]
-level = "high"                 # unlimited | high | medium | low
-follow_battery = false         # Auto-switch to low on battery
-on_battery_level = "low"       # Level to use when on battery
+enabled = false                # Opt-in dense-vector sidecar (~400 MB models)
 ```
 
-See [`docs/config.example.toml`](docs/config.example.toml) for the full reference.
+Every supported section — `[ranking]`, `[keybindings]`, `[preview]`,
+`[gui]` (sizing, blur, theme, matugen), the source plugins
+(`[[maildir]]`, `[thunderbird]`, `[calculator]`, `[shell]`,
+`[semantic]`), `[extract]`, `[ocr]`, and `[impact]` — is documented
+with defaults and commentary in
+[`docs/config.example.toml`](docs/config.example.toml), the single
+reference for the config schema.
 
 ---
 
@@ -779,6 +710,12 @@ user-visible search downtime. Expect transient CPU and I/O for the
 duration of the reindex (minutes on typical home corpora).
 
 Recent version bumps:
+
+- **v0.7.0** (UX hardening pass). Keyboard-flow fixes: the top-hit preview
+  chord, safe Enter on empty results, and session text selection. Honest
+  daemon/indexing states in the status surfaces, calculator and shell
+  plugins enabled by default (no config section required), visible
+  selection styling, and accessibility fixes. No INDEX_VERSION bump.
 
 - **v0.6.0** (cross-modal image search + RRF fusion). Added CLIP-based
   text→image search: query "photos of dogs" returns photos ranked by visual
