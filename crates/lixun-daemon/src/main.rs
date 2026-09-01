@@ -1820,10 +1820,17 @@ fn register_plugin_sources(
         state_dir_root: state_dir_root.to_path_buf(),
         impact,
     };
+    // Zero-config factories (`default_enabled`) build with an empty
+    // table when their section is absent — missing section means
+    // "enabled with defaults". An explicit section still applies its
+    // config, including the factory-honoured `enabled = false` opt-out.
+    let empty_section = toml::Value::Table(toml::map::Map::new());
     for factory in factories {
         let section = factory.section();
-        let Some(raw) = config.plugin_sections.get(section) else {
-            continue;
+        let raw = match config.plugin_sections.get(section) {
+            Some(raw) => raw,
+            None if factory.default_enabled() => &empty_section,
+            None => continue,
         };
         let instances = factory
             .build(raw, &ctx)
@@ -1833,9 +1840,14 @@ fn register_plugin_sources(
             registry.register(inst.instance_id, state_dir_root, inst.source);
         }
         tracing::info!(
-            "plugin '{}' registered {} instance(s) from config",
+            "plugin '{}' registered {} instance(s) from {}",
             section,
-            count
+            count,
+            if config.plugin_sections.contains_key(section) {
+                "config"
+            } else {
+                "defaults (no config section)"
+            }
         );
     }
 

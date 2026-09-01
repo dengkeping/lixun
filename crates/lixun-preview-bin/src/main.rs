@@ -975,16 +975,19 @@ fn rebuild_header(
     let text = gtk::Box::new(gtk::Orientation::Vertical, 2);
     text.set_hexpand(true);
 
+    // halign (not xalign) so RTL locales mirror the header. The
+    // ellipsis still triggers: a non-Fill label's allocation is
+    // capped at min(natural, available).
     let title = gtk::Label::new(Some(&hit.title));
     title.set_widget_name("lixun-preview-title");
-    title.set_xalign(0.0);
+    title.set_halign(gtk::Align::Start);
     title.set_ellipsize(gtk::pango::EllipsizeMode::End);
     text.append(&title);
 
     if !hit.subtitle.is_empty() {
         let subtitle = gtk::Label::new(Some(&hit.subtitle));
         subtitle.set_widget_name("lixun-preview-subtitle");
-        subtitle.set_xalign(0.0);
+        subtitle.set_halign(gtk::Align::Start);
         subtitle.set_ellipsize(gtk::pango::EllipsizeMode::End);
         text.append(&subtitle);
     }

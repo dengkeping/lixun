@@ -294,6 +294,9 @@ pub fn default_launch(hit: &lixun_core::Hit) -> anyhow::Result<()> {
         Action::ExecCapture { .. } => {
             anyhow::bail!("ExecCapture has no standalone launch semantics");
         }
+        Action::CopyText { .. } => {
+            anyhow::bail!("CopyText has no standalone launch semantics");
+        }
     }
 }
 

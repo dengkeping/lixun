@@ -18,14 +18,25 @@ impl PluginFactory for ShellFactory {
         "shell"
     }
 
+    /// Zero-config: the daemon registers the shell runner even without
+    /// a `[shell]` section (argv-exec mode, home working dir).
+    /// `enabled = false` in an explicit section opts out.
+    fn default_enabled(&self) -> bool {
+        true
+    }
+
     fn build(&self, raw: &toml::Value, _ctx: &PluginBuildContext) -> Result<Vec<PluginInstance>> {
         #[derive(Deserialize)]
         struct ShellCfg {
+            enabled: Option<bool>,
             working_dir: Option<String>,
             strict_mode: Option<bool>,
             shell_mode: Option<bool>,
         }
         let cfg: ShellCfg = raw.clone().try_into()?;
+        if cfg.enabled == Some(false) {
+            return Ok(Vec::new());
+        }
         let working_dir = cfg
             .working_dir
             .map(expand_tilde)

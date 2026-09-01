@@ -286,17 +286,31 @@ impl PreviewSpawner {
     /// Until then it stays warm so the next Space/scrub is a hot
     /// path, not a cold spawn.
     ///
-    /// Only meaningful when the preview is `Ready` — in `Starting`
-    /// the window has not even been built yet, and in `Dead` there
-    /// is no process to talk to. Both are no-ops; the launcher's
-    /// local `preview_mode_active` reset is the source of truth
-    /// for UI state, this method only adjusts the warm process.
+    /// Only `Ready` has a window to hide — in `Starting` the
+    /// window has not even been built yet, and in `Dead` there is
+    /// no process to talk to. `Dead` is a pure no-op; `Starting`
+    /// clears the buffered `ShowOrUpdate` so the dismissed
+    /// preview is not resurrected when `Ready` drains the buffer.
+    /// The launcher's local `preview_mode_active` reset is the
+    /// source of truth for UI state, this method only adjusts the
+    /// warm process.
     pub async fn hide(&self) -> anyhow::Result<()> {
         let epoch = self.epoch.fetch_add(1, Ordering::Relaxed) + 1;
         let mut state = self.state.lock().await;
 
         match &mut *state {
-            PreviewLifecycle::Dead | PreviewLifecycle::Starting { .. } => Ok(()),
+            PreviewLifecycle::Dead => Ok(()),
+            PreviewLifecycle::Starting { latest_desired, .. } => {
+                // Nothing on screen yet, but a buffered
+                // ShowOrUpdate would be drained and presented the
+                // moment Ready arrives — popping up a preview the
+                // user already dismissed. Drop the pending show
+                // intent; the parent handle and launcher geometry
+                // buffers stay (they present nothing on their own
+                // and remain valid for the next dispatch).
+                *latest_desired = None;
+                Ok(())
+            }
             PreviewLifecycle::Ready { cmd_tx, .. } => {
                 let cmd = PreviewCommand::Hide { epoch };
                 if send_or_drop(cmd_tx, cmd) {
@@ -955,6 +969,44 @@ mod tests {
             s.socket_path().unwrap().to_string_lossy(),
             "/tmp/lixun-preview-1234.sock"
         );
+    }
+
+    #[tokio::test]
+    async fn hide_while_starting_clears_buffered_show() {
+        // Dismiss during cold start: the buffered ShowOrUpdate
+        // must be dropped so nothing is presented when Ready
+        // drains the buffer. The parent-handle buffer survives —
+        // it presents nothing on its own and a later dispatch
+        // while still Starting reuses it.
+        let spawner = PreviewSpawner::new(Arc::new(GuiControl::new()));
+        *spawner.state.lock().await = PreviewLifecycle::Starting {
+            pid: 1234,
+            socket_path: PathBuf::from("/tmp/lixun-preview-1234.sock"),
+            latest_desired: Some((7, fake_hit(), Some("eDP-1".into()))),
+            latest_parent_handle: Some("export-handle-xyz".into()),
+            latest_launcher_geometry: None,
+        };
+
+        spawner.hide().await.unwrap();
+
+        let state = spawner.state.lock().await;
+        match &*state {
+            PreviewLifecycle::Starting {
+                latest_desired,
+                latest_parent_handle,
+                ..
+            } => {
+                assert!(
+                    latest_desired.is_none(),
+                    "hide during Starting must clear the buffered ShowOrUpdate"
+                );
+                assert!(
+                    latest_parent_handle.is_some(),
+                    "hide must not clear the buffered parent handle"
+                );
+            }
+            _ => panic!("hide during Starting must not change the lifecycle state"),
+        }
     }
 
     #[test]

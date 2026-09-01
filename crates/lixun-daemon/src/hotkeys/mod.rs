@@ -49,7 +49,12 @@ pub async fn spawn_global_toggle_listener(
         } else {
             tracing::info!("hotkeys: using xdg-desktop-portal backend");
             if let Err(e) = portal::run(preferred_trigger, state_dir, tx).await {
-                tracing::warn!("hotkeys[portal]: listener failed: {:#}", e);
+                tracing::warn!(
+                    "hotkeys[portal]: listener failed: {:#}; the global toggle \
+                     hotkey is unavailable — bind 'lixun-cli toggle' in your \
+                     compositor config instead",
+                    e
+                );
             }
         }
     });

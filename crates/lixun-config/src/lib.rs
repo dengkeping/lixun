@@ -363,6 +363,7 @@ struct KeybindingsToml {
     secondary_action: Option<String>,
     copy: Option<String>,
     quick_look: Option<String>,
+    quick_look_alt: Option<String>,
     history_up: Option<String>,
     next_result: Option<String>,
     previous_result: Option<String>,
@@ -384,6 +385,9 @@ pub struct Keybindings {
     pub secondary_action: String,
     pub copy: String,
     pub quick_look: String,
+    /// Quick Look chord that works while the search entry owns focus
+    /// (bare `quick_look` Space must stay typeable there).
+    pub quick_look_alt: String,
     pub history_up: String,
     pub next_result: String,
     pub previous_result: String,
@@ -575,6 +579,7 @@ impl Default for Keybindings {
             secondary_action: "<Shift>Return".into(),
             copy: "<Ctrl>c".into(),
             quick_look: "space".into(),
+            quick_look_alt: "<Ctrl>space".into(),
             history_up: "Up".into(),
             next_result: "Down".into(),
             previous_result: "Up".into(),
@@ -589,6 +594,89 @@ impl Default for Keybindings {
             reset_gui_position: "<Ctrl>0".into(),
         }
     }
+}
+
+/// Modifier bitmask + lowercased keysym name for a GTK accelerator
+/// string, used only for duplicate detection. Mirrors the subset of
+/// `gtk::accelerator_parse` syntax the GUI dispatches (`<Ctrl>c`,
+/// `<Shift>Return`, `<Ctrl><Shift>0`, bare keysym names) without
+/// linking GTK — lixun-config is shared by the headless daemon and
+/// CLI. Returns `None` for strings that are not GTK accelerators
+/// (e.g. the XDG-spec `global_toggle` form `Super+space`).
+fn normalize_accel(accel: &str) -> Option<(u8, String)> {
+    let mut mods: u8 = 0;
+    let mut rest = accel.trim();
+    while let Some(stripped) = rest.strip_prefix('<') {
+        let (name, tail) = stripped.split_once('>')?;
+        mods |= match name.to_ascii_lowercase().as_str() {
+            "shift" => 1,
+            "ctrl" | "control" | "primary" => 2,
+            "alt" => 4,
+            "super" => 8,
+            "meta" => 16,
+            "hyper" => 32,
+            _ => return None,
+        };
+        rest = tail;
+    }
+    if rest.is_empty() || rest.contains(['<', '>', '+', ' ']) {
+        return None;
+    }
+    Some((mods, rest.to_ascii_lowercase()))
+}
+
+/// One warning line per pair of keybindings that resolve to the same
+/// (modifiers, key) accelerator. The GUI dispatches accels in a fixed
+/// order, so of two colliding actions one silently never fires — warn
+/// naming both, never reject. The `previous_result` / `history_up`
+/// pair is exempt: both default to `Up` on purpose and are dispatched
+/// in mutually exclusive contexts (history only fires while the
+/// search entry is empty). `global_toggle` is excluded entirely — it
+/// uses XDG shortcut syntax and is bound by the compositor, not the
+/// launcher window.
+fn duplicate_accel_warnings(kb: &Keybindings) -> Vec<String> {
+    const EXEMPT: [(&str, &str); 1] = [("history_up", "previous_result")];
+    let actions: [(&str, &str); 17] = [
+        ("close", &kb.close),
+        ("primary_action", &kb.primary_action),
+        ("secondary_action", &kb.secondary_action),
+        ("copy", &kb.copy),
+        ("quick_look", &kb.quick_look),
+        ("quick_look_alt", &kb.quick_look_alt),
+        ("history_up", &kb.history_up),
+        ("next_result", &kb.next_result),
+        ("previous_result", &kb.previous_result),
+        ("next_category", &kb.next_category),
+        ("previous_category", &kb.previous_category),
+        ("filter_all", &kb.filter_all),
+        ("filter_apps", &kb.filter_apps),
+        ("filter_files", &kb.filter_files),
+        ("filter_mail", &kb.filter_mail),
+        ("filter_attachments", &kb.filter_attachments),
+        ("reset_gui_position", &kb.reset_gui_position),
+    ];
+    type NormalizedAction<'a> = (&'a str, &'a str, Option<(u8, String)>);
+    let normalized: Vec<NormalizedAction> = actions
+        .iter()
+        .map(|(name, accel)| (*name, *accel, normalize_accel(accel)))
+        .collect();
+    let mut warnings = Vec::new();
+    for (i, (name_a, accel_a, norm_a)) in normalized.iter().enumerate() {
+        let Some(norm_a) = norm_a else { continue };
+        for (name_b, _, norm_b) in &normalized[i + 1..] {
+            if norm_b.as_ref() != Some(norm_a) {
+                continue;
+            }
+            if EXEMPT.contains(&(name_a, name_b)) || EXEMPT.contains(&(name_b, name_a)) {
+                continue;
+            }
+            warnings.push(format!(
+                "config: [keybindings] `{name_a}` and `{name_b}` both bind \"{accel_a}\"; \
+                 dispatch order decides which one fires — rebind one of them"
+            ));
+        }
+    }
+    warnings
 }
 
 impl Config {
@@ -672,6 +760,9 @@ impl Config {
             if let Some(v) = bindings.quick_look {
                 cfg.keybindings.quick_look = v;
             }
+            if let Some(v) = bindings.quick_look_alt {
+                cfg.keybindings.quick_look_alt = v;
+            }
             if let Some(v) = bindings.history_up {
                 cfg.keybindings.history_up = v;
             }
@@ -708,6 +799,13 @@ impl Config {
             if let Some(v) = bindings.reset_gui_position {
                 cfg.keybindings.reset_gui_position = v;
             }
+        }
+        // Warn-only duplicate scan over the resolved bindings: a
+        // collision (e.g. filter_all = "<Ctrl>0" vs the default
+        // reset_gui_position = "<Ctrl>0") means one action silently
+        // never fires, decided by GUI dispatch order.
+        for warning in duplicate_accel_warnings(&cfg.keybindings) {
+            tracing::warn!("{warning}");
         }
         if let Some(preview) = parsed.preview {
             if let Some(v) = preview.enabled {
@@ -1268,5 +1366,94 @@ follow_battery = false
     fn gui_theme_is_trimmed() {
         let cfg = Config::from_toml_str("[gui]\ntheme = \"  midnight  \"\n").unwrap();
         assert_eq!(cfg.gui.theme.as_deref(), Some("midnight"));
+    }
+
+    #[test]
+    fn default_keybindings_have_no_duplicate_accels() {
+        // previous_result and history_up share "Up" by design (mutually
+        // exclusive dispatch contexts) and must not be reported.
+        let warnings = duplicate_accel_warnings(&Keybindings::default());
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn duplicate_accel_names_both_actions() {
+        let kb = Keybindings {
+            filter_all: "<Ctrl>0".into(),
+            ..Keybindings::default()
+        };
+        let warnings = duplicate_accel_warnings(&kb);
+        assert_eq!(warnings.len(), 1, "warnings: {warnings:?}");
+        assert!(warnings[0].contains("filter_all"));
+        assert!(warnings[0].contains("reset_gui_position"));
+        assert!(warnings[0].contains("<Ctrl>0"));
+    }
+
+    #[test]
+    fn duplicate_accel_detects_modifier_aliases() {
+        // <Control>c, <Primary>c, and <Ctrl>c all normalize to the same
+        // (mods, key) pair the way gtk::accelerator_parse would.
+        let kb = Keybindings {
+            copy: "<Control>c".into(),
+            quick_look: "<Primary>C".into(),
+            ..Keybindings::default()
+        };
+        let warnings = duplicate_accel_warnings(&kb);
+        assert_eq!(warnings.len(), 1, "warnings: {warnings:?}");
+        assert!(warnings[0].contains("copy"));
+        assert!(warnings[0].contains("quick_look"));
+    }
+
+    #[test]
+    fn non_accel_strings_never_collide() {
+        // XDG-spec shortcut syntax (`Super+space`) is not a GTK accel
+        // and must not be reported against `quick_look = "space"`.
+        assert_eq!(normalize_accel("Super+space"), None);
+        assert_eq!(normalize_accel("<Bogus>x"), None);
+        assert_eq!(normalize_accel(""), None);
+        assert_eq!(
+            normalize_accel("<Ctrl><Shift>Return"),
+            Some((3, "return".into()))
+        );
+    }
+
+    /// Drift guard: docs/config.example.toml is the single config
+    /// reference, so it must always parse cleanly against the current
+    /// schema — no legacy top-level keys, no unknown sections, no
+    /// colliding keybindings.
+    #[test]
+    fn example_config_stays_in_sync_with_schema() {
+        const EXAMPLE: &str = include_str!("../../../docs/config.example.toml");
+        let cfg = Config::from_toml_str(EXAMPLE).expect("docs/config.example.toml must parse");
+
+        let raw: toml::Value = toml::from_str(EXAMPLE).unwrap();
+        let top = raw.as_table().unwrap();
+        for key in LEGACY_TOP_LEVEL_KEYS {
+            assert!(
+                !top.contains_key(*key),
+                "docs/config.example.toml uses removed legacy top-level key `{key}`"
+            );
+        }
+        // Every top-level table must be a known host section or one of
+        // the plugin stanzas the example currently documents. This list
+        // mirrors the doc file, not host behaviour — the daemon still
+        // discovers factories purely via inventory.
+        let documented_plugin_sections = ["calculator", "shell", "semantic"];
+        for key in top.keys() {
+            assert!(
+                KNOWN_TOP_LEVEL_KEYS.contains(&key.as_str())
+                    || documented_plugin_sections.contains(&key.as_str()),
+                "unknown top-level section [{key}] in docs/config.example.toml \
+                 (the daemon would warn `no factory registered` at startup)"
+            );
+        }
+
+        assert!(
+            duplicate_accel_warnings(&cfg.keybindings).is_empty(),
+            "docs/config.example.toml documents colliding keybindings"
+        );
+        // The example's keybindings must show the shipped defaults.
+        assert_eq!(cfg.keybindings.filter_all, "<Ctrl>grave");
+        assert_eq!(cfg.keybindings.reset_gui_position, "<Ctrl>0");
     }
 }

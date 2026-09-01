@@ -7,11 +7,13 @@
 //! standard protocol first, falls back to the KDE-private protocol, and
 //! asks the compositor to blur the area underneath our surface.
 //!
-//! On compositors without the protocol (sway, niri, GNOME, …) every entry
-//! point silently no-ops: the user gets the translucent CSS panel without
-//! a backdrop blur, which is the same result as if this module did not
-//! exist. Hyprland users get blur via `layerrule = blur, lixun-gui` in
-//! their compositor config and don't need this module either.
+//! On compositors without the protocol (sway, niri, GNOME, …) the
+//! protocol attach no-ops and the `lixun-no-blur` CSS class is forced
+//! on instead, so the stylesheet compensates with a heavier background
+//! fill and the panel stays legible over the raw backdrop. Hyprland is
+//! the exception: it blurs layer surfaces via `layerrule = blur,
+//! lixun-gui` in the compositor config without either protocol, so the
+//! fallback class is not forced there.
 //!
 //! # Surface lifecycle
 //!
@@ -93,13 +95,14 @@ enum BlurBackendKind {
 /// compositor doesn't blur outside the visible rounded body.
 const WINDOW_BORDER_RADIUS: i32 = 14;
 
-/// CSS class added to `.lixun-window` when blur is disabled so the
-/// stylesheet can compensate with a heavier background fill. This is
-/// the WM-agnostic half of the toggle: on compositors that don't
-/// implement either `ext_background_effect_manager_v1` or
-/// `org_kde_kwin_blur_manager` (Hyprland, sway, niri, GNOME) the protocol
-/// attach is a no-op, but the class still toggles, so the panel always
-/// reflects the user's preference visually.
+/// CSS class added to `.lixun-window` when blur is disabled — or when
+/// neither blur protocol is available — so the stylesheet can
+/// compensate with a heavier background fill. On compositors that
+/// implement neither `ext_background_effect_manager_v1` nor
+/// `org_kde_kwin_blur_manager` (sway, niri, GNOME) the attach reports
+/// "no protocol" and the class is forced on regardless of the config
+/// flag, so the panel never shows low-alpha glass over an un-blurred
+/// backdrop. See [`should_force_no_blur`] for the Hyprland exception.
 const NO_BLUR_CLASS: &str = "lixun-no-blur";
 
 /// Runtime controller for KDE compositor blur.
@@ -142,6 +145,7 @@ impl BlurController {
                 return;
             };
             let state_inner = Rc::clone(&state_layout);
+            let window_weak = w.downgrade();
             gdk_surface.connect_layout(move |surface, width, height| {
                 if width <= 1 || height <= 1 {
                     return;
@@ -167,7 +171,19 @@ impl BlurController {
                         tracing::debug!("KDE blur enabled: {width}×{height} (layout)");
                         st.attachment = Some(att);
                     }
-                    Ok(None) => {}
+                    Ok(None) => {
+                        // Neither blur protocol is available: force the
+                        // no-blur fallback fill so the panel stays
+                        // legible over the raw backdrop. Hyprland is
+                        // exempt — it blurs layer surfaces via a
+                        // compositor-side layerrule without either
+                        // protocol.
+                        if should_force_no_blur(std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE"))
+                            && let Some(win) = window_weak.upgrade()
+                        {
+                            apply_no_blur_class(&win, true);
+                        }
+                    }
                     Err(e) => {
                         tracing::warn!("KDE blur attach failed: {e:#}");
                     }
@@ -220,7 +236,16 @@ impl BlurController {
                         tracing::debug!("KDE blur re-enabled: {w}×{h}");
                         self.state.borrow_mut().attachment = Some(att);
                     }
-                    Ok(None) => {}
+                    Ok(None) => {
+                        // No blur protocol: re-add the fallback class the
+                        // toggle just removed, keeping the panel legible.
+                        // Hyprland is exempt — it blurs layer surfaces via
+                        // a compositor-side layerrule without either
+                        // protocol.
+                        if should_force_no_blur(std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE")) {
+                            apply_no_blur_class(&self.window, true);
+                        }
+                    }
                     Err(e) => tracing::warn!("KDE blur re-attach failed: {e:#}"),
                 }
             }
@@ -234,6 +259,17 @@ fn apply_no_blur_class(window: &gtk::ApplicationWindow, no_blur: bool) {
     } else {
         window.remove_css_class(NO_BLUR_CLASS);
     }
+}
+
+/// Whether `Ok(None)` from [`BlurAttachment::create`] — neither blur
+/// protocol advertised — should force the `lixun-no-blur` fallback.
+/// Hyprland blurs layer surfaces via a compositor-side `layerrule =
+/// blur` without exposing either protocol, so forcing the heavy
+/// fallback fill there would stack an opaque panel on top of a
+/// working compositor blur. Takes the `HYPRLAND_INSTANCE_SIGNATURE`
+/// env value as a parameter so the decision is unit-testable.
+fn should_force_no_blur(hyprland_instance: Option<std::ffi::OsString>) -> bool {
+    hyprland_instance.is_none()
 }
 
 struct BlurAttachment {
@@ -639,6 +675,18 @@ mod tests {
         assert_eq!(bind_version(old_range.clone(), 1), None);
         assert_eq!(bind_version(old_range.clone(), 3), None);
         assert_eq!(bind_version(old_range, 4), Some(4));
+    }
+
+    #[test]
+    fn missing_protocols_force_the_no_blur_fallback() {
+        assert!(should_force_no_blur(None));
+    }
+
+    #[test]
+    fn hyprland_keeps_the_glass_panel_without_protocols() {
+        // Hyprland blurs layer surfaces compositor-side (layerrule)
+        // without either protocol; the fallback must not fight that.
+        assert!(!should_force_no_blur(Some("sig_v1".into())));
     }
 
     #[test]

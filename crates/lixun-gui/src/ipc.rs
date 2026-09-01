@@ -18,19 +18,33 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
-use lixun_core::{Calculation, DocId, Hit};
+use lixun_core::{DocId, Hit};
 use lixun_ipc::{Phase, Request, Response, socket_path};
 
 #[derive(Debug, Clone)]
 pub(crate) enum IpcMessage {
+    // The wire `Response::SearchChunk` also carries a `calculation`
+    // field; the GUI drops it here — calculator results present as a
+    // normal hit row, so the status-bar calculation path is gone.
     SearchChunk {
         epoch: u64,
         phase: Phase,
         hits: Vec<Hit>,
-        calculation: Option<Calculation>,
         top_hit: Option<DocId>,
         claimed: bool,
     },
+    /// The search never reached the daemon (connect/write failed and
+    /// the retry didn't either) or the reader lost the connection
+    /// mid-search. Deliberately NOT a synthetic empty Final: an empty
+    /// Final renders as an authoritative "No results" for a query the
+    /// daemon never answered. The GUI shows a daemon-unresponsive
+    /// state with a Relaunch affordance instead.
+    TransportFailed { epoch: u64 },
+    /// `READ_WATCHDOG` expired with a search still awaiting its
+    /// Final. The reader keeps the connection open, so a late Final
+    /// may still follow; the GUI keeps its spinner up rather than
+    /// claiming "No results".
+    SearchTimeout { epoch: u64 },
 }
 
 pub(crate) struct IpcClient {
@@ -65,10 +79,10 @@ impl Drop for ReaderAliveGuard {
 }
 
 /// Read timeout on the persistent connection. This is a watchdog, not a
-/// per-search deadline: on expiry the reader synthesizes a Final for the
-/// current session (unblocking the spinner) and KEEPS reading, so a
-/// slow-but-successful fused Final is never discarded. Must exceed the
-/// daemon's semantic search timeout (5 s).
+/// per-search deadline: on expiry the reader emits a `SearchTimeout`
+/// notice for the current session (the GUI keeps its spinner up) and
+/// KEEPS reading, so a slow-but-successful fused Final is never
+/// discarded. Must exceed the daemon's semantic search timeout (5 s).
 const READ_WATCHDOG: Duration = Duration::from_secs(10);
 
 pub(crate) fn start_ipc_thread(
@@ -141,15 +155,12 @@ pub(crate) fn start_ipc_thread(
 
             if !sent {
                 tracing::error!("ipc: failed to send search request to daemon");
-                // Unblock the spinner for the current session.
+                // Tell the GUI the transport is down for the current
+                // session so it can show an actionable error instead
+                // of a fabricated "No results".
                 if epoch_at_send == session_epoch.load(Ordering::SeqCst) {
-                    let _ = event_tx.send_blocking(IpcMessage::SearchChunk {
+                    let _ = event_tx.send_blocking(IpcMessage::TransportFailed {
                         epoch: epoch_at_send,
-                        phase: Phase::Final,
-                        hits: Vec::new(),
-                        calculation: None,
-                        top_hit: None,
-                        claimed: false,
                     });
                 }
             }
@@ -212,22 +223,26 @@ fn read_loop(
         return;
     }
 
-    // Highest epoch for which a Final (real or synthetic) was delivered.
+    // Highest epoch for which a Final (or terminal transport-failure
+    // notice) was delivered.
     let mut last_final = 0u64;
+    // Highest epoch the watchdog already flagged, so a search that
+    // stays pending across several expiries produces one
+    // `SearchTimeout`, not one per READ_WATCHDOG period.
+    let mut last_timeout = 0u64;
 
-    let synth_final_if_pending = |last_final: &mut u64| {
+    // Epoch still awaiting its Final for the *current* session, if
+    // any, given the highest epoch already answered (`delivered`).
+    let pending_epoch = |delivered: u64| -> Option<u64> {
         let sent = last_sent_epoch.load(Ordering::SeqCst);
         let session = session_epoch.load(Ordering::SeqCst);
-        if sent == session && *last_final < sent {
-            let _ = event_tx.send_blocking(IpcMessage::SearchChunk {
-                epoch: sent,
-                phase: Phase::Final,
-                hits: Vec::new(),
-                calculation: None,
-                top_hit: None,
-                claimed: false,
-            });
-            *last_final = sent;
+        (sent == session && delivered < sent).then_some(sent)
+    };
+
+    let fail_if_pending = |last_final: &mut u64| {
+        if let Some(epoch) = pending_epoch(*last_final) {
+            let _ = event_tx.send_blocking(IpcMessage::TransportFailed { epoch });
+            *last_final = epoch;
         }
     };
 
@@ -240,32 +255,37 @@ fn read_loop(
                     || e.kind() == std::io::ErrorKind::TimedOut =>
             {
                 // Watchdog: a search has gone unanswered for READ_WATCHDOG.
-                // Unblock the GUI but keep the connection open — a late
-                // Final still gets delivered if the session hasn't moved.
-                synth_final_if_pending(&mut last_final);
+                // Flag it once but keep the connection open — a late
+                // Final still gets delivered if the session hasn't
+                // moved, and it will replace the GUI's slow-search
+                // spinner when it lands.
+                if let Some(epoch) = pending_epoch(last_final.max(last_timeout)) {
+                    let _ = event_tx.send_blocking(IpcMessage::SearchTimeout { epoch });
+                    last_timeout = epoch;
+                }
                 continue;
             }
             Err(e) => {
                 tracing::debug!("ipc: reader connection closed: {}", e);
-                synth_final_if_pending(&mut last_final);
+                fail_if_pending(&mut last_final);
                 return;
             }
         }
         let resp_len = u32::from_be_bytes(header) as usize;
         if !(2..=lixun_ipc::MAX_FRAME_LEN).contains(&resp_len) {
             tracing::error!("ipc: bad response frame length {}", resp_len);
-            synth_final_if_pending(&mut last_final);
+            fail_if_pending(&mut last_final);
             return;
         }
         let mut version_buf = [0u8; 2];
         if stream.read_exact(&mut version_buf).is_err() {
-            synth_final_if_pending(&mut last_final);
+            fail_if_pending(&mut last_final);
             return;
         }
         let resp_version = u16::from_be_bytes(version_buf);
         let mut resp_buf = vec![0u8; resp_len - 2];
         if stream.read_exact(&mut resp_buf).is_err() {
-            synth_final_if_pending(&mut last_final);
+            fail_if_pending(&mut last_final);
             return;
         }
 
@@ -274,7 +294,7 @@ fn read_loop(
                 epoch: resp_epoch,
                 phase,
                 hits,
-                calculation,
+                calculation: _,
                 top_hit,
                 explanations: _,
                 claimed,
@@ -300,7 +320,6 @@ fn read_loop(
                     epoch: resp_epoch,
                     phase,
                     hits,
-                    calculation,
                     top_hit,
                     claimed,
                 });
@@ -320,7 +339,7 @@ fn read_loop(
             }
             Err(e) => {
                 tracing::error!("Failed to deserialize response: {}", e);
-                synth_final_if_pending(&mut last_final);
+                fail_if_pending(&mut last_final);
                 return;
             }
         }
@@ -358,6 +377,12 @@ pub(crate) fn request_search_history(limit: u32) -> Vec<String> {
     let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&sock) else {
         return Vec::new();
     };
+    // This round-trip runs on the GTK main thread (Up-arrow key
+    // handler). A wedged or restarting daemon must degrade to "no
+    // history", never freeze the launcher on an unbounded read —
+    // same 500 ms bound as `fetch_claimed_prefixes`. (A proper
+    // async request path is a later refactor.)
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
     if stream.write_all(&buf).is_err() {
         return Vec::new();
     }
@@ -382,6 +407,40 @@ pub(crate) fn request_search_history(limit: u32) -> Vec<String> {
     match lixun_ipc::decode_response(resp_version, &resp_buf) {
         Ok(Response::Queries(qs)) => qs,
         _ => Vec::new(),
+    }
+}
+
+/// One-shot `Request::Status` round-trip. Returns
+/// `(indexed_docs, reindex_in_progress)`, or `None` on any transport
+/// or decode failure. Same 500 ms read bound as
+/// `request_search_history`, but callers run this on a worker thread
+/// (never the GTK main thread): the zero-hit path uses it to tell
+/// "nothing matches" apart from "the index is still being built".
+pub(crate) fn request_index_status() -> Option<(u64, bool)> {
+    let sock = socket_path();
+    let buf = encode_frame(&Request::Status)?;
+    let mut stream = std::os::unix::net::UnixStream::connect(&sock).ok()?;
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+    stream.write_all(&buf).ok()?;
+
+    let mut header = [0u8; 4];
+    stream.read_exact(&mut header).ok()?;
+    let resp_len = u32::from_be_bytes(header) as usize;
+    if resp_len < 2 {
+        return None;
+    }
+    let mut version_buf = [0u8; 2];
+    stream.read_exact(&mut version_buf).ok()?;
+    let resp_version = u16::from_be_bytes(version_buf);
+    let mut resp_buf = vec![0u8; resp_len - 2];
+    stream.read_exact(&mut resp_buf).ok()?;
+    match lixun_ipc::decode_response(resp_version, &resp_buf) {
+        Ok(Response::Status {
+            indexed_docs,
+            reindex_in_progress,
+            ..
+        }) => Some((indexed_docs, reindex_in_progress)),
+        _ => None,
     }
 }
 

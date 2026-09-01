@@ -26,7 +26,9 @@
 //! * `nix::sys::wait::waitpid` in a SIGCHLD handler — async-signal
 //!   safety constraints make it fragile.
 //!
-//! This module uses only `std`. No `unsafe`. No new dependencies.
+//! This module uses `std` plus the crate's existing `async_channel`
+//! (the bridge that carries launch failures to the GTK main loop for
+//! a desktop notification). No `unsafe`. No new dependencies.
 
 use std::process::{Child, Command};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -50,6 +52,39 @@ struct Tracked {
 struct ReaperState {
     children: Mutex<Vec<Tracked>>,
     cv: Condvar,
+}
+
+/// A launch failure observed by the reaper: program name plus exit
+/// code, forwarded to the GTK side. By the time the child dies the
+/// launcher has usually hidden itself, so the status bar cannot carry
+/// the message — the drain in `window.rs` raises a desktop
+/// notification instead.
+pub(crate) struct LaunchFailure {
+    pub(crate) program: String,
+    pub(crate) code: Option<i32>,
+}
+
+static FAILURE_TX: OnceLock<async_channel::Sender<LaunchFailure>> = OnceLock::new();
+static FAILURE_RX: OnceLock<async_channel::Receiver<LaunchFailure>> = OnceLock::new();
+
+fn failure_tx() -> &'static async_channel::Sender<LaunchFailure> {
+    FAILURE_TX.get_or_init(|| {
+        let (tx, rx) = async_channel::unbounded::<LaunchFailure>();
+        let _ = FAILURE_RX.set(rx);
+        tx
+    })
+}
+
+/// Receiver for launch failures the reaper observed. Mirrors the
+/// `async_channel` boundary used by `icons::icon_ready_rx`: the GTK
+/// main loop drains this and turns each event into a desktop
+/// notification.
+pub(crate) fn failure_rx() -> async_channel::Receiver<LaunchFailure> {
+    let _ = failure_tx();
+    FAILURE_RX
+        .get()
+        .expect("failure channel initialised by failure_tx()")
+        .clone()
 }
 
 static REAPER: OnceLock<Arc<ReaperState>> = OnceLock::new();
@@ -92,19 +127,26 @@ fn reaper_loop(state: Arc<ReaperState>) {
         guard.retain_mut(|tracked| match tracked.child.try_wait() {
             Ok(None) => true, // still running
             Ok(Some(status)) if !status.success() => {
-                // The ONLY place a launch failure becomes visible.
-                // `Command::spawn()` succeeds as soon as the fork/exec
-                // lands, so a handler that execs fine and then dies on
-                // its own (missing X cookie, wrong desktop, bad argv)
-                // returns Ok to the caller and would otherwise vanish
-                // without trace — the launcher has already hidden by
-                // then, so the user just sees "nothing happened".
+                // The ONLY place a late launch failure becomes
+                // observable. `Command::spawn()` succeeds as soon as
+                // the fork/exec lands, so a handler that execs fine
+                // and then dies on its own (missing X cookie, wrong
+                // desktop, bad argv) returns Ok to the caller and
+                // would otherwise vanish without trace — the launcher
+                // has already hidden by then, so the user just sees
+                // "nothing happened". Besides the log line, forward
+                // the failure to the GTK side for a desktop
+                // notification.
                 tracing::warn!(
                     program = %tracked.program,
                     pid = tracked.child.id(),
                     code = ?status.code(),
                     "reaper: launched child exited non-zero — the action likely failed to open"
                 );
+                let _ = failure_tx().send_blocking(LaunchFailure {
+                    program: tracked.program.clone(),
+                    code: status.code(),
+                });
                 false
             }
             Ok(Some(_status)) => false, // exited cleanly, reaped

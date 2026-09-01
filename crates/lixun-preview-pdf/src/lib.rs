@@ -61,7 +61,7 @@ impl PreviewPlugin for PdfPreview {
         {
             return 90;
         }
-        if hit.kind_label.as_deref() == Some("application/pdf") {
+        if hit.mime.as_deref() == Some("application/pdf") {
             return 70;
         }
         0
@@ -101,7 +101,7 @@ impl PreviewPlugin for PdfPreview {
             .extension()
             .and_then(|e| e.to_str())
             .is_some_and(|e| e.eq_ignore_ascii_case("pdf"))
-            && hit.kind_label.as_deref() != Some("application/pdf")
+            && hit.mime.as_deref() != Some("application/pdf")
         {
             anyhow::bail!(UPDATE_UNSUPPORTED);
         }
@@ -146,7 +146,7 @@ mod tests {
     use lixun_core::{Category, DocId};
     use std::path::{Path, PathBuf};
 
-    fn file_hit(path: impl Into<PathBuf>, kind: Option<&str>) -> Hit {
+    fn file_hit(path: impl Into<PathBuf>, mime: Option<&str>) -> Hit {
         let path = path.into();
         Hit {
             id: DocId(canonical_fs_doc_id(&path)),
@@ -157,10 +157,10 @@ mod tests {
                 .unwrap_or_default(),
             subtitle: path.display().to_string(),
             icon_name: None,
-            kind_label: kind.map(str::to_string),
+            kind_label: None,
             score: 1.0,
             action: Action::OpenFile { path },
-            mime: None,
+            mime: mime.map(str::to_string),
             extract_fail: false,
             sender: None,
             recipients: None,

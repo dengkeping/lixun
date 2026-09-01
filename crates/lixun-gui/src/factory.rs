@@ -30,6 +30,7 @@ use crate::actions::{copy_to_clipboard, execute_action, execute_secondary_action
 use crate::icons::{category_fallback, resolve_icon};
 use crate::ipc::dispatch_click_pair;
 use crate::ipc::send_preview_request;
+use crate::status::StatusBar;
 
 pub(crate) const ICON_SIZE_NORMAL: i32 = 32;
 pub(crate) const ICON_SIZE_TOP_HIT: i32 = 48;
@@ -198,6 +199,30 @@ fn menu_has_conditional_secondary(def: &RowMenuDef) -> bool {
     })
 }
 
+/// Display-only subtitle for absolute-path rows: the parent
+/// directory with `home` contracted to `~`. The trailing filename is
+/// dropped because it duplicates the row title; the deep directories
+/// are the disambiguating part, so callers pair this with
+/// `EllipsizeMode::Middle` and put the full path on the row tooltip.
+/// Never touches the `Hit` — index semantics stay unchanged.
+fn display_path_subtitle(subtitle: &str, home: Option<&std::path::Path>) -> String {
+    let path = std::path::Path::new(subtitle);
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(path);
+    if let Some(home) = home
+        && let Ok(rest) = dir.strip_prefix(home)
+    {
+        return if rest.as_os_str().is_empty() {
+            "~".to_string()
+        } else {
+            format!("~/{}", rest.display())
+        };
+    }
+    dir.display().to_string()
+}
+
 fn hit_file_path(hit: &Hit) -> Option<std::path::PathBuf> {
     match &hit.action {
         Action::OpenFile { path } | Action::ShowInFileManager { path } => Some(path.clone()),
@@ -229,9 +254,13 @@ fn populate_info_popover_body(vbox: &gtk::Box, hit: &Hit) {
     }
 }
 
-pub(crate) fn create_list_factory(entry: gtk::Entry) -> gtk::SignalListItemFactory {
+pub(crate) fn create_list_factory(
+    entry: gtk::Entry,
+    status: Rc<StatusBar>,
+) -> gtk::SignalListItemFactory {
     let factory = gtk::SignalListItemFactory::new();
     let setup_entry = entry.clone();
+    let setup_status = status.clone();
 
     factory.connect_setup(move |_, list_item| {
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
@@ -246,14 +275,19 @@ pub(crate) fn create_list_factory(entry: gtk::Entry) -> gtk::SignalListItemFacto
         let text_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
         text_box.set_hexpand(true);
 
+        // Direction-aware alignment (halign, not xalign) so RTL
+        // locales mirror the row. Ellipsizing still works with
+        // halign Start: a non-Fill label's allocation is capped at
+        // min(natural, available), so the ellipsis kicks in whenever
+        // the text outgrows the row.
         let title = gtk::Label::new(None);
-        title.set_xalign(0.0);
+        title.set_halign(gtk::Align::Start);
         title.set_ellipsize(gtk::pango::EllipsizeMode::End);
         add_css_class(&title, "lixun-title");
         text_box.append(&title);
 
         let subtitle = gtk::Label::new(None);
-        subtitle.set_xalign(0.0);
+        subtitle.set_halign(gtk::Align::Start);
         subtitle.set_ellipsize(gtk::pango::EllipsizeMode::End);
         add_css_class(&subtitle, "lixun-subtitle");
         text_box.append(&subtitle);
@@ -261,7 +295,7 @@ pub(crate) fn create_list_factory(entry: gtk::Entry) -> gtk::SignalListItemFacto
         row.append(&text_box);
 
         let kind = gtk::Label::new(None);
-        kind.set_xalign(1.0);
+        kind.set_halign(gtk::Align::End);
         add_css_class(&kind, "lixun-kind");
         row.append(&kind);
 
@@ -289,6 +323,7 @@ pub(crate) fn create_list_factory(entry: gtk::Entry) -> gtk::SignalListItemFacto
 
         let open_state = Rc::clone(&state);
         let open_entry = setup_entry.clone();
+        let open_status = setup_status.clone();
         let open = gio::SimpleAction::new("open", None);
         open.connect_activate(move |_, _| {
             let Some(doc_id) = open_state.borrow().doc_id.clone() else {
@@ -299,12 +334,17 @@ pub(crate) fn create_list_factory(entry: gtk::Entry) -> gtk::SignalListItemFacto
                 dispatch_click_pair(&hit.id.0, open_entry.text().as_str());
                 if let Err(e) = execute_action(&hit) {
                     tracing::error!("Action failed: {}", e);
+                    // Same visibility rule as the Enter path (keymap):
+                    // a silent failure is indistinguishable from
+                    // success.
+                    open_status.show_error(&format!("Couldn't open “{}”: {}", hit.title, e));
                 }
             }
         });
         group.add_action(&open);
 
         let secondary_state = Rc::clone(&state);
+        let secondary_status = setup_status.clone();
         let secondary = gio::SimpleAction::new("secondary", None);
         secondary.connect_activate(move |_, _| {
             let Some(doc_id) = secondary_state.borrow().doc_id.clone() else {
@@ -315,6 +355,7 @@ pub(crate) fn create_list_factory(entry: gtk::Entry) -> gtk::SignalListItemFacto
                 && let Err(e) = execute_secondary_action(&hit)
             {
                 tracing::error!("Secondary action failed: {}", e);
+                secondary_status.show_error(&format!("Couldn't open “{}”: {}", hit.title, e));
             }
         });
         group.add_action(&secondary);
@@ -406,6 +447,7 @@ pub(crate) fn create_list_factory(entry: gtk::Entry) -> gtk::SignalListItemFacto
         // ===== Double-click primary = launch + clear-and-hide =====
         let dblclick_state = Rc::clone(&state);
         let dblclick_entry = setup_entry.clone();
+        let dblclick_status = setup_status.clone();
         let dblclick_gesture = gtk::GestureClick::new();
         dblclick_gesture.set_button(gdk::BUTTON_PRIMARY);
         dblclick_gesture.connect_pressed(move |_g, n_press, _x, _y| {
@@ -420,6 +462,9 @@ pub(crate) fn create_list_factory(entry: gtk::Entry) -> gtk::SignalListItemFacto
                 dispatch_click_pair(&hit.id.0, dblclick_entry.text().as_str());
                 if let Err(e) = execute_action(&hit) {
                     tracing::error!("double-click open failed: {}", e);
+                    // The launcher stays up (no clear-and-hide below),
+                    // so the status bar can say what went wrong.
+                    dblclick_status.show_error(&format!("Couldn't open “{}”: {}", hit.title, e));
                     return;
                 }
                 // Double-click = launch-completing action;
@@ -553,7 +598,9 @@ fn on_item_notify(
         // callbacks no-op, and disable the secondary action so a
         // recycled row does not show stale "Open parent mail"
         // availability before its next bind writes the correct
-        // state.
+        // state. The path tooltip is display state too: drop it so
+        // a recycled row never shows the previous hit's path.
+        row.set_tooltip_text(None);
         let mut s = state.borrow_mut();
         s.doc_id = None;
         s.menu_key = None;
@@ -579,7 +626,24 @@ fn on_item_notify(
                 .next_sibling()
                 .and_downcast::<gtk::Label>()
                 .expect("subtitle");
-            subtitle.set_text(&hit.subtitle);
+            // Display-only path contraction (the Hit itself is
+            // untouched): "~" for $HOME, trailing filename dropped
+            // (it duplicates the title), middle-ellipsis so the
+            // disambiguating deep directories survive, full path on
+            // the row tooltip. Non-path subtitles (mail authors,
+            // "Recent search") keep the plain end-ellipsized text.
+            if hit.subtitle.starts_with('/') {
+                subtitle.set_text(&display_path_subtitle(
+                    &hit.subtitle,
+                    dirs::home_dir().as_deref(),
+                ));
+                subtitle.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+                row.set_tooltip_text(Some(&hit.subtitle));
+            } else {
+                subtitle.set_text(&hit.subtitle);
+                subtitle.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                row.set_tooltip_text(None);
+            }
 
             let kind = text_box
                 .next_sibling()
@@ -763,6 +827,32 @@ mod tests {
             }],
         };
         assert!(!menu_has_conditional_secondary(&def));
+    }
+
+    #[test]
+    fn display_path_subtitle_contracts_home_and_strips_filename() {
+        let home = std::path::Path::new("/home/user");
+        assert_eq!(
+            display_path_subtitle("/home/user/docs/deep/report.pdf", Some(home)),
+            "~/docs/deep"
+        );
+        assert_eq!(display_path_subtitle("/home/user/report.pdf", Some(home)), "~");
+    }
+
+    #[test]
+    fn display_path_subtitle_outside_home_keeps_absolute_dir() {
+        let home = std::path::Path::new("/home/user");
+        assert_eq!(
+            display_path_subtitle("/etc/systemd/system/foo.service", Some(home)),
+            "/etc/systemd/system"
+        );
+        assert_eq!(display_path_subtitle("/foo.txt", Some(home)), "/");
+    }
+
+    #[test]
+    fn display_path_subtitle_root_and_no_home() {
+        assert_eq!(display_path_subtitle("/", None), "/");
+        assert_eq!(display_path_subtitle("/home/user/a.txt", None), "/home/user");
     }
 
     #[test]

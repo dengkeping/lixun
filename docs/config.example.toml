@@ -301,16 +301,24 @@ primary_action = "Return"
 secondary_action = "<Shift>Return"
 copy = "<Ctrl>c"
 quick_look = "space"
+# Preview the selected row even while the search entry has focus (the
+# bare-Space `quick_look` only opens preview when the entry is empty).
+quick_look_alt = "<Ctrl>space"
 history_up = "Up"
 next_result = "Down"
 previous_result = "Up"
 next_category = "<Ctrl>Down"
 previous_category = "<Ctrl>Up"
-filter_all = "<Ctrl>0"
+filter_all = "<Ctrl>grave"
 filter_apps = "<Ctrl>1"
 filter_files = "<Ctrl>2"
 filter_mail = "<Ctrl>3"
 filter_attachments = "<Ctrl>4"
+# Re-center the launcher window on the active monitor. NOTE: this binds
+# <Ctrl>0 — do not assign <Ctrl>0 to filter_all (or any other action):
+# reset_gui_position is dispatched first and would swallow the key.
+# The daemon logs a warning at startup when two bindings collide.
+reset_gui_position = "<Ctrl>0"
 #
 # global_toggle values follow the XDG shortcuts specification:
 # modifiers are CTRL, ALT, SHIFT, NUM, LOGO (joined with +), followed by an
@@ -354,6 +362,28 @@ global_toggle = "Super+space"
 # stops preview from being unreadably large on big monitors.
 # preview_max_width_px = 2000
 # preview_max_height_px = 1400
+
+# ============================================================
+# Theming
+# ============================================================
+#
+# Ask the compositor to blur the region behind the translucent window.
+# KWin and Hyprland implement a blur protocol; on compositors without
+# one (sway, niri, GNOME) the flag is a no-op. Default true.
+# blur = true
+
+# Named theme: loads ~/.config/lixun/themes/<name>/style.css instead of
+# the built-in stylesheet. Empty or absent = built-in style (plus the
+# optional user-wide override at ~/.config/lixun/style.css).
+# theme = "midnight"
+
+# Matugen (Material You) color integration. Opt-in: requires matugen
+# installed with a [templates.lixun] entry rendering the template at
+# /usr/share/lixun/matugen/lixun-colors.css.tmpl. When enabled, lixun
+# watches matugen_colors_path and layers the rendered `--lixun-*`
+# custom properties on top of the active theme.
+# matugen = false
+# matugen_colors_path = "~/.config/lixun/colors.css"
 
 # ============================================================
 # Preview subsystem
@@ -471,9 +501,10 @@ max_file_size_mb = 200
 # replaces the query with the computed value. Calculator queries are
 # never recorded in the frecency log.
 #
-# The plugin has no configurable options; presence of this empty stanza
-# is what enables it. Remove the `[calculator]` line to disable.
+# Enabled by default — the plugin needs no configuration, so this
+# stanza is optional. Set `enabled = false` to turn it off.
 [calculator]
+# enabled = true
 
 # ───────────────────────────────────────────────────────────────────
 # Shell plugin
@@ -509,8 +540,9 @@ max_file_size_mb = 200
 # then `$TERMINAL`, then `xterm`. Install `xdg-terminal-exec` for the
 # best experience; otherwise export `TERMINAL` to your terminal binary.
 #
-# Presence of the `[shell]` header enables the plugin. All keys below
-# are optional.
+# Enabled by default (argv-exec mode, home working dir) — this stanza
+# is optional. All keys below are optional too; set `enabled = false`
+# to turn the plugin off.
 #
 # Execution model: by default the command is split into an argv vector
 # and the program is run directly, so shell metacharacters (`;`, `|`,
@@ -523,6 +555,7 @@ max_file_size_mb = 200
 # the legacy `sh -c <cmd>` path (full shell semantics) if you accept the
 # injection risk.
 [shell]
+# enabled = true
 # working_dir = "~"            # `~` expands to $HOME; absolute path also OK
 # strict_mode = false          # true: drop non-whitelisted (argv mode) or risky (legacy mode) entirely
 # shell_mode  = false          # default: argv exec, no shell. true: legacy `sh -c <cmd>` (opt-in)
@@ -571,3 +604,27 @@ max_file_size_mb = 200
 # max_cpu_pressure_avg10 = 10.0
 # nice_level = 19
 # io_class_idle = false
+
+# -----------------------------------------------------------------------------
+# [semantic] — dense-vector hybrid retrieval: text embeddings plus
+# cross-modal image search (query "photos of dogs", get photos ranked
+# by visual content), fused with BM25 via Reciprocal Rank Fusion.
+#
+# OPT-IN: requires the separate `lixun-semantic-worker` sidecar binary,
+# and first use downloads ~400 MB of embedding models. The daemon
+# locates the worker via $LIXUN_SEMANTIC_WORKER, then $PATH, then
+# /usr/lib/lixun/lixun-semantic-worker (where the lixun-semantic Arch
+# package installs it).
+[semantic]
+enabled = false
+
+# -----------------------------------------------------------------------------
+# [impact] — system-impact preset: one knob controlling thread pools,
+# batch sizes, cache ceilings, and scheduling hints across the daemon.
+# `lixun-cli impact set <level> [--persist]` writes this section too.
+#
+# All keys are optional; defaults shown below.
+[impact]
+# level = "high"               # unlimited | high | medium | low
+# follow_battery = false       # auto-switch level while on battery
+# on_battery_level = "low"     # level used when follow_battery trips
