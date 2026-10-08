@@ -100,6 +100,8 @@ const KNOWN_SECTION_KEYS: &[(&str, &[&str])] = &[
             "filter_attachments",
             "global_toggle",
             "reset_gui_position",
+            "actions_menu",
+            "info",
         ],
     ),
     (
@@ -148,6 +150,42 @@ struct ConfigToml {
     extract: Option<ExtractToml>,
     ocr: Option<OcrToml>,
     impact: Option<ImpactToml>,
+    search: Option<SearchToml>,
+}
+
+/// Parse-side mirror of the `[search]` table's host-owned keys. The
+/// table intentionally stays OUT of [`KNOWN_TOP_LEVEL_KEYS`]: the raw
+/// `[search]` subtree (including `[[search.keyword]]` entries) is
+/// forwarded verbatim through [`Config::plugin_sections`] to the
+/// keyword source plugin, which owns that shape. Only
+/// `web_engine_url` is resolved here, for the GUI's web-search
+/// fallback.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct SearchToml {
+    web_engine_url: Option<String>,
+}
+
+/// Resolved `[search]` host config (C3a). `web_engine_url` is the
+/// browser search template used by the zero-results fallback (status
+/// button, Enter-on-zero, and the synthetic "Search the web" row).
+/// Must contain a `{query}` placeholder, replaced with the
+/// URL-encoded query at open time.
+#[derive(Debug, Clone)]
+pub struct SearchConfig {
+    pub web_engine_url: String,
+}
+
+/// Default web-search engine template. A browser is only ever opened
+/// on explicit user activation (button click / Enter on the web row).
+pub const DEFAULT_WEB_ENGINE_URL: &str = "https://duckduckgo.com/?q={query}";
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            web_engine_url: DEFAULT_WEB_ENGINE_URL.to_string(),
+        }
+    }
 }
 
 /// Wire-format mirror of the `[core]` table. Hosts the indexer's
@@ -497,6 +535,8 @@ struct KeybindingsToml {
     filter_attachments: Option<String>,
     global_toggle: Option<String>,
     reset_gui_position: Option<String>,
+    actions_menu: Option<String>,
+    info: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -521,6 +561,11 @@ pub struct Keybindings {
     pub filter_attachments: String,
     pub global_toggle: String,
     pub reset_gui_position: String,
+    /// Open the selected row's actions menu (the same popover that
+    /// right-click shows). `Menu` and `Shift+F10` also work, fixed.
+    pub actions_menu: String,
+    /// Open the selected row's Get Info popover.
+    pub info: String,
 }
 
 pub struct Config {
@@ -551,6 +596,7 @@ pub struct Config {
     pub extract: ExtractConfig,
     pub ocr: OcrConfig,
     pub impact: ImpactConfig,
+    pub search: SearchConfig,
     pub state_dir: PathBuf,
     pub plugin_sections: BTreeMap<String, toml::Value>,
 }
@@ -768,6 +814,7 @@ impl Default for Config {
             extract: ExtractConfig::default(),
             ocr: OcrConfig::default(),
             impact: ImpactConfig::default(),
+            search: SearchConfig::default(),
             state_dir: state_dir(),
             plugin_sections: BTreeMap::new(),
         }
@@ -812,6 +859,8 @@ impl Default for Keybindings {
             filter_attachments: "<Ctrl>4".into(),
             global_toggle: "Super+space".into(),
             reset_gui_position: "<Ctrl>0".into(),
+            actions_menu: "<Ctrl>k".into(),
+            info: "<Ctrl>i".into(),
         }
     }
 }
@@ -856,7 +905,7 @@ fn normalize_accel(accel: &str) -> Option<(u8, String)> {
 /// launcher window.
 fn duplicate_accel_warnings(kb: &Keybindings) -> Vec<String> {
     const EXEMPT: [(&str, &str); 1] = [("history_up", "previous_result")];
-    let actions: [(&str, &str); 17] = [
+    let actions: [(&str, &str); 19] = [
         ("close", &kb.close),
         ("primary_action", &kb.primary_action),
         ("secondary_action", &kb.secondary_action),
@@ -874,6 +923,8 @@ fn duplicate_accel_warnings(kb: &Keybindings) -> Vec<String> {
         ("filter_mail", &kb.filter_mail),
         ("filter_attachments", &kb.filter_attachments),
         ("reset_gui_position", &kb.reset_gui_position),
+        ("actions_menu", &kb.actions_menu),
+        ("info", &kb.info),
     ];
     type NormalizedAction<'a> = (&'a str, &'a str, Option<(u8, String)>);
     let normalized: Vec<NormalizedAction> = actions
@@ -1046,6 +1097,12 @@ impl Config {
             if let Some(v) = bindings.reset_gui_position {
                 cfg.keybindings.reset_gui_position = v;
             }
+            if let Some(v) = bindings.actions_menu {
+                cfg.keybindings.actions_menu = v;
+            }
+            if let Some(v) = bindings.info {
+                cfg.keybindings.info = v;
+            }
         }
         // Warn-only duplicate scan over the resolved bindings: a
         // collision (e.g. filter_all = "<Ctrl>0" vs the default
@@ -1129,6 +1186,21 @@ impl Config {
                 if !trimmed.is_empty() {
                     cfg.gui.matugen.colors_path = expand_tilde(trimmed);
                 }
+            }
+        }
+        if let Some(search_toml) = parsed.search
+            && let Some(url) = search_toml.web_engine_url
+        {
+            let trimmed = url.trim();
+            if trimmed.is_empty() {
+                // Empty string = explicit "use the default".
+            } else if trimmed.contains("{query}") {
+                cfg.search.web_engine_url = trimmed.to_string();
+            } else {
+                tracing::warn!(
+                    "config: [search].web_engine_url lacks the {{query}} placeholder; \
+                     keeping the default engine"
+                );
             }
         }
         if let Some(impact_toml) = parsed.impact {
@@ -1704,6 +1776,73 @@ follow_battery = false
     }
 
     #[test]
+    fn search_web_engine_url_default_and_override() {
+        let cfg = Config::default();
+        assert_eq!(cfg.search.web_engine_url, DEFAULT_WEB_ENGINE_URL);
+        let cfg = Config::from_toml_str(
+            "[search]\nweb_engine_url = \"https://www.startpage.com/sp/search?query={query}\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.search.web_engine_url,
+            "https://www.startpage.com/sp/search?query={query}"
+        );
+        // Missing {query} placeholder → keep the default, warn only.
+        let cfg =
+            Config::from_toml_str("[search]\nweb_engine_url = \"https://example.com/\"\n").unwrap();
+        assert_eq!(cfg.search.web_engine_url, DEFAULT_WEB_ENGINE_URL);
+    }
+
+    #[test]
+    fn search_section_flows_into_plugin_sections_for_keyword_factory() {
+        // The keyword source factory reads [[search.keyword]] through
+        // plugin_sections; the host must not swallow the table.
+        let cfg = Config::from_toml_str(
+            "[search]\nweb_engine_url = \"https://duckduckgo.com/?q={query}\"\n\n\
+             [[search.keyword]]\nkey = \"gh\"\nurl = \"https://github.com/search?q={query}\"\n",
+        )
+        .unwrap();
+        let search = cfg
+            .plugin_sections
+            .get("search")
+            .expect("[search] kept in plugin_sections");
+        let keywords = search
+            .get("keyword")
+            .and_then(|v| v.as_array())
+            .expect("keyword array present");
+        assert_eq!(keywords.len(), 1);
+        assert_eq!(
+            keywords[0].get("key").and_then(|v| v.as_str()),
+            Some("gh")
+        );
+    }
+
+    #[test]
+    fn actions_menu_and_info_keybindings_parse_and_default() {
+        let kb = Keybindings::default();
+        assert_eq!(kb.actions_menu, "<Ctrl>k");
+        assert_eq!(kb.info, "<Ctrl>i");
+        let cfg = Config::from_toml_str(
+            "[keybindings]\nactions_menu = \"<Ctrl>m\"\ninfo = \"<Ctrl><Shift>i\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.keybindings.actions_menu, "<Ctrl>m");
+        assert_eq!(cfg.keybindings.info, "<Ctrl><Shift>i");
+    }
+
+    #[test]
+    fn actions_menu_participates_in_duplicate_audit() {
+        let kb = Keybindings {
+            actions_menu: "<Ctrl>c".into(),
+            ..Keybindings::default()
+        };
+        let warnings = duplicate_accel_warnings(&kb);
+        assert_eq!(warnings.len(), 1, "warnings: {warnings:?}");
+        assert!(warnings[0].contains("copy"));
+        assert!(warnings[0].contains("actions_menu"));
+    }
+
+    #[test]
     fn default_keybindings_have_no_duplicate_accels() {
         // previous_result and history_up share "Up" by design (mutually
         // exclusive dispatch contexts) and must not be reported.
@@ -1773,7 +1912,12 @@ follow_battery = false
         // the plugin stanzas the example currently documents. This list
         // mirrors the doc file, not host behaviour — the daemon still
         // discovers factories purely via inventory.
-        let documented_plugin_sections = ["calculator", "shell", "semantic"];
+        // `search` is half host ([search].web_engine_url resolved
+        // here) and half plugin ([[search.keyword]] entries consumed
+        // by the keyword source factory); the whole table is kept in
+        // plugin_sections so the factory can read it.
+        let documented_plugin_sections =
+            ["calculator", "shell", "semantic", "search", "command_source"];
         for key in top.keys() {
             assert!(
                 KNOWN_TOP_LEVEL_KEYS.contains(&key.as_str())

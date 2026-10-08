@@ -24,3 +24,11 @@ use lixun_source_calculator as _;
 #[cfg(feature = "shell")]
 #[allow(unused_imports)]
 use lixun_source_shell as _;
+
+#[cfg(feature = "keyword")]
+#[allow(unused_imports)]
+use lixun_source_keyword as _;
+
+#[cfg(feature = "command")]
+#[allow(unused_imports)]
+use lixun_source_command as _;

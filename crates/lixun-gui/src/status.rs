@@ -14,10 +14,15 @@ pub(crate) struct StatusBar {
     /// stale timeout must not collapse a newer loading/empty/error
     /// state that replaced the toast within its 1.5 s lifetime.
     epoch: std::rc::Rc<std::cell::Cell<u64>>,
+    /// `[search] web_engine_url` template (C3a): the browser search
+    /// URL with a `{query}` placeholder, shared by the "Search the
+    /// web" button, the keymap's Enter-on-zero fallback, and the
+    /// synthetic web-search row.
+    web_engine_url: String,
 }
 
 impl StatusBar {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(web_engine_url: String) -> Self {
         let revealer = gtk::Revealer::new();
         revealer.set_widget_name("lixun-status");
         revealer.set_transition_type(gtk::RevealerTransitionType::Crossfade);
@@ -48,11 +53,17 @@ impl StatusBar {
             revealer,
             content,
             epoch: std::rc::Rc::new(std::cell::Cell::new(0)),
+            web_engine_url,
         }
     }
 
     pub(crate) fn widget(&self) -> &gtk::Revealer {
         &self.revealer
+    }
+
+    /// The resolved web-search URL template ({query} placeholder).
+    pub(crate) fn web_search_url(&self) -> &str {
+        &self.web_engine_url
     }
 
     fn clear(&self) {
@@ -166,8 +177,9 @@ impl StatusBar {
             let button = gtk::Button::with_label("Search the web");
             add_css_class(&button, "lixun-status-action");
             let q = query.to_string();
+            let template = self.web_engine_url.clone();
             button.connect_clicked(move |_| {
-                open_web_search(&q);
+                open_web_search(&template, &q);
             });
             row.append(&button);
         }
@@ -190,6 +202,27 @@ impl StatusBar {
         self.revealer.set_visible(true);
         self.revealer.set_reveal_child(true);
         self.announce(&announced);
+    }
+
+    /// Category-aware empty state (R5): a chip filter yielded zero
+    /// rows. Names the active category so the void is explained
+    /// ("No mail results for …") instead of silent.
+    pub(crate) fn show_empty_filtered(&self, category_label: &str, query: &str) {
+        self.clear();
+        let text = if query.is_empty() {
+            format!("No {category_label} results")
+        } else {
+            format!("No {category_label} results for \u{201c}{query}\u{201d}")
+        };
+        let label = gtk::Label::new(Some(&text));
+        add_css_class(&label, "lixun-status-label");
+        label.set_hexpand(true);
+        label.set_halign(gtk::Align::Start);
+        label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        self.content.append(&label);
+        self.revealer.set_visible(true);
+        self.revealer.set_reveal_child(true);
+        self.announce(&text);
     }
 
     /// Persistent dimmed key-hint line shown while results are
@@ -275,19 +308,31 @@ impl StatusBar {
     }
 }
 
-/// Open a web search for `query` in the default browser. Shared by
-/// the status bar's "Search the web" button and the keymap's
-/// Enter-on-zero-results fallback so both paths build the identical
-/// URL.
-pub(crate) fn open_web_search(query: &str) {
+/// Render the web-search URL for `query` from the configured
+/// `{query}`-placeholder template. Shared by every web-search path
+/// (status button, Enter-on-zero, synthetic row) so all build the
+/// identical URL.
+pub(crate) fn web_search_url_for(template: &str, query: &str) -> String {
     let encoded = urlencode(query);
-    let url = format!("https://duckduckgo.com/?q={}", encoded);
+    if template.contains("{query}") {
+        template.replace("{query}", &encoded)
+    } else {
+        // Defensive: lixun-config validates the placeholder, but a
+        // caller-supplied template may bypass it.
+        format!("{}{}", lixun_config::DEFAULT_WEB_ENGINE_URL.replace("{query}", ""), encoded)
+    }
+}
+
+/// Open a web search for `query` in the default browser via the
+/// configured engine template (C3a).
+pub(crate) fn open_web_search(template: &str, query: &str) {
+    let url = web_search_url_for(template, query);
     if let Err(e) = opener::open(&url) {
         tracing::error!("Failed to open web search URL: {}", e);
     }
 }
 
-fn urlencode(input: &str) -> String {
+pub(crate) fn urlencode(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for b in input.bytes() {
         match b {
@@ -303,11 +348,23 @@ fn urlencode(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::urlencode;
+    use super::{urlencode, web_search_url_for};
 
     #[test]
     fn test_urlencode_plain() {
         assert_eq!(urlencode("hello"), "hello");
+    }
+
+    #[test]
+    fn web_search_url_uses_template_placeholder() {
+        assert_eq!(
+            web_search_url_for("https://duckduckgo.com/?q={query}", "rust gtk"),
+            "https://duckduckgo.com/?q=rust+gtk"
+        );
+        assert_eq!(
+            web_search_url_for("https://www.startpage.com/sp/search?query={query}", "a&b"),
+            "https://www.startpage.com/sp/search?query=a%26b"
+        );
     }
 
     #[test]

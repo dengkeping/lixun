@@ -39,26 +39,14 @@ window, popover {
 }
 
 /* ----- Top-level window transparency -----
-   GTK4's root `window` CSS node paints a default opaque background
-   BEHIND our content. Without this rule the `.lixun-window`
-   border-radius rounds the INNER surface while the outer
-   rectangular buffer stays opaque, so the compositor paints the
-   four corners as solid black squares around the rounded body.
-   Setting background: transparent here lets the compositor see
-   through the corners to the desktop underneath, so border-radius
-   on `.lixun-window` below produces actual rounded corners.
-
-   Confirmed fix-pattern: anyrun, ags, walker, ironbar all set the
-   same rule. GTK docs (class.Window.html#css-nodes) identify the
-   `window` node as the site of the default paint. No Rust-side
-   gdk_surface_set_opaque_region() is needed in GTK4 ≥ 4.16. */
-window,
-window.background,
-.background,
-#lixun-root {
-    background: transparent !important;
-    background-color: transparent !important;
-}
+   The root window IS `.lixun-window` (widget name `lixun-root`), so
+   no separate rule may clear its background: an ID or
+   `window.background` selector would out-rank `.lixun-window` and
+   wipe the panel fill. GTK's default `window` paint comes from the
+   theme-priority stylesheet, which the application-priority
+   `.lixun-window` background below already replaces; the area
+   outside its border-radius stays unpainted, so the corners are
+   see-through without any extra rule. GTK CSS has no `!important`. */
 
 /* ----- Main window -----
    Only the Top edge is anchored in layer-shell (see window.rs); the
@@ -292,6 +280,14 @@ listview row:selected:hover {
     font-size: 8.25pt;
     font-weight: 500;
     margin-right: 4px;
+}
+
+/* R9: "Top Hit" caption in the hero row's kind-label slot. Colour
+   and weight only — the box model must not change (BUG-6: row
+   height is layout-critical). */
+.lixun-kind.lixun-top-hit-caption {
+    color: var(--lixun-primary);
+    font-weight: 700;
 }
 
 /* ----- Status bar ----- */

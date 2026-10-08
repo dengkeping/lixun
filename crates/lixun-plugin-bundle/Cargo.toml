@@ -9,14 +9,18 @@ name = "lixun_plugin_bundle"
 path = "src/lib.rs"
 
 [features]
-default = ["maildir", "thunderbird", "calculator", "shell"]
+default = ["maildir", "thunderbird", "calculator", "shell", "keyword", "command"]
 maildir = ["dep:lixun-source-maildir"]
 thunderbird = ["dep:lixun-source-thunderbird"]
 calculator = ["dep:lixun-source-calculator"]
 shell = ["dep:lixun-source-shell"]
+keyword = ["dep:lixun-source-keyword"]
+command = ["dep:lixun-source-command"]
 
 [dependencies]
 lixun-source-maildir = { path = "../lixun-source-maildir", optional = true }
 lixun-source-thunderbird = { path = "../lixun-source-thunderbird", optional = true }
 lixun-source-calculator = { path = "../lixun-source-calculator", optional = true }
 lixun-source-shell = { path = "../lixun-source-shell", optional = true }
+lixun-source-keyword = { path = "../lixun-source-keyword", optional = true }
+lixun-source-command = { path = "../lixun-source-command", optional = true }

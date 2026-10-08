@@ -135,6 +135,12 @@ impl FrecencyStore {
         1.0 + alpha * self.raw(doc_id, now)
     }
 
+    /// Drop every stored visit for `doc_id` (C2 "Reset ranking").
+    /// Returns `true` when a record existed. Unknown ids are a no-op.
+    pub fn remove_doc(&mut self, doc_id: &str) -> bool {
+        self.records.remove(doc_id).is_some()
+    }
+
     /// Doc ids ranked by raw frecency, best first, capped at `limit`.
     /// Backs `Request::Recents` (O4): the empty-launcher "Recent"
     /// section is the user's most-frequently/recently opened hits.
@@ -179,6 +185,18 @@ mod tests {
     #[test]
     fn top_docs_empty_store_is_empty() {
         assert!(FrecencyStore::default().top_docs(0, 5).is_empty());
+    }
+
+    #[test]
+    fn remove_doc_resets_to_neutral() {
+        let mut store = FrecencyStore::default();
+        let now: i64 = 1_700_000_000;
+        store.record_click("doc", now);
+        store.record_click("doc", now);
+        assert!(store.mult("doc", now, 0.1) > 1.0);
+        assert!(store.remove_doc("doc"));
+        assert!((store.mult("doc", now, 0.1) - 1.0).abs() < 1e-6);
+        assert!(!store.remove_doc("doc"), "second remove is a no-op");
     }
     use tempfile::tempdir;
 

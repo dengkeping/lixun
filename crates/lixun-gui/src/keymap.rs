@@ -6,8 +6,8 @@
 
 use glib::clone;
 use gtk::prelude::*;
-use lixun_core::Action;
 use lixun_config::Keybindings;
+use lixun_core::{Action, Category};
 
 use crate::actions::{
     copy_to_clipboard, execute_action, execute_secondary_action, run_and_capture_async,
@@ -40,43 +40,153 @@ fn selected_hit_in<F: FnOnce(&lixun_core::Hit)>(
     }
 }
 
+/// Fixed cycle order for Ctrl+Down/Up category jumps (R6): Apps →
+/// Files → Mail → Attachments → the plugin categories. Stable and
+/// predictable regardless of how scores interleave the flat list.
+fn category_cycle_rank(cat: Category) -> u8 {
+    match cat {
+        Category::App => 0,
+        Category::File => 1,
+        Category::Mail => 2,
+        Category::Attachment => 3,
+        Category::Calculator => 4,
+        Category::Shell => 5,
+    }
+}
+
+/// Row index of the next category's highest-ranked hit (its first
+/// row in score order), cycling the FIXED category order over the
+/// categories actually present (R6). `None` when fewer than two
+/// categories are present — nothing to jump between. Pure so it
+/// unit-tests headlessly.
+fn next_category_target(rows: &[Category], current_idx: usize, direction: i32) -> Option<usize> {
+    if rows.is_empty() {
+        return None;
+    }
+    let current_idx = current_idx.min(rows.len() - 1);
+    let mut present: Vec<Category> = Vec::new();
+    for cat in rows {
+        if !present.contains(cat) {
+            present.push(*cat);
+        }
+    }
+    present.sort_by_key(|c| category_cycle_rank(*c));
+    if present.len() < 2 {
+        return None;
+    }
+    let current_cat = rows[current_idx];
+    let pos = present.iter().position(|c| *c == current_cat)?;
+    let len = present.len() as i32;
+    let next_pos = (pos as i32 + direction.signum()).rem_euclid(len) as usize;
+    let next_cat = present[next_pos];
+    rows.iter().position(|c| *c == next_cat)
+}
+
+/// Categories of the currently-visible (filtered) rows, in list
+/// order. Unresolvable ids (a race against a model swap) fall back
+/// to `File` so the jump still lands somewhere sensible.
+fn visible_categories(filter_model: &gtk::FilterListModel) -> Vec<Category> {
+    let n = filter_model.n_items();
+    (0..n)
+        .map(|i| {
+            filter_model
+                .item(i)
+                .and_then(|o| o.downcast::<gtk::StringObject>().ok())
+                .and_then(|s| {
+                    let id = s.string().to_string();
+                    with_cached_hits(|hits| {
+                        hits.iter().find(|h| h.id.0 == id).map(|h| h.category)
+                    })
+                })
+                .unwrap_or(Category::File)
+        })
+        .collect()
+}
+
 fn jump_to_next_category(
     selection: &gtk::SingleSelection,
     filter_model: &gtk::FilterListModel,
     direction: i32,
 ) {
-    let n = filter_model.n_items();
-    if n == 0 {
-        return;
-    }
-    let current_idx = selection.selected();
-
-    let current_cat = filter_model
-        .item(current_idx)
-        .and_then(|o| o.downcast::<gtk::StringObject>().ok())
-        .and_then(|s| {
-            let id = s.string().to_string();
-            with_cached_hits(|hits| hits.iter().find(|h| h.id.0 == id).map(|h| h.category))
-        });
-
-    let range: Box<dyn Iterator<Item = u32>> = if direction > 0 {
-        Box::new((current_idx + 1)..n)
-    } else {
-        Box::new((0..current_idx).rev())
+    let rows = visible_categories(filter_model);
+    let current_idx = match selection.selected() {
+        gtk::INVALID_LIST_POSITION => 0,
+        idx => idx as usize,
     };
+    if let Some(target) = next_category_target(&rows, current_idx, direction) {
+        selection.set_selected(target as u32);
+    }
+}
 
-    for i in range {
-        let cat = filter_model
-            .item(i)
-            .and_then(|o| o.downcast::<gtk::StringObject>().ok())
-            .and_then(|s| {
-                let id = s.string().to_string();
-                with_cached_hits(|hits| hits.iter().find(|h| h.id.0 == id).map(|h| h.category))
-            });
-        if cat != current_cat {
-            selection.set_selected(i);
-            return;
+/// Doc id of the currently-selected visible row, if any.
+fn selected_doc_id(
+    selection: &gtk::SingleSelection,
+    filter_model: &gtk::FilterListModel,
+) -> Option<String> {
+    let idx = selection.selected();
+    filter_model
+        .item(idx)
+        .and_then(|o| o.downcast::<gtk::StringObject>().ok())
+        .map(|s| s.string().to_string())
+}
+
+/// Primary activation for one hit, shared by Enter and the
+/// Alt+digit launch-by-index path (K12). Returns whether the
+/// launcher should clear-and-hide afterwards.
+fn activate_primary_action(
+    hit: &lixun_core::Hit,
+    entry: &gtk::Entry,
+    status_bar: &StatusBar,
+    query_at_activation: &str,
+) -> bool {
+    // R7: the terminal "Show more results" row re-issues the query
+    // with a larger limit instead of launching anything.
+    if crate::factory::is_more_results_doc_id(&hit.id.0) {
+        if let Some(app) = gtk::gio::Application::default() {
+            app.activate_action("show-more-results", None);
         }
+        return false;
+    }
+    if let Action::ReplaceQuery { q } = &hit.action {
+        entry.set_text(q);
+        entry.set_position(-1);
+        entry.grab_focus();
+        return false;
+    }
+    // Primary CopyText: put the value on the clipboard, confirm via
+    // toast, and KEEP the launcher open so the user can keep
+    // chaining (calculator results).
+    if let Action::CopyText { text } = &hit.action {
+        if let Some(display) = gtk::gdk::Display::default() {
+            display.clipboard().set_text(text);
+        }
+        status_bar.show_toast(&format!("Copied: {}", text));
+        return false;
+    }
+    dispatch_click_pair(&hit.id.0, query_at_activation);
+    if let Err(e) = execute_action(hit) {
+        tracing::error!("Action failed: {}", e);
+        // Keep the launcher up and say what went wrong — a silent
+        // failure is indistinguishable from success.
+        status_bar.show_error(&format!("Couldn't open \u{201c}{}\u{201d}: {}", hit.title, e));
+        return false;
+    }
+    true
+}
+
+/// Alt+1..9 index for launch-by-index (K12); `None` for other keys.
+fn launch_index_for_key(key: gtk::gdk::Key) -> Option<u32> {
+    match key {
+        gtk::gdk::Key::_1 => Some(0),
+        gtk::gdk::Key::_2 => Some(1),
+        gtk::gdk::Key::_3 => Some(2),
+        gtk::gdk::Key::_4 => Some(3),
+        gtk::gdk::Key::_5 => Some(4),
+        gtk::gdk::Key::_6 => Some(5),
+        gtk::gdk::Key::_7 => Some(6),
+        gtk::gdk::Key::_8 => Some(7),
+        gtk::gdk::Key::_9 => Some(8),
+        _ => None,
     }
 }
 
@@ -458,8 +568,15 @@ pub(crate) fn install_keyboard_handler(
                 return glib::signal::Propagation::Stop;
             }
             if accel_matches(&keybindings.previous_result, key, state) {
-                // Up on empty entry = let entry_key_controller handle history
-                if entry.text().is_empty() && entry_has_focus(&entry, &window) {
+                // Up on empty entry = let entry_key_controller handle
+                // history. K9: NOT while the history list is already
+                // up — re-fetching would yank the selection back to
+                // row 0; fall through to normal list navigation
+                // instead.
+                if entry.text().is_empty()
+                    && entry_has_focus(&entry, &window)
+                    && !controller.history_mode()
+                {
                     return glib::signal::Propagation::Proceed;
                 }
                 // Defensive: no results, no list to navigate. Pin focus
@@ -506,7 +623,65 @@ pub(crate) fn install_keyboard_handler(
                     list_view.grab_focus();
                 }
                 glib::signal::Propagation::Stop
+            } else if let Some(n) = launch_index_for_key(key)
+                .filter(|_| mods_match_exact(gtk::gdk::ModifierType::ALT_MASK, state))
+            {
+                // K12: Alt+1..9 activates the nth visible row through
+                // the same primary dispatch as Enter. Fixed chord, not
+                // rebindable.
+                if let Some(doc_id) = filter_model
+                    .item(n)
+                    .and_then(|o| o.downcast::<gtk::StringObject>().ok())
+                    .map(|s| s.string().to_string())
+                    && let Some(hit) = cached_hit_by_id(&doc_id)
+                {
+                    selection.set_selected(n);
+                    controller.mark_user_selected();
+                    let query_at_activation = entry.text().to_string();
+                    let should_hide =
+                        activate_primary_action(&hit, &entry, &status_bar, &query_at_activation);
+                    if should_hide {
+                        if controller.preview_mode_active() {
+                            crate::ipc::send_preview_hide_request();
+                            controller.set_preview_mode_active(false);
+                        }
+                        controller.clear_and_hide();
+                    }
+                }
+                glib::signal::Propagation::Stop
+            } else if accel_matches(&keybindings.actions_menu, key, state)
+                || key == gtk::gdk::Key::Menu
+                || (key == gtk::gdk::Key::F10
+                    && mods_match_exact(gtk::gdk::ModifierType::SHIFT_MASK, state))
+            {
+                // K11: pop the SELECTED row's existing actions
+                // popover (the right-click menu) from the keyboard.
+                // `Menu` and `Shift+F10` are the platform-standard
+                // context-menu keys, fixed alongside the rebindable
+                // accel. The popover-open counter gates the
+                // focus-leave handler while it is up (see
+                // RowFactoryCtx::popover_open).
+                if let Some(doc_id) = selected_doc_id(&selection, &filter_model)
+                    && !crate::factory::open_row_menu(&doc_id)
+                {
+                    tracing::debug!("actions menu: selected row not realized");
+                }
+                glib::signal::Propagation::Stop
+            } else if accel_matches(&keybindings.info, key, state) {
+                // K11: Get Info popover for the selected row.
+                if let Some(doc_id) = selected_doc_id(&selection, &filter_model)
+                    && !crate::factory::open_row_info(&doc_id)
+                {
+                    tracing::debug!("info: selected row not realized");
+                }
+                glib::signal::Propagation::Stop
             } else if accel_matches(&keybindings.close, key, state) {
+                if controller.history_mode() && !controller.preview_mode_active() {
+                    // K9: Escape from the Up-arrow history list is
+                    // modal — clear the list, keep the launcher up.
+                    controller.exit_history_mode();
+                    return glib::signal::Propagation::Stop;
+                }
                 if controller.preview_mode_active() {
                     // Two-stage Escape: first press dismisses
                     // the preview only (warm process stays
@@ -533,7 +708,7 @@ pub(crate) fn install_keyboard_handler(
                 if filter_model.n_items() == 0 {
                     let q = entry.text().to_string();
                     if !q.is_empty() {
-                        crate::status::open_web_search(&q);
+                        crate::status::open_web_search(status_bar.web_search_url(), &q);
                         controller.clear_and_hide();
                     }
                     return glib::signal::Propagation::Stop;
@@ -542,12 +717,23 @@ pub(crate) fn install_keyboard_handler(
                 let query_at_click = entry.text().to_string();
                 let is_secondary = accel_matches(&keybindings.secondary_action, key, state);
                 selected_hit_in(&selection, &filter_model, |hit| {
+                    if !is_secondary {
+                        // Primary leg shared with Alt+digit (K12):
+                        // "Show more", ReplaceQuery, CopyText and the
+                        // generic launch all live in the helper.
+                        should_hide = activate_primary_action(
+                            hit,
+                            &entry,
+                            &status_bar,
+                            &query_at_click,
+                        );
+                        return;
+                    }
                     // Secondary ReplaceQuery chains the hit's value back
                     // into the entry (e.g. Shift+Enter on a calculator
                     // result continues the computation) — mid-session,
                     // never a launch.
-                    if is_secondary
-                        && let Some(sec) = &hit.secondary_action
+                    if let Some(sec) = &hit.secondary_action
                         && let Action::ReplaceQuery { q } = sec.as_ref()
                     {
                         entry.set_text(q);
@@ -563,19 +749,6 @@ pub(crate) fn install_keyboard_handler(
                         should_hide = false;
                         return;
                     }
-                    // Primary CopyText: put the value on the clipboard,
-                    // confirm via toast, and KEEP the launcher open so
-                    // the user can keep chaining (calculator results).
-                    if !is_secondary
-                        && let Action::CopyText { text } = &hit.action
-                    {
-                        if let Some(display) = gtk::gdk::Display::default() {
-                            display.clipboard().set_text(text);
-                        }
-                        status_bar.show_toast(&format!("Copied: {}", text));
-                        should_hide = false;
-                        return;
-                    }
                     // Shift+Enter on a hit whose secondary action is
                     // ExecCapture: run the command headless, capture
                     // stdout, and replace the query text. Used by
@@ -584,8 +757,7 @@ pub(crate) fn install_keyboard_handler(
                     // capture waits on a worker thread; the query
                     // replacement callback runs back on the main
                     // thread once output (or a timeout) arrives.
-                    if is_secondary
-                        && let Some(sec) = &hit.secondary_action
+                    if let Some(sec) = &hit.secondary_action
                         && let Action::ExecCapture {
                             cmdline,
                             working_dir,
@@ -603,12 +775,7 @@ pub(crate) fn install_keyboard_handler(
                         return;
                     }
                     dispatch_click_pair(&hit.id.0, &query_at_click);
-                    let result = if is_secondary {
-                        execute_secondary_action(hit)
-                    } else {
-                        execute_action(hit)
-                    };
-                    if let Err(e) = result {
+                    if let Err(e) = execute_secondary_action(hit) {
                         tracing::error!("Action failed: {}", e);
                         // Keep the launcher up and say what went wrong.
                         // Hiding on a failed launch makes the failure
@@ -747,9 +914,17 @@ pub(crate) fn install_keyboard_handler(
         scrolled,
         #[strong]
         chips_container,
+        #[strong]
+        controller,
         move |_, key, _keycode, state| {
             tracing::info!("gui: ENTRY key_controller fired key={:?}", key.name());
             if accel_matches(&keybindings.history_up, key, state) && entry.text().is_empty() {
+                // K9: the history list is already up — Up must not
+                // re-fire the IPC fetch and yank the cursor to row 0.
+                // The window-level handler owns navigation now.
+                if controller.history_mode() {
+                    return glib::signal::Propagation::Proceed;
+                }
                 // K8b: the history round-trip used to block the GTK
                 // main thread inside this key handler for up to its
                 // 500 ms socket timeout. Route it through the same
@@ -764,6 +939,7 @@ pub(crate) fn install_keyboard_handler(
                 let status_bar = std::rc::Rc::clone(&status_bar);
                 let chips_container = chips_container.clone();
                 let scrolled = scrolled.clone();
+                let controller = std::rc::Rc::clone(&controller);
                 fetch_search_history_async(10, move |queries| {
                     if queries.is_empty() || !entry.text().is_empty() {
                         return;
@@ -781,6 +957,10 @@ pub(crate) fn install_keyboard_handler(
                     chips_container.set_visible(true);
                     scrolled.set_visible(true);
                     scrolled.set_vexpand(false);
+                    // K9: history is modal — Escape clears the list
+                    // (keeping the launcher up) and Up stops
+                    // re-fetching until the entry text changes.
+                    controller.enter_history_mode();
                 });
                 glib::signal::Propagation::Stop
             } else {
@@ -793,8 +973,53 @@ pub(crate) fn install_keyboard_handler(
 
 #[cfg(test)]
 mod tests {
-    use super::{accel_matches, mods_match_exact};
+    use super::{accel_matches, mods_match_exact, next_category_target};
     use gtk::gdk::{Key, ModifierType};
+    use lixun_core::Category;
+
+    #[test]
+    fn category_jump_cycles_fixed_order() {
+        use Category::{App, File, Mail};
+        // Score-interleaved flat list: File at 0, App at 1, Mail at 2,
+        // File again at 3. Fixed order is App → File → Mail.
+        let rows = [File, App, Mail, File];
+        // From the App row, next is File's best (index 0).
+        assert_eq!(next_category_target(&rows, 1, 1), Some(0));
+        // From File, next is Mail's best (index 2).
+        assert_eq!(next_category_target(&rows, 0, 1), Some(2));
+        // From Mail, cycling wraps to App (index 1).
+        assert_eq!(next_category_target(&rows, 2, 1), Some(1));
+        // Backwards from File goes to App's best (index 1).
+        assert_eq!(next_category_target(&rows, 3, -1), Some(1));
+        // Backwards from App wraps to Mail as well (App is first).
+        assert_eq!(next_category_target(&rows, 1, -1), Some(2));
+    }
+
+    #[test]
+    fn category_jump_lands_on_highest_ranked_of_next_category() {
+        use Category::{App, File};
+        // Two Files at 1 and 3; the jump from App must land on the
+        // FIRST (highest-ranked) File, never ping-pong to a later one.
+        let rows = [App, File, App, File];
+        assert_eq!(next_category_target(&rows, 0, 1), Some(1));
+        assert_eq!(next_category_target(&rows, 2, 1), Some(1));
+    }
+
+    #[test]
+    fn category_jump_noop_with_single_category() {
+        use Category::File;
+        let rows = [File, File, File];
+        assert_eq!(next_category_target(&rows, 1, 1), None);
+        assert_eq!(next_category_target(&[], 0, 1), None);
+    }
+
+    #[test]
+    fn category_jump_clamps_out_of_range_index() {
+        use Category::{App, File};
+        let rows = [App, File];
+        // INVALID_LIST_POSITION-style garbage clamps to the last row.
+        assert_eq!(next_category_target(&rows, 999, 1), Some(0));
+    }
 
     #[test]
     fn mods_match_exact_requires_equality_not_containment() {
@@ -820,18 +1045,22 @@ mod tests {
         ));
     }
 
-    /// All `gtk::accelerator_parse`-backed assertions live in ONE
-    /// test: `gtk::init()` pins "the GTK main thread" to whichever
-    /// thread runs it first and the libtest harness gives every test
-    /// its own thread, so two such tests in parallel would trip the
-    /// gtk4-rs main-thread assertion. Headless environments (no
-    /// display) skip silently.
+    /// `gtk::accelerator_parse` needs an initialized GTK. Runs on
+    /// the shared `test_gtk` worker thread — GTK is initialized
+    /// exactly once there, so GTK-touching tests can no longer race
+    /// the gtk4-rs cross-thread init assertion. Headless
+    /// environments (no display) skip silently.
     #[test]
     fn accel_matches_is_exact_on_modifiers() {
-        if gtk::init().is_err() {
+        let ran = crate::test_gtk::run_gtk(|| {
+            accel_matches_assertions();
+        });
+        if !ran {
             eprintln!("skipping accel_matches_is_exact_on_modifiers: no display");
-            return;
         }
+    }
+
+    fn accel_matches_assertions() {
         // Bare "Down" must no longer match Ctrl+Down — that chord
         // belongs to `next_category`.
         assert!(accel_matches("Down", Key::Down, ModifierType::empty()));

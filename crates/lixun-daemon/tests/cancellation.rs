@@ -26,6 +26,7 @@ fn encode_search(q: &str, limit: u32, epoch: u64) -> Vec<u8> {
         limit,
         explain: false,
         epoch,
+        category: None,
     };
     let json = serde_json::to_vec(&req).expect("serialize Request::Search");
     let total_len = (2 + json.len()) as u32;

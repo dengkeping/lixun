@@ -256,6 +256,19 @@ fn dispatch_action(action: &Action) -> Result<()> {
     }
 }
 
+/// Launch `path` with the application identified by `app_id` (a
+/// desktop-file id from the MIME registry). Backs the "Open With"
+/// submenu (C1): the id arrives as menu-item data resolved from
+/// `gio::AppInfo::all_for_type`, so this stays mime-driven and names
+/// no application.
+pub(crate) fn launch_with_app_id(app_id: &str, path: &std::path::Path) -> Result<()> {
+    let app = DesktopAppInfo::new(app_id)
+        .ok_or_else(|| anyhow::anyhow!("application {app_id:?} is no longer installed"))?;
+    let file = gio::File::for_path(path);
+    app.launch(&[file], None::<&gio::AppLaunchContext>)?;
+    Ok(())
+}
+
 pub(crate) fn execute_secondary_action(hit: &Hit) -> Result<()> {
     if let Some(secondary) = hit.secondary_action.as_deref() {
         return dispatch_action(secondary);

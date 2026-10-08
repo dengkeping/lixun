@@ -73,15 +73,36 @@ the curve (more democratic), lower `k` amplifies top-ranked hits.
   ANN distances are in [0, 2]. Naive score fusion (weighted sum) requires
   careful normalization and per-backend weight tuning. RRF only cares about
   rank, not raw scores.
-- **No query classification needed.** A query for an application name gets
-  BM25 hits (matching .desktop entries, source files, icons) ranked high,
-  plus some image noise from CLIP ranked low. RRF naturally promotes the
-  BM25 hits because they appear in top positions. No need to guess "is this
-  a text query or image query?" upfront.
 - **Graceful degradation.** If one backend returns garbage (e.g., CLIP
   returns 80 random JPGs for a short keyword query), those hits get low RRF
-  scores because they only appear in one list at low ranks. BM25's exact
-  match dominates.
+  scores because they only appear in one list at low ranks.
+
+**Modality weighting and its two guard rails**
+
+Canonical RRF is modality-blind, so a query router classifies each query
+(Text / Image / Both) and scales the per-channel reciprocal contributions —
+`(1.0, 0.8, 1.8)` for image-intent, `(1.0, 1.0, 1.3)` for mixed, strictly
+neutral `(1.0, 1.0, 1.0)` for text or when the router is unavailable.
+Weighting introduces a failure mode the neutral math didn't have: a
+single-leg CLIP hit earns `w_image/(k+1)`, which beats the BM25 #1's
+`w_bm25/(k+1)` whenever `w_image > w_bm25` — so an exact filename query
+("golf-cart-vvp") can be buried under ~`k·(w_image−1)` photos *of* golf
+carts unless the doc's own text embedding rescues it (and mid-backfill it
+can't). Two guard rails close this:
+
+1. **Navigational pin** (`handle.rs::looks_navigational`): a single-token
+   query joined by `-`/`_`/`.`/`/` names a document, not a scene — the
+   router only sees the words ("golf cart" reads as image-intent). Such
+   queries pin to neutral Text weights before fusion. Bare words
+   ("sunset") and phrases still classify freely.
+2. **Precision-first invariant** (`rrf.rs::precision_first`): when the
+   query precision-matches at least one document lexically (title
+   prefix / exact-title boost on a full, non-fallback match), every doc
+   with lexical standing is stably moved ahead of every ANN-only doc.
+   RRF order still rules inside both groups, and queries with no
+   precision match pass through untouched — genuinely semantic queries
+   are unaffected. This also covers un-hyphenated navigational queries
+   ("golf cart vvp") that the pin cannot detect.
 
 ## Hydration and score preservation
 

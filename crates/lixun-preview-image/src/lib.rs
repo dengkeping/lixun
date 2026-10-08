@@ -255,6 +255,27 @@ fn build_canvas_view(path: &Path, texture: &gdk::Texture, intrinsic: (i32, i32))
     let toolbar = build_image_toolbar(&canvas, &scroll);
     scroll.set_child(Some(&canvas));
 
+    // Initial fit-to-viewport: the canvas opens at zoom 1.0 (true
+    // pixels), and with decode targets up to MAX_DECODE_DIM that means
+    // every large photo opened zoomed-in and cropped. The viewport has
+    // no allocation yet at build time (this runs when the worker's
+    // decode lands, before the stack swaps children), so apply the fit
+    // on the first frame the scroll has a real size. One-shot: user
+    // zoom is never fought afterwards.
+    {
+        let canvas_weak = canvas.downgrade();
+        scroll.add_tick_callback(move |scroll, _clock| {
+            let (vw, vh) = (scroll.width(), scroll.height());
+            if vw <= 0 || vh <= 0 {
+                return glib::ControlFlow::Continue;
+            }
+            if let Some(canvas) = canvas_weak.upgrade() {
+                canvas.fit_to_viewport(vw, vh);
+            }
+            glib::ControlFlow::Break
+        });
+    }
+
     let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
     vbox.append(&toolbar);
     vbox.append(&scroll);

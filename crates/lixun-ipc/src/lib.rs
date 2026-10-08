@@ -346,6 +346,15 @@ pub enum Request {
         /// search per connection at any time. Required (no default):
         /// every v4 client tracks its own epoch.
         epoch: u64,
+        /// Optional category constraint (R5). When set, the daemon
+        /// over-fetches, drops non-matching hits BEFORE the limit
+        /// truncation, and returns up to `limit` hits of this
+        /// category — so a chip filter can surface matches that rank
+        /// below the default page in the unfiltered list. Trailing
+        /// `#[serde(default)]` field per the additive-wire
+        /// convention (see `Hit::timestamp`).
+        #[serde(default)]
+        category: Option<lixun_core::Category>,
     },
     Reindex {
         paths: Vec<PathBuf>,
@@ -496,6 +505,22 @@ pub enum Request {
     /// no epoch bump). Appended at the end of the enum so existing
     /// variants keep their wire identity.
     PreviewScroll { down: bool, pages: u32 },
+    /// Ranking control (C2): add (`hidden: true`) or remove
+    /// (`hidden: false`) a doc id on the daemon's persistent
+    /// blocklist. Blocklisted ids are dropped from every search
+    /// result and from Recents. Reply is `Response::Ok`. Appended
+    /// for wire stability.
+    SetDocHidden { doc_id: String, hidden: bool },
+    /// Ranking control (C2): delete the learned frecency and
+    /// query-latch state for one doc id, returning it to neutral
+    /// ranking. Reply is `Response::Ok`. Appended for wire
+    /// stability.
+    ResetDocRanking { doc_id: String },
+    /// List the doc ids currently on the blocklist (C2). Reply is
+    /// `Response::HiddenDocs`. Backs `lixun-cli hidden list` so
+    /// hides are inspectable and undoable. Appended for wire
+    /// stability.
+    ListHiddenDocs,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -602,6 +627,10 @@ pub enum Response {
     /// the end of the enum so existing variants keep their wire
     /// identity.
     Recents { hits: Vec<Hit> },
+    /// Reply to [`Request::ListHiddenDocs`]: every doc id on the
+    /// ranking blocklist, sorted. Appended at the end of the enum so
+    /// existing variants keep their wire identity.
+    HiddenDocs(Vec<String>),
 }
 
 /// Serde-friendly mirror of [`lixun_core::ImpactProfile`]. Lives in
@@ -809,6 +838,7 @@ mod tests {
             limit: 10,
             explain: false,
             epoch: 42,
+            category: Some(lixun_core::Category::Mail),
         };
         codec.encode(req.clone(), &mut buf).unwrap();
 
@@ -819,13 +849,73 @@ mod tests {
                 limit,
                 explain,
                 epoch,
+                category,
             } => {
                 assert_eq!(q, "hello world");
                 assert_eq!(limit, 10);
                 assert!(!explain);
                 assert_eq!(epoch, 42);
+                assert_eq!(category, Some(lixun_core::Category::Mail));
             }
             _ => panic!("Expected Search variant"),
+        }
+    }
+
+    #[test]
+    fn test_search_category_defaults_none_for_legacy_wire() {
+        // A JSON frame written before the category field existed must
+        // still decode (trailing #[serde(default)] convention).
+        let legacy = r#"{"Search":{"q":"foo","limit":5,"explain":false,"epoch":7}}"#;
+        let decoded: Request = serde_json::from_str(legacy).unwrap();
+        match decoded {
+            Request::Search { category, .. } => assert_eq!(category, None),
+            other => panic!("expected Search, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_hidden_doc_requests_roundtrip() {
+        let mut codec = FrameCodec::default();
+        let mut buf = BytesMut::new();
+        codec
+            .encode(
+                Request::SetDocHidden {
+                    doc_id: "fs:/tmp/a".into(),
+                    hidden: true,
+                },
+                &mut buf,
+            )
+            .unwrap();
+        codec
+            .encode(
+                Request::ResetDocRanking {
+                    doc_id: "fs:/tmp/a".into(),
+                },
+                &mut buf,
+            )
+            .unwrap();
+        codec.encode(Request::ListHiddenDocs, &mut buf).unwrap();
+        match codec.decode(&mut buf).unwrap().unwrap() {
+            Request::SetDocHidden { doc_id, hidden } => {
+                assert_eq!(doc_id, "fs:/tmp/a");
+                assert!(hidden);
+            }
+            other => panic!("expected SetDocHidden, got {:?}", other),
+        }
+        match codec.decode(&mut buf).unwrap().unwrap() {
+            Request::ResetDocRanking { doc_id } => assert_eq!(doc_id, "fs:/tmp/a"),
+            other => panic!("expected ResetDocRanking, got {:?}", other),
+        }
+        assert!(matches!(
+            codec.decode(&mut buf).unwrap().unwrap(),
+            Request::ListHiddenDocs
+        ));
+
+        let resp = Response::HiddenDocs(vec!["fs:/tmp/a".into()]);
+        let bytes = serde_json::to_vec(&resp).unwrap();
+        match serde_json::from_slice::<Response>(&bytes).unwrap() {
+            Response::HiddenDocs(ids) => assert_eq!(ids, vec!["fs:/tmp/a".to_string()]),
+            other => panic!("expected HiddenDocs, got {:?}", other),
         }
     }
 

@@ -73,3 +73,11 @@
     color: alpha(var(--lixun-on-surface-variant), 0.85);
     border-top: 1px solid alpha(var(--lixun-outline-variant), 0.4);
 }
+
+/* Transient launch-failure strip in the header (P10). Uses the
+   error token so a user palette that redefines it recolours the
+   strip consistently. */
+.lixun-preview-error {
+    font-size: 9pt;
+    color: var(--lixun-error);
+}

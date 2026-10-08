@@ -118,6 +118,21 @@ impl QueryLatchStore {
         (1.0 + weight * raw).clamp(1.0, cap)
     }
 
+    /// Drop every latch entry pointing at `doc_id`, across all query
+    /// keys (C2 "Reset ranking"). Query keys left empty afterwards
+    /// are removed entirely. Returns `true` when anything was
+    /// deleted.
+    pub fn remove_doc(&mut self, doc_id: &str) -> bool {
+        let mut removed = false;
+        self.by_query.retain(|_, per_query| {
+            if per_query.remove(doc_id).is_some() {
+                removed = true;
+            }
+            !per_query.is_empty()
+        });
+        removed
+    }
+
     /// Returns `true` iff the `(query_raw, doc_id)` pair has at least
     /// `threshold` recorded clicks. Used by Top Hit confidence (T6).
     #[allow(dead_code)]
@@ -232,6 +247,21 @@ mod tests {
         store.record("", "doc1", now);
         store.record("   ", "doc1", now);
         assert!((store.mult("", "doc1", now, 0.5, 3.0) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn remove_doc_clears_all_query_keys() {
+        let mut store = QueryLatchStore::default();
+        let now: i64 = 1_700_000_000;
+        store.record("foo", "doc1", now);
+        store.record("bar", "doc1", now);
+        store.record("foo", "doc2", now);
+        assert!(store.remove_doc("doc1"));
+        assert!((store.mult("foo", "doc1", now, 0.5, 3.0) - 1.0).abs() < 1e-6);
+        assert!((store.mult("bar", "doc1", now, 0.5, 3.0) - 1.0).abs() < 1e-6);
+        // Unrelated doc under a shared query key survives.
+        assert!(store.mult("foo", "doc2", now, 0.5, 3.0) > 1.0);
+        assert!(!store.remove_doc("doc1"), "second remove is a no-op");
     }
 
     #[test]

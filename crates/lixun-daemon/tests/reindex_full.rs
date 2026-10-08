@@ -35,6 +35,7 @@ fn test_config(root: std::path::PathBuf, state_dir: std::path::PathBuf) -> Confi
         extract: ExtractConfig::default(),
         ocr: OcrConfig::default(),
         impact: ImpactConfig::default(),
+        search: lixun_daemon::config::SearchConfig::default(),
         state_dir,
         plugin_sections: BTreeMap::new(),
     }

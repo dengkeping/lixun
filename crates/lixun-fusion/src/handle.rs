@@ -261,7 +261,22 @@ impl HybridSearchHandle {
         // canonical RRF — so a degraded worker never changes ranking.
         // Image-intent queries lean the fusion toward CLIP image hits;
         // Both leans mildly. No channel is ever zeroed.
-        let modality = modality_res.unwrap_or(lixun_mutation::Modality::Text);
+        //
+        // Navigational pin: a filename-shaped query ("golf-cart-vvp",
+        // "IMG_1234", "report.pdf") names a document — the CLIP router
+        // only sees the WORDS ("golf cart" reads as image-intent) and
+        // would tilt the fusion toward photos of the thing instead of
+        // the thing itself. Pin such queries to neutral Text weights;
+        // bare words ("sunset") still classify freely.
+        let modality = if looks_navigational(&query.text) {
+            tracing::debug!(
+                target: "lixun_fusion",
+                "fusion: navigational query — modality pinned to Text"
+            );
+            lixun_mutation::Modality::Text
+        } else {
+            modality_res.unwrap_or(lixun_mutation::Modality::Text)
+        };
         let weights = match modality {
             lixun_mutation::Modality::Image => (1.0, 0.8, 1.8),
             lixun_mutation::Modality::Both => (1.0, 1.0, 1.3),
@@ -281,6 +296,22 @@ impl HybridSearchHandle {
             self.rrf_k,
             weights,
         );
+
+        // Precision-first invariant: when the query precision-matches a
+        // document lexically (title prefix / exact-title boost), docs
+        // with lexical standing outrank ANN-only docs wholesale — a
+        // precisely-named doc must not need its own semantic leg to
+        // beat generic CLIP neighbours (see rrf::precision_first).
+        let precision_ids: std::collections::HashSet<String> = lex_pairs
+            .iter()
+            .filter(|(_, bd)| {
+                !bd.lexical_fallback && (bd.prefix_mult > 1.0 || bd.exact_title_mult > 1.0)
+            })
+            .map(|(h, _)| h.id.0.clone())
+            .collect();
+        let lexical_ids: std::collections::HashSet<String> =
+            bm25_ranked.iter().map(|(id, _)| id.clone()).collect();
+        let fused = crate::rrf::precision_first(fused, &precision_ids, &lexical_ids);
 
         // The RRF order is authoritative for the Final chunk, but downstream
         // stage-2 (frecency/latch) multiplies `hit.score` and re-sorts, and
@@ -417,5 +448,39 @@ impl HybridSearchHandle {
             .await;
 
         Ok(())
+    }
+}
+
+/// Filename-shaped query heuristic for the navigational modality pin:
+/// a single token joined by separator characters (`-`, `_`, `.`, `/`)
+/// reads as an identifier the user is naming, not a scene they are
+/// describing. Multi-word queries and bare words are NOT navigational —
+/// those legitimately belong to the modality router.
+fn looks_navigational(query: &str) -> bool {
+    let t = query.trim();
+    !t.is_empty() && !t.contains(char::is_whitespace) && t.contains(['-', '_', '.', '/'])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::looks_navigational;
+
+    #[test]
+    fn navigational_detects_separator_joined_tokens() {
+        assert!(looks_navigational("golf-cart-vvp"));
+        assert!(looks_navigational("IMG_1234"));
+        assert!(looks_navigational("report.pdf"));
+        assert!(looks_navigational("src/main.rs"));
+        assert!(looks_navigational("  golf-cart-vvp  "));
+    }
+
+    #[test]
+    fn navigational_rejects_natural_language_and_bare_words() {
+        assert!(!looks_navigational("photos of dogs"));
+        assert!(!looks_navigational("sunset"));
+        assert!(!looks_navigational("golf cart vvp"));
+        assert!(!looks_navigational(""));
+        assert!(!looks_navigational("   "));
+        assert!(!looks_navigational("my-file with spaces"));
     }
 }

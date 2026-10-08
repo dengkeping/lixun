@@ -174,6 +174,21 @@ mod tests {
     }
 
     #[test]
+    fn on_query_bare_conversion_yields_hit() {
+        let src = CalculatorSource;
+        // Conversions ride the same bare-arithmetic path as "2+2": the
+        // raw query goes through detect::detect, whose conversion pass
+        // runs before the looks_like_math gate.
+        let hits = src.on_query("5km in mi", &ctx());
+        assert_eq!(hits.len(), 1);
+        let hit = &hits[0];
+        assert_eq!(hit.title, "3.106856 mi");
+        assert_eq!(hit.subtitle, "= 5km in mi");
+        assert_eq!(hit.category, Category::Calculator);
+        assert!(matches!(&hit.action, Action::CopyText { text } if text == "3.106856 mi"));
+    }
+
+    #[test]
     fn on_query_with_prefix_returns_hit() {
         let src = CalculatorSource;
         let hits = src.on_query("= 2+2", &ctx());

@@ -274,6 +274,14 @@ impl SearchHandle {
         self.run_blocking(move |idx| idx.get_body_by_id(&id)).await
     }
 
+    /// Synchronous body lookup for callers already running on a
+    /// blocking-capable thread (rayon workers, `spawn_blocking`
+    /// closures). Must not be called from an async task: the tantivy
+    /// read blocks the calling thread.
+    pub fn get_body_blocking(&self, doc_id: &str) -> Result<Option<String>> {
+        self.index.get_body_by_id(doc_id)
+    }
+
     /// Reconstruct a `Hit` + `ScoreBreakdown` for a single doc without
     /// running a query. The breakdown is degenerate (tantivy=0.0,
     /// multipliers=1.0) because there is no query context; the caller

@@ -20,6 +20,8 @@ mod reaper;
 mod status;
 mod style_manager;
 mod style_watcher;
+#[cfg(test)]
+mod test_gtk;
 mod theme;
 mod window;
 

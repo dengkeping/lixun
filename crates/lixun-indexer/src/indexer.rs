@@ -84,41 +84,52 @@ pub async fn reindex_paths(
     config: &dyn IndexerSources,
     paths: &[std::path::PathBuf],
 ) -> Result<usize> {
-    let mut all_docs: Vec<Document> = Vec::new();
-
     let caps = config.caps();
     let enqueue = config.ocr_enqueue();
     let body_checker = config.body_checker();
-    for path in paths {
-        if path.is_file() {
-            let enq_ref = enqueue
-                .as_ref()
-                .map(|a| a.as_ref() as &dyn lixun_sources::OcrEnqueue);
-            let body_ref = body_checker
-                .as_ref()
-                .map(|a| a.as_ref() as &dyn lixun_sources::HasBody);
-            if let Ok(doc) = crate::index_service::index_file(
-                path,
-                config.max_file_size_mb(),
-                caps.as_ref(),
-                enq_ref,
-                body_ref,
-                config.min_image_side_px(),
-            ) {
-                all_docs.push(doc);
+    let exclude = config.exclude().to_vec();
+    let max_file_size_mb = config.max_file_size_mb();
+    let min_image_side_px = config.min_image_side_px();
+    let paths = paths.to_vec();
+
+    // Extraction and the body-checker probes are blocking work; keep
+    // them off the async workers.
+    let all_docs = tokio::task::spawn_blocking(move || -> Result<Vec<Document>> {
+        let mut all_docs: Vec<Document> = Vec::new();
+        for path in &paths {
+            if path.is_file() {
+                let enq_ref = enqueue
+                    .as_ref()
+                    .map(|a| a.as_ref() as &dyn lixun_sources::OcrEnqueue);
+                let body_ref = body_checker
+                    .as_ref()
+                    .map(|a| a.as_ref() as &dyn lixun_sources::HasBody);
+                if let Ok(doc) = crate::index_service::index_file(
+                    path,
+                    max_file_size_mb,
+                    caps.as_ref(),
+                    enq_ref,
+                    body_ref,
+                    min_image_side_px,
+                ) {
+                    all_docs.push(doc);
+                }
+            } else if path.is_dir() {
+                let source = lixun_sources::fs::FsSource::new_with_ocr(
+                    vec![path.clone()],
+                    exclude.clone(),
+                    max_file_size_mb,
+                    Arc::clone(&caps),
+                    enqueue.clone(),
+                )
+                .with_body_checker(body_checker.clone());
+                all_docs.extend(source.index_all()?);
             }
-        } else if path.is_dir() {
-            let source = lixun_sources::fs::FsSource::new_with_ocr(
-                vec![path.clone()],
-                config.exclude().to_vec(),
-                config.max_file_size_mb(),
-                Arc::clone(&caps),
-                enqueue.clone(),
-            )
-            .with_body_checker(body_checker.clone());
-            all_docs.extend(source.index_all()?);
         }
-    }
+        Ok(all_docs)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("reindex_paths extraction task failed: {e}"))??;
 
     let count = all_docs.len();
     mutation_tx.send(Mutation::UpsertMany(all_docs)).await?;

@@ -45,6 +45,20 @@ pub fn zoomed_out(zoom: f64) -> f64 {
     (zoom / ZOOM_STEP).clamp(MIN_ZOOM, MAX_ZOOM)
 }
 
+/// Zoom factor that fits a `w`×`h` image inside a `vw`×`vh` viewport
+/// without upscaling: `min(1.0, vw/w, vh/h)`, clamped to the zoom
+/// range. Degenerate inputs (empty image or unallocated viewport)
+/// yield 1.0 so a race with layout can never blank the canvas.
+pub fn fit_zoom(w: i32, h: i32, vw: i32, vh: i32) -> f64 {
+    if w <= 0 || h <= 0 || vw <= 0 || vh <= 0 {
+        return 1.0;
+    }
+    (f64::from(vw) / f64::from(w))
+        .min(f64::from(vh) / f64::from(h))
+        .min(1.0)
+        .clamp(MIN_ZOOM, MAX_ZOOM)
+}
+
 mod imp {
     use super::*;
 
@@ -136,6 +150,19 @@ impl ImageCanvas {
     /// Current zoom factor.
     pub fn zoom(&self) -> f64 {
         self.imp().zoom.get()
+    }
+
+    /// Zoom so the whole image fits inside a `vw`×`vh` viewport,
+    /// never upscaling past 1:1 (Quick Look opens small images at
+    /// 100%, not stretched). Rotation-aware: odd quarter-turns swap
+    /// the effective extent.
+    pub fn fit_to_viewport(&self, vw: i32, vh: i32) {
+        let imp = self.imp();
+        let (mut w, mut h) = (imp.base_w.get(), imp.base_h.get());
+        if imp.rotation_quarter_turns.get() % 2 == 1 {
+            std::mem::swap(&mut w, &mut h);
+        }
+        self.set_zoom(fit_zoom(w, h, vw, vh));
     }
 
     /// Set the zoom factor, clamped to `[MIN_ZOOM, MAX_ZOOM]`.
@@ -408,5 +435,44 @@ impl ImageCanvas {
                 snapshot.append_color(&border, &graphene::Rect::new(rx + rw - t, ry, t, rh));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod fit_tests {
+    use super::fit_zoom;
+
+    #[test]
+    fn fit_zoom_shrinks_oversized_images_to_viewport() {
+        // 2560x1440 texture into a 1200x800 viewport: width is the
+        // binding axis (1200/2560 = 0.469 < 800/1440 = 0.556) — the
+        // whole image must be visible.
+        let z = fit_zoom(2560, 1440, 1200, 800);
+        assert!((z - 1200.0 / 2560.0).abs() < 1e-9);
+        // Both axes fit at the chosen zoom.
+        assert!(2560.0 * z <= 1200.0 + 1e-6);
+        assert!(1440.0 * z <= 800.0 + 1e-6);
+    }
+
+    #[test]
+    fn fit_zoom_never_upscales_small_images() {
+        assert_eq!(fit_zoom(400, 300, 1200, 800), 1.0);
+        assert_eq!(fit_zoom(1200, 800, 1200, 800), 1.0);
+    }
+
+    #[test]
+    fn fit_zoom_degenerate_inputs_yield_identity() {
+        assert_eq!(fit_zoom(0, 100, 500, 500), 1.0);
+        assert_eq!(fit_zoom(100, 0, 500, 500), 1.0);
+        assert_eq!(fit_zoom(100, 100, 0, 500), 1.0);
+        assert_eq!(fit_zoom(100, 100, 500, -1), 1.0);
+    }
+
+    #[test]
+    fn fit_zoom_clamps_to_zoom_range() {
+        // Absurdly wide panorama in a tiny viewport clamps at MIN_ZOOM
+        // instead of vanishing.
+        let z = fit_zoom(100_000, 200, 300, 300);
+        assert!((z - super::MIN_ZOOM).abs() < 1e-9);
     }
 }
