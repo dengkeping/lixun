@@ -440,8 +440,25 @@ async fn handle_msg(msg: Msg, conn: &Arc<SemanticConnection>, writer: &mpsc::Sen
 }
 
 async fn kill_child(child: &mut Child) {
+    // SIGTERM first: the worker treats it like Cmd::Shutdown and
+    // drains in-flight LanceDB commits before exiting. A bare
+    // SIGKILL truncates mid-commit writes — observed in the field
+    // as zero-byte Lance manifests that crash-looped the worker on
+    // every subsequent start. Escalate only if the grace window
+    // expires (wedged worker).
     if let Some(id) = child.id() {
-        tracing::debug!(pid = id, "semantic supervisor: killing worker child");
+        tracing::debug!(pid = id, "semantic supervisor: stopping worker child (SIGTERM)");
+        // SAFETY: plain kill(2) on a pid we own; no memory involved.
+        unsafe {
+            libc::kill(id as libc::pid_t, libc::SIGTERM);
+        }
+        if timeout(Duration::from_secs(3), child.wait()).await.is_ok() {
+            return;
+        }
+        tracing::warn!(
+            pid = id,
+            "semantic supervisor: worker ignored SIGTERM for 3s; escalating to SIGKILL"
+        );
     }
     let _ = child.start_kill();
     let _ = timeout(Duration::from_secs(2), child.wait()).await;

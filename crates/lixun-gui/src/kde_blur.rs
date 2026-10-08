@@ -1,11 +1,15 @@
 //! KDE Plasma compositor blur for the launcher window.
 //!
 //! GTK4 has no `backdrop-filter` and Wayland forbids reading the backdrop
-//! pixels, so a real blur can only come from the compositor. KDE exposes
-//! modern Plasma exposes `ext_background_effect_manager_v1`, while older
+//! pixels, so a real blur can only come from the compositor. Modern
+//! Plasma exposes `ext_background_effect_manager_v1`, while older
 //! Plasma exposes `org_kde_kwin_blur_manager`; this module binds the
 //! standard protocol first, falls back to the KDE-private protocol, and
-//! asks the compositor to blur the area underneath our surface.
+//! asks the compositor to blur the area underneath our surface. GTK
+//! 4.23.3+ claims the standard protocol's per-surface object itself and
+//! drives it from CSS `backdrop-filter`, so on those versions we never
+//! touch the standard protocol directly: a `backdrop-filter` rule is
+//! installed and toggled through the `lixun-backdrop-blur` class.
 //!
 //! On compositors without the protocol (sway, niri, GNOME, …) the
 //! protocol attach no-ops and the `lixun-no-blur` CSS class is forced
@@ -66,11 +70,33 @@ fn bind_version(range: RangeInclusive<u32>, advertised: u32) -> Option<u32> {
     }
 }
 
-fn backend_preference() -> [BlurBackendKind; 2] {
-    [
-        BlurBackendKind::ExtBackgroundEffect,
-        BlurBackendKind::KdeBlur,
-    ]
+/// GTK 4.23.3 started creating an `ext_background_effect_surface_v1`
+/// for every `wl_surface` it owns. The protocol allows one such object
+/// per surface, so a second `get_background_effect` from us is a fatal
+/// `background_effect_exists` error and the compositor disconnects the
+/// client. On those GTK versions the standard protocol is reached
+/// through GTK's CSS `backdrop-filter` support instead.
+fn gtk_owns_background_effect(major: u32, minor: u32, micro: u32) -> bool {
+    (major, minor, micro) >= (4, 23, 3)
+}
+
+fn gtk_owns_background_effect_at_runtime() -> bool {
+    gtk_owns_background_effect(
+        gtk::major_version(),
+        gtk::minor_version(),
+        gtk::micro_version(),
+    )
+}
+
+fn backend_preference(gtk_owns_ext: bool) -> &'static [BlurBackendKind] {
+    if gtk_owns_ext {
+        &[BlurBackendKind::ToolkitBackdrop, BlurBackendKind::KdeBlur]
+    } else {
+        &[
+            BlurBackendKind::ExtBackgroundEffect,
+            BlurBackendKind::KdeBlur,
+        ]
+    }
 }
 
 fn kde_blur_manager_bind_range() -> RangeInclusive<u32> {
@@ -88,8 +114,20 @@ fn background_effect_manager_bind_range() -> RangeInclusive<u32> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BlurBackendKind {
     ExtBackgroundEffect,
+    ToolkitBackdrop,
     KdeBlur,
 }
+
+const EXT_BACKGROUND_EFFECT_MANAGER_INTERFACE: &str = "ext_background_effect_manager_v1";
+
+/// CSS class that enables the toolkit-driven `backdrop-filter` rule.
+const BACKDROP_BLUR_CLASS: &str = "lixun-backdrop-blur";
+
+/// GTK translates a non-empty `backdrop-filter` on the toplevel into a
+/// blur region on its own `ext_background_effect_surface_v1`, following
+/// the CSS border box and radius. The blur strength is up to the
+/// compositor; the value only has to be non-zero.
+const BACKDROP_BLUR_CSS: &str = ".lixun-window.lixun-backdrop-blur { backdrop-filter: blur(12px); }";
 
 /// Border-radius (in CSS pixels) of `.lixun-window` in style.css. Must
 /// match so the blur region honours the rounded silhouette and the
@@ -150,6 +188,16 @@ impl BlurController {
 
         apply_no_blur_class(window, !initial_mode.wants_blur());
 
+        if gtk_owns_background_effect_at_runtime() {
+            let provider = gtk::CssProvider::new();
+            provider.load_from_string(BACKDROP_BLUR_CSS);
+            gtk::style_context_add_provider_for_display(
+                &WidgetExt::display(window),
+                &provider,
+                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+            );
+        }
+
         let state_layout = Rc::clone(&state);
         window.connect_realize(move |w| {
             let Some(gdk_surface) = w.surface() else {
@@ -181,6 +229,9 @@ impl BlurController {
                 match BlurAttachment::create(surface, width, height) {
                     Ok(Some(att)) => {
                         tracing::debug!("KDE blur enabled: {width}×{height} (layout)");
+                        if let Some(win) = window_weak.upgrade() {
+                            apply_backdrop_class(&win, att.is_toolkit_backdrop());
+                        }
                         st.attachment = Some(att);
                     }
                     Ok(None) => {
@@ -207,10 +258,11 @@ impl BlurController {
         });
 
         let state_hide = Rc::clone(&state);
-        window.connect_hide(move |_| {
+        window.connect_hide(move |w| {
             if let Some(att) = state_hide.borrow_mut().attachment.take() {
                 att.detach();
             }
+            apply_backdrop_class(w, false);
         });
 
         Self {
@@ -237,6 +289,9 @@ impl BlurController {
         drop(st);
 
         apply_no_blur_class(&self.window, !enabled);
+        if !enabled {
+            apply_backdrop_class(&self.window, false);
+        }
 
         if enabled && let Some(surface) = self.window.surface() {
             let (w, h) = (surface.width(), surface.height());
@@ -248,6 +303,7 @@ impl BlurController {
                 match BlurAttachment::create(&surface, w, h) {
                     Ok(Some(att)) => {
                         tracing::debug!("KDE blur re-enabled: {w}×{h}");
+                        apply_backdrop_class(&self.window, att.is_toolkit_backdrop());
                         self.state.borrow_mut().attachment = Some(att);
                     }
                     Ok(None) => {
@@ -275,6 +331,14 @@ fn apply_no_blur_class(window: &gtk::ApplicationWindow, no_blur: bool) {
         window.add_css_class(NO_BLUR_CLASS);
     } else {
         window.remove_css_class(NO_BLUR_CLASS);
+    }
+}
+
+fn apply_backdrop_class(window: &gtk::ApplicationWindow, backdrop: bool) {
+    if backdrop {
+        window.add_css_class(BACKDROP_BLUR_CLASS);
+    } else {
+        window.remove_css_class(BACKDROP_BLUR_CLASS);
     }
 }
 
@@ -309,6 +373,10 @@ enum BlurBackend {
         blur: OrgKdeKwinBlur,
         manager: OrgKdeKwinBlurManager,
     },
+    /// GTK owns the standard protocol object and derives the blur
+    /// region from the `backdrop-filter` rule; the controller only
+    /// toggles [`BACKDROP_BLUR_CLASS`].
+    ToolkitBackdrop,
 }
 
 struct BlurProtocolContext<'a> {
@@ -377,13 +445,27 @@ impl BlurAttachment {
             compositor: &compositor,
         };
 
-        for backend in backend_preference() {
-            if backend == BlurBackendKind::ExtBackgroundEffect
-                && let Some(backend) =
+        for &kind in backend_preference(gtk_owns_background_effect_at_runtime()) {
+            let backend = match kind {
+                BlurBackendKind::ExtBackgroundEffect => {
                     Self::create_ext_background_effect(&protocol, &wl_surface, width, height)?
-            {
-                wl_surface.commit();
-                let _ = conn.flush();
+                }
+                BlurBackendKind::ToolkitBackdrop => {
+                    let advertised = globals.contents().with_list(|list| {
+                        list.iter()
+                            .any(|g| g.interface == EXT_BACKGROUND_EFFECT_MANAGER_INTERFACE)
+                    });
+                    advertised.then_some(BlurBackend::ToolkitBackdrop)
+                }
+                BlurBackendKind::KdeBlur => break,
+            };
+            if let Some(backend) = backend {
+                // The toolkit backend has no protocol state of ours to
+                // flush; GTK commits its own background-effect state.
+                if !matches!(backend, BlurBackend::ToolkitBackdrop) {
+                    wl_surface.commit();
+                    let _ = conn.flush();
+                }
                 return Ok(Some(Self {
                     backend,
                     surface: wl_surface,
@@ -485,8 +567,12 @@ impl BlurAttachment {
     /// surface commit — no registry roundtrip, no blur unset/create
     /// churn, nothing that can stall the compositor or the GTK main
     /// thread the way full re-creation per layout callback did.
+    fn is_toolkit_backdrop(&self) -> bool {
+        matches!(self.backend, BlurBackend::ToolkitBackdrop)
+    }
+
     fn update_region(&mut self, width: i32, height: i32) {
-        if width == self.width && height == self.height {
+        if self.is_toolkit_backdrop() || (width == self.width && height == self.height) {
             return;
         }
         self.width = width;
@@ -501,6 +587,7 @@ impl BlurAttachment {
                 blur.set_region(Some(&region));
                 blur.commit();
             }
+            BlurBackend::ToolkitBackdrop => {}
         }
         region.destroy();
         self.surface.commit();
@@ -520,6 +607,7 @@ impl BlurAttachment {
                 manager.unset(&self.surface);
                 blur.release();
             }
+            BlurBackend::ToolkitBackdrop => return,
         }
         let _ = self.conn.flush();
     }
@@ -709,11 +797,24 @@ mod tests {
     #[test]
     fn standardized_background_effect_is_preferred_before_kde_fallback() {
         assert_eq!(
-            backend_preference(),
+            backend_preference(false),
             [
                 BlurBackendKind::ExtBackgroundEffect,
                 BlurBackendKind::KdeBlur
             ]
         );
+    }
+
+    #[test]
+    fn gtk_owned_background_effect_is_never_duplicated() {
+        assert!(!gtk_owns_background_effect(4, 22, 4));
+        assert!(!gtk_owns_background_effect(4, 23, 2));
+        assert!(gtk_owns_background_effect(4, 23, 3));
+        assert!(gtk_owns_background_effect(4, 24, 1));
+        assert_eq!(
+            backend_preference(true),
+            [BlurBackendKind::ToolkitBackdrop, BlurBackendKind::KdeBlur]
+        );
+        assert!(!backend_preference(true).contains(&BlurBackendKind::ExtBackgroundEffect));
     }
 }

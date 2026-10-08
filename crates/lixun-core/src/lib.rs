@@ -292,6 +292,22 @@ pub enum RowMenuVerb {
     QuickLook,
     /// Detailed info popover.
     Info,
+    /// "Open With…" application chooser. The host renders this as a
+    /// submenu populated per-hit from the platform's application
+    /// registry keyed by the hit's MIME type (or a content-type guess
+    /// from the path) — mime-driven only, never plugin-specific.
+    /// Appended after `Info` so existing wire encodings keep their
+    /// variant indices.
+    OpenWith,
+    /// Ranking control: add the hit's doc id to the daemon's
+    /// blocklist so it stops appearing in results. Host-dispatched;
+    /// undo is exposed via the CLI (`lixun-cli hidden`). Appended
+    /// for wire stability.
+    HideFromResults,
+    /// Ranking control: delete the daemon's learned frecency +
+    /// query-latch state for this doc id, returning it to neutral
+    /// ranking. Appended for wire stability.
+    ResetRanking,
 }
 
 /// When a [`RowMenuItem`] should be enabled / visible.

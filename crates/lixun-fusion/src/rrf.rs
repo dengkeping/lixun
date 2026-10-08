@@ -78,9 +78,81 @@ pub fn rrf_fuse_3way_weighted(
     out
 }
 
+/// Precision-first partition (stable): when the query PRECISION-matches
+/// at least one document lexically (title prefix / exact-title boost on
+/// a full, non-fallback match), every document with lexical standing is
+/// moved ahead of every ANN-only document. Relative RRF order is
+/// preserved inside both groups. With no precision match the fused
+/// order passes through untouched — genuinely semantic queries
+/// ("photos of dogs") are unaffected.
+///
+/// Why: modality weighting hands a single-leg CLIP hit `w_image/(k+1)`,
+/// which beats the BM25 #1's `w_bm25/(k+1)` whenever `w_image > w_bm25`
+/// — so an exact filename query like "golf-cart-vvp" gets buried under
+/// ~k·(w_image−1) generic golf-cart photos unless its own text
+/// embedding happens to rescue it (and mid-backfill it can't). A doc
+/// the user names precisely must never need a semantic leg of its own
+/// to survive the fusion.
+pub fn precision_first(
+    fused: Vec<(String, f32)>,
+    precision_ids: &std::collections::HashSet<String>,
+    lexical_ids: &std::collections::HashSet<String>,
+) -> Vec<(String, f32)> {
+    if precision_ids.is_empty() {
+        return fused;
+    }
+    let (lexical, ann_only): (Vec<_>, Vec<_>) = fused
+        .into_iter()
+        .partition(|(id, _)| lexical_ids.contains(id));
+    let mut out = lexical;
+    out.extend(ann_only);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ids(v: &[(String, f32)]) -> Vec<&str> {
+        v.iter().map(|(id, _)| id.as_str()).collect()
+    }
+
+    #[test]
+    fn precision_first_noop_without_precision_match() {
+        let fused = vec![("photo".into(), 0.9), ("doc".into(), 0.5)];
+        let precision = std::collections::HashSet::new();
+        let lexical: std::collections::HashSet<String> = ["doc".to_string()].into();
+        let out = precision_first(fused.clone(), &precision, &lexical);
+        assert_eq!(out, fused);
+    }
+
+    #[test]
+    fn precision_first_lifts_lexical_block_above_ann_only() {
+        // RRF order: two CLIP-only photos beat the precision-matched doc
+        // (the golf-cart-vvp shape). The lexical block must come first,
+        // stable within each group.
+        let fused = vec![
+            ("photo1".into(), 0.030),
+            ("photo2".into(), 0.029),
+            ("doc".into(), 0.016),
+            ("mail".into(), 0.015),
+            ("photo3".into(), 0.014),
+        ];
+        let precision: std::collections::HashSet<String> = ["doc".to_string()].into();
+        let lexical: std::collections::HashSet<String> =
+            ["doc".to_string(), "mail".to_string()].into();
+        let out = precision_first(fused, &precision, &lexical);
+        assert_eq!(ids(&out), vec!["doc", "mail", "photo1", "photo2", "photo3"]);
+    }
+
+    #[test]
+    fn precision_first_pure_ann_set_untouched() {
+        let fused = vec![("a".into(), 0.9), ("b".into(), 0.5)];
+        let precision: std::collections::HashSet<String> = ["x".to_string()].into();
+        let lexical = std::collections::HashSet::new();
+        let out = precision_first(fused.clone(), &precision, &lexical);
+        assert_eq!(out, fused);
+    }
 
     #[test]
     fn fuses_disjoint_lists_by_reciprocal_rank() {

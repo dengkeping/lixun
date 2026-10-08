@@ -24,6 +24,39 @@ use lixun_core::{Action, Category, Hit, RowMenuDef, RowMenuVerb, RowMenuVisibili
 struct RowState {
     doc_id: Option<String>,
     menu_key: Option<String>,
+    /// MIME key the row's "Open With" submenu was last populated
+    /// for; `None` when the submenu is empty/absent. Lets bind skip
+    /// the repopulation when consecutive hits share a type, which is
+    /// the common case while scrolling a homogeneous list.
+    openwith_mime: Option<String>,
+}
+
+/// Everything `create_list_factory` needs beyond the widgets it
+/// builds itself. Bundled so the call site stays readable as the
+/// row machinery grows.
+pub(crate) struct RowFactoryCtx {
+    pub(crate) entry: gtk::Entry,
+    pub(crate) status: Rc<StatusBar>,
+    /// Resolved keybindings, used for the menu items' accelerator
+    /// labels (K11) — the popover doubles as shortcut documentation.
+    pub(crate) keybindings: Rc<lixun_config::Keybindings>,
+    /// K10: clicking a row is explicit user selection; late Final
+    /// chunks must preserve it instead of snapping to row 0.
+    pub(crate) user_selected: Rc<std::cell::Cell<bool>>,
+    /// Count of currently-mapped row popovers (context menu / Get
+    /// Info). While non-zero the launcher's focus-leave handler must
+    /// not hide the window: an autohide popover takes an xdg_popup
+    /// grab that moves keyboard focus to the popup surface, which
+    /// fires `connect_leave` — without this gate the launcher hides
+    /// and the popover dies with it (the trap that bit the ?/F1
+    /// overlay twice). Map/unmap (not popup/closed) keep the count
+    /// balanced even when a popover is torn down without a `closed`
+    /// emission.
+    pub(crate) popover_open: Rc<std::cell::Cell<u32>>,
+    /// The unfiltered results model, so row verbs that remove a row
+    /// (C2 "Hide from Results") can update the visible list without
+    /// waiting for the next search round-trip.
+    pub(crate) model: gtk::StringList,
 }
 
 use crate::actions::{copy_to_clipboard, execute_action, execute_secondary_action};
@@ -53,6 +86,20 @@ fn category_kind_fallback(cat: &Category) -> &'static str {
 thread_local! {
     static CACHED_HITS: RefCell<Vec<Hit>> = const { RefCell::new(Vec::new()) };
     static TOP_HIT_DOC_ID: RefCell<Option<String>> = const { RefCell::new(None) };
+    /// doc_id → row widget currently bound to it (K11). Weak refs:
+    /// the pool owns the widgets; entries are pruned on unbind, so
+    /// the map never outgrows the visible row pool.
+    static ROW_WIDGETS: RefCell<HashMap<String, glib::WeakRef<gtk::Box>>> =
+        RefCell::new(HashMap::new());
+    /// doc_id → one-line ranking explanation from the daemon (R9).
+    /// Refreshed on every Final chunk; read by the Get Info popover.
+    static EXPLANATIONS: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+    /// mime → (app name, desktop id) pairs for the "Open With"
+    /// submenu (C1). AppInfo enumeration walks the desktop database;
+    /// caching per MIME keeps row binds cheap. Bounded by the number
+    /// of distinct MIME types the user's results surface.
+    static OPENWITH_CACHE: RefCell<HashMap<String, OpenWithApps>> =
+        RefCell::new(HashMap::new());
 }
 
 pub(crate) fn cache_hits(hits: Vec<Hit>) {
@@ -78,6 +125,107 @@ pub(crate) fn cached_hit_by_id(doc_id: &str) -> Option<Hit> {
 pub(crate) fn clear_cached_hits() {
     CACHED_HITS.with(|c| c.borrow_mut().clear());
     TOP_HIT_DOC_ID.with(|c| *c.borrow_mut() = None);
+    EXPLANATIONS.with(|c| c.borrow_mut().clear());
+}
+
+/// Replace the ranking-explanation map (R9). Called on every Final
+/// chunk with entries zipped from the daemon's index-aligned
+/// `explanations`.
+pub(crate) fn cache_explanations(map: HashMap<String, String>) {
+    EXPLANATIONS.with(|c| *c.borrow_mut() = map);
+}
+
+/// The row widget currently bound to `doc_id`, if that row is
+/// realized in the visible pool (K11).
+pub(crate) fn row_widget_for(doc_id: &str) -> Option<gtk::Box> {
+    ROW_WIDGETS.with(|m| m.borrow().get(doc_id).and_then(|w| w.upgrade()))
+}
+
+/// Pop the actions menu of the row bound to `doc_id` (K11 keyboard
+/// path). Returns false when the row is not realized.
+pub(crate) fn open_row_menu(doc_id: &str) -> bool {
+    let Some(row) = row_widget_for(doc_id) else {
+        return false;
+    };
+    gtk::prelude::WidgetExt::activate_action(&row, "row.menu", None).is_ok()
+}
+
+/// Pop the Get Info popover of the row bound to `doc_id` (K11).
+pub(crate) fn open_row_info(doc_id: &str) -> bool {
+    let Some(row) = row_widget_for(doc_id) else {
+        return false;
+    };
+    gtk::prelude::WidgetExt::activate_action(&row, "row.info", None).is_ok()
+}
+
+/// Doc-id namespace for rows the GUI synthesizes locally (recent
+/// searches, the web-search fallback, "Show more results"). These
+/// never exist in the index, so click recording skips them.
+pub(crate) fn is_synthetic_doc_id(doc_id: &str) -> bool {
+    doc_id.starts_with("history:")
+        || doc_id.starts_with("gui-web:")
+        || doc_id.starts_with("gui-more:")
+}
+
+/// Zero-results fallback row (C3c): a selectable, Enter-able
+/// "Search the web" hit mirroring `synthetic_history_hits`, so the
+/// fallback is keyboard-reachable instead of button-only.
+pub(crate) fn synthetic_web_search_hit(query: &str, engine_template: &str) -> Hit {
+    use lixun_core::DocId;
+    let uri = crate::status::web_search_url_for(engine_template, query);
+    Hit {
+        id: DocId(format!("gui-web:{query}")),
+        category: Category::File,
+        title: format!("Search the web for \u{201c}{query}\u{201d}"),
+        subtitle: uri.clone(),
+        icon_name: Some("web-browser".to_string()),
+        kind_label: Some("Web Search".to_string()),
+        score: 0.0,
+        action: Action::OpenUri { uri },
+        extract_fail: false,
+        sender: None,
+        recipients: None,
+        body: None,
+        secondary_action: None,
+        source_instance: String::new(),
+        row_menu: RowMenuDef::empty(),
+        mime: None,
+        timestamp: None,
+        size: None,
+    }
+}
+
+/// Terminal "Show more results" row (R7), appended when a page came
+/// back full. Activation is intercepted by id prefix (see
+/// `is_more_results_doc_id`) and re-issues the query with a larger
+/// limit; the stored action is an inert same-query ReplaceQuery so
+/// unknown dispatch paths degrade harmlessly.
+pub(crate) fn synthetic_more_results_hit(query: &str, next_limit: u32) -> Hit {
+    use lixun_core::DocId;
+    Hit {
+        id: DocId(format!("gui-more:{next_limit}:{query}")),
+        category: Category::File,
+        title: "Show more results".to_string(),
+        subtitle: format!("Fetch up to {next_limit} results"),
+        icon_name: Some("go-down-symbolic".to_string()),
+        kind_label: Some("More".to_string()),
+        score: 0.0,
+        action: Action::ReplaceQuery { q: query.to_string() },
+        extract_fail: false,
+        sender: None,
+        recipients: None,
+        body: None,
+        secondary_action: None,
+        source_instance: String::new(),
+        row_menu: RowMenuDef::empty(),
+        mime: None,
+        timestamp: None,
+        size: None,
+    }
+}
+
+pub(crate) fn is_more_results_doc_id(doc_id: &str) -> bool {
+    doc_id.starts_with("gui-more:")
 }
 
 pub(crate) fn cache_top_hit_doc_id(id: Option<String>) {
@@ -169,25 +317,126 @@ thread_local! {
 /// host never names a plugin here; it iterates whatever verbs the
 /// plugin's `row_menu()` declared and maps them to the fixed
 /// action vocabulary below.
-fn menu_for_key(key: &str, def: &RowMenuDef) -> gio::Menu {
+fn menu_for_key(key: &str, def: &RowMenuDef, kb: &lixun_config::Keybindings) -> gio::Menu {
     MENU_CACHE.with(|cache| {
         if let Some(existing) = cache.borrow().get(key) {
             return existing.clone();
         }
         let menu = gio::Menu::new();
         for item in &def.items {
-            let action = match item.verb {
-                RowMenuVerb::Open => "row.open",
-                RowMenuVerb::Secondary => "row.secondary",
-                RowMenuVerb::Copy => "row.copy",
-                RowMenuVerb::QuickLook => "row.quicklook",
-                RowMenuVerb::Info => "row.info",
+            // Verb → (row action, accelerator shown as the item's
+            // shortcut label). The accel attribute is documentation:
+            // GTK renders it beside the item, so the panel doubles
+            // as a per-row cheat sheet (K11). Dispatch itself stays
+            // in the keymap.
+            let (action, accel): (&str, Option<&str>) = match item.verb {
+                RowMenuVerb::Open => ("row.open", Some(kb.primary_action.as_str())),
+                RowMenuVerb::Secondary => ("row.secondary", Some(kb.secondary_action.as_str())),
+                RowMenuVerb::Copy => ("row.copy", Some(kb.copy.as_str())),
+                RowMenuVerb::QuickLook => ("row.quicklook", Some(kb.quick_look_alt.as_str())),
+                RowMenuVerb::Info => ("row.info", Some(kb.info.as_str())),
+                // Rendered as a per-hit submenu by the bind path —
+                // never into this shared, per-source cached model
+                // (C1; the cache is the popover-leak fix).
+                RowMenuVerb::OpenWith => continue,
+                RowMenuVerb::HideFromResults => ("row.hide", None),
+                RowMenuVerb::ResetRanking => ("row.reset-rank", None),
             };
-            menu.append(Some(&item.label), Some(action));
+            let menu_item = gio::MenuItem::new(Some(&item.label), Some(action));
+            // No parse-validation here: GTK ignores unparseable
+            // accel attributes at render time, and validating would
+            // drag gtk::accelerator_parse (main-thread-only) into
+            // this otherwise gio-level, headless-testable function.
+            if let Some(accel) = accel {
+                menu_item.set_attribute_value("accel", Some(&accel.to_variant()));
+            }
+            menu.append_item(&menu_item);
+        }
+        // Host-owned ranking-control section (C2). Frecency and the
+        // query latch are daemon/host state, not plugin domain, so
+        // the host appends these verbs to every non-empty row menu
+        // uniformly rather than asking each source to declare them.
+        if !def.is_empty() {
+            let ranking = gio::Menu::new();
+            ranking.append(Some("Hide from Results"), Some("row.hide"));
+            ranking.append(Some("Reset Ranking"), Some("row.reset-rank"));
+            menu.append_section(None, &ranking);
         }
         cache.borrow_mut().insert(key.to_string(), menu.clone());
         menu
     })
+}
+
+/// The declared "Open With" item's label, when the source opted into
+/// the verb (C1). Presence drives whether the bind path links the
+/// per-row submenu into the popover shell.
+fn menu_openwith_label(def: &RowMenuDef) -> Option<String> {
+    def.items
+        .iter()
+        .find(|it| it.verb == RowMenuVerb::OpenWith)
+        .map(|it| it.label.clone())
+}
+
+/// (display name, desktop id) pairs registered for one MIME type.
+type OpenWithApps = Rc<Vec<(String, String)>>;
+
+/// Applications registered for `mime`, as (display name, desktop id)
+/// pairs, cached per MIME type. Enumeration order is GIO's
+/// recommendation order; capped so a type with dozens of handlers
+/// does not produce an unusable submenu.
+fn openwith_apps_for_mime(mime: &str) -> OpenWithApps {
+    const MAX_OPENWITH_APPS: usize = 8;
+    OPENWITH_CACHE.with(|cache| {
+        if let Some(existing) = cache.borrow().get(mime) {
+            return Rc::clone(existing);
+        }
+        let apps: Vec<(String, String)> = gio::AppInfo::all_for_type(mime)
+            .into_iter()
+            .filter_map(|app| {
+                let id = app.id()?;
+                Some((app.name().to_string(), id.to_string()))
+            })
+            .take(MAX_OPENWITH_APPS)
+            .collect();
+        let apps = Rc::new(apps);
+        cache
+            .borrow_mut()
+            .insert(mime.to_string(), Rc::clone(&apps));
+        apps
+    })
+}
+
+/// MIME key for a hit's "Open With" submenu: the stored MIME when
+/// the source recorded one, otherwise a content-type guess from the
+/// file extension. `None` for hits without a file path — the
+/// submenu is omitted for those.
+fn openwith_mime_for_hit(hit: &Hit) -> Option<String> {
+    if let Some(mime) = hit.mime.as_deref().filter(|m| !m.is_empty()) {
+        return Some(mime.to_string());
+    }
+    let path = hit_file_path(hit)?;
+    let (guess, _uncertain) =
+        gio::functions::content_type_guess(Some(&path), None::<&[u8]>);
+    Some(guess.to_string())
+}
+
+/// Rebuild `submenu` with the applications for `mime`. Item targets
+/// carry the desktop id; the shared `row.openwith` action launches
+/// by id, so the submenu content is pure data.
+fn populate_openwith_menu(submenu: &gio::Menu, mime: &str) {
+    submenu.remove_all();
+    let apps = openwith_apps_for_mime(mime);
+    if apps.is_empty() {
+        // Item with an unregistered action renders insensitive —
+        // an honest "nothing installed" placeholder.
+        submenu.append(Some("No applications found"), Some("row.none"));
+        return;
+    }
+    for (name, id) in apps.iter() {
+        let item = gio::MenuItem::new(Some(name), None);
+        item.set_action_and_target_value(Some("row.openwith"), Some(&id.to_variant()));
+        submenu.append_item(&item);
+    }
 }
 
 /// Does the source's menu expose a conditionally-enabled Secondary
@@ -355,6 +604,95 @@ fn apply_highlight(label: &gtk::Label, displayed_text: &str, query: &str) {
     label.set_attributes(Some(&attrs));
 }
 
+/// Parse the daemon's one-line score breakdown
+/// (`score=… = tantivy(…) × cat(1.300) × prefix(1.400) × …`) into
+/// named multiplier values. `score`/`tantivy` are the base, not
+/// multipliers, and are skipped. Pure so it unit-tests headlessly.
+fn parse_score_multipliers(explanation: &str) -> Vec<(String, f32)> {
+    let mut out = Vec::new();
+    let bytes = explanation.as_bytes();
+    let mut i = 0;
+    while let Some(open_rel) = explanation[i..].find('(') {
+        let open = i + open_rel;
+        // Walk back over the multiplier name (ascii alnum + '_').
+        let mut start = open;
+        while start > 0
+            && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_')
+        {
+            start -= 1;
+        }
+        let Some(close_rel) = explanation[open..].find(')') else {
+            break;
+        };
+        let close = open + close_rel;
+        let name = &explanation[start..open];
+        if let Ok(value) = explanation[open + 1..close].parse::<f32>()
+            && !name.is_empty()
+            && name != "score"
+            && name != "tantivy"
+        {
+            out.push((name.to_string(), value));
+        }
+        i = close + 1;
+    }
+    out
+}
+
+/// Human labels for the breakdown's multiplier tokens. Unknown
+/// tokens fall back to themselves so a future daemon field still
+/// renders something meaningful.
+fn multiplier_label(name: &str) -> &str {
+    match name {
+        "cat" => "category weight",
+        "exact" => "exact title match",
+        "prefix" => "title starts with query",
+        "acronym" => "acronym match",
+        "recency" => "recently modified",
+        "coord" => "all words in title",
+        "stage2" => "opened often",
+        other => other,
+    }
+}
+
+/// The top ranking factors as a short human line for the Get Info
+/// popover (R9): non-neutral multipliers, strongest first, capped at
+/// three. `None` when everything is ~1.0 (neutral ranking).
+fn ranking_summary(explanation: &str) -> Option<String> {
+    const NEUTRAL_EPSILON: f32 = 0.02;
+    let mut mults: Vec<(String, f32)> = parse_score_multipliers(explanation)
+        .into_iter()
+        .filter(|(_, v)| (v - 1.0).abs() > NEUTRAL_EPSILON)
+        .collect();
+    if mults.is_empty() {
+        return None;
+    }
+    mults.sort_by(|a, b| {
+        (b.1 - 1.0)
+            .abs()
+            .partial_cmp(&(a.1 - 1.0).abs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    mults.truncate(3);
+    let ups: Vec<String> = mults
+        .iter()
+        .filter(|(_, v)| *v > 1.0)
+        .map(|(n, v)| format!("{} \u{d7}{:.2}", multiplier_label(n), v))
+        .collect();
+    let downs: Vec<String> = mults
+        .iter()
+        .filter(|(_, v)| *v < 1.0)
+        .map(|(n, v)| format!("{} \u{d7}{:.2}", multiplier_label(n), v))
+        .collect();
+    let mut parts = Vec::new();
+    if !ups.is_empty() {
+        parts.push(format!("Ranked up: {}", ups.join(", ")));
+    }
+    if !downs.is_empty() {
+        parts.push(format!("Ranked down: {}", downs.join(", ")));
+    }
+    Some(parts.join(" \u{b7} "))
+}
+
 fn populate_info_popover_body(vbox: &gtk::Box, hit: &Hit) {
     while let Some(child) = vbox.first_child() {
         vbox.remove(&child);
@@ -396,15 +734,27 @@ fn populate_info_popover_body(vbox: &gtk::Box, hit: &Hit) {
     if let Some(path) = hit_file_path(hit) {
         meta_row(format!("Where: {}", path.display()));
     }
+
+    // R9: why this hit ranked where it did — top non-neutral
+    // multipliers from the daemon's explain pipeline.
+    let summary = EXPLANATIONS.with(|m| {
+        m.borrow()
+            .get(&hit.id.0)
+            .and_then(|expl| ranking_summary(expl))
+    });
+    if let Some(summary) = summary {
+        meta_row(summary);
+    }
 }
 
-pub(crate) fn create_list_factory(
-    entry: gtk::Entry,
-    status: Rc<StatusBar>,
-) -> gtk::SignalListItemFactory {
+pub(crate) fn create_list_factory(ctx: RowFactoryCtx) -> gtk::SignalListItemFactory {
     let factory = gtk::SignalListItemFactory::new();
-    let setup_entry = entry.clone();
-    let setup_status = status.clone();
+    let setup_entry = ctx.entry.clone();
+    let setup_status = ctx.status.clone();
+    let setup_kb = Rc::clone(&ctx.keybindings);
+    let setup_user_selected = Rc::clone(&ctx.user_selected);
+    let setup_popover_open = Rc::clone(&ctx.popover_open);
+    let setup_model = ctx.model.clone();
 
     factory.connect_setup(move |_, list_item| {
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
@@ -474,6 +824,12 @@ pub(crate) fn create_list_factory(
                 tracing::debug!("row.open fired on unbound row");
                 return;
             };
+            if is_more_results_doc_id(&doc_id) {
+                if let Some(app) = gio::Application::default() {
+                    app.activate_action("show-more-results", None);
+                }
+                return;
+            }
             if let Some(hit) = cached_hit_by_id(&doc_id) {
                 dispatch_click_pair(&hit.id.0, open_entry.text().as_str());
                 if let Err(e) = execute_action(&hit) {
@@ -535,6 +891,86 @@ pub(crate) fn create_list_factory(
         });
         group.add_action(&quick);
 
+        // ===== "Open With <app>" (C1) =====
+        // Shared action taking the desktop id as its target; the
+        // per-hit submenu items carry the id as pure data. Launch is
+        // mime-registry driven — the host names no application.
+        let openwith_state = Rc::clone(&state);
+        let openwith_entry = setup_entry.clone();
+        let openwith_status = setup_status.clone();
+        let openwith =
+            gio::SimpleAction::new("openwith", Some(glib::VariantTy::STRING));
+        openwith.connect_activate(move |_, param| {
+            let Some(doc_id) = openwith_state.borrow().doc_id.clone() else {
+                tracing::debug!("row.openwith fired on unbound row");
+                return;
+            };
+            let Some(app_id) = param.and_then(|v| v.get::<String>()) else {
+                return;
+            };
+            if let Some(hit) = cached_hit_by_id(&doc_id) {
+                let Some(path) = hit_file_path(&hit) else {
+                    return;
+                };
+                dispatch_click_pair(&hit.id.0, openwith_entry.text().as_str());
+                if let Err(e) = crate::actions::launch_with_app_id(&app_id, &path) {
+                    tracing::error!("open-with failed: {}", e);
+                    openwith_status
+                        .show_error(&format!("Couldn't open \u{201c}{}\u{201d}: {}", hit.title, e));
+                }
+            }
+        });
+        group.add_action(&openwith);
+
+        // ===== Ranking controls (C2) =====
+        let hide_state = Rc::clone(&state);
+        let hide_status = setup_status.clone();
+        let hide_model = setup_model.clone();
+        let hide = gio::SimpleAction::new("hide", None);
+        hide.connect_activate(move |_, _| {
+            let Some(doc_id) = hide_state.borrow().doc_id.clone() else {
+                tracing::debug!("row.hide fired on unbound row");
+                return;
+            };
+            if is_synthetic_doc_id(&doc_id) {
+                return;
+            }
+            crate::ipc::send_set_doc_hidden(&doc_id, true);
+            // Remove the row locally so the hide is visible without
+            // a search round-trip.
+            let n = hide_model.n_items();
+            for i in 0..n {
+                if hide_model.string(i).is_some_and(|s| s == doc_id) {
+                    hide_model.remove(i);
+                    break;
+                }
+            }
+            CACHED_HITS.with(|c| c.borrow_mut().retain(|h| h.id.0 != doc_id));
+            hide_status.show_toast(
+                "Hidden from results \u{2014} undo with `lixun-cli hidden`",
+            );
+        });
+        group.add_action(&hide);
+
+        let reset_state = Rc::clone(&state);
+        let reset_status = setup_status.clone();
+        let reset = gio::SimpleAction::new("reset-rank", None);
+        reset.connect_activate(move |_, _| {
+            let Some(doc_id) = reset_state.borrow().doc_id.clone() else {
+                tracing::debug!("row.reset-rank fired on unbound row");
+                return;
+            };
+            if is_synthetic_doc_id(&doc_id) {
+                return;
+            }
+            crate::ipc::send_reset_doc_ranking(&doc_id);
+            let title = cached_hit_by_id(&doc_id)
+                .map(|h| h.title)
+                .unwrap_or_else(|| doc_id.clone());
+            reset_status.show_toast(&format!("Ranking reset for \u{201c}{}\u{201d}", title));
+        });
+        group.add_action(&reset);
+
         // ===== Info popover (persistent child of the row) =====
         // Parented once via set_parent(&row). popdown() hides it;
         // we NEVER call unparent() — that would crash on the next
@@ -569,14 +1005,38 @@ pub(crate) fn create_list_factory(
 
         row.insert_action_group("row", Some(&group));
 
-        // ===== Right-click popover (persistent, menu model swapped on bind) =====
-        // PopoverMenu is built once with an empty menu; `on_item_notify`
-        // later calls `set_menu_model` only when the bound hit's
-        // `source_instance` differs from the previously-bound one
-        // (see MENU_CACHE). Parented once; never rebuilt.
-        let right_click_popover = gtk::PopoverMenu::from_model(Some(&gio::Menu::new()));
+        // ===== Right-click popover (persistent; shell mutated on bind) =====
+        // Each pool slot owns ONE PopoverMenu whose model is a
+        // per-slot `shell` menu, set exactly once here. On bind,
+        // `on_item_notify` mutates the shell only when the hit's
+        // `source_instance` changes: it links in the per-source
+        // cached section (see MENU_CACHE — the popover-leak fix:
+        // `set_menu_model` is never called again) plus, for sources
+        // declaring the OpenWith verb, the per-slot `openwith_menu`
+        // submenu whose items are per-hit data (C1).
+        let shell_menu = gio::Menu::new();
+        let openwith_menu = gio::Menu::new();
+        let right_click_popover = gtk::PopoverMenu::from_model(Some(&shell_menu));
         right_click_popover.set_parent(&row);
         right_click_popover.set_has_arrow(false);
+
+        // Focus-trap guard (K11): count mapped row popovers so the
+        // launcher's focus-leave handler ignores the focus loss an
+        // autohide popover's grab produces. Map/unmap stay balanced
+        // on every teardown path, unlike popup/closed.
+        for popover in [
+            right_click_popover.clone().upcast::<gtk::Widget>(),
+            info_popover.clone().upcast::<gtk::Widget>(),
+        ] {
+            let opened = Rc::clone(&setup_popover_open);
+            popover.connect_map(move |_| {
+                opened.set(opened.get() + 1);
+            });
+            let closed_count = Rc::clone(&setup_popover_open);
+            popover.connect_unmap(move |_| {
+                closed_count.set(closed_count.get().saturating_sub(1));
+            });
+        }
 
         let right_click_gesture = gtk::GestureClick::new();
         right_click_gesture.set_button(gdk::BUTTON_SECONDARY);
@@ -588,13 +1048,34 @@ pub(crate) fn create_list_factory(
         });
         row.add_controller(right_click_gesture);
 
+        // K11 keyboard path: `row.menu` pops the same popover
+        // pointing at the row itself (no pointer position to anchor
+        // to). Reached via the keymap's actions_menu / Menu /
+        // Shift+F10 dispatch through `open_row_menu`.
+        let menu_popover = right_click_popover.clone();
+        let menu_action = gio::SimpleAction::new("menu", None);
+        menu_action.connect_activate(move |_, _| {
+            menu_popover.set_pointing_to(None);
+            menu_popover.popup();
+        });
+        group.add_action(&menu_action);
+
         // ===== Double-click primary = launch + clear-and-hide =====
         let dblclick_state = Rc::clone(&state);
         let dblclick_entry = setup_entry.clone();
         let dblclick_status = setup_status.clone();
+        let dblclick_user_selected = Rc::clone(&setup_user_selected);
         let dblclick_gesture = gtk::GestureClick::new();
         dblclick_gesture.set_button(gdk::BUTTON_PRIMARY);
         dblclick_gesture.connect_pressed(move |_g, n_press, _x, _y| {
+            if n_press == 1 {
+                // K10: a plain click is explicit user selection —
+                // protect it from a late Final chunk snapping the
+                // cursor back to row 0 (and swapping the preview
+                // under the user in preview mode).
+                dblclick_user_selected.set(true);
+                return;
+            }
             if n_press != 2 {
                 return;
             }
@@ -602,6 +1083,14 @@ pub(crate) fn create_list_factory(
                 tracing::debug!("double-click fired on unbound row");
                 return;
             };
+            // R7: the terminal "Show more results" row re-issues the
+            // query with a larger limit instead of launching.
+            if is_more_results_doc_id(&doc_id) {
+                if let Some(app) = gio::Application::default() {
+                    app.activate_action("show-more-results", None);
+                }
+                return;
+            }
             if let Some(hit) = cached_hit_by_id(&doc_id) {
                 dispatch_click_pair(&hit.id.0, dblclick_entry.text().as_str());
                 if let Err(e) = execute_action(&hit) {
@@ -663,16 +1152,20 @@ pub(crate) fn create_list_factory(
         // a shared factory-level connect_bind handler would have
         // required, at the cost of one extra closure per row.
         let notify_state = Rc::clone(&state);
-        let notify_right_click_popover = right_click_popover.clone();
+        let notify_shell = shell_menu.clone();
+        let notify_openwith = openwith_menu.clone();
         let notify_secondary = secondary.clone();
         let notify_entry = setup_entry.clone();
+        let notify_kb = Rc::clone(&setup_kb);
         list_item.connect_notify_local(Some("item"), move |list_item, _| {
             on_item_notify(
                 list_item,
                 &notify_state,
-                &notify_right_click_popover,
+                &notify_shell,
+                &notify_openwith,
                 &notify_secondary,
                 &notify_entry,
+                &notify_kb,
             );
         });
 
@@ -726,12 +1219,15 @@ pub(crate) fn create_list_factory(
 /// hint, shared RowState, and the right-click popover's menu
 /// model to match the newly-bound Hit. On unbind (item is None)
 /// clears the RowState so subsequent callbacks no-op safely.
+#[allow(clippy::too_many_arguments)]
 fn on_item_notify(
     list_item: &gtk::ListItem,
     state: &Rc<RefCell<RowState>>,
-    right_click_popover: &gtk::PopoverMenu,
+    shell_menu: &gio::Menu,
+    openwith_menu: &gio::Menu,
     secondary: &gio::SimpleAction,
     entry: &gtk::Entry,
+    kb: &Rc<lixun_config::Keybindings>,
 ) {
     let Some(row) = list_item.child().and_downcast::<gtk::Box>() else {
         return;
@@ -749,7 +1245,12 @@ fn on_item_notify(
         // a recycled row never shows the previous hit's path.
         row.set_tooltip_text(None);
         let mut s = state.borrow_mut();
-        s.doc_id = None;
+        if let Some(old_id) = s.doc_id.take() {
+            // K11 registry: this row no longer answers for that doc.
+            ROW_WIDGETS.with(|m| {
+                m.borrow_mut().remove(&old_id);
+            });
+        }
         s.menu_key = None;
         secondary.set_enabled(false);
         return;
@@ -811,15 +1312,25 @@ fn on_item_notify(
             // the label's tooltip; the full metadata lives in Get
             // Info). Generic: keyed on category + timestamp presence.
             let mail_like = matches!(hit.category, Category::Mail | Category::Attachment);
-            match hit.timestamp {
-                Some(ts) if mail_like => {
-                    let now = chrono::Utc::now().timestamp();
-                    kind.set_text(&relative_age(ts, now));
-                    kind.set_tooltip_text(Some(&kind_text));
-                }
-                _ => {
-                    kind.set_text(&kind_text);
-                    kind.set_tooltip_text(None);
+            // R9: the hero row carries a "Top Hit" caption in the
+            // existing kind-label slot (no box-model change — BUG-6);
+            // the displaced kind text moves to the tooltip.
+            if is_top_hit_doc(&doc_id) {
+                kind.set_text("Top Hit");
+                kind.set_tooltip_text(Some(&kind_text));
+                kind.add_css_class("lixun-top-hit-caption");
+            } else {
+                kind.remove_css_class("lixun-top-hit-caption");
+                match hit.timestamp {
+                    Some(ts) if mail_like => {
+                        let now = chrono::Utc::now().timestamp();
+                        kind.set_text(&relative_age(ts, now));
+                        kind.set_tooltip_text(Some(&kind_text));
+                    }
+                    _ => {
+                        kind.set_text(&kind_text);
+                        kind.set_tooltip_text(None);
+                    }
                 }
             }
 
@@ -833,19 +1344,55 @@ fn on_item_notify(
             }
             row.update_property(&[gtk::accessible::Property::Label(&accessible_label)]);
 
-            // Cache-aware menu swap: only call `set_menu_model`
+            // Cache-aware menu swap: only rebuild the per-slot shell
             // when this row's menu_key differs from the new hit's
             // source_instance. Combined with the per-source
-            // `MENU_CACHE`, this bounds `set_menu_model` calls to
-            // O(unique source_instances) per process instead of
-            // O(binds), which fixes the PopoverMenu retention
-            // leak measured by heaptrack on the old code path.
+            // `MENU_CACHE`, this bounds shell rebuilds to
+            // O(unique source_instances) per slot instead of
+            // O(binds) — `set_menu_model` itself is never called
+            // after setup, which preserves the PopoverMenu
+            // retention-leak fix measured by heaptrack on the old
+            // per-bind code path.
             let current_key = state.borrow().menu_key.clone();
             let new_key = Some(hit.source_instance.clone());
+            let openwith_declared = menu_openwith_label(&hit.row_menu);
             if current_key != new_key {
-                let menu = menu_for_key(&hit.source_instance, &hit.row_menu);
-                right_click_popover.set_menu_model(Some(&menu));
+                shell_menu.remove_all();
+                let cached = menu_for_key(&hit.source_instance, &hit.row_menu, kb);
+                shell_menu.append_section(None, &cached);
+                if let Some(label) = openwith_declared.as_deref() {
+                    // Per-HIT content lives in the per-slot submenu,
+                    // never in the shared cached model (C1).
+                    shell_menu.append_submenu(Some(label), openwith_menu);
+                }
+                state.borrow_mut().openwith_mime = None;
             }
+
+            // C1: (re)populate the per-slot Open With submenu when
+            // the hit's MIME key changed since the last bind of this
+            // slot. Homogeneous lists (all one type) repopulate once.
+            if openwith_declared.is_some() {
+                let mime = openwith_mime_for_hit(hit);
+                let prev = state.borrow().openwith_mime.clone();
+                if mime != prev {
+                    match mime.as_deref() {
+                        Some(m) => populate_openwith_menu(openwith_menu, m),
+                        None => openwith_menu.remove_all(),
+                    }
+                    state.borrow_mut().openwith_mime = mime;
+                }
+            }
+
+            // K11 registry: this row now answers for the bound doc.
+            ROW_WIDGETS.with(|m| {
+                let mut map = m.borrow_mut();
+                if let Some(old_id) = state.borrow().doc_id.as_deref()
+                    && old_id != doc_id
+                {
+                    map.remove(old_id);
+                }
+                map.insert(doc_id.clone(), row.downgrade());
+            });
 
             // Conditional-secondary items live in a shared menu
             // model cached per source_instance; visibility of
@@ -950,30 +1497,151 @@ mod tests {
         let s = RowState::default();
         assert!(s.doc_id.is_none());
         assert!(s.menu_key.is_none());
+        assert!(s.openwith_mime.is_none());
     }
 
+    // The three menu_for_key tests touch GTK (gio::Menu + accel
+    // labels), so their bodies run on the shared `test_gtk` worker —
+    // initializing GTK per-test raced the gtk4-rs cross-thread init
+    // assertion against keymap's accel test. MENU_CACHE is a
+    // thread_local; routing every toucher through the single worker
+    // also keeps the cache the tests inspect on one thread.
     #[test]
     fn menu_for_key_caches_by_key() {
-        gtk::init().ok();
-        MENU_CACHE.with(|c| c.borrow_mut().clear());
-        let key = "test.key.cache";
-        let def = sample_def_single(RowMenuVerb::Open, "Open");
-        let a = menu_for_key(key, &def);
-        let b = menu_for_key(key, &def);
-        assert_eq!(a.n_items(), 1);
-        assert_eq!(b.n_items(), 1);
-        assert!(MENU_CACHE.with(|c| c.borrow().contains_key(key)));
+        let ran = crate::test_gtk::run_gtk(|| {
+            MENU_CACHE.with(|c| c.borrow_mut().clear());
+            let key = "test.key.cache";
+            let def = sample_def_single(RowMenuVerb::Open, "Open");
+            let kb = lixun_config::Keybindings::default();
+            let a = menu_for_key(key, &def, &kb);
+            let b = menu_for_key(key, &def, &kb);
+            // One plugin item plus the host-appended ranking section.
+            assert_eq!(a.n_items(), 2);
+            assert_eq!(b.n_items(), 2);
+            assert!(MENU_CACHE.with(|c| c.borrow().contains_key(key)));
+        });
+        if !ran {
+            eprintln!("skipping menu_for_key_caches_by_key: no display");
+        }
     }
 
     #[test]
     fn menu_for_key_separate_keys_separate_entries() {
-        gtk::init().ok();
+        let ran = crate::test_gtk::run_gtk(|| {
+            MENU_CACHE.with(|c| c.borrow_mut().clear());
+            let def = sample_def_single(RowMenuVerb::Copy, "Copy");
+            let kb = lixun_config::Keybindings::default();
+            let _ = menu_for_key("a.key", &def, &kb);
+            let _ = menu_for_key("b.key", &def, &kb);
+            let len = MENU_CACHE.with(|c| c.borrow().len());
+            assert!(len >= 2);
+        });
+        if !ran {
+            eprintln!("skipping menu_for_key_separate_keys_separate_entries: no display");
+        }
+    }
+
+    #[test]
+    fn menu_for_key_skips_openwith_items_in_shared_model() {
+        let ran = crate::test_gtk::run_gtk(menu_for_key_skips_openwith_assertions);
+        if !ran {
+            eprintln!("skipping menu_for_key_skips_openwith_items_in_shared_model: no display");
+        }
+    }
+
+    fn menu_for_key_skips_openwith_assertions() {
         MENU_CACHE.with(|c| c.borrow_mut().clear());
-        let def = sample_def_single(RowMenuVerb::Copy, "Copy");
-        let _ = menu_for_key("a.key", &def);
-        let _ = menu_for_key("b.key", &def);
-        let len = MENU_CACHE.with(|c| c.borrow().len());
-        assert!(len >= 2);
+        let def = RowMenuDef {
+            items: vec![
+                RowMenuItem {
+                    label: "Open".into(),
+                    verb: RowMenuVerb::Open,
+                    visibility: Default::default(),
+                },
+                RowMenuItem {
+                    label: "Open With".into(),
+                    verb: RowMenuVerb::OpenWith,
+                    visibility: Default::default(),
+                },
+            ],
+        };
+        let kb = lixun_config::Keybindings::default();
+        let menu = menu_for_key("openwith.key", &def, &kb);
+        // Open + ranking section only — OpenWith is per-hit and must
+        // never enter the shared cached model.
+        assert_eq!(menu.n_items(), 2);
+        assert_eq!(
+            menu_openwith_label(&def).as_deref(),
+            Some("Open With")
+        );
+        assert!(menu_openwith_label(&sample_def_single(RowMenuVerb::Open, "Open")).is_none());
+    }
+
+    #[test]
+    fn synthetic_doc_id_namespace() {
+        assert!(is_synthetic_doc_id("history:0:foo"));
+        assert!(is_synthetic_doc_id("gui-web:foo"));
+        assert!(is_synthetic_doc_id("gui-more:120:foo"));
+        assert!(is_more_results_doc_id("gui-more:120:foo"));
+        assert!(!is_synthetic_doc_id("fs:/tmp/foo"));
+        assert!(!is_more_results_doc_id("fs:/tmp/foo"));
+    }
+
+    #[test]
+    fn synthetic_web_search_hit_builds_engine_url() {
+        let hit = synthetic_web_search_hit("rust gtk", "https://duckduckgo.com/?q={query}");
+        assert_eq!(hit.id.0, "gui-web:rust gtk");
+        match &hit.action {
+            Action::OpenUri { uri } => {
+                assert_eq!(uri, "https://duckduckgo.com/?q=rust+gtk");
+            }
+            other => panic!("expected OpenUri, got {other:?}"),
+        }
+        assert_eq!(hit.kind_label.as_deref(), Some("Web Search"));
+    }
+
+    #[test]
+    fn synthetic_more_results_hit_shape() {
+        let hit = synthetic_more_results_hit("foo", 120);
+        assert_eq!(hit.id.0, "gui-more:120:foo");
+        assert_eq!(hit.title, "Show more results");
+        assert!(matches!(&hit.action, Action::ReplaceQuery { q } if q == "foo"));
+    }
+
+    #[test]
+    fn parse_score_multipliers_extracts_named_values() {
+        let expl = "score=2.1000 = tantivy(1.2000) \u{d7} cat(1.300) \u{d7} exact(1.000) \
+                    \u{d7} prefix(1.400) \u{d7} acronym(1.000) \u{d7} recency(1.050) \
+                    \u{d7} coord(1.000) \u{d7} stage2(1.350)";
+        let mults = parse_score_multipliers(expl);
+        let get = |n: &str| mults.iter().find(|(k, _)| k == n).map(|(_, v)| *v);
+        assert_eq!(get("cat"), Some(1.3));
+        assert_eq!(get("stage2"), Some(1.35));
+        assert_eq!(get("tantivy"), None, "base score is not a multiplier");
+        assert_eq!(get("score"), None);
+    }
+
+    #[test]
+    fn ranking_summary_picks_top_non_neutral() {
+        let expl = "score=2.1 = tantivy(1.2) \u{d7} cat(1.300) \u{d7} exact(1.000) \
+                    \u{d7} prefix(1.400) \u{d7} acronym(1.000) \u{d7} recency(1.000) \
+                    \u{d7} coord(1.000) \u{d7} stage2(1.350)";
+        let summary = ranking_summary(expl).expect("non-neutral multipliers present");
+        assert!(summary.starts_with("Ranked up:"), "got: {summary}");
+        assert!(summary.contains("title starts with query"), "got: {summary}");
+        assert!(summary.contains("opened often"), "got: {summary}");
+        // Neutral breakdown → no summary line at all.
+        let neutral = "score=1.0 = tantivy(1.0) \u{d7} cat(1.000) \u{d7} exact(1.000) \
+                       \u{d7} prefix(1.000) \u{d7} acronym(1.000) \u{d7} recency(1.000) \
+                       \u{d7} coord(1.000) \u{d7} stage2(1.000)";
+        assert!(ranking_summary(neutral).is_none());
+        // Below-1.0 multipliers read as ranked down.
+        let down = "score=0.9 = tantivy(1.0) \u{d7} cat(0.900) \u{d7} exact(1.000) \
+                    \u{d7} prefix(1.000) \u{d7} acronym(1.000) \u{d7} recency(1.000) \
+                    \u{d7} coord(1.000) \u{d7} stage2(1.000)";
+        let summary = ranking_summary(down).expect("down multiplier present");
+        assert!(summary.contains("Ranked down:"), "got: {summary}");
+        assert!(summary.contains("category weight"), "got: {summary}");
     }
 
     #[test]

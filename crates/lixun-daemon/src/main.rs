@@ -22,11 +22,13 @@ use tokio::sync::{RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 
 mod battery;
+mod blocklist;
 mod frecency;
 mod query_latch;
 mod query_log;
 mod sched;
 mod top_hit;
+use blocklist::Blocklist;
 use frecency::FrecencyStore;
 use lixun_daemon::symlink_alias::SymlinkAliases;
 use query_latch::QueryLatchStore;
@@ -571,6 +573,8 @@ async fn async_main(
     let query_log = QueryLog::load(&state_dir)?;
     let query_log = Arc::new(RwLock::new(query_log));
 
+    let blocklist = Arc::new(RwLock::new(Blocklist::load(&state_dir)));
+
     let symlink_aliases = Arc::new(SymlinkAliases::load(&state_dir));
 
     let gui_control = Arc::new(GuiControl::new());
@@ -771,6 +775,7 @@ async fn async_main(
                 let frecency = Arc::clone(&frecency);
                 let query_latch = Arc::clone(&query_latch);
                 let query_log = Arc::clone(&query_log);
+                let client_blocklist = Arc::clone(&blocklist);
                 let stats = Arc::clone(&stats);
                 let gui_control = Arc::clone(&gui_control);
                 let preview_spawner = Arc::clone(&preview_spawner);
@@ -783,7 +788,7 @@ async fn async_main(
                 let client_runtime_info = Arc::clone(&runtime_info);
 
                 tokio::spawn(async move {
-                    if let Err(e) = handle_client(stream, search, mutation_tx, frecency, query_latch, query_log, stats, gui_control, preview_spawner, shared_config, client_sources, client_registry, client_ocr_queue, client_ocr_worker_stats, client_profile_swap, client_runtime_info).await {
+                    if let Err(e) = handle_client(stream, search, mutation_tx, frecency, query_latch, query_log, client_blocklist, stats, gui_control, preview_spawner, shared_config, client_sources, client_registry, client_ocr_queue, client_ocr_worker_stats, client_profile_swap, client_runtime_info).await {
                         tracing::debug!("Client error: {}", e);
                     }
                 });
@@ -1004,6 +1009,7 @@ impl ConnectionState {
 
 const PLUGIN_BUDGET: std::time::Duration = std::time::Duration::from_millis(50);
 
+#[allow(clippy::too_many_arguments)]
 async fn process_search_chunk(
     mut hits: Vec<lixun_core::Hit>,
     mut breakdowns: Vec<lixun_core::ScoreBreakdown>,
@@ -1013,6 +1019,7 @@ async fn process_search_chunk(
     q: &str,
     frecency: &Arc<RwLock<FrecencyStore>>,
     query_latch: &Arc<RwLock<QueryLatchStore>>,
+    blocklist: &Arc<RwLock<Blocklist>>,
     config: &Arc<config::Config>,
     registry: &Arc<lixun_indexer::SourceRegistry>,
 ) -> anyhow::Result<(
@@ -1023,6 +1030,32 @@ async fn process_search_chunk(
     bool,
 )> {
     let now = chrono::Utc::now().timestamp();
+
+    // Ranking blocklist (C2): drop user-hidden docs BEFORE any
+    // ranking multiplier or top-hit selection runs. Snapshot the set
+    // once so the plugin fan-out below can reuse it without holding
+    // the lock. Kept in lockstep with `breakdowns`, which is
+    // index-aligned with `hits` in explain mode.
+    let hidden: std::collections::HashSet<String> = {
+        let list = blocklist.read().await;
+        list.list().into_iter().collect()
+    };
+    if !hidden.is_empty() {
+        if explain && breakdowns.len() == hits.len() {
+            let mut kept_breakdowns = Vec::with_capacity(breakdowns.len());
+            let mut kept_hits = Vec::with_capacity(hits.len());
+            for (hit, breakdown) in hits.drain(..).zip(breakdowns.drain(..)) {
+                if !hidden.contains(&hit.id.0) {
+                    kept_hits.push(hit);
+                    kept_breakdowns.push(breakdown);
+                }
+            }
+            hits = kept_hits;
+            breakdowns = kept_breakdowns;
+        } else {
+            hits.retain(|h| !hidden.contains(&h.id.0));
+        }
+    }
 
     let claiming_entry = if phase == lixun_fusion::Phase::Final {
         registry.instances.iter().find(|e| e.source.claims_query(q))
@@ -1147,6 +1180,9 @@ async fn process_search_chunk(
                     Ok(h) => h,
                     Err(_) => continue,
                 };
+                if !hidden.is_empty() {
+                    plugin_hits.retain(|h| !hidden.contains(&h.id.0));
+                }
                 for h in &mut plugin_hits {
                     h.score = h.score.clamp(0.0, 1.0) * max_lexical_score;
                 }
@@ -1233,6 +1269,15 @@ async fn process_search_chunk(
     Ok((hits, calculation, top_hit_id, explanations, claimed))
 }
 
+/// Absolute ceiling on any daemon-side fetch, matching the upper
+/// bound of the `[core] max_results` validation range. The "Show
+/// more results" escape hatch (R7) may legitimately ask for more
+/// than `max_results`, so the per-request cap is
+/// `max_results × 4` bounded by this constant — still bounded for a
+/// hostile client, but no longer a hard wall at the default page
+/// size.
+const ABSOLUTE_RESULT_CEILING: u32 = 1000;
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_search(
     generation: u64,
@@ -1242,20 +1287,39 @@ async fn handle_search(
     q: String,
     limit: u32,
     explain: bool,
+    category: Option<lixun_core::Category>,
     fusion: Arc<SearchSurface>,
     frecency: Arc<RwLock<FrecencyStore>>,
     query_latch: Arc<RwLock<QueryLatchStore>>,
+    blocklist: Arc<RwLock<Blocklist>>,
     config: Arc<config::Config>,
     registry: Arc<lixun_indexer::SourceRegistry>,
     active_search_slot: Arc<tokio::sync::Mutex<Option<SearchSlot>>>,
 ) -> anyhow::Result<()> {
     // The client-supplied limit is untrusted; cap it by the
-    // config-validated result ceiling so a buggy client cannot
-    // request an unbounded result set.
-    let limit = limit.min(config.max_results);
+    // config-validated ceiling (×4 for the R7 "Show more" step)
+    // bounded by the absolute ceiling. The ceiling can never fall
+    // below 1 (max_results is validated into 1..=1000), so the
+    // clamp bounds are always ordered.
+    let ceiling = config
+        .max_results
+        .saturating_mul(4)
+        .clamp(1, ABSOLUTE_RESULT_CEILING);
+    let limit = limit.clamp(1, ceiling);
+    // Category filter (R5): a chip constraint drops rows AFTER
+    // retrieval, so fetch deeper to keep the page fillable — a mail
+    // hit ranked below the unfiltered page must still be reachable
+    // when the Mail chip is active.
+    let fetch_limit = if category.is_some() {
+        limit
+            .saturating_mul(4)
+            .min(ABSOLUTE_RESULT_CEILING)
+    } else {
+        limit
+    };
     let query_obj = lixun_core::Query {
         text: q.clone(),
-        limit,
+        limit: fetch_limit,
     };
 
     let mut rx = fusion.search_streaming(&query_obj, cancel.clone()).await?;
@@ -1277,7 +1341,7 @@ async fn handle_search(
             (chunk.hits.into_iter().map(|(h, _)| h).collect(), Vec::new())
         };
 
-        let (processed_hits, calculation, top_hit_id, explanations, claimed) =
+        let (mut processed_hits, calculation, top_hit_id, explanations, claimed) =
             process_search_chunk(
                 hits,
                 breakdowns,
@@ -1287,6 +1351,7 @@ async fn handle_search(
                 &q,
                 &frecency,
                 &query_latch,
+                &blocklist,
                 &config,
                 &registry,
             )
@@ -1295,6 +1360,41 @@ async fn handle_search(
         if cancel.is_cancelled() {
             return Ok(());
         }
+
+        // R5: apply the category constraint AFTER ranking but BEFORE
+        // the page truncation, so the returned page is filled with
+        // matching hits rather than sliced out of the unfiltered
+        // page. Claimed queries bypass the filter — their plugin
+        // replaced the result set wholesale. Explanations (index-
+        // aligned with hits) are filtered in lockstep.
+        let mut explanations = explanations;
+        if let Some(cat) = category
+            && !claimed
+        {
+            if explanations.len() == processed_hits.len() {
+                let mut kept_hits = Vec::with_capacity(processed_hits.len());
+                let mut kept_expl = Vec::with_capacity(explanations.len());
+                for (hit, expl) in processed_hits.drain(..).zip(explanations.drain(..)) {
+                    if hit.category == cat {
+                        kept_hits.push(hit);
+                        kept_expl.push(expl);
+                    }
+                }
+                processed_hits = kept_hits;
+                explanations = kept_expl;
+            } else {
+                processed_hits.retain(|h| h.category == cat);
+            }
+            // Only the category path over-fetched; trim back to the
+            // requested page size. The unfiltered path keeps its
+            // historical shape (fusion page + plugin fan-out hits,
+            // untruncated).
+            if processed_hits.len() > limit as usize {
+                processed_hits.truncate(limit as usize);
+                explanations.truncate(limit as usize);
+            }
+        }
+        let processed_hits = processed_hits;
 
         let phase = match chunk.phase {
             lixun_fusion::Phase::Initial => lixun_ipc::Phase::Initial,
@@ -1390,6 +1490,7 @@ async fn handle_client(
     frecency: Arc<RwLock<FrecencyStore>>,
     query_latch: Arc<RwLock<QueryLatchStore>>,
     query_log: Arc<RwLock<QueryLog>>,
+    blocklist: Arc<RwLock<Blocklist>>,
     stats: Arc<RwLock<IndexStats>>,
     gui_control: Arc<GuiControl>,
     preview_spawner: Arc<PreviewSpawner>,
@@ -1474,6 +1575,7 @@ async fn handle_client(
                 limit,
                 explain,
                 epoch,
+                category,
             } => {
                 let mut slot = conn_state.active_search_slot.lock().await;
                 if let Some(prev) = slot.take() {
@@ -1500,6 +1602,7 @@ async fn handle_client(
                 let fusion_c = Arc::clone(&fusion);
                 let frecency_c = Arc::clone(&frecency);
                 let query_latch_c = Arc::clone(&query_latch);
+                let blocklist_c = Arc::clone(&blocklist);
                 let config_c = Arc::clone(&config);
                 let registry_c = Arc::clone(&registry);
                 let active_slot_c = Arc::clone(&conn_state.active_search_slot);
@@ -1512,9 +1615,11 @@ async fn handle_client(
                     q,
                     limit,
                     explain,
+                    category,
                     fusion_c,
                     frecency_c,
                     query_latch_c,
+                    blocklist_c,
                     config_c,
                     registry_c,
                     active_slot_c,
@@ -1764,10 +1869,17 @@ async fn handle_client(
                 // order so the frecency ranking survives.
                 let limit = limit.min(config.max_results) as usize;
                 let now = chrono::Utc::now().timestamp();
-                let ids = {
+                let mut ids = {
                     let frec = frecency.read().await;
                     frec.top_docs(now, limit.saturating_mul(2))
                 };
+                // User-hidden docs never come back as Recents (C2).
+                {
+                    let list = blocklist.read().await;
+                    if !list.is_empty() {
+                        ids.retain(|id| !list.contains(id));
+                    }
+                }
                 let mut hits: Vec<lixun_core::Hit> = match fusion.hydrate_docs(ids).await {
                     Ok(pairs) => pairs.into_iter().map(|(h, _)| h).collect(),
                     Err(e) => {
@@ -1791,6 +1903,56 @@ async fn handle_client(
             Request::PreviewScroll { down, pages } => {
                 preview_spawner.scroll(down, pages).await;
                 if write_tx.send(Response::Ok).await.is_err() {
+                    break;
+                }
+            }
+            Request::SetDocHidden { doc_id, hidden } => {
+                // Persist immediately: hides are rare, explicit user
+                // actions and must survive a crash (unlike the
+                // shutdown-saved frecency/latch stores).
+                {
+                    let mut list = blocklist.write().await;
+                    if list.set_hidden(&doc_id, hidden)
+                        && let Err(e) = list.save(&config.state_dir)
+                    {
+                        tracing::error!("blocklist: save failed: {e:#}");
+                    }
+                }
+                tracing::info!(doc_id = %doc_id, hidden, "ranking blocklist updated");
+                if write_tx.send(Response::Ok).await.is_err() {
+                    break;
+                }
+            }
+            Request::ResetDocRanking { doc_id } => {
+                let removed_frecency = {
+                    let mut frec = frecency.write().await;
+                    let removed = frec.remove_doc(&doc_id);
+                    if removed && let Err(e) = frec.save(&config.state_dir) {
+                        tracing::error!("frecency: save after reset failed: {e:#}");
+                    }
+                    removed
+                };
+                let removed_latch = {
+                    let mut latch = query_latch.write().await;
+                    let removed = latch.remove_doc(&doc_id);
+                    if removed && let Err(e) = latch.save(&config.state_dir) {
+                        tracing::error!("query_latch: save after reset failed: {e:#}");
+                    }
+                    removed
+                };
+                tracing::info!(
+                    doc_id = %doc_id,
+                    removed_frecency,
+                    removed_latch,
+                    "ranking state reset"
+                );
+                if write_tx.send(Response::Ok).await.is_err() {
+                    break;
+                }
+            }
+            Request::ListHiddenDocs => {
+                let ids = blocklist.read().await.list();
+                if write_tx.send(Response::HiddenDocs(ids)).await.is_err() {
                     break;
                 }
             }
@@ -2012,62 +2174,36 @@ fn register_builtin_nonplugin_sources(
     Ok(())
 }
 
-// Adapter bridging lixun-sources::HasBody to the concrete async
-// SearchHandle. `maybe_enqueue_ocr` runs on rayon worker threads
-// (not tokio workers), so we can safely drive the async
-// SearchHandle::has_body via Handle::block_on. On any error we fall
-// through to enqueue — the OcrQueue's INSERT OR IGNORE dedups, so
-// "re-enqueue on probe failure" is the safe default. Isolates
-// lixun-sources from tokio + Tantivy per AGENTS.md modularity.
+// Adapter bridging lixun-sources::HasBody to the concrete
+// SearchHandle. Callers (rayon workers in FsSource, `spawn_blocking`
+// closures in the watcher and `reindex_paths`) are all
+// blocking-capable threads, so the lookup reads the index
+// synchronously — no runtime bridging, no thread-kind guess. On any
+// error we fall through to enqueue — the OcrQueue's INSERT OR IGNORE
+// dedups, so "re-enqueue on probe failure" is the safe default.
+// Isolates lixun-sources from tokio + Tantivy per AGENTS.md
+// modularity.
 struct SearchHandleBodyChecker {
     search: SearchHandle,
-    runtime: tokio::runtime::Handle,
 }
 
 impl SearchHandleBodyChecker {
     fn new(search: SearchHandle) -> Self {
-        Self {
-            search,
-            runtime: tokio::runtime::Handle::current(),
-        }
+        Self { search }
     }
 }
 
 impl lixun_sources::HasBody for SearchHandleBodyChecker {
     fn has_body(&self, doc_id: &str) -> anyhow::Result<bool> {
-        if tokio::runtime::Handle::try_current().is_ok() {
-            // On a tokio worker we would deadlock on block_on. The
-            // rayon threads that drive maybe_enqueue_ocr are NOT tokio
-            // workers, so this branch normally never fires; it is a
-            // defensive fall-through for unforeseen callers.
-            tracing::warn!(
-                "body checker: called from tokio runtime thread, skipping short-circuit \
-                 (OCR enqueue coverage degraded — caller is misrouted)"
-            );
-            return Ok(false);
-        }
-        let search = self.search.clone();
-        let doc_id = doc_id.to_string();
         Ok(self
-            .runtime
-            .block_on(async move { search.has_body(&doc_id).await })
+            .search
+            .get_body_blocking(doc_id)
+            .map(|b| b.is_some())
             .unwrap_or(false))
     }
 
     fn get_body(&self, doc_id: &str) -> anyhow::Result<Option<String>> {
-        if tokio::runtime::Handle::try_current().is_ok() {
-            tracing::warn!(
-                "body checker: get_body called from tokio runtime thread, skipping preservation \
-                 (OCR enqueue coverage degraded — caller is misrouted)"
-            );
-            return Ok(None);
-        }
-        let search = self.search.clone();
-        let doc_id = doc_id.to_string();
-        Ok(self
-            .runtime
-            .block_on(async move { search.get_body(&doc_id).await })
-            .unwrap_or(None))
+        Ok(self.search.get_body_blocking(doc_id).unwrap_or(None))
     }
 }
 

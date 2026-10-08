@@ -208,14 +208,47 @@ async fn main() -> Result<()> {
     // stderr print races the supervisor killing the child once the
     // socket reader exits, so without this the actual LanceDB error
     // never reaches the daemon journal and the crash loop is opaque.
+    //
+    // Self-heal on a corrupt store: the vector store is DERIVED data
+    // (re-creatable via `lixun-cli semantic backfill`), so an open
+    // failure — e.g. a zero-byte Lance manifest left by a hard kill
+    // mid-commit — must not crash-loop the worker forever behind the
+    // supervisor's backoff. Quarantine the damaged directory
+    // (reversible: rename, not delete) and start fresh; only a
+    // failure on the fresh directory is fatal.
     let store = match VectorStore::open(&vectors_dir, text_dim, image_dim).await {
         Ok(s) => Arc::new(s),
         Err(e) => {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let quarantine = data_root.join(format!("vectors.corrupt-{ts}"));
             tracing::error!(
-                "FATAL: opening LanceDB at {} failed: {e:#}",
-                vectors_dir.display()
+                "opening LanceDB at {} failed: {e:#}; quarantining the corrupt store to {} \
+                 and starting fresh — run `lixun-cli semantic backfill` to re-embed",
+                vectors_dir.display(),
+                quarantine.display()
             );
-            return Err(e).with_context(|| format!("opening LanceDB at {}", vectors_dir.display()));
+            if let Err(mv) = std::fs::rename(&vectors_dir, &quarantine) {
+                tracing::error!(
+                    "FATAL: could not quarantine corrupt store: {mv}; original error: {e:#}"
+                );
+                return Err(e)
+                    .with_context(|| format!("opening LanceDB at {}", vectors_dir.display()));
+            }
+            match VectorStore::open(&vectors_dir, text_dim, image_dim).await {
+                Ok(s) => Arc::new(s),
+                Err(e2) => {
+                    tracing::error!(
+                        "FATAL: opening a FRESH LanceDB at {} also failed: {e2:#}",
+                        vectors_dir.display()
+                    );
+                    return Err(e2).with_context(|| {
+                        format!("opening fresh LanceDB at {}", vectors_dir.display())
+                    });
+                }
+            }
         }
     };
 
@@ -349,7 +382,29 @@ async fn main() -> Result<()> {
 
     tracing::info!("semantic worker ready");
 
-    while let Some(frame) = stream.next().await {
+    // SIGTERM routes into the same orderly exit as Cmd::Shutdown:
+    // break the dispatch loop, then the drop sequence below drains
+    // the embed-worker thread so an in-flight LanceDB commit
+    // completes instead of being truncated. The supervisor sends
+    // SIGTERM with a grace window before escalating to SIGKILL —
+    // a bare SIGKILL mid-commit is how zero-byte manifests (and a
+    // permanent open-crash loop) happened in the field.
+    let mut sigterm =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .context("installing SIGTERM handler")?;
+
+    loop {
+        let frame = tokio::select! {
+            biased;
+            _ = sigterm.recv() => {
+                tracing::info!("SIGTERM — draining in-flight work and exiting cleanly");
+                break;
+            }
+            f = stream.next() => match f {
+                Some(f) => f,
+                None => break,
+            },
+        };
         let cmd = match frame {
             Ok(c) => c,
             Err(e) => {

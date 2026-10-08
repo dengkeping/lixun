@@ -26,6 +26,7 @@ const BUILTIN_VERBS: &[&str] = &[
     "impact",
     "check-exclude",
     "dashboard",
+    "hidden",
 ];
 
 async fn open_daemon_stream() -> Result<UnixStream> {
@@ -88,6 +89,7 @@ async fn run_search(query: String, limit: u32, explain: bool) -> Result<Response
             limit,
             explain,
             epoch: 1,
+            category: None,
         },
     )
     .await?;
@@ -213,7 +215,25 @@ fn root_command(plugin_verbs: &[CliVerb]) -> Command {
                 .about("Check if a path would be excluded by current config.")
                 .arg(Arg::new("path").required(true).help("Path to check")),
         )
-        .subcommand(Command::new("dashboard").about("Launch btop-style TUI dashboard"));
+        .subcommand(Command::new("dashboard").about("Launch btop-style TUI dashboard"))
+        .subcommand(
+            Command::new("hidden")
+                .about("Inspect and undo \"Hide from results\" (ranking blocklist).")
+                .subcommand_required(true)
+                .arg_required_else_help(true)
+                .subcommand(
+                    Command::new("list").about("List every doc id hidden from results."),
+                )
+                .subcommand(
+                    Command::new("unhide")
+                        .about("Remove a doc id from the blocklist so it appears again.")
+                        .arg(
+                            Arg::new("doc-id")
+                                .required(true)
+                                .help("Doc id as printed by `hidden list` (e.g. fs:/home/u/x)."),
+                        ),
+                ),
+        );
 
     for verb in plugin_verbs {
         if BUILTIN_VERBS.contains(&verb.name.as_str()) {
@@ -375,6 +395,41 @@ async fn main() -> Result<()> {
         }
         "dashboard" => {
             dashboard_main().await?;
+        }
+        "hidden" => {
+            let (hidden_sub, hidden_m) = sub_matches
+                .subcommand()
+                .expect("clap subcommand_required is set");
+            match hidden_sub {
+                "list" => match send_request(Request::ListHiddenDocs).await? {
+                    Response::HiddenDocs(ids) => {
+                        if ids.is_empty() {
+                            println!("No hidden results.");
+                        } else {
+                            for id in ids {
+                                println!("{id}");
+                            }
+                        }
+                    }
+                    other => handle_response(other, false),
+                },
+                "unhide" => {
+                    let doc_id = hidden_m
+                        .get_one::<String>("doc-id")
+                        .expect("clap required arg")
+                        .clone();
+                    match send_request(Request::SetDocHidden {
+                        doc_id: doc_id.clone(),
+                        hidden: false,
+                    })
+                    .await?
+                    {
+                        Response::Ok => println!("Unhidden: {doc_id}"),
+                        other => handle_response(other, false),
+                    }
+                }
+                other => anyhow::bail!("unknown hidden subcommand: {}", other),
+            }
         }
         other => {
             let (verb_path, args) = collect_plugin_invocation(other, sub_matches);
@@ -587,6 +642,7 @@ async fn dashboard_main() -> Result<()> {
                                 limit: config.max_results,
                                 explain: false,
                                 epoch: 1,
+                                category: None,
                             },
                         )
                         .await;
@@ -877,6 +933,12 @@ fn handle_response(resp: Response, ocr_only: bool) {
         // Recents is a GUI-only request; defensive routing guard.
         Response::Recents { .. } => {
             eprintln!("Error: recents response routed to built-in handler");
+        }
+        // Handled inline by the `hidden` subcommand; defensive guard.
+        Response::HiddenDocs(ids) => {
+            for id in ids {
+                println!("{id}");
+            }
         }
         Response::Error(msg) => {
             eprintln!("Error: {}", msg);

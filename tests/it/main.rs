@@ -140,6 +140,7 @@ fn ipc_codec_roundtrip_v1_hits() {
                 limit: 10,
                 explain: false,
                 epoch: 1,
+                category: None,
             },
             &mut buf,
         )

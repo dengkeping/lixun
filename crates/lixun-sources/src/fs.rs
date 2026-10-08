@@ -552,6 +552,14 @@ impl crate::source::IndexerSource for FsSource {
                     visibility: Default::default(),
                 },
                 RowMenuItem {
+                    // Rendered by the host as a per-hit submenu of
+                    // applications registered for the hit's MIME type
+                    // (mime-driven only; the source names no app).
+                    label: "Open With".into(),
+                    verb: RowMenuVerb::OpenWith,
+                    visibility: Default::default(),
+                },
+                RowMenuItem {
                     label: "Reveal in File Manager".into(),
                     verb: RowMenuVerb::Secondary,
                     visibility: Default::default(),

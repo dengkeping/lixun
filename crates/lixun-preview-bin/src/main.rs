@@ -79,6 +79,23 @@ const LAUNCHER_COLUMN_GAP: i32 = 16;
 /// process self-quits and the next Space pays cold-start again.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// How long a programmatic `set_default_size` is allowed to echo
+/// back through `notify::default-width` / `notify::default-height`
+/// before those notifies are again interpreted as user-driven
+/// resizes. Covers the asynchronous configure round-trip through the
+/// compositor (request → configure → allocate → property update),
+/// which lands well inside one frame under normal load; the margin
+/// absorbs a busy compositor.
+const PROGRAMMATIC_RESIZE_SETTLE: Duration = Duration::from_millis(250);
+
+/// How long the transient launch-failure strip (P10) stays mounted
+/// in the header before removing itself.
+const ERROR_STRIP_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// Character cap for the inline launch-failure strip. The full
+/// message stays readable via the strip's tooltip.
+const ERROR_STRIP_MAX_CHARS: usize = 160;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "lixun-preview",
@@ -150,6 +167,36 @@ struct PreviewState {
     /// Bottom keyboard-hint strip (P7), rebuilt per `ShowOrUpdate`
     /// from the active plugin's `capabilities()`.
     hints_label: RefCell<Option<gtk::Label>>,
+    /// Transient launch-failure strip currently mounted in the
+    /// header (P10). Removed by its own timeout or by the next
+    /// `rebuild_header`, whichever fires first.
+    error_strip: RefCell<Option<gtk::Label>>,
+    /// Sizing class applied by the most recent `apply_sizing` call,
+    /// `None` until the first `ShowOrUpdate`. An unchanged class on
+    /// an already-mapped window skips the re-size entirely so the
+    /// window stops thrashing between FitToContent and cap sizes
+    /// while the user scrubs same-class content (P9).
+    last_sizing_class: Cell<Option<SizingPreference>>,
+    /// Latched when the user interactively resizes the
+    /// window-managed toplevel (P9). While set, `apply_sizing` is
+    /// skipped — the WM and the user own the size — until the
+    /// sizing class changes, which clears the latch. Never set in
+    /// overlay placement: a layer surface has no interactive
+    /// resize, and the notify handler bails there.
+    user_resized: Cell<bool>,
+    /// True while a programmatic `set_default_size` is settling
+    /// (see [`PROGRAMMATIC_RESIZE_SETTLE`]). Default-size notifies
+    /// arriving in this window update `programmatic_size` instead
+    /// of arming the `user_resized` latch.
+    programmatic_resize_active: Cell<bool>,
+    /// Generation counter pairing each programmatic resize with its
+    /// settle timeout, so an older timeout cannot clear the flag
+    /// while a newer resize is still in flight.
+    programmatic_resize_gen: Cell<u64>,
+    /// Last default size this process set itself (or observed while
+    /// a programmatic resize was settling). A notify that reports
+    /// exactly this size is our own echo, not a user resize.
+    programmatic_size: Cell<Option<(i32, i32)>>,
     /// Active 60s self-quit timer. Replaced (after cancellation) on
     /// every `ShowOrUpdate` and (re)scheduled on every Close /
     /// Escape / Space / launch. Storing the `SourceId` is the only
@@ -657,7 +704,26 @@ fn show_or_update(
     // remember the first one.
     let (w_max, h_max) = apply_monitor_and_cap(state, &display, requested_monitor, gui_cfg);
 
-    apply_sizing(state, plugin.sizing(), w_max, h_max);
+    // P9: re-apply window sizing only when the decision helper says
+    // so. A sizing-class change always re-sizes and re-arms host
+    // control (clearing any user-resize latch); an unchanged class
+    // on a mapped window is left alone so arrow-scrub across
+    // same-class hits cannot thrash the window, and a user-resized
+    // window keeps its size until the class changes.
+    let sizing = plugin.sizing();
+    let prev_class = state.last_sizing_class.get();
+    if prev_class != Some(sizing) {
+        state.user_resized.set(false);
+    }
+    let mapped = state
+        .window
+        .borrow()
+        .as_ref()
+        .is_some_and(|w| w.is_mapped());
+    if should_apply_sizing(prev_class, sizing, mapped, state.user_resized.get()) {
+        apply_sizing(state, sizing, w_max, h_max);
+    }
+    state.last_sizing_class.set(Some(sizing));
     rebuild_header(state, hit, app, Rc::clone(&plugin), outbound_tx);
 
     let same_plugin = state
@@ -739,6 +805,7 @@ fn show_or_update(
 
     *state.current_hit.borrow_mut() = Some(hit.clone());
 
+    apply_content_accessible_label(state, hit, &plugin);
     update_hints(state, &plugin, hit);
 
     if let Some(window) = state.window.borrow().as_ref() {
@@ -874,6 +941,20 @@ fn build_window_skeleton(
     }
     state.layer_shell_active.set(layer_shell);
 
+    // P9: observe default-size changes to detect interactive
+    // resizes. Installed unconditionally; the handler bails in
+    // overlay placement where no interactive resize exists.
+    {
+        let state_for_notify = Rc::clone(state);
+        window.connect_default_width_notify(move |w| {
+            note_default_size_change(&state_for_notify, w);
+        });
+        let state_for_notify = Rc::clone(state);
+        window.connect_default_height_notify(move |w| {
+            note_default_size_change(&state_for_notify, w);
+        });
+    }
+
     // Embedded stylesheet first (APPLICATION priority), then the
     // user's ~/.config/lixun/style.css above it (APPLICATION + 1,
     // inside install_user_css) — the same layering the launcher's
@@ -993,6 +1074,27 @@ fn launcher_fits_beside(monitor_w: i32, launcher_w: i32, preview_w: i32) -> bool
     column_w >= launcher_w.max(LAUNCHER_MIN_WIDTH) + 2 * LAUNCHER_COLUMN_GAP
 }
 
+/// Window-mode predicate: true when a launcher tucked to the LEFT
+/// edge (at [`PREVIEW_EDGE_MARGIN`], matching the GUI's window-mode
+/// slide) clears a WM-CENTRED preview of width `preview_w` — i.e. the
+/// launcher's right edge sits left of the centred preview's left
+/// edge, with [`LAUNCHER_COLUMN_GAP`] of breathing room.
+///
+/// Unlike [`launcher_fits_beside`] (right-anchored preview, overlay
+/// mode) this accounts for the preview being centred by the
+/// compositor, which a Wayland client cannot reposition. On a laptop
+/// panel a left launcher and a centred half-screen preview overlap
+/// even though their widths would fit side by side; there the
+/// launcher is soft-hidden and arrow-scrub carries navigation.
+fn launcher_clears_centered_preview(monitor_w: i32, launcher_w: i32, preview_w: i32) -> bool {
+    if monitor_w <= 0 || preview_w <= 0 {
+        return false;
+    }
+    let launcher_right = PREVIEW_EDGE_MARGIN + launcher_w.max(LAUNCHER_MIN_WIDTH);
+    let centered_preview_left = (monitor_w - preview_w) / 2;
+    launcher_right + LAUNCHER_COLUMN_GAP <= centered_preview_left
+}
+
 /// Decide whether the launcher can stay visible while this preview
 /// is mapped, and ask the daemon to soft-hide it when it cannot.
 /// No-op while the preview window itself is hidden.
@@ -1009,12 +1111,17 @@ fn launcher_fits_beside(monitor_w: i32, launcher_w: i32, preview_w: i32) -> bool
 /// backstopped by the daemon's Closed → `GuiCommand::Show` dispatch.
 ///
 /// Window-managed placement (default): the WM owns the preview's
-/// position, which a Wayland client cannot observe, so no
-/// fits-beside statement is possible and the launcher's visibility
-/// is NEVER touched from here. Residual launcher-over-preview
-/// overlap is the documented tradeoff of this mode — the preview is
-/// freely draggable, and the launcher tucks against the left edge
-/// while preview mode is active (lixun-gui slide).
+/// position, which a Wayland client cannot observe — but
+/// [`launcher_fits_beside`] depends only on WIDTHS, so one statement
+/// remains valid: when it returns false, launcher and preview cannot
+/// coexist at ANY position the WM might pick (laptop-width monitors),
+/// and the launcher is soft-hidden exactly like overlay mode —
+/// arrow-scrub keeps working via NavKey forwarding, Escape restores.
+/// When it returns true, visibility is left alone: the WM may still
+/// have centered the preview under the launcher, and that residual,
+/// position-dependent overlap is the documented tradeoff of this mode
+/// (drag the preview, or pin it with a WM rule on app-id
+/// `app.lixun.preview`).
 fn update_launcher_visibility(
     state: &Rc<PreviewState>,
     window: &gtk::ApplicationWindow,
@@ -1040,13 +1147,10 @@ fn update_launcher_visibility(
         }
     };
 
-    if !state.layer_shell_active.get() {
-        // Window-managed placement: never touch launcher visibility
-        // (see docstring). `launcher_hidden_by_us` stays false in
-        // this mode, so the close-path restores are no-ops too.
-        return;
-    }
-
+    // Both placements run the same width-only fits check below: in
+    // window mode it fires only for the cannot-coexist-anywhere case
+    // (see docstring) — the monitor/connector resolution and the
+    // hide/restore plumbing are placement-independent.
     let launcher_monitor = state.launcher_monitor.borrow();
     let Some(launcher_mon) = launcher_monitor.as_ref() else {
         tracing::debug!("visibility: no launcher monitor yet");
@@ -1091,9 +1195,25 @@ fn update_launcher_visibility(
     let pw = surface
         .width()
         .max(configured_preview_width(mon_w, gui_cfg));
-    let fits = launcher_fits_beside(mon_w, lw, pw);
+    // The fit model depends on WHERE the preview sits, which differs
+    // by placement mode:
+    //   overlay: the preview is right-anchored (we place it), so the
+    //     launcher survives whenever the two widths fit side by side.
+    //   window:  the WM centres the preview (KWin default), and the
+    //     launcher — even slid to the left edge — only clears a
+    //     centred preview when its right edge is left of the
+    //     preview's left edge. Width-sum "fits" is NOT enough here:
+    //     a left launcher + centred preview overlap unless the
+    //     monitor is wide enough for the whole preview to sit right
+    //     of the launcher.
+    let fits = if state.layer_shell_active.get() {
+        launcher_fits_beside(mon_w, lw, pw)
+    } else {
+        launcher_clears_centered_preview(mon_w, lw, pw)
+    };
     tracing::debug!(
-        "visibility: monitor_w={} launcher_w={} preview_w={} fits={} hidden_by_us={}",
+        "visibility: mode={} monitor_w={} launcher_w={} preview_w={} fits={} hidden_by_us={}",
+        if state.layer_shell_active.get() { "overlay" } else { "window" },
         mon_w,
         lw,
         pw,
@@ -1101,9 +1221,9 @@ fn update_launcher_visibility(
         state.launcher_hidden_by_us.get()
     );
     if fits {
-        restore_if_hidden("launcher fits beside the preview");
+        restore_if_hidden("launcher clears the preview");
     } else {
-        hide_if_visible("left column too narrow for the launcher");
+        hide_if_visible("launcher would overlap the preview");
     }
 }
 
@@ -1157,6 +1277,92 @@ fn apply_monitor_and_cap(
     }
 }
 
+/// Decide whether `apply_sizing` should run for this `ShowOrUpdate`
+/// (P9). Pure so the policy is unit-testable headlessly.
+///
+/// Precedence, highest first:
+/// 1. Sizing-class change → always apply. The window layout for the
+///    new class is genuinely different; this is also the point that
+///    re-enables host sizing after a user resize (the caller clears
+///    the latch on class change before consulting this function).
+/// 2. User-resize latch → never apply. The user set a size by hand;
+///    the host stops overriding it until the class changes.
+/// 3. Window already mapped with an unchanged class → skip. The
+///    current size came from this same class (or the WM); rewriting
+///    it on every arrow-step is what caused the size thrash.
+/// 4. Otherwise (unmapped, e.g. reopening after Close) → apply.
+fn should_apply_sizing(
+    prev_class: Option<SizingPreference>,
+    new_class: SizingPreference,
+    mapped: bool,
+    user_resized: bool,
+) -> bool {
+    if prev_class != Some(new_class) {
+        return true;
+    }
+    if user_resized {
+        return false;
+    }
+    !mapped
+}
+
+/// Set the window default size, recording it so the resulting
+/// `notify::default-width` / `notify::default-height` echoes are not
+/// mistaken for user resizes (P9). The settle window covers the
+/// asynchronous configure round-trip; the generation counter keeps
+/// an older timeout from clearing the flag under a newer resize.
+fn set_default_size_tracked(
+    state: &Rc<PreviewState>,
+    window: &gtk::ApplicationWindow,
+    width: i32,
+    height: i32,
+) {
+    state.programmatic_size.set(Some((width, height)));
+    state.programmatic_resize_active.set(true);
+    let generation = state.programmatic_resize_gen.get().wrapping_add(1);
+    state.programmatic_resize_gen.set(generation);
+    window.set_default_size(width, height);
+    let state = Rc::clone(state);
+    glib::timeout_add_local_once(PROGRAMMATIC_RESIZE_SETTLE, move || {
+        if state.programmatic_resize_gen.get() == generation {
+            state.programmatic_resize_active.set(false);
+        }
+    });
+}
+
+/// Classify a `notify::default-width` / `notify::default-height`
+/// emission (P9). GTK4 records the surface's post-configure size
+/// back into the default-size properties, so on Wayland these
+/// notifies are the only client-visible trace of an interactive
+/// resize — but they also fire as echoes of our own
+/// `set_default_size` calls. While a programmatic resize is
+/// settling, the observed size just updates the record (the
+/// compositor may clamp what we asked for); afterwards, any size
+/// that differs from the record arms the user-resize latch.
+/// Layer-shell surfaces cannot be user-resized, so overlay
+/// placement never latches.
+fn note_default_size_change(state: &Rc<PreviewState>, window: &gtk::ApplicationWindow) {
+    if state.layer_shell_active.get() {
+        return;
+    }
+    let size = (window.default_width(), window.default_height());
+    if state.programmatic_resize_active.get() {
+        state.programmatic_size.set(Some(size));
+        return;
+    }
+    if state.programmatic_size.get() == Some(size) {
+        return;
+    }
+    if !state.user_resized.get() {
+        tracing::debug!(
+            "preview: user resize to {}x{}; host sizing paused until the sizing class changes",
+            size.0,
+            size.1
+        );
+        state.user_resized.set(true);
+    }
+}
+
 fn apply_sizing(state: &Rc<PreviewState>, sizing: SizingPreference, w_max: i32, h_max: i32) {
     let window_ref = state.window.borrow();
     let scroll_ref = state.content_scroll.borrow();
@@ -1165,7 +1371,7 @@ fn apply_sizing(state: &Rc<PreviewState>, sizing: SizingPreference, w_max: i32, 
     };
     match sizing {
         SizingPreference::FixedCap => {
-            window.set_default_size(w_max, h_max);
+            set_default_size_tracked(state, window, w_max, h_max);
             scroll.set_visible(true);
             scroll.set_vexpand(true);
             scroll.set_hexpand(true);
@@ -1173,7 +1379,7 @@ fn apply_sizing(state: &Rc<PreviewState>, sizing: SizingPreference, w_max: i32, 
             scroll.set_propagate_natural_height(false);
         }
         SizingPreference::FitToContent => {
-            window.set_default_size(MIN_WIDTH, MIN_HEIGHT);
+            set_default_size_tracked(state, window, MIN_WIDTH, MIN_HEIGHT);
             scroll.set_visible(true);
             scroll.set_vexpand(false);
             scroll.set_hexpand(false);
@@ -1187,7 +1393,7 @@ fn apply_sizing(state: &Rc<PreviewState>, sizing: SizingPreference, w_max: i32, 
             // any non-scrolling chrome. Hide the host's outer scroll
             // so its container does not also scroll the chrome out
             // of view, and let the widget itself fill the cap.
-            window.set_default_size(w_max, h_max);
+            set_default_size_tracked(state, window, w_max, h_max);
             scroll.set_visible(false);
         }
     }
@@ -1206,6 +1412,10 @@ fn rebuild_header(
     while let Some(child) = header.first_child() {
         header.remove(&child);
     }
+    // Any launch-error strip from the previous document was removed
+    // with the children above; drop the reference too so its pending
+    // timeout recognises it as stale and does nothing (P10).
+    state.error_strip.borrow_mut().take();
 
     let text = gtk::Box::new(gtk::Orientation::Vertical, 2);
     text.set_hexpand(true);
@@ -1290,8 +1500,109 @@ fn run_plugin_launch(
                 hit.id.0,
                 e
             );
+            // A silent failure looks like a dead Enter key (P10):
+            // surface the cause in the header. `{:#}` renders the
+            // whole anyhow context chain down to the root cause.
+            show_launch_error(state, &format!("Open failed: {e:#}"));
         }
     }
+}
+
+/// Mount a transient error strip in the preview header (P10). The
+/// strip removes itself after [`ERROR_STRIP_TIMEOUT`]; a header
+/// rebuild for the next document removes it earlier and invalidates
+/// the pending timeout via the `error_strip` identity check, so a
+/// strip can never linger onto a different document. Generic host
+/// UI: the message comes from the plugin's error, never from any
+/// knowledge of which plugin failed.
+fn show_launch_error(state: &Rc<PreviewState>, message: &str) {
+    let Some(header) = state.header_box.borrow().clone() else {
+        return;
+    };
+    // Replace any strip still standing from an earlier failure so
+    // repeated attempts don't stack labels.
+    if let Some(prev) = state.error_strip.borrow_mut().take()
+        && prev.parent().as_ref() == Some(header.upcast_ref())
+    {
+        header.remove(&prev);
+    }
+
+    let strip = gtk::Label::new(Some(&truncate_chars(message, ERROR_STRIP_MAX_CHARS)));
+    strip.add_css_class("lixun-preview-error");
+    strip.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    strip.set_tooltip_text(Some(message));
+    header.append(&strip);
+    *state.error_strip.borrow_mut() = Some(strip.clone());
+
+    let state_for_timeout = Rc::clone(state);
+    glib::timeout_add_local_once(ERROR_STRIP_TIMEOUT, move || {
+        // Remove only the strip this timeout mounted: a later
+        // rebuild_header (next document) or show_launch_error
+        // (newer failure) already replaced it, and tearing down
+        // the newer strip early would truncate its display time.
+        let is_current = state_for_timeout
+            .error_strip
+            .borrow()
+            .as_ref()
+            .is_some_and(|current| current == &strip);
+        if !is_current {
+            return;
+        }
+        state_for_timeout.error_strip.borrow_mut().take();
+        if let Some(parent) = strip.parent()
+            && let Ok(container) = parent.downcast::<gtk::Box>()
+        {
+            container.remove(&strip);
+        }
+    });
+}
+
+/// Trim `text` to at most `max_chars` characters, appending an
+/// ellipsis when truncated. Char-based, never byte-based, so
+/// multi-byte input cannot be split mid code point. Pure for
+/// headless unit testing.
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let cut: String = text.chars().take(max_chars.saturating_sub(1)).collect();
+    format!("{cut}\u{2026}")
+}
+
+/// Describe the mounted content to assistive technology (A8). The
+/// preview content is typically a flat rendered canvas that exposes
+/// nothing useful to a screen reader on its own, so the host labels
+/// the content area "{title}, {kind} preview". The kind comes from
+/// the hit's own `kind_label` or, absent that, the plugin's
+/// `display_name()` — both opaque data the host renders verbatim,
+/// never plugin identity the host branches on. The label lands on
+/// whichever container actually hosts the content: the plugin's
+/// widget for OwnsScroll mounts, the outer ScrolledWindow otherwise
+/// (the hidden counterpart is not rendered to the a11y tree).
+fn apply_content_accessible_label(
+    state: &Rc<PreviewState>,
+    hit: &Hit,
+    plugin: &Rc<dyn PreviewPlugin>,
+) {
+    let kind = hit
+        .kind_label
+        .clone()
+        .unwrap_or_else(|| plugin.display_name().to_string());
+    let text = content_accessible_label(&hit.title, &kind);
+    let props = [gtk::accessible::Property::Label(&text)];
+    if state.current_widget_owns_scroll.get() {
+        if let Some(widget) = state.current_widget.borrow().as_ref() {
+            widget.update_property(&props);
+        }
+    } else if let Some(scroll) = state.content_scroll.borrow().as_ref() {
+        scroll.update_property(&props);
+    }
+}
+
+/// Pure formatter for the content-area accessible label (A8); split
+/// out for headless unit testing.
+fn content_accessible_label(title: &str, kind: &str) -> String {
+    format!("{title}, {kind} preview")
 }
 
 /// Resolve which monitor the preview window should open on.
@@ -1614,7 +1925,108 @@ fn cancel_idle(state: &Rc<PreviewState>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{clamp_scroll_value, launcher_fits_beside};
+    use super::{
+        SizingPreference, clamp_scroll_value, content_accessible_label, launcher_clears_centered_preview,
+        launcher_fits_beside, should_apply_sizing, truncate_chars,
+    };
+
+    #[test]
+    fn sizing_applies_on_first_show() {
+        // No previous class recorded: always size the window.
+        assert!(should_apply_sizing(
+            None,
+            SizingPreference::FixedCap,
+            false,
+            false
+        ));
+        assert!(should_apply_sizing(
+            None,
+            SizingPreference::FitToContent,
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn sizing_applies_on_class_change_even_when_user_resized() {
+        // Class change re-enables host sizing; the caller clears the
+        // latch, but the decision must not depend on that ordering.
+        assert!(should_apply_sizing(
+            Some(SizingPreference::FitToContent),
+            SizingPreference::FixedCap,
+            true,
+            true
+        ));
+        assert!(should_apply_sizing(
+            Some(SizingPreference::FixedCap),
+            SizingPreference::OwnsScroll,
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn sizing_skipped_for_same_class_on_mapped_window() {
+        // The anti-thrash core: arrow-scrub across same-class hits
+        // must not rewrite the window size.
+        assert!(!should_apply_sizing(
+            Some(SizingPreference::FixedCap),
+            SizingPreference::FixedCap,
+            true,
+            false
+        ));
+        assert!(!should_apply_sizing(
+            Some(SizingPreference::FitToContent),
+            SizingPreference::FitToContent,
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn sizing_reapplied_on_remap_unless_user_resized() {
+        // Reopening after Close (window unmapped): re-apply for the
+        // same class — unless the user resized, in which case their
+        // size persists until the class changes.
+        assert!(should_apply_sizing(
+            Some(SizingPreference::FixedCap),
+            SizingPreference::FixedCap,
+            false,
+            false
+        ));
+        assert!(!should_apply_sizing(
+            Some(SizingPreference::FixedCap),
+            SizingPreference::FixedCap,
+            false,
+            true
+        ));
+    }
+
+    #[test]
+    fn truncate_chars_passes_short_text_through() {
+        assert_eq!(truncate_chars("short", 10), "short");
+        assert_eq!(truncate_chars("", 10), "");
+    }
+
+    #[test]
+    fn truncate_chars_appends_ellipsis_and_respects_char_boundaries() {
+        let long = "a".repeat(20);
+        let out = truncate_chars(&long, 10);
+        assert_eq!(out.chars().count(), 10);
+        assert!(out.ends_with('\u{2026}'));
+        // Multi-byte input must not split a code point.
+        let unicode = "\u{e9}".repeat(20);
+        let out = truncate_chars(&unicode, 10);
+        assert_eq!(out.chars().count(), 10);
+    }
+
+    #[test]
+    fn content_accessible_label_format() {
+        assert_eq!(
+            content_accessible_label("report.pdf", "PDF"),
+            "report.pdf, PDF preview"
+        );
+    }
 
     #[test]
     fn fits_beside_mirrors_launcher_slide_math() {
@@ -1623,6 +2035,37 @@ mod tests {
         assert!(launcher_fits_beside(1920, 720, 960));
         // 1366 laptop panel, 683 preview: column = 667 < 720 + 32.
         assert!(!launcher_fits_beside(1366, 720, 683));
+    }
+
+    #[test]
+    fn clears_centered_preview_hides_on_laptop_panel() {
+        // The reported field case: 1646 scaled panel, 654 launcher,
+        // 823 (50%) preview. Widths sum below the monitor, so
+        // fits_beside (overlay model) says "fits" — but the WM
+        // centres the preview at left edge (1646-823)/2 = 411, and
+        // the left launcher's right edge is 16+654 = 670 > 411. The
+        // centred model must return false so the launcher hides.
+        assert!(launcher_fits_beside(1646, 654, 823)); // overlay model: fits
+        assert!(!launcher_clears_centered_preview(1646, 654, 823)); // window model: overlaps
+    }
+
+    #[test]
+    fn clears_centered_preview_keeps_launcher_on_wide_monitor() {
+        // 3440 ultrawide: centred 1720 preview starts at 860; a
+        // left launcher (16 + 720) = 736, +16 gap = 752 <= 860.
+        assert!(launcher_clears_centered_preview(3440, 720, 1720));
+    }
+
+    #[test]
+    fn clears_centered_preview_floors_launcher_width() {
+        // Sub-floor launcher width still reserves the 480 minimum.
+        assert!(!launcher_clears_centered_preview(1646, 100, 823));
+    }
+
+    #[test]
+    fn clears_centered_preview_rejects_degenerate_sizes() {
+        assert!(!launcher_clears_centered_preview(0, 720, 960));
+        assert!(!launcher_clears_centered_preview(1920, 720, 0));
     }
 
     #[test]

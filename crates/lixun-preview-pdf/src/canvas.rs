@@ -192,6 +192,9 @@ mod scrollable;
 #[path = "canvas_search.rs"]
 mod search_accessors;
 
+#[path = "canvas_accessibility.rs"]
+mod accessibility;
+
 glib::wrapper! {
     pub struct PdfCanvas(ObjectSubclass<imp::PdfCanvas>)
         @extends gtk::Widget,
@@ -200,7 +203,15 @@ glib::wrapper! {
 
 impl PdfCanvas {
     pub fn new() -> Self {
-        let canvas: Self = glib::Object::new();
+        // Img accessible role (A8): the canvas is one rendered
+        // graphic to assistive tech — its page children are bare
+        // texture surfaces with nothing further to expose. The
+        // accompanying label/description are maintained by
+        // `refresh_accessible_state` (canvas_accessibility.rs).
+        // The role is construct-only, hence the builder.
+        let canvas: Self = glib::Object::builder()
+            .property("accessible-role", gtk::AccessibleRole::Img)
+            .build();
         canvas.set_overflow(gtk::Overflow::Hidden);
         canvas
     }
@@ -238,7 +249,12 @@ impl PdfCanvas {
     }
 
     pub fn set_current_page(&self, p: u32) {
-        self.imp().current_page.set(p);
+        // Refresh the accessible page label only on an actual page
+        // change — this runs from every scroll-adjustment tick via
+        // recompute_current_page.
+        if self.imp().current_page.replace(p) != p {
+            self.refresh_accessible_state();
+        }
     }
 
     pub fn selection(&self) -> Option<PdfSelection> {
@@ -417,6 +433,14 @@ impl PdfCanvas {
         self.reconfigure_adjustments(self.width(), self.height());
         self.allocate_children(self.width(), self.height());
         self.queue_draw();
+        // Both document-arrival paths (set_session, replace_path)
+        // rebuild the page widgets, so this keeps the accessible
+        // label's filename and page count current even when the
+        // page index itself did not change. The description is
+        // extracted only here — see refresh_accessible_description
+        // for why it must not run per page change.
+        self.refresh_accessible_state();
+        self.refresh_accessible_description();
     }
 
     fn intrinsic_size(&self) -> (i32, i32) {

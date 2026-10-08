@@ -314,6 +314,13 @@ filter_apps = "<Ctrl>1"
 filter_files = "<Ctrl>2"
 filter_mail = "<Ctrl>3"
 filter_attachments = "<Ctrl>4"
+# Pop the selected row's actions menu (same panel as right-click).
+# The Menu key and Shift+F10 also work, fixed. Menu items display the
+# resolved accelerators, so the panel doubles as a cheat sheet.
+actions_menu = "<Ctrl>k"
+# Open the selected row's Get Info popover (metadata + ranking
+# factors).
+info = "<Ctrl>i"
 # Re-center the launcher window on the active monitor. NOTE: this binds
 # <Ctrl>0 — do not assign <Ctrl>0 to filter_all (or any other action):
 # reset_gui_position is dispatched first and would swallow the key.
@@ -375,6 +382,11 @@ global_toggle = "Super+space"
 #             the two overlap — while a preview is open the launcher
 #             tucks against the left screen edge to stay out of the
 #             way, and you can drag the preview anywhere.
+#             On monitors too narrow for launcher + preview to fit
+#             side by side at all (laptops), the launcher hides
+#             itself while the preview is open — arrow keys still
+#             scrub results, Escape brings the launcher back.
+#             Shrink preview_width_percent to keep both visible.
 #   "overlay" — the preview joins the launcher's compositor-overlay
 #             layer, pinned beside it at the right screen edge:
 #             a fixed side-by-side layout, not draggable.
@@ -540,6 +552,16 @@ max_file_size_mb = 200
 # replaces the query with the computed value. Calculator queries are
 # never recorded in the frecency log.
 #
+# Unit / base / percent conversions also work, with or without the `=`
+# prefix:
+#   5km in mi        72F in C        1 GiB in MB       90 min in h
+#   0xff             0b1010          255 in hex        10 in bin
+#   15% of 80
+# Dimensions: length, mass, temperature, data sizes (decimal kB/MB/GB
+# and binary KiB/MiB/GiB), time. Currency conversion is an explicit
+# non-goal: exchange rates would need a network fetch, and lixun does
+# not talk to the network.
+#
 # Enabled by default — the plugin needs no configuration, so this
 # stanza is optional. Set `enabled = false` to turn it off.
 [calculator]
@@ -599,6 +621,76 @@ max_file_size_mb = 200
 # strict_mode = false          # true: drop non-whitelisted (argv mode) or risky (legacy mode) entirely
 # shell_mode  = false          # default: argv exec, no shell. true: legacy `sh -c <cmd>` (opt-in)
 # trigger_prefix = ">"         # reserved, not yet configurable — v1 hard-codes `>`
+
+# ───────────────────────────────────────────────────────────────────
+# Web search
+# ───────────────────────────────────────────────────────────────────
+# The zero-results fallback ("Search the web" button, Enter on an
+# empty result list, and the selectable web-search row) opens this
+# URL in your default browser. `{query}` is replaced with the
+# URL-encoded query. A browser is only ever opened on explicit
+# activation — nothing is fetched while you type.
+[search]
+# web_engine_url = "https://duckduckgo.com/?q={query}"
+
+# Keyword searches: queries whose FIRST token matches `key` (followed
+# by a space) are routed to the given URL — `gh rust lifetimes` opens
+# a GitHub search. Each entry claims its prefix exclusively, like the
+# calculator claims `=`. `name` is optional (defaults to the key).
+#
+# [[search.keyword]]
+# key  = "gh"
+# url  = "https://github.com/search?q={query}"
+# name = "GitHub"
+#
+# [[search.keyword]]
+# key  = "so"
+# url  = "https://stackoverflow.com/search?q={query}"
+# name = "Stack Overflow"
+
+# ───────────────────────────────────────────────────────────────────
+# Command sources — user-installable extensions (no recompiling)
+# ───────────────────────────────────────────────────────────────────
+# Each [[command_source]] entry maps a claimed query prefix to a local
+# program. On a matching query, `argv` is spawned DIRECTLY (no shell,
+# no interpolation — `{query}` is substituted as a literal argv token),
+# and stdout is parsed as a JSON array or JSON lines of result rows:
+#
+#   {"title": "…", "subtitle": "…", "icon": "…", "action": {…}}
+#
+# Supported actions (all map onto lixun's generic action vocabulary):
+#   {"type": "open-uri",  "uri":  "https://…"}
+#   {"type": "open-file", "path": "/abs/path"}
+#   {"type": "copy-text", "text": "secret"}
+#   {"type": "exec", "argv": ["prog", "arg"], "cwd": "/dir", "terminal": false}
+#
+# Bounds: stdout capped at 256 KiB, at most 20 rows per invocation,
+# the child is killed at `timeout_ms` (default 1500, max 30000).
+# Non-zero exit, timeout, or unparseable output surface as a single
+# error row (never silence). Command-source queries are excluded from
+# the recent-search log — arguments may be sensitive (password entry
+# names, etc.). Prefixes must be unique across all plugins: the daemon
+# refuses to start on a conflict (e.g. reusing `=` or `>`).
+#
+# Complete worked example — a password-store front end. Save as
+# ~/bin/lixun-pass.sh (chmod +x), then type `pass mail` in lixun:
+#
+#   #!/bin/sh
+#   # Emits one JSON line per matching pass(1) entry.
+#   prefix="$1"
+#   cd "${PASSWORD_STORE_DIR:-$HOME/.password-store}" || exit 1
+#   find . -name '*.gpg' | sed 's|^\./||; s|\.gpg$||' | \
+#     grep -i -- "$prefix" | head -20 | while IFS= read -r entry; do
+#       printf '{"title":"%s","subtitle":"pass entry","action":{"type":"exec","argv":["pass","-c","%s"],"terminal":false}}\n' \
+#         "$entry" "$entry"
+#   done
+#
+# [[command_source]]
+# name       = "Passwords"
+# prefix     = "pass "
+# argv       = ["/home/you/bin/lixun-pass.sh", "{query}"]
+# timeout_ms = 1500
+# # cwd      = "~"
 
 # -----------------------------------------------------------------------------
 # [extract] — text-extraction cache and in-process decompression caps.

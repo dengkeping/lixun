@@ -2,7 +2,7 @@
 
 use lixun_core::Calculation;
 
-const MAX_INPUT_LEN: usize = 256;
+pub(crate) const MAX_INPUT_LEN: usize = 256;
 const FUNCTIONS: &[&str] = &[
     "sqrt", "sin", "cos", "tan", "asin", "acos", "atan", "ln", "log", "exp", "abs", "floor", "ceil",
 ];
@@ -73,12 +73,21 @@ pub fn looks_like_math(input: &str) -> bool {
     saw_math_signal
 }
 
-/// Try to evaluate `input` as a math expression via meval.
-/// Returns `Some(Calculation)` iff `looks_like_math(input)` AND evaluation
-/// produced a finite result OR a well-defined special value (NaN/Inf map
-/// to an error-style result).
+/// Detect and evaluate a calculator query. Two passes, in order:
+///
+/// 1. The static conversion grammars in [`crate::convert`] (unit, base,
+///    and percent-of conversions). These run first because their inputs
+///    contain identifiers ("km", "of", "0xff") that `looks_like_math`
+///    rejects, and their exact grammars keep prose from matching.
+/// 2. The meval fallback: returns `Some(Calculation)` iff
+///    `looks_like_math(input)` AND evaluation produced a finite result
+///    OR a well-defined special value (NaN/Inf map to an error-style
+///    result).
 pub fn detect(input: &str) -> Option<Calculation> {
     let expr = input.trim();
+    if let Some(calc) = crate::convert::convert(expr) {
+        return Some(calc);
+    }
     if !looks_like_math(expr) {
         return None;
     }
@@ -95,7 +104,7 @@ pub fn detect(input: &str) -> Option<Calculation> {
 /// - Integers without fractional part: `"42"`, `"-7"`.
 /// - Otherwise up to 10 significant digits, trailing zeros stripped.
 /// - NaN / Inf → "Error".
-fn format_result(x: f64) -> String {
+pub(crate) fn format_result(x: f64) -> String {
     if !x.is_finite() {
         return "Error".to_string();
     }
@@ -298,6 +307,53 @@ mod tests {
                 result: "-5".to_string(),
             })
         );
+    }
+
+    #[test]
+    fn detect_runs_conversion_pass_before_math_gate() {
+        // These inputs fail `looks_like_math` (unknown identifiers), so
+        // they only work because the conversion pass runs first.
+        assert_eq!(
+            detect("5km in mi"),
+            Some(Calculation {
+                expr: "5km in mi".to_string(),
+                result: "3.106856 mi".to_string(),
+            })
+        );
+        assert_eq!(
+            detect("0xff"),
+            Some(Calculation {
+                expr: "0xff".to_string(),
+                result: "255".to_string(),
+            })
+        );
+        assert_eq!(
+            detect("15% of 80"),
+            Some(Calculation {
+                expr: "15% of 80".to_string(),
+                result: "12".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn detect_converts_temperature_affinely() {
+        let got = detect("72F in C").expect("conversion fires");
+        let value: f64 = got
+            .result
+            .strip_suffix(" °C")
+            .expect("celsius suffix")
+            .parse()
+            .expect("numeric result");
+        assert!((value - 22.2222).abs() < 1e-3, "got {}", got.result);
+    }
+
+    #[test]
+    fn detect_still_rejects_prose_with_conversion_keywords() {
+        assert_eq!(detect("made in china"), None);
+        assert_eq!(detect("cash in hand"), None);
+        assert_eq!(detect("5 in"), None);
+        assert_eq!(detect("km in mi"), None);
     }
 
     #[test]

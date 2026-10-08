@@ -125,3 +125,46 @@ fn scroll_to_page_clamp_arithmetic() {
     let target = 0u32.saturating_sub(1);
     assert_eq!(target, 0, "saturating_sub from 0 should stay 0");
 }
+
+#[test]
+fn accessible_page_label_is_one_indexed() {
+    assert_eq!(
+        accessibility::page_accessible_label(0, 12, "report.pdf"),
+        "Page 1 of 12 \u{2014} report.pdf"
+    );
+    assert_eq!(
+        accessibility::page_accessible_label(11, 12, "report.pdf"),
+        "Page 12 of 12 \u{2014} report.pdf"
+    );
+}
+
+#[test]
+fn accessible_page_label_floors_page_count_at_one() {
+    // A zero-page document still reads as "of 1" — the label must
+    // never claim "Page 1 of 0".
+    assert_eq!(
+        accessibility::page_accessible_label(0, 0, "empty.pdf"),
+        "Page 1 of 1 \u{2014} empty.pdf"
+    );
+}
+
+#[test]
+fn accessible_truncate_passes_short_text_through() {
+    assert_eq!(accessibility::truncate_chars("abc", 10), "abc");
+    assert_eq!(accessibility::truncate_chars("", 10), "");
+}
+
+#[test]
+fn accessible_truncate_caps_length_and_marks_ellipsis() {
+    let long = "x".repeat(400);
+    let out = accessibility::truncate_chars(&long, accessibility::A11Y_DESCRIPTION_MAX_CHARS);
+    assert_eq!(
+        out.chars().count(),
+        accessibility::A11Y_DESCRIPTION_MAX_CHARS
+    );
+    assert!(out.ends_with('\u{2026}'));
+    // Multi-byte input must not split a code point.
+    let unicode = "\u{e4}".repeat(400);
+    let out = accessibility::truncate_chars(&unicode, 10);
+    assert_eq!(out.chars().count(), 10);
+}

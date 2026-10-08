@@ -18,8 +18,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
-use lixun_core::{DocId, Hit};
+use lixun_core::{Category, DocId, Hit};
 use lixun_ipc::{Phase, Request, Response, socket_path};
+
+/// One queued search request: query text, page limit, session epoch,
+/// optional category constraint (R5 — daemon-side chip filtering).
+pub(crate) type SearchRequest = (String, u32, u64, Option<Category>);
 
 #[derive(Debug, Clone)]
 pub(crate) enum IpcMessage {
@@ -32,6 +36,11 @@ pub(crate) enum IpcMessage {
         hits: Vec<Hit>,
         top_hit: Option<DocId>,
         claimed: bool,
+        /// Per-hit ranking explanations, index-aligned with `hits`
+        /// (R9). Populated on Final chunks because the GUI now sends
+        /// `explain: true`; empty for Initial chunks and older
+        /// daemons.
+        explanations: Vec<String>,
     },
     /// The search never reached the daemon (connect/write failed and
     /// the retry didn't either) or the reader lost the connection
@@ -48,7 +57,7 @@ pub(crate) enum IpcMessage {
 }
 
 pub(crate) struct IpcClient {
-    pub(crate) request_tx: mpsc::Sender<(String, u32, u64)>,
+    pub(crate) request_tx: mpsc::Sender<SearchRequest>,
 }
 
 impl Clone for IpcClient {
@@ -88,7 +97,7 @@ const READ_WATCHDOG: Duration = Duration::from_secs(10);
 pub(crate) fn start_ipc_thread(
     session_epoch: Arc<AtomicU64>,
 ) -> (IpcClient, async_channel::Receiver<IpcMessage>) {
-    let (tx, rx) = mpsc::channel::<(String, u32, u64)>();
+    let (tx, rx) = mpsc::channel::<SearchRequest>();
     let (event_tx, event_rx) = async_channel::unbounded::<IpcMessage>();
     // Epoch of the most recently written Search. The reader watchdog uses
     // this to know whether a search is still awaiting its Final chunk.
@@ -97,7 +106,7 @@ pub(crate) fn start_ipc_thread(
     std::thread::spawn(move || {
         let mut conn: Option<Conn> = None;
 
-        while let Ok((query, limit, epoch_at_send)) = rx.recv() {
+        while let Ok((query, limit, epoch_at_send, category)) = rx.recv() {
             if epoch_at_send != session_epoch.load(Ordering::SeqCst) {
                 tracing::debug!(
                     "ipc: skipping superseded search request (epoch {})",
@@ -112,11 +121,15 @@ pub(crate) fn start_ipc_thread(
                 epoch_at_send
             );
 
+            // `explain: true` (R9): the Get Info popover surfaces the
+            // top ranking multipliers, so the daemon's breakdown
+            // pipeline is no longer discarded.
             let req = Request::Search {
                 q: query,
                 limit,
-                explain: false,
+                explain: true,
                 epoch: epoch_at_send,
+                category,
             };
             let Some(frame) = encode_frame(&req) else {
                 continue;
@@ -296,7 +309,7 @@ fn read_loop(
                 hits,
                 calculation: _,
                 top_hit,
-                explanations: _,
+                explanations,
                 claimed,
             }) => {
                 // Authoritative stale check at hand-off time: the chunk
@@ -322,6 +335,7 @@ fn read_loop(
                     hits,
                     top_hit,
                     claimed,
+                    explanations,
                 });
                 if is_final {
                     last_final = last_final.max(resp_epoch);
@@ -499,9 +513,33 @@ pub(crate) fn send_preview_scroll(down: bool, pages: u32) {
 }
 
 pub(crate) fn dispatch_click_pair(doc_id: &str, query: &str) {
+    // GUI-synthetic rows (recent-search, web-search fallback, "Show
+    // more results") never reach the daemon's ranking stores: their
+    // ids are not index docs, so recording them would only pollute
+    // frecency with unresolvable entries.
+    if crate::factory::is_synthetic_doc_id(doc_id) {
+        return;
+    }
     for req in build_click_pair(doc_id, query) {
         send_request_fire_and_forget(&req);
     }
+}
+
+/// Fire-and-forget ranking-blocklist update (C2, "Hide from
+/// Results" row verb).
+pub(crate) fn send_set_doc_hidden(doc_id: &str, hidden: bool) {
+    send_request_fire_and_forget(&Request::SetDocHidden {
+        doc_id: doc_id.to_string(),
+        hidden,
+    });
+}
+
+/// Fire-and-forget learned-ranking reset (C2, "Reset Ranking" row
+/// verb).
+pub(crate) fn send_reset_doc_ranking(doc_id: &str) {
+    send_request_fire_and_forget(&Request::ResetDocRanking {
+        doc_id: doc_id.to_string(),
+    });
 }
 
 /// Build the two-request click pair: always a `RecordClick`, and a

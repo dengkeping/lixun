@@ -236,6 +236,11 @@ pub(crate) struct LauncherController {
     /// `OverlayColumn` centers it in the column beside the
     /// right-anchored overlay preview.
     slide_mode: crate::preview_layout::SlideMode,
+    /// K9: true while the Up-arrow history list is showing. Makes
+    /// history modal: Escape clears the list instead of hiding the
+    /// launcher, and Up stops re-firing the IPC fetch. Cleared on
+    /// any entry text change and by `scrub_ui`.
+    history_mode: std::rc::Rc<std::cell::Cell<bool>>,
 }
 
 impl LauncherController {
@@ -656,6 +661,35 @@ impl LauncherController {
         self.preview_mode_active.get()
     }
 
+    pub(crate) fn history_mode(&self) -> bool {
+        self.history_mode.get()
+    }
+
+    pub(crate) fn enter_history_mode(&self) {
+        self.history_mode.set(true);
+    }
+
+    /// K9: leave the Up-arrow history list without hiding the
+    /// launcher — clear the synthetic rows and return to the idle
+    /// empty state (which re-offers Recents when enabled).
+    pub(crate) fn exit_history_mode(&self) {
+        self.history_mode.set(false);
+        self.selection.set_autoselect(false);
+        let n = self.model.n_items();
+        for _ in 0..n {
+            self.model.remove(0);
+        }
+        self.selection.set_selected(gtk::INVALID_LIST_POSITION);
+        self.selection.set_autoselect(true);
+        clear_cached_hits();
+        self.scrolled.set_visible(false);
+        self.scrolled.set_vexpand(false);
+        self.chips.container.set_visible(false);
+        self.status.hide();
+        self.entry.grab_focus();
+        self.maybe_show_recents();
+    }
+
     /// Re-arm layer-shell keyboard interactivity. Toggles the
     /// keyboard mode `None → OnDemand` to force the compositor
     /// (e.g. KWin) to re-evaluate `keyboard_interactivity` for the
@@ -741,6 +775,7 @@ impl LauncherController {
     fn scrub_ui(&self) {
         self.cached_session.borrow_mut().take();
         self.user_selected_override.set(false);
+        self.history_mode.set(false);
 
         if let Some(id) = self.pending_debounce.borrow_mut().take() {
             id.remove();
@@ -1073,11 +1108,11 @@ fn accel_display(accel: &str) -> String {
 /// resolved keybindings so user rebinds display truthfully.
 fn build_hint_line(kb: &lixun_config::Keybindings) -> String {
     format!(
-        "{} Open · {} Reveal · {} Preview · {} Copy · ? Shortcuts",
+        "{} Open · {} Reveal · {} Preview · {} Actions · ? Shortcuts",
         accel_display(&kb.primary_action),
         accel_display(&kb.secondary_action),
         accel_display(&kb.quick_look),
-        accel_display(&kb.copy),
+        accel_display(&kb.actions_menu),
     )
 }
 
@@ -1122,12 +1157,15 @@ pub(crate) fn show_shortcuts_overlay(
         p.popdown();
         return;
     }
-    let rows: [(&str, String); 13] = [
+    let rows: [(&str, String); 16] = [
         ("Open", accel_display(&kb.primary_action)),
+        ("Open result 1\u{2026}9", "Alt+1\u{2026}9".to_string()),
         ("Secondary action", accel_display(&kb.secondary_action)),
         ("Quick Look", accel_display(&kb.quick_look)),
         ("Quick Look (from entry)", accel_display(&kb.quick_look_alt)),
         ("Copy", accel_display(&kb.copy)),
+        ("Row actions menu", accel_display(&kb.actions_menu)),
+        ("Get info", accel_display(&kb.info)),
         ("Next result", accel_display(&kb.next_result)),
         ("Previous result", accel_display(&kb.previous_result)),
         ("Next category", accel_display(&kb.next_category)),
@@ -1669,14 +1707,29 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
     // Built before the factory: the row action handlers surface
     // launch failures through the status bar (they used to vanish
     // into the log).
-    let status_bar = std::rc::Rc::new(StatusBar::new());
+    let status_bar = std::rc::Rc::new(StatusBar::new(
+        daemon_config.search.web_engine_url.clone(),
+    ));
+
+    // Shared with the factory rows: click-selection protection (K10)
+    // and the popover-open counter that gates the focus-leave hide
+    // (K11 — see RowFactoryCtx::popover_open).
+    let user_selected_override: std::rc::Rc<std::cell::Cell<bool>> =
+        std::rc::Rc::new(std::cell::Cell::new(false));
+    let row_popover_open: std::rc::Rc<std::cell::Cell<u32>> =
+        std::rc::Rc::new(std::cell::Cell::new(0));
+    let keybindings_rc = std::rc::Rc::new(daemon_config.keybindings.clone());
 
     let list_view = gtk::ListView::builder()
         .model(&selection)
-        .factory(&create_list_factory(
-            entry.clone(),
-            std::rc::Rc::clone(&status_bar),
-        ))
+        .factory(&create_list_factory(crate::factory::RowFactoryCtx {
+            entry: entry.clone(),
+            status: std::rc::Rc::clone(&status_bar),
+            keybindings: std::rc::Rc::clone(&keybindings_rc),
+            user_selected: std::rc::Rc::clone(&user_selected_override),
+            popover_open: std::rc::Rc::clone(&row_popover_open),
+            model: model.clone(),
+        }))
         .build();
     list_view.set_widget_name("lixun-results");
     // A1: name the results surface for assistive tech.
@@ -1787,9 +1840,9 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
         std::rc::Rc::new(std::cell::RefCell::new(None));
     let is_restoring: std::rc::Rc<std::cell::Cell<bool>> =
         std::rc::Rc::new(std::cell::Cell::new(false));
-    let user_selected_override: std::rc::Rc<std::cell::Cell<bool>> =
-        std::rc::Rc::new(std::cell::Cell::new(false));
     let searching_indicator: std::rc::Rc<std::cell::Cell<bool>> =
+        std::rc::Rc::new(std::cell::Cell::new(false));
+    let history_mode_flag: std::rc::Rc<std::cell::Cell<bool>> =
         std::rc::Rc::new(std::cell::Cell::new(false));
     let preview_mode_active: std::rc::Rc<std::cell::Cell<bool>> =
         std::rc::Rc::new(std::cell::Cell::new(false));
@@ -1839,6 +1892,7 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
         preview_width_percent: daemon_config.gui.preview_width_percent,
         preview_max_width_px: daemon_config.gui.preview_max_width_px,
         slide_mode,
+        history_mode: std::rc::Rc::clone(&history_mode_flag),
     });
 
     let close_action = gio::SimpleAction::new("close-launcher", None);
@@ -1895,6 +1949,93 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
         controller_for_clear.clear_and_hide();
     });
     app.add_action(&clear_action);
+
+    // R7: page limit of the most recent search this session issued.
+    // The entry handler resets it to `max_results` per keystroke;
+    // the "Show more results" action raises it one ×4 step; the
+    // response handler compares against it to decide whether the
+    // page came back full (append the terminal row) or exhausted.
+    let last_requested_limit: std::rc::Rc<std::cell::Cell<u32>> =
+        std::rc::Rc::new(std::cell::Cell::new(max_results));
+
+    // R7: activating the synthetic "Show more results" row re-issues
+    // the current query with a ×4 limit (one step; the daemon caps at
+    // max_results × 4 bounded by 1000).
+    {
+        let entry_for_more = entry.clone();
+        let ipc_for_more = ipc.clone();
+        let epoch_for_more = Arc::clone(&session_epoch);
+        let category_for_more = std::rc::Rc::clone(&current_category);
+        let limit_for_more = std::rc::Rc::clone(&last_requested_limit);
+        let more_action = gio::SimpleAction::new("show-more-results", None);
+        more_action.connect_activate(move |_, _| {
+            let q = entry_for_more.text().to_string();
+            if q.is_empty() {
+                return;
+            }
+            let next_limit = max_results.saturating_mul(4).min(1000);
+            limit_for_more.set(next_limit);
+            let epoch = epoch_for_more.load(Ordering::SeqCst);
+            tracing::info!(
+                "gui: show-more-results → re-issuing query with limit={}",
+                next_limit
+            );
+            let _ = ipc_for_more
+                .request_tx
+                .send((q, next_limit, epoch, category_for_more.get()));
+        });
+        app.add_action(&more_action);
+    }
+
+    // R5: a chip toggle re-issues the current query with the active
+    // category so the daemon filters PRE-limit — matching mail
+    // ranked below the unfiltered page becomes reachable. Guarded
+    // against restore-time chip writes and the empty query (the
+    // client-side CustomFilter still handles those instantly).
+    {
+        let entry_for_chips = entry.clone();
+        let ipc_for_chips = ipc.clone();
+        let epoch_for_chips = Arc::clone(&session_epoch);
+        let category_for_chips = std::rc::Rc::clone(&current_category);
+        let is_restoring_for_chips = std::rc::Rc::clone(&is_restoring);
+        let limit_for_chips = std::rc::Rc::clone(&last_requested_limit);
+        let status_for_chips = std::rc::Rc::clone(&status_bar);
+        let selection_for_chips = selection.clone();
+        let model_for_chips = model.clone();
+        for button in &chips_rc.buttons {
+            let entry = entry_for_chips.clone();
+            let ipc = ipc_for_chips.clone();
+            let epoch = Arc::clone(&epoch_for_chips);
+            let category = std::rc::Rc::clone(&category_for_chips);
+            let is_restoring = std::rc::Rc::clone(&is_restoring_for_chips);
+            let limit = std::rc::Rc::clone(&limit_for_chips);
+            let status = std::rc::Rc::clone(&status_for_chips);
+            let selection = selection_for_chips.clone();
+            let model = model_for_chips.clone();
+            button.connect_toggled(move |b| {
+                if !b.is_active() || is_restoring.get() {
+                    return;
+                }
+                let q = entry.text().to_string();
+                if !q.is_empty() {
+                    // Fresh page for the new constraint; the reply
+                    // replaces the client-filtered view.
+                    let new_epoch = epoch.fetch_add(1, Ordering::SeqCst) + 1;
+                    limit.set(max_results);
+                    let _ = ipc.request_tx.send((q, max_results, new_epoch, category.get()));
+                } else if selection.n_items() == 0 && model.n_items() > 0 {
+                    // No query to re-issue (history/recents view):
+                    // the client-side filter produced a silent void —
+                    // name the category instead (R5).
+                    if let Some(cat) = category.get() {
+                        status.show_empty_filtered(category_chip_label(cat), "");
+                    }
+                } else if q.is_empty() {
+                    status.hide();
+                }
+            });
+        }
+    }
 
     let relaunch_action = gio::SimpleAction::new("relaunch", None);
     relaunch_action.connect_activate(move |_, _| {
@@ -1981,6 +2122,10 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
         std::rc::Rc::clone(&loading_timer),
         build_hint_line(&daemon_config.keybindings),
         std::rc::Rc::clone(&semantic_ui),
+        std::rc::Rc::clone(&current_category),
+        daemon_config.search.web_engine_url.clone(),
+        std::rc::Rc::clone(&last_requested_limit),
+        max_results,
     );
 
     // Drain the icon-loader's ready channel on the GTK main loop.
@@ -2042,6 +2187,9 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
         std::rc::Rc::clone(&claimed_prefixes),
         max_results,
         std::rc::Rc::new(move || controller_for_empty.maybe_show_recents()),
+        std::rc::Rc::clone(&current_category),
+        std::rc::Rc::clone(&history_mode_flag),
+        std::rc::Rc::clone(&last_requested_limit),
     );
 
     crate::keymap::install_keyboard_handler(
@@ -2068,10 +2216,23 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
     });
     let controller_for_leave = std::rc::Rc::clone(&controller);
     let just_showed_for_leave = std::rc::Rc::clone(&just_showed_until);
+    let popover_open_for_leave = std::rc::Rc::clone(&row_popover_open);
     focus_ctrl.connect_leave(move |_| {
         tracing::info!("gui: focus_ctrl LEAVE fired, just_showed_until check");
         if Instant::now() < just_showed_for_leave.get() {
             tracing::info!("gui: spurious leave during show transition, ignored");
+            return;
+        }
+        // K11: an open row popover (context menu / Get Info) with the
+        // default autohide takes an xdg_popup grab — keyboard focus
+        // moves to the popup surface and this leave fires. Hiding
+        // here would unmap the launcher and kill the popover with it
+        // (the trap that bit the ?/F1 overlay). Gate on the mapped-
+        // popover counter, mirroring the preview_mode gate below;
+        // both mouse- and keyboard-opened popovers pass through the
+        // same map/unmap counting.
+        if popover_open_for_leave.get() > 0 {
+            tracing::info!("gui: focus_ctrl LEAVE with row popover open → ignored");
             return;
         }
         // While the preview window is open, the compositor will hand
@@ -2370,6 +2531,10 @@ fn install_response_handler(
     loading_timer: std::rc::Rc<std::cell::RefCell<Option<glib::SourceId>>>,
     results_hint_line: String,
     semantic_ui: SemanticUiState,
+    current_category: CategoryFilter,
+    web_engine_url: String,
+    last_requested_limit: std::rc::Rc<std::cell::Cell<u32>>,
+    max_results: u32,
 ) {
     let pending_hits = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
     let last_epoch = std::rc::Rc::new(std::cell::Cell::new(0u64));
@@ -2398,6 +2563,7 @@ fn install_response_handler(
                     hits,
                     top_hit,
                     claimed,
+                    explanations,
                 } => {
                     let current_session_epoch = session_epoch.load(Ordering::SeqCst);
                     if epoch < current_session_epoch {
@@ -2515,6 +2681,22 @@ fn install_response_handler(
                             if let Some(id) = loading_timer.borrow_mut().take() {
                                 id.remove();
                             }
+                            // R9: associate each hit with its ranking
+                            // explanation for the Get Info popover.
+                            // Index-aligned only on a genuine Final;
+                            // the buffered-Initial fallback below has
+                            // no explanations, and the map is simply
+                            // replaced empty then.
+                            let explanation_map: std::collections::HashMap<String, String> =
+                                if explanations.len() == hits.len() {
+                                    hits.iter()
+                                        .map(|h| h.id.0.clone())
+                                        .zip(explanations)
+                                        .collect()
+                                } else {
+                                    std::collections::HashMap::new()
+                                };
+                            crate::factory::cache_explanations(explanation_map);
                             let all_hits = if hits.is_empty() {
                                 let pending = pending_hits.borrow().clone();
                                 if !pending.is_empty() {
@@ -2550,7 +2732,27 @@ fn install_response_handler(
                                 None
                             };
 
-                            let plan = compute_render_plan(&all_hits, top_hit.as_ref());
+                            let mut plan = compute_render_plan(&all_hits, top_hit.as_ref());
+                            // R7: a page that came back full is very
+                            // likely truncated — offer a terminal
+                            // "Show more results" row. One ×4 step;
+                            // once expanded, the row is not offered
+                            // again.
+                            let requested = last_requested_limit.get();
+                            if !claimed
+                                && !plan.hits.is_empty()
+                                && plan.hits.len() as u32 >= requested
+                                && requested < max_results.saturating_mul(4).min(1000)
+                            {
+                                let q = last_query.borrow().clone();
+                                if !q.is_empty() {
+                                    let next = max_results.saturating_mul(4).min(1000);
+                                    plan.hits.push(
+                                        crate::factory::synthetic_more_results_hit(&q, next),
+                                    );
+                                }
+                            }
+                            let plan = plan;
                             let top_hit_doc_id = plan
                                 .top_hit_index
                                 .and_then(|i| plan.hits.get(i))
@@ -2593,8 +2795,40 @@ fn install_response_handler(
                                 let q = last_query.borrow().clone();
                                 if !q.is_empty() {
                                     chips_container.set_visible(true);
-                                    scrolled.set_visible(false);
-                                    scrolled.set_vexpand(false);
+                                    let category = current_category.get();
+                                    // C3c: on an unfiltered zero-hit,
+                                    // render the web-search fallback
+                                    // as a selectable synthetic row so
+                                    // it is Enter-able, not only a
+                                    // status-bar button. With a chip
+                                    // filter active the row (a File-
+                                    // category synthetic) would be
+                                    // filtered out — show the
+                                    // category-aware message instead.
+                                    if !claimed && category.is_none() {
+                                        let web_hit =
+                                            crate::factory::synthetic_web_search_hit(
+                                                &q,
+                                                &web_engine_url,
+                                            );
+                                        update_results(
+                                            &model,
+                                            &selection,
+                                            &[web_hit],
+                                            None,
+                                        );
+                                        filter.changed(gtk::FilterChange::Different);
+                                        if selection.n_items() > 0 {
+                                            selection.set_selected(0);
+                                        }
+                                        scrolled.set_visible(true);
+                                        scrolled.set_vexpand(false);
+                                    } else {
+                                        scrolled.set_visible(false);
+                                        scrolled.set_vexpand(false);
+                                        selection
+                                            .set_selected(gtk::INVALID_LIST_POSITION);
+                                    }
                                     present_zero_hit_status(
                                         &q,
                                         claimed,
@@ -2604,8 +2838,8 @@ fn install_response_handler(
                                         &index_status_cache,
                                         &index_status_inflight,
                                         &semantic_ui,
+                                        category.map(category_chip_label),
                                     );
-                                    selection.set_selected(gtk::INVALID_LIST_POSITION);
                                 } else {
                                     chips_container.set_visible(false);
                                     scrolled.set_visible(false);
@@ -2696,11 +2930,20 @@ fn present_zero_hit_status(
     cache: &std::rc::Rc<std::cell::RefCell<Option<IndexStatusSnapshot>>>,
     fetch_inflight: &std::rc::Rc<std::cell::Cell<bool>>,
     semantic_ui: &SemanticUiState,
+    category_label: Option<&'static str>,
 ) {
     // Claimed queries (shell `>`, calculator `=`) are answered by
     // their plugin, not the index — a reindex is irrelevant to them.
     if claimed {
         status.show_empty(q);
+        return;
+    }
+
+    // R5: a category-constrained zero-hit names the filter so the
+    // void is explained. The indexing/semantic upgrades below are
+    // skipped — the constraint, not index freshness, is the headline.
+    if let Some(label) = category_label {
+        status.show_empty_filtered(label, q);
         return;
     }
 
@@ -2778,9 +3021,14 @@ fn install_entry_handler(
     claimed_prefixes: std::rc::Rc<Vec<String>>,
     max_results: u32,
     on_empty_query: std::rc::Rc<dyn Fn()>,
+    current_category: CategoryFilter,
+    history_mode: std::rc::Rc<std::cell::Cell<bool>>,
+    last_requested_limit: std::rc::Rc<std::cell::Cell<u32>>,
 ) {
     tracing::info!("gui: install_entry_handler called, registering connect_changed");
     entry.connect_changed(move |e| {
+        // K9: any text change ends history-list modality.
+        history_mode.set(false);
         if is_restoring.get() {
             tracing::debug!("gui: entry changed but is_restoring=true, skipping");
             return;
@@ -2892,6 +3140,8 @@ fn install_entry_handler(
         let epoch = Arc::clone(&session_epoch);
         let prefixes_for_debounce = std::rc::Rc::clone(&claimed_prefixes);
         let loading_timer_for_debounce = std::rc::Rc::clone(&loading_timer);
+        let category_for_debounce = std::rc::Rc::clone(&current_category);
+        let limit_for_debounce = std::rc::Rc::clone(&last_requested_limit);
         // 30 ms keystroke debounce. A6 (8a309de) introduced
         // cooperative cancellation in the daemon's collector, so
         // superseded queries are aborted server-side and the GUI
@@ -2936,11 +3186,34 @@ fn install_entry_handler(
                     });
                 *loading_timer_for_debounce.borrow_mut() = Some(timer_id);
             }
-            let _ = ipc.request_tx.send((q, max_results, epoch_snapshot));
+            // R7: each keystroke resets the page size; only the
+            // "Show more results" action raises it.
+            limit_for_debounce.set(max_results);
+            // R5: keep the active chip constraint on the wire so the
+            // daemon filters pre-limit.
+            let _ = ipc.request_tx.send((
+                q,
+                max_results,
+                epoch_snapshot,
+                category_for_debounce.get(),
+            ));
             *pending_self.borrow_mut() = None;
         });
         *pending_debounce.borrow_mut() = Some(id);
     });
+}
+
+/// Human word for a category in the R5 filtered-empty message
+/// ("No mail results for …").
+fn category_chip_label(cat: Category) -> &'static str {
+    match cat {
+        Category::App => "app",
+        Category::File => "file",
+        Category::Mail => "mail",
+        Category::Attachment => "attachment",
+        Category::Calculator => "calculator",
+        Category::Shell => "shell",
+    }
 }
 
 pub(crate) struct CategoryChips {

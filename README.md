@@ -50,13 +50,34 @@ fuse with Reciprocal Rank Fusion.
 - **Email (Maildir)** — any number of maildir roots (mutt/neomutt/offlineimap
   /isync/fdm-style layouts).
 - **Calculator** — type `= sqrt(16) + pi` and get `7.1415…` at the top.
+  Also unit, base, and percent conversions: `5km in mi`, `72F in C`,
+  `1 GiB in MB`, `0xff`, `255 in hex`, `15% of 80`.
 - **Shell** — type `> ls -la` to spawn a terminal via `xdg-terminal-exec`.
+- **Keyword web searches** — declare `[[search.keyword]]` shortcuts
+  (`gh rust lifetimes` → GitHub search) and pick your `web_engine_url`
+  for the zero-results fallback. A browser opens only when you
+  explicitly activate the result.
+- **Command sources** — extend the launcher without recompiling: a
+  `[[command_source]]` entry maps a query prefix (e.g. `pass `) to a
+  local script whose JSON stdout becomes result rows (the
+  Ulauncher/rofi-script model). Argv is spawned directly — no shell
+  interpolation — with a timeout and bounded output.
+- **Ranking you can steer** — frecency and query-latch learning with
+  per-result controls: "Hide from Results" and "Reset Ranking" in the
+  row menu, `lixun-cli hidden list|unhide` to inspect and undo hides.
 - **Automatic OCR** — index scanned PDFs and images via Tesseract.
 - **Theming** — full GTK4 CSS customization via `~/.config/lixun/style.css`.
 - **System impact preset** — four resource levels (unlimited/high/medium/low)
   controlling thread pools, heap sizes, and scheduling hints.
 
 Everything local. No telemetry, no cloud, no vendor.
+
+Deliberately out of scope for now: **window switching** (listing and
+focusing open windows, as KRunner does). It needs per-compositor
+protocols — wlr-foreign-toplevel on wlroots, the KWin D-Bus interface
+on Plasma — with no portable fallback; revisit when a common protocol
+settles. Users coming from KRunner should keep their compositor's
+native switcher bound.
 
 ---
 

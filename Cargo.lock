@@ -5613,6 +5613,8 @@ name = "lixun-plugin-bundle"
 version = "0.7.0"
 dependencies = [
  "lixun-source-calculator",
+ "lixun-source-command",
+ "lixun-source-keyword",
  "lixun-source-maildir",
  "lixun-source-shell",
  "lixun-source-thunderbird",
@@ -5882,6 +5884,32 @@ dependencies = [
  "lixun-core",
  "lixun-sources",
  "meval",
+ "serde",
+ "toml 0.8.23",
+ "tracing",
+]
+
+[[package]]
+name = "lixun-source-command"
+version = "0.7.0"
+dependencies = [
+ "anyhow",
+ "dirs 5.0.1",
+ "lixun-core",
+ "lixun-sources",
+ "serde",
+ "serde_json",
+ "toml 0.8.23",
+ "tracing",
+]
+
+[[package]]
+name = "lixun-source-keyword"
+version = "0.7.0"
+dependencies = [
+ "anyhow",
+ "lixun-core",
+ "lixun-sources",
  "serde",
  "toml 0.8.23",
  "tracing",
