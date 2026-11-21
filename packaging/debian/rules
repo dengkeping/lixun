@@ -10,4 +10,4 @@ override_dh_strip:
 	dh_strip --no-automatic-dbgsym
 
 override_dh_installsystemduser:
-	dh_installsystemduser --no-enable --no-start
+	dh_installsystemduser --no-enable
