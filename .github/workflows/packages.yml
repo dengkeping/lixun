@@ -1,0 +1,103 @@
+name: Linux packages
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and install on ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: arch
+            build_image: archlinux:base-devel
+            test_image: archlinux:base
+          - target: debian13
+            build_image: debian:13-slim
+            test_image: debian:13-slim
+          - target: ubuntu26.04
+            build_image: ubuntu:26.04
+            test_image: ubuntu:26.04
+    env:
+      TARGET: ${{ matrix.target }}
+      BUILD_IMAGE: ${{ matrix.build_image }}
+      TEST_IMAGE: ${{ matrix.test_image }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Prepare release sources
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          if [[ "$GITHUB_EVENT_NAME" == push && "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match workspace version $version"
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/package-input" "$RUNNER_TEMP/packages"
+          git archive --format=tar.gz --prefix="lixun-$GITHUB_SHA/" HEAD > "$RUNNER_TEMP/package-input/source.tar.gz"
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+      - name: Build native packages
+        run: |
+          docker run --rm -e VERSION -e TARGET -e GITHUB_SHA \
+            -v "$RUNNER_TEMP/package-input:/input:ro" -v "$RUNNER_TEMP/packages:/out" \
+            -v "$GITHUB_WORKSPACE/packaging/release:/scripts:ro" \
+            "$BUILD_IMAGE" bash /scripts/build.sh
+      - name: Install and exercise packages on a clean image
+        run: |
+          docker run --rm -e TARGET -e VERSION -v "$RUNNER_TEMP/packages:/packages:ro" \
+            -v "$GITHUB_WORKSPACE/packaging/release:/scripts:ro" \
+            "$TEST_IMAGE" bash /scripts/test-install.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: packages-${{ matrix.target }}
+          path: ${{ runner.temp }}/packages/*
+          if-no-files-found: error
+          compression-level: 0
+
+  publish:
+    name: Publish verified packages
+    needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    concurrency: release-${{ github.ref }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: packages-*
+          path: packages
+          merge-multiple: true
+      - name: Attach packages and checksums to the release
+        working-directory: packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          shopt -s nullglob
+          files=(*.pkg.tar.zst *.deb)
+          [[ ${#files[@]} == 9 ]]
+          sha256sum "${files[@]}" > SHA256SUMS
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json id >/dev/null 2>&1; then
+            for file in "${files[@]}" SHA256SUMS; do
+              digest=$(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json assets \
+                --jq ".assets[] | select(.name == \"$file\") | .digest")
+              if [[ -z "$digest" ]]; then
+                gh release upload "$TAG" "$file" -R "$GITHUB_REPOSITORY"
+              elif [[ "$digest" != "sha256:$(sha256sum "$file" | cut -d' ' -f1)" ]]; then
+                echo "::error::Release already contains a different $file"
+                exit 1
+              fi
+            done
+          else
+            gh release create "$TAG" "${files[@]}" SHA256SUMS -R "$GITHUB_REPOSITORY" \
+              --verify-tag --title "$TAG" --generate-notes
+          fi

@@ -1,0 +1,26 @@
+Source: lixun
+Section: utils
+Priority: optional
+Maintainer: Denis Kopin <deng@lixun.app>
+Build-Depends: debhelper-compat (= 13), clang, cmake, protobuf-compiler, libgtk-4-dev (>= 4.16), libgtk4-layer-shell-dev, libpoppler-glib-dev, libheif-dev (>= 1.21), pkg-config, libssl-dev, libbz2-dev, liblzma-dev, zlib1g-dev
+Homepage: https://lixun.app
+Rules-Requires-Root: no
+
+Package: lixun
+Architecture: amd64
+Depends: ${shlibs:Depends}, ${misc:Depends}, xdg-utils
+Suggests: lixun-semantic, lixun-ocr
+Description: Desktop search daemon and launcher
+ Includes the graphical launcher, preview application and command-line client.
+
+Package: lixun-semantic
+Architecture: amd64
+Depends: lixun (= ${binary:Version}), ${shlibs:Depends}, ${misc:Depends}
+Description: Semantic search worker for Lixun
+ Adds dense-vector indexing and retrieval to the Lixun search daemon.
+
+Package: lixun-ocr
+Architecture: all
+Depends: lixun (= ${binary:Version}), tesseract-ocr, tesseract-ocr-eng, ${misc:Depends}
+Description: Optical character recognition support for Lixun
+ Installs the OCR engine and English language data for scanned documents.

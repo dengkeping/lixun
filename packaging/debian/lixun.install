@@ -1,0 +1,11 @@
+target/release/lixund usr/bin
+target/release/lixun-cli usr/bin
+target/release/lixun-gui usr/bin
+target/release/lixun-preview usr/bin
+packaging/systemd/lixund.service usr/lib/systemd/user
+packaging/desktop/app.lixun.daemon.desktop usr/share/applications
+packaging/icons/lixun-logo-light.svg usr/share/icons/hicolor/scalable/apps
+crates/lixun-gui/assets/matugen/lixun-colors.css.tmpl usr/share/lixun/matugen
+docs/config.example.toml usr/share/doc/lixun
+LICENSE-MIT usr/share/doc/lixun
+LICENSE-APACHE usr/share/doc/lixun

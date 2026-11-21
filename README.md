@@ -83,7 +83,22 @@ native switcher bound.
 
 ## Install
 
-### Arch Linux
+### Release packages (x86_64)
+
+The Linux packages workflow builds for Arch Linux/CachyOS, Debian 13 and
+Ubuntu 26.04 LTS. A manual run produces downloadable Actions artifacts.
+Pushing a tag matching the workspace version (for example, `v0.7.2` for
+version `0.7.2`) publishes the tested packages and `SHA256SUMS` to
+[GitHub Releases](https://github.com/dengkeping/lixun/releases).
+
+Download the core package for your distribution. From its download directory,
+install it with `sudo pacman -U ./lixun-<version>-1-x86_64.pkg.tar.zst`
+on Arch/CachyOS or `sudo apt install ./lixun_<version>_<arch>.deb` on
+Debian/Ubuntu, substituting the downloaded filename. Install the matching
+`lixun-semantic` and `lixun-ocr` packages to add semantic search and OCR.
+Start the daemon with `systemctl --user enable --now lixund.service`.
+
+### Build on Arch Linux
 
 Build and install the core package with the Arch packaging tools:
 
