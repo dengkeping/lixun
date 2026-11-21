@@ -32,7 +32,7 @@ else
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
     apt-get install -y --no-install-recommends build-essential debhelper ca-certificates \
-        curl clang cmake protobuf-compiler libgtk-4-dev libgtk4-layer-shell-dev \
+        curl clang cmake protobuf-compiler libprotobuf-dev libgtk-4-dev libgtk4-layer-shell-dev \
         libpoppler-glib-dev libheif-dev pkg-config libssl-dev libbz2-dev liblzma-dev zlib1g-dev
     curl --fail --silent --show-error --location --proto '=https' https://sh.rustup.rs -o /tmp/rustup-init.sh
     sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain stable --no-modify-path
