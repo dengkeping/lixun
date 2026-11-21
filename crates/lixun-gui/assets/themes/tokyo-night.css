@@ -1,6 +1,6 @@
 /* Built-in Tokyo Night launcher theme. Matugen can override the palette. */
 window, popover {
-  --lixun-secondary-text: mix(var(--lixun-on-surface-variant), var(--lixun-on-surface), 0.75);
+  --lixun-secondary-text: color-mix(in srgb, var(--lixun-on-surface-variant), var(--lixun-on-surface) 75%);
   --lixun-primary:               #7aa2f7;
   --lixun-on-primary:            #1a1b26;
   --lixun-primary-container:     #bb9af7;
@@ -128,20 +128,20 @@ listview row:selected:focus {
 }
 
 .lixun-hit:hover {
-  background-color: alpha(mix(var(--lixun-surface), var(--lixun-primary), 0.15), 0.30);
+  background-color: alpha(color-mix(in srgb, var(--lixun-surface), var(--lixun-primary) 15%), 0.30);
 }
 
 /* The best match keeps its frame when selection moves to another row.
  * Only the keyboard selection gets the accent bar. */
 .lixun-hit.lixun-top-hit-hero {
-  background-color: alpha(mix(var(--lixun-surface), var(--lixun-primary), 0.15), 0.30);
+  background-color: alpha(color-mix(in srgb, var(--lixun-surface), var(--lixun-primary) 15%), 0.30);
   border: 1px solid var(--lixun-outline-variant);
   padding: 9px 11px;
 }
 
 .lixun-hit.lixun-top-hit,
 .lixun-hit.lixun-top-hit:hover {
-  background-color: alpha(mix(var(--lixun-surface), var(--lixun-primary), 0.21), 0.65);
+  background-color: alpha(color-mix(in srgb, var(--lixun-surface), var(--lixun-primary) 21%), 0.65);
   box-shadow: inset 3px 0 0 0 var(--lixun-primary);
 }
 

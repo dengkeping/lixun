@@ -215,6 +215,11 @@ pub struct LixunIndex {
     reload_epoch: std::sync::atomic::AtomicU64,
 }
 
+struct SearchCandidates {
+    merged: Vec<(f32, DocAddress)>,
+    fallback_addrs: HashSet<DocAddress>,
+}
+
 impl LixunIndex {
     pub fn create_or_open(index_path: impl AsRef<Path>, ranking: RankingConfig) -> Result<Self> {
         Self::create_or_open_with_plugins(index_path, &BTreeMap::new(), ranking)
@@ -462,159 +467,11 @@ impl LixunIndex {
         let s = &self.schema;
         let q_norm = normalize_for_match(&query.text);
         let now_secs = Utc::now().timestamp();
-        let limit = query.limit as usize;
-
-        let query_obj = build_search_query(
-            &query.text,
-            &self.index,
-            s,
-            &self.plugins,
-            &self.ranking,
-            true,
-        );
-        let restrict_category = |candidate: Box<dyn tantivy::query::Query>,
-                                 category: Option<Category>|
-         -> Box<dyn tantivy::query::Query> {
-            let Some(category) = category else {
-                return candidate;
-            };
-            let filter = TermQuery::new(
-                Term::from_field_text(s.category, category.as_str()),
-                IndexRecordOption::Basic,
-            );
-            Box::new(BooleanQuery::new(vec![
-                (Occur::Must, candidate),
-                (
-                    Occur::Must,
-                    Box::new(tantivy::query::ConstScoreQuery::new(Box::new(filter), 0.0)),
-                ),
-            ]))
-        };
-        let query_obj = restrict_category(query_obj, category);
-        let top_docs = searcher.search(&query_obj, &TopDocs::with_limit(limit).order_by_score())?;
-
-        // Fast-path: exact title equality (bypasses BM25 IDF collapse).
-        //
-        // Popular terms like "firefox" appear in thousands of files (paths,
-        // OCR bodies, Mail), collapsing IDF to the point where an App entry
-        // whose title *is* that term never reaches BM25 top-N. We probe the
-        // dedicated `title_exact` STRING field for q_norm and union those
-        // doc addresses into the candidate set; `exact_title_mult` then
-        // fires naturally in the scoring loop below. Synthetic base score
-        // for exact-only hits = max(top_docs) or 1.0 — keeps them
-        // comparable to BM25 hits after the multiplier chain. Bounded by
-        // `limit`: many docs sharing one exact title (common filenames)
-        // must not turn the probe into a full-postings materialization.
-        let max_top_score = top_docs
-            .iter()
-            .map(|(s, _)| *s)
-            .fold(0.0_f32, f32::max)
-            .max(1.0);
-        let exact_addrs: Vec<(f32, DocAddress)> =
-            if !q_norm.is_empty() && !lixun_core::query_uses_operators(&query.text) {
-                let term = Term::from_field_text(s.title_exact, &q_norm);
-                let tq = TermQuery::new(term, IndexRecordOption::Basic);
-                searcher
-                    .search(
-                        &restrict_category(Box::new(tq), category),
-                        &TopDocs::with_limit(limit).order_by_score(),
-                    )?
-                    .into_iter()
-                    .map(|(_, addr)| (max_top_score, addr))
-                    .collect()
-            } else {
-                Vec::new()
-            };
-
-        let mut seen_addrs: HashSet<DocAddress> = top_docs.iter().map(|(_, a)| *a).collect();
-        let mut merged: Vec<(f32, DocAddress)> = top_docs;
-        for (score, addr) in exact_addrs {
-            if seen_addrs.insert(addr) {
-                merged.push((score, addr));
-            }
-        }
-
-        // Keep application candidates reachable even on a crowded mixed page.
-        if category.is_none() {
-            let probe = restrict_category(query_obj.box_clone(), Some(Category::App));
-            for (score, addr) in
-                searcher.search(&probe, &TopDocs::with_limit(limit).order_by_score())?
-            {
-                if seen_addrs.insert(addr) {
-                    merged.push((score, addr));
-                }
-            }
-        }
-
-        // Preserve literal title completions before the global raw-score cutoff.
-        // A large category can otherwise fill TopDocs with equally scored names
-        // and exclude other categories before their ranking multipliers apply.
-        // Probe each category independently, with a bounded quota and the same
-        // synthetic base score as the exact-title fast path above.
-        if q_norm.chars().count() >= MIN_QUERY_PREFIX_LEN
-            && !lixun_core::query_uses_operators(&query.text)
-        {
-            let categories = [
-                Category::App,
-                Category::File,
-                Category::Mail,
-                Category::Attachment,
-            ];
-            for &candidate_category in category
-                .as_ref()
-                .map(std::slice::from_ref)
-                .unwrap_or(&categories)
-            {
-                let prefix = tantivy::query::FuzzyTermQuery::new_prefix(
-                    Term::from_field_text(s.title_exact, &q_norm),
-                    0,
-                    true,
-                );
-                let probe = tantivy::query::ConstScoreQuery::new(
-                    restrict_category(Box::new(prefix), Some(candidate_category)),
-                    max_top_score,
-                );
-                for (score, addr) in
-                    searcher.search(&probe, &TopDocs::with_limit(limit).order_by_score())?
-                {
-                    if seen_addrs.insert(addr) {
-                        merged.push((score, addr));
-                    }
-                }
-            }
-        }
-
         let q_tokens = tokenize_with_spotlight(&self.index, &query.text).unwrap_or_default();
-
-        // Conjunction-by-default is precision-first: one term with no
-        // (fuzzy-reachable) match empties the whole result set. When the
-        // AND pass leaves the page underfilled, refill from a disjunctive
-        // pass. Refill hits are FALLBACK tier: they rank strictly below
-        // full matches and are flagged in the breakdown so the hybrid
-        // fusion layer keeps them out of RRF standing — a page of docs
-        // that merely contain "of" must not crowd out semantic hits.
-        let mut fallback_addrs: HashSet<DocAddress> = HashSet::new();
-        if merged.len() < limit
-            && q_tokens.len() >= 2
-            && !lixun_core::query_uses_operators(&query.text)
-        {
-            let or_query = build_search_query(
-                &query.text,
-                &self.index,
-                s,
-                &self.plugins,
-                &self.ranking,
-                false,
-            );
-            let or_query = restrict_category(or_query, category);
-            let extra = searcher.search(&or_query, &TopDocs::with_limit(limit).order_by_score())?;
-            for (score, addr) in extra {
-                if seen_addrs.insert(addr) {
-                    fallback_addrs.insert(addr);
-                    merged.push((score, addr));
-                }
-            }
-        }
+        let SearchCandidates {
+            merged,
+            fallback_addrs,
+        } = self.search_candidates(&searcher, query, category, &q_norm, &q_tokens)?;
 
         let passage = lixun_core::fragment::PassageMatcher::new(&query.text);
         let mut results: Vec<(Hit, ScoreBreakdown)> = Vec::new();
@@ -788,6 +645,164 @@ impl LixunIndex {
         results.truncate(query.limit as usize);
 
         Ok(results)
+    }
+
+    fn search_candidates(
+        &self,
+        searcher: &tantivy::Searcher,
+        query: &Query,
+        category: Option<Category>,
+        q_norm: &str,
+        q_tokens: &[String],
+    ) -> Result<SearchCandidates> {
+        let s = &self.schema;
+        let limit = query.limit as usize;
+
+        let query_obj = build_search_query(
+            &query.text,
+            &self.index,
+            s,
+            &self.plugins,
+            &self.ranking,
+            true,
+        );
+        let restrict_category = |candidate: Box<dyn tantivy::query::Query>,
+                                 category: Option<Category>|
+         -> Box<dyn tantivy::query::Query> {
+            let Some(category) = category else {
+                return candidate;
+            };
+            let filter = TermQuery::new(
+                Term::from_field_text(s.category, category.as_str()),
+                IndexRecordOption::Basic,
+            );
+            Box::new(BooleanQuery::new(vec![
+                (Occur::Must, candidate),
+                (
+                    Occur::Must,
+                    Box::new(tantivy::query::ConstScoreQuery::new(Box::new(filter), 0.0)),
+                ),
+            ]))
+        };
+        let query_obj = restrict_category(query_obj, category);
+        let top_docs = searcher.search(&query_obj, &TopDocs::with_limit(limit).order_by_score())?;
+
+        // Fast-path: exact title equality (bypasses BM25 IDF collapse).
+        //
+        // Popular terms like "firefox" appear in thousands of files (paths,
+        // OCR bodies, Mail), collapsing IDF to the point where an App entry
+        // whose title *is* that term never reaches BM25 top-N. We probe the
+        // dedicated `title_exact` STRING field for q_norm and union those
+        // doc addresses into the candidate set; `exact_title_mult` then
+        // fires naturally in the scoring loop below. Synthetic base score
+        // for exact-only hits = max(top_docs) or 1.0 — keeps them
+        // comparable to BM25 hits after the multiplier chain. Bounded by
+        // `limit`: many docs sharing one exact title (common filenames)
+        // must not turn the probe into a full-postings materialization.
+        let max_top_score = top_docs
+            .iter()
+            .map(|(s, _)| *s)
+            .fold(0.0_f32, f32::max)
+            .max(1.0);
+        let exact_addrs: Vec<(f32, DocAddress)> =
+            if !q_norm.is_empty() && !lixun_core::query_uses_operators(&query.text) {
+                let term = Term::from_field_text(s.title_exact, q_norm);
+                let tq = TermQuery::new(term, IndexRecordOption::Basic);
+                searcher
+                    .search(
+                        &restrict_category(Box::new(tq), category),
+                        &TopDocs::with_limit(limit).order_by_score(),
+                    )?
+                    .into_iter()
+                    .map(|(_, addr)| (max_top_score, addr))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+        let mut seen_addrs: HashSet<DocAddress> = top_docs.iter().map(|(_, a)| *a).collect();
+        let mut merged: Vec<(f32, DocAddress)> = top_docs;
+        let mut add_new = |matches: Vec<(f32, DocAddress)>| {
+            merged.extend(
+                matches
+                    .into_iter()
+                    .filter(|(_, addr)| seen_addrs.insert(*addr)),
+            );
+        };
+        add_new(exact_addrs);
+
+        // Keep application candidates reachable even on a crowded mixed page.
+        if category.is_none() {
+            let probe = restrict_category(query_obj.box_clone(), Some(Category::App));
+            add_new(searcher.search(&probe, &TopDocs::with_limit(limit).order_by_score())?);
+        }
+
+        // Preserve literal title completions before the global raw-score cutoff.
+        // A large category can otherwise fill TopDocs with equally scored names
+        // and exclude other categories before their ranking multipliers apply.
+        // Probe each category independently, with a bounded quota and the same
+        // synthetic base score as the exact-title fast path above.
+        if q_norm.chars().count() >= MIN_QUERY_PREFIX_LEN
+            && !lixun_core::query_uses_operators(&query.text)
+        {
+            let categories = [
+                Category::App,
+                Category::File,
+                Category::Mail,
+                Category::Attachment,
+            ];
+            for &candidate_category in category
+                .as_ref()
+                .map(std::slice::from_ref)
+                .unwrap_or(&categories)
+            {
+                let prefix = tantivy::query::FuzzyTermQuery::new_prefix(
+                    Term::from_field_text(s.title_exact, q_norm),
+                    0,
+                    true,
+                );
+                let probe = tantivy::query::ConstScoreQuery::new(
+                    restrict_category(Box::new(prefix), Some(candidate_category)),
+                    max_top_score,
+                );
+                add_new(searcher.search(&probe, &TopDocs::with_limit(limit).order_by_score())?);
+            }
+        }
+
+        // Conjunction-by-default is precision-first: one term with no
+        // (fuzzy-reachable) match empties the whole result set. When the
+        // AND pass leaves the page underfilled, refill from a disjunctive
+        // pass. Refill hits are FALLBACK tier: they rank strictly below
+        // full matches and are flagged in the breakdown so the hybrid
+        // fusion layer keeps them out of RRF standing — a page of docs
+        // that merely contain "of" must not crowd out semantic hits.
+        let mut fallback_addrs: HashSet<DocAddress> = HashSet::new();
+        if merged.len() < limit
+            && q_tokens.len() >= 2
+            && !lixun_core::query_uses_operators(&query.text)
+        {
+            let or_query = build_search_query(
+                &query.text,
+                &self.index,
+                s,
+                &self.plugins,
+                &self.ranking,
+                false,
+            );
+            let or_query = restrict_category(or_query, category);
+            let extra = searcher.search(&or_query, &TopDocs::with_limit(limit).order_by_score())?;
+            for (score, addr) in extra {
+                if seen_addrs.insert(addr) {
+                    fallback_addrs.insert(addr);
+                    merged.push((score, addr));
+                }
+            }
+        }
+
+        Ok(SearchCandidates {
+            merged,
+            fallback_addrs,
+        })
     }
 
     /// Commit pending writes.

@@ -1214,6 +1214,98 @@ pub(crate) fn create_list_factory(ctx: RowFactoryCtx) -> gtk::SignalListItemFact
     factory
 }
 
+fn bind_row_labels(
+    row: &gtk::Box,
+    hit: &Hit,
+    query: &str,
+    date_sources: &std::collections::HashSet<String>,
+) {
+    let text_box = row
+        .first_child()
+        .and_then(|c| c.next_sibling())
+        .and_downcast::<gtk::Box>()
+        .expect("text_box");
+
+    let title = text_box
+        .first_child()
+        .and_downcast::<gtk::Label>()
+        .expect("title");
+    title.set_text(&hit.title);
+    // R2: embolden the query's matches so body-only hits stop
+    // looking unrelated. Folding mirrors the index tokenizer
+    // (NFKD + strip combining marks + lowercase).
+    apply_highlight(&title, &hit.title, query);
+
+    let subtitle = title
+        .next_sibling()
+        .and_downcast::<gtk::Label>()
+        .expect("subtitle");
+    // Display-only path contraction (the Hit itself is
+    // untouched): "~" for $HOME, trailing filename dropped
+    // (it duplicates the title), middle-ellipsis so the
+    // disambiguating deep directories survive, full path on
+    // the row tooltip. Non-path subtitles (mail authors,
+    // "Recent search") keep the plain end-ellipsized text.
+    let passage = lixun_core::fragment::PassageMatcher::new(query);
+    if let Some((text, fragment)) = hit.body.as_deref().and_then(|b| passage.as_ref()?.find(b)) {
+        let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        subtitle.set_text(&line);
+        apply_highlight(&subtitle, &line, &fragment.quote);
+        subtitle.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        row.set_tooltip_text(Some(&hit.subtitle));
+    } else if hit.subtitle.starts_with('/') {
+        let displayed = display_path_subtitle(&hit.subtitle, dirs::home_dir().as_deref());
+        subtitle.set_text(&displayed);
+        apply_highlight(&subtitle, &displayed, query);
+        subtitle.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+        row.set_tooltip_text(Some(&hit.subtitle));
+    } else {
+        subtitle.set_text(&hit.subtitle);
+        apply_highlight(&subtitle, &hit.subtitle, query);
+        subtitle.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        row.set_tooltip_text(None);
+    }
+
+    let kind = text_box
+        .next_sibling()
+        .and_downcast::<gtk::Label>()
+        .expect("kind");
+    let kind_text = hit
+        .kind_label
+        .clone()
+        .unwrap_or_else(|| hit.category.display_name().to_string());
+    // R9: the hero row carries a "Top Hit" caption in the
+    // existing kind-label slot (no box-model change — BUG-6);
+    // the displaced kind text moves to the tooltip.
+    if is_top_hit_doc(&hit.id.0) {
+        kind.set_text("Top Hit");
+        kind.set_tooltip_text(Some(&kind_text));
+        kind.add_css_class("lixun-top-hit-caption");
+    } else {
+        kind.remove_css_class("lixun-top-hit-caption");
+        match relative_caption_timestamp(hit, date_sources) {
+            Some(ts) => {
+                let now = chrono::Utc::now().timestamp();
+                kind.set_text(&relative_age(ts, now));
+                kind.set_tooltip_text(Some(&kind_text));
+            }
+            _ => {
+                kind.set_text(&kind_text);
+                kind.set_tooltip_text(None);
+            }
+        }
+    }
+
+    // A1: expose the whole row to assistive tech. Selection
+    // moves while focus stays on the entry, so the label is
+    // the only thing Orca can read per row.
+    let mut accessible_label = format!("{}, {}, {}", hit.title, hit.subtitle, kind_text);
+    if is_top_hit_doc(&hit.id.0) {
+        accessible_label.push_str(", Top Hit");
+    }
+    row.update_property(&[gtk::accessible::Property::Label(&accessible_label)]);
+}
+
 /// Called from `connect_notify_local("item", ...)` on each list
 /// item: fires when the item is bound (item becomes Some) and
 /// unbound (item becomes None). Updates the row's labels, icon
@@ -1260,163 +1352,79 @@ fn on_item_notify(
 
     let doc_id = str_obj.string().to_string();
     with_cached_hits(|hits| {
-        if let Some(hit) = hits.iter().find(|h| h.id.0 == doc_id) {
-            let text_box = row
-                .first_child()
-                .and_then(|c| c.next_sibling())
-                .and_downcast::<gtk::Box>()
-                .expect("text_box");
-            let query = entry.text().to_string();
-            let title = text_box
-                .first_child()
-                .and_downcast::<gtk::Label>()
-                .expect("title");
-            title.set_text(&hit.title);
-            // R2: embolden the query's matches so body-only hits stop
-            // looking unrelated. Folding mirrors the index tokenizer
-            // (NFKD + strip combining marks + lowercase).
-            apply_highlight(&title, &hit.title, &query);
+        let Some(hit) = hits.iter().find(|h| h.id.0 == doc_id) else {
+            return;
+        };
+        bind_row_labels(&row, hit, &entry.text(), date_sources);
 
-            let subtitle = title
-                .next_sibling()
-                .and_downcast::<gtk::Label>()
-                .expect("subtitle");
-            // Display-only path contraction (the Hit itself is
-            // untouched): "~" for $HOME, trailing filename dropped
-            // (it duplicates the title), middle-ellipsis so the
-            // disambiguating deep directories survive, full path on
-            // the row tooltip. Non-path subtitles (mail authors,
-            // "Recent search") keep the plain end-ellipsized text.
-            let passage = lixun_core::fragment::PassageMatcher::new(&query);
-            if let Some((text, fragment)) =
-                hit.body.as_deref().and_then(|b| passage.as_ref()?.find(b))
-            {
-                let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
-                subtitle.set_text(&line);
-                apply_highlight(&subtitle, &line, &fragment.quote);
-                subtitle.set_ellipsize(gtk::pango::EllipsizeMode::End);
-                row.set_tooltip_text(Some(&hit.subtitle));
-            } else if hit.subtitle.starts_with('/') {
-                let displayed = display_path_subtitle(&hit.subtitle, dirs::home_dir().as_deref());
-                subtitle.set_text(&displayed);
-                apply_highlight(&subtitle, &displayed, &query);
-                subtitle.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
-                row.set_tooltip_text(Some(&hit.subtitle));
-            } else {
-                subtitle.set_text(&hit.subtitle);
-                apply_highlight(&subtitle, &hit.subtitle, &query);
-                subtitle.set_ellipsize(gtk::pango::EllipsizeMode::End);
-                row.set_tooltip_text(None);
+        // Cache-aware menu swap: only rebuild the per-slot shell
+        // when this row's menu_key differs from the new hit's
+        // source_instance. Combined with the per-source
+        // `MENU_CACHE`, this bounds shell rebuilds to
+        // O(unique source_instances) per slot instead of
+        // O(binds) — `set_menu_model` itself is never called
+        // after setup, which preserves the PopoverMenu
+        // retention-leak fix measured by heaptrack on the old
+        // per-bind code path.
+        let current_key = state.borrow().menu_key.clone();
+        let new_key = Some(hit.source_instance.clone());
+        let openwith_declared = menu_openwith_label(&hit.row_menu);
+        if current_key != new_key {
+            shell_menu.remove_all();
+            let cached = menu_for_key(&hit.source_instance, &hit.row_menu, kb);
+            shell_menu.append_section(None, &cached);
+            if let Some(label) = openwith_declared.as_deref() {
+                // Per-HIT content lives in the per-slot submenu,
+                // never in the shared cached model (C1).
+                shell_menu.append_submenu(Some(label), openwith_menu);
             }
-
-            let kind = text_box
-                .next_sibling()
-                .and_downcast::<gtk::Label>()
-                .expect("kind");
-            let kind_text = hit
-                .kind_label
-                .clone()
-                .unwrap_or_else(|| hit.category.display_name().to_string());
-            // R9: the hero row carries a "Top Hit" caption in the
-            // existing kind-label slot (no box-model change — BUG-6);
-            // the displaced kind text moves to the tooltip.
-            if is_top_hit_doc(&doc_id) {
-                kind.set_text("Top Hit");
-                kind.set_tooltip_text(Some(&kind_text));
-                kind.add_css_class("lixun-top-hit-caption");
-            } else {
-                kind.remove_css_class("lixun-top-hit-caption");
-                match relative_caption_timestamp(hit, date_sources) {
-                    Some(ts) => {
-                        let now = chrono::Utc::now().timestamp();
-                        kind.set_text(&relative_age(ts, now));
-                        kind.set_tooltip_text(Some(&kind_text));
-                    }
-                    _ => {
-                        kind.set_text(&kind_text);
-                        kind.set_tooltip_text(None);
-                    }
-                }
-            }
-
-            // A1: expose the whole row to assistive tech. Selection
-            // moves while focus stays on the entry, so the label is
-            // the only thing Orca can read per row.
-            let mut accessible_label = format!("{}, {}, {}", hit.title, hit.subtitle, kind_text);
-            if is_top_hit_doc(&doc_id) {
-                accessible_label.push_str(", Top Hit");
-            }
-            row.update_property(&[gtk::accessible::Property::Label(&accessible_label)]);
-
-            // Cache-aware menu swap: only rebuild the per-slot shell
-            // when this row's menu_key differs from the new hit's
-            // source_instance. Combined with the per-source
-            // `MENU_CACHE`, this bounds shell rebuilds to
-            // O(unique source_instances) per slot instead of
-            // O(binds) — `set_menu_model` itself is never called
-            // after setup, which preserves the PopoverMenu
-            // retention-leak fix measured by heaptrack on the old
-            // per-bind code path.
-            let current_key = state.borrow().menu_key.clone();
-            let new_key = Some(hit.source_instance.clone());
-            let openwith_declared = menu_openwith_label(&hit.row_menu);
-            if current_key != new_key {
-                shell_menu.remove_all();
-                let cached = menu_for_key(&hit.source_instance, &hit.row_menu, kb);
-                shell_menu.append_section(None, &cached);
-                if let Some(label) = openwith_declared.as_deref() {
-                    // Per-HIT content lives in the per-slot submenu,
-                    // never in the shared cached model (C1).
-                    shell_menu.append_submenu(Some(label), openwith_menu);
-                }
-                state.borrow_mut().openwith_mime = None;
-            }
-
-            // C1: (re)populate the per-slot Open With submenu when
-            // the hit's MIME key changed since the last bind of this
-            // slot. Homogeneous lists (all one type) repopulate once.
-            if openwith_declared.is_some() {
-                let mime = openwith_mime_for_hit(hit);
-                let prev = state.borrow().openwith_mime.clone();
-                if mime != prev {
-                    match mime.as_deref() {
-                        Some(m) => populate_openwith_menu(openwith_menu, m),
-                        None => openwith_menu.remove_all(),
-                    }
-                    state.borrow_mut().openwith_mime = mime;
-                }
-            }
-
-            // K11 registry: this row now answers for the bound doc.
-            ROW_WIDGETS.with(|m| {
-                let mut map = m.borrow_mut();
-                if let Some(old_id) = state.borrow().doc_id.as_deref()
-                    && old_id != doc_id
-                {
-                    map.remove(old_id);
-                }
-                map.insert(doc_id.clone(), row.downgrade());
-            });
-
-            // Conditional-secondary items live in a shared menu
-            // model cached per source_instance; visibility of
-            // "Open parent mail" (and any future
-            // `RequiresSecondaryAction` item) is expressed via
-            // GAction enabled state, not by rebuilding the menu.
-            if menu_has_conditional_secondary(&hit.row_menu) {
-                secondary.set_enabled(hit.secondary_action.is_some());
-            } else {
-                // Source does not use conditional secondary; keep
-                // the action enabled so sources that expose an
-                // unconditional "Secondary" verb (e.g. fs reveal)
-                // still work.
-                secondary.set_enabled(true);
-            }
-
-            let mut s = state.borrow_mut();
-            s.doc_id = Some(doc_id);
-            s.menu_key = new_key;
+            state.borrow_mut().openwith_mime = None;
         }
+
+        // C1: (re)populate the per-slot Open With submenu when
+        // the hit's MIME key changed since the last bind of this
+        // slot. Homogeneous lists (all one type) repopulate once.
+        if openwith_declared.is_some() {
+            let mime = openwith_mime_for_hit(hit);
+            let prev = state.borrow().openwith_mime.clone();
+            if mime != prev {
+                match mime.as_deref() {
+                    Some(m) => populate_openwith_menu(openwith_menu, m),
+                    None => openwith_menu.remove_all(),
+                }
+                state.borrow_mut().openwith_mime = mime;
+            }
+        }
+
+        // K11 registry: this row now answers for the bound doc.
+        ROW_WIDGETS.with(|m| {
+            let mut map = m.borrow_mut();
+            if let Some(old_id) = state.borrow().doc_id.as_deref()
+                && old_id != doc_id
+            {
+                map.remove(old_id);
+            }
+            map.insert(doc_id.clone(), row.downgrade());
+        });
+
+        // Conditional-secondary items live in a shared menu
+        // model cached per source_instance; visibility of
+        // "Open parent mail" (and any future
+        // `RequiresSecondaryAction` item) is expressed via
+        // GAction enabled state, not by rebuilding the menu.
+        if menu_has_conditional_secondary(&hit.row_menu) {
+            secondary.set_enabled(hit.secondary_action.is_some());
+        } else {
+            // Source does not use conditional secondary; keep
+            // the action enabled so sources that expose an
+            // unconditional "Secondary" verb (e.g. fs reveal)
+            // still work.
+            secondary.set_enabled(true);
+        }
+
+        let mut s = state.borrow_mut();
+        s.doc_id = Some(doc_id);
+        s.menu_key = new_key;
     });
 }
 

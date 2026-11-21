@@ -394,18 +394,6 @@ impl HybridSearchHandle {
         for i in 1..ladder.len() {
             ladder[i] = ladder[i].min(ladder[i - 1].next_down());
         }
-        let score_for_rank = |pos: usize, rrf_score: f32| -> f32 {
-            if let Some(s) = ladder.get(pos) {
-                *s
-            } else if let Some(last) = ladder.last() {
-                // Past the lexical list: decay below the weakest BM25 score so
-                // appended ANN-only hits keep their relative RRF order.
-                last * 0.95_f32.powi((pos + 1 - ladder.len()) as i32)
-            } else {
-                // Pure-ANN result set: only relative order matters.
-                rrf_score
-            }
-        };
 
         let mut out: Vec<(lixun_core::Hit, lixun_core::ScoreBreakdown)> =
             Vec::with_capacity(target_limit);
@@ -470,35 +458,13 @@ impl HybridSearchHandle {
             // A lexical refill candidate can independently qualify through ANN.
             // Only the filler appended below remains in the partial-match tier.
             bd.lexical_fallback = false;
-            let assigned = score_for_rank(pos, rrf_score);
+            let assigned = score_for_rank(&ladder, pos, rrf_score);
             hit.score = assigned;
             bd.final_score = assigned;
             out.push((hit, bd));
         }
 
-        // Pad the page with fallback-tier lexical hits only when fusion
-        // (strong lexical + ANN) could not fill it. They keep their own
-        // ladder positions after every fused hit, so they always render
-        // below the relevant results.
-        if out.len() < target_limit {
-            let in_out: std::collections::HashSet<&str> =
-                out.iter().map(|(h, _)| h.id.0.as_str()).collect();
-            let filler: Vec<(lixun_core::Hit, lixun_core::ScoreBreakdown)> = lex_pairs
-                .iter()
-                .filter(|(h, bd)| bd.lexical_fallback && !in_out.contains(h.id.0.as_str()))
-                .take(target_limit - out.len())
-                .cloned()
-                .collect();
-            // Decay below the weakest fused hit so filler stays at the
-            // bottom through the daemon's re-sort.
-            let floor = out.last().map(|(h, _)| h.score).unwrap_or(1.0);
-            for (i, (mut hit, mut bd)) in filler.into_iter().enumerate() {
-                let assigned = floor * 0.95_f32.powi(i as i32 + 1);
-                hit.score = assigned;
-                bd.final_score = assigned;
-                out.push((hit, bd));
-            }
-        }
+        append_lexical_fallbacks(&mut out, &lex_pairs, target_limit);
 
         if tracing::enabled!(target: "lixun_fusion::ranks", tracing::Level::TRACE) {
             let ranks: Vec<_> = out
@@ -567,6 +533,49 @@ fn prioritize_fused(fused: &mut [(String, f32)], priorities: &std::collections::
     fused.sort_by_key(|(id, _)| {
         std::cmp::Reverse(priorities.get(id.as_str()).copied().unwrap_or(0))
     });
+}
+
+fn score_for_rank(ladder: &[f32], pos: usize, rrf_score: f32) -> f32 {
+    if let Some(s) = ladder.get(pos) {
+        *s
+    } else if let Some(last) = ladder.last() {
+        // Past the lexical list: decay below the weakest BM25 score so
+        // appended ANN-only hits keep their relative RRF order.
+        last * 0.95_f32.powi((pos + 1 - ladder.len()) as i32)
+    } else {
+        // Pure-ANN result set: only relative order matters.
+        rrf_score
+    }
+}
+
+fn append_lexical_fallbacks(
+    out: &mut Vec<(lixun_core::Hit, lixun_core::ScoreBreakdown)>,
+    lex_pairs: &[(lixun_core::Hit, lixun_core::ScoreBreakdown)],
+    target_limit: usize,
+) {
+    // Pad the page with fallback-tier lexical hits only when fusion
+    // (strong lexical + ANN) could not fill it. They keep their own
+    // ladder positions after every fused hit, so they always render
+    // below the relevant results.
+    if out.len() < target_limit {
+        let in_out: std::collections::HashSet<&str> =
+            out.iter().map(|(h, _)| h.id.0.as_str()).collect();
+        let filler: Vec<(lixun_core::Hit, lixun_core::ScoreBreakdown)> = lex_pairs
+            .iter()
+            .filter(|(h, bd)| bd.lexical_fallback && !in_out.contains(h.id.0.as_str()))
+            .take(target_limit - out.len())
+            .cloned()
+            .collect();
+        // Decay below the weakest fused hit so filler stays at the
+        // bottom through the daemon's re-sort.
+        let floor = out.last().map(|(h, _)| h.score).unwrap_or(1.0);
+        for (i, (mut hit, mut bd)) in filler.into_iter().enumerate() {
+            let assigned = floor * 0.95_f32.powi(i as i32 + 1);
+            hit.score = assigned;
+            bd.final_score = assigned;
+            out.push((hit, bd));
+        }
+    }
 }
 
 fn lead_separation(hits: &[lixun_mutation::AnnHit]) -> f32 {

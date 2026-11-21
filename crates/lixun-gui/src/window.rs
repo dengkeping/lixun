@@ -2523,6 +2523,32 @@ pub(crate) fn report_launcher_geometry(window: &gtk::ApplicationWindow) {
     crate::ipc::send_launcher_geometry(connector, x, top, w, h);
 }
 
+struct SearchResultsView {
+    session_epoch: Arc<AtomicU64>,
+    model: gtk::StringList,
+    filter: gtk::CustomFilter,
+    selection: gtk::SingleSelection,
+    list_view: gtk::ListView,
+    chips_container: gtk::Box,
+    scrolled: gtk::ScrolledWindow,
+    status: std::rc::Rc<StatusBar>,
+    last_query: std::rc::Rc<std::cell::RefCell<String>>,
+    user_selected_override: std::rc::Rc<std::cell::Cell<bool>>,
+    searching_indicator: std::rc::Rc<std::cell::Cell<bool>>,
+    loading_timer: std::rc::Rc<std::cell::RefCell<Option<glib::SourceId>>>,
+    results_hint_line: String,
+    semantic_ui: SemanticUiState,
+    current_category: CategoryFilter,
+    web_engine_url: String,
+    last_requested_limit: std::rc::Rc<std::cell::Cell<u32>>,
+    max_results: u32,
+    pending_hits: std::cell::RefCell<Vec<Hit>>,
+    last_epoch: std::cell::Cell<u64>,
+    initial_timer: std::cell::RefCell<Option<glib::SourceId>>,
+    index_status_cache: std::rc::Rc<std::cell::RefCell<Option<IndexStatusSnapshot>>>,
+    index_status_inflight: std::rc::Rc<std::cell::Cell<bool>>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn install_response_handler(
     event_rx: async_channel::Receiver<crate::ipc::IpcMessage>,
@@ -2545,362 +2571,331 @@ fn install_response_handler(
     last_requested_limit: std::rc::Rc<std::cell::Cell<u32>>,
     max_results: u32,
 ) {
-    let pending_hits = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-    let last_epoch = std::rc::Rc::new(std::cell::Cell::new(0u64));
-    // F3: pending render timer for the Initial (BM25-only) chunk. In
-    // semantic mode the Final waits on embedding + ANN + fusion;
-    // deliberately buffering Initial made keystroke→results latency
-    // equal embedding time. If the Final hasn't landed ~100 ms after
-    // Initial, render the provisional hits (epoch-guarded); the
-    // Final re-renders with the fused ranking when it arrives. Fast
-    // lexical queries beat the timer and keep their single rebuild.
-    let initial_timer: std::rc::Rc<std::cell::RefCell<Option<glib::SourceId>>> =
-        std::rc::Rc::new(std::cell::RefCell::new(None));
-    // Zero-hit path: cached daemon Status sample plus a latch that
-    // stops fetch threads from stacking up while one round-trip is
-    // still in flight (see `present_zero_hit_status`).
-    let index_status_cache: std::rc::Rc<std::cell::RefCell<Option<IndexStatusSnapshot>>> =
-        std::rc::Rc::new(std::cell::RefCell::new(None));
-    let index_status_inflight = std::rc::Rc::new(std::cell::Cell::new(false));
-
+    let view = std::rc::Rc::new(SearchResultsView {
+        session_epoch,
+        model,
+        filter,
+        selection,
+        list_view,
+        chips_container,
+        scrolled,
+        status,
+        last_query,
+        user_selected_override,
+        searching_indicator,
+        loading_timer,
+        results_hint_line,
+        semantic_ui,
+        current_category,
+        web_engine_url,
+        last_requested_limit,
+        max_results,
+        pending_hits: Default::default(),
+        last_epoch: Default::default(),
+        initial_timer: Default::default(),
+        index_status_cache: Default::default(),
+        index_status_inflight: Default::default(),
+    });
     glib::spawn_future_local(async move {
         while let Ok(msg) = event_rx.recv().await {
-            match msg {
-                crate::ipc::IpcMessage::SearchChunk {
-                    epoch,
-                    phase,
-                    hits,
-                    top_hit,
-                    claimed,
-                    explanations,
-                } => {
-                    let current_session_epoch = session_epoch.load(Ordering::SeqCst);
-                    if epoch < current_session_epoch {
-                        tracing::debug!(
-                            "gui: dropping stale chunk epoch={} < session_epoch={}",
-                            epoch,
-                            current_session_epoch
-                        );
-                        continue;
-                    }
-
-                    if epoch > last_epoch.get() {
-                        tracing::debug!(
-                            "gui: new epoch {} > {}, clearing pending",
-                            epoch,
-                            last_epoch.get()
-                        );
-                        pending_hits.borrow_mut().clear();
-                        last_epoch.set(epoch);
-                    }
-
-                    match phase {
-                        lixun_ipc::Phase::Initial => {
-                            tracing::debug!(
-                                "gui: buffering Initial chunk epoch={} hits={}",
-                                epoch,
-                                hits.len()
-                            );
-                            *pending_hits.borrow_mut() = hits;
-                            searching_indicator.set(true);
-
-                            if let Some(id) = initial_timer.borrow_mut().take() {
-                                id.remove();
-                            }
-                            let pending = std::rc::Rc::clone(&pending_hits);
-                            let session_epoch_t = Arc::clone(&session_epoch);
-                            let model_t = model.clone();
-                            let filter_t = filter.clone();
-                            let selection_t = selection.clone();
-                            let list_view_t = list_view.clone();
-                            let chips_t = chips_container.clone();
-                            let scrolled_t = scrolled.clone();
-                            let override_t = std::rc::Rc::clone(&user_selected_override);
-                            let timer_slot = std::rc::Rc::clone(&initial_timer);
-                            let id = glib::timeout_add_local_once(
-                                Duration::from_millis(100),
-                                move || {
-                                    *timer_slot.borrow_mut() = None;
-                                    if session_epoch_t.load(Ordering::SeqCst) != epoch {
-                                        return;
-                                    }
-                                    let hits = pending.borrow().clone();
-                                    if hits.is_empty() {
-                                        return;
-                                    }
-                                    tracing::debug!(
-                                        "gui: provisional render of {} Initial hits epoch={}",
-                                        hits.len(),
-                                        epoch
-                                    );
-                                    let prior = override_t
-                                        .get()
-                                        .then(|| {
-                                            let idx = selection_t.selected();
-                                            selection_t.item(idx).and_then(|obj| {
-                                                obj.downcast::<gtk::StringObject>()
-                                                    .ok()
-                                                    .map(|s| s.string().to_string())
-                                            })
-                                        })
-                                        .flatten();
-                                    // No top-hit nomination on Initial —
-                                    // hero styling waits for the Final.
-                                    let plan = compute_render_plan(&hits, None);
-                                    update_results(&model_t, &selection_t, &plan.hits, None);
-                                    filter_t.changed(gtk::FilterChange::Different);
-                                    let new_idx = prior
-                                        .as_deref()
-                                        .and_then(|want| {
-                                            (0..selection_t.n_items()).find(|&i| {
-                                                selection_t
-                                                    .item(i)
-                                                    .and_then(|o| {
-                                                        o.downcast::<gtk::StringObject>().ok()
-                                                    })
-                                                    .map(|s| s.string() == want)
-                                                    .unwrap_or(false)
-                                            })
-                                        })
-                                        .unwrap_or(0);
-                                    if selection_t.n_items() > 0 {
-                                        selection_t.set_selected(new_idx);
-                                        list_view_t.scroll_to(
-                                            new_idx,
-                                            gtk::ListScrollFlags::NONE,
-                                            None,
-                                        );
-                                    }
-                                    chips_t.set_visible(true);
-                                    scrolled_t.set_visible(true);
-                                    scrolled_t.set_vexpand(false);
-                                },
-                            );
-                            *initial_timer.borrow_mut() = Some(id);
-                        }
-                        lixun_ipc::Phase::Final => {
-                            tracing::debug!(
-                                "gui: rendering Final chunk epoch={} hits={} claimed={}",
-                                epoch,
-                                hits.len(),
-                                claimed
-                            );
-                            // Final wins: never let the provisional
-                            // Initial render fire after it.
-                            if let Some(id) = initial_timer.borrow_mut().take() {
-                                id.remove();
-                            }
-                            if let Some(id) = loading_timer.borrow_mut().take() {
-                                id.remove();
-                            }
-                            // R9: associate each hit with its ranking
-                            // explanation for the Get Info popover.
-                            // Index-aligned only on a genuine Final;
-                            // the buffered-Initial fallback below has
-                            // no explanations, and the map is simply
-                            // replaced empty then.
-                            let explanation_map: std::collections::HashMap<String, String> =
-                                if explanations.len() == hits.len() {
-                                    hits.iter()
-                                        .map(|h| h.id.0.clone())
-                                        .zip(explanations)
-                                        .collect()
-                                } else {
-                                    std::collections::HashMap::new()
-                                };
-                            crate::factory::cache_explanations(explanation_map);
-                            let all_hits = if hits.is_empty() {
-                                let pending = pending_hits.borrow().clone();
-                                if !pending.is_empty() {
-                                    tracing::debug!(
-                                        "gui: Final empty, falling back to {} buffered Initial hits",
-                                        pending.len()
-                                    );
-                                }
-                                pending
-                            } else {
-                                hits
-                            };
-                            pending_hits.borrow_mut().clear();
-
-                            let preserve_doc_id = user_selected_override.get();
-                            let prior_selected = if preserve_doc_id {
-                                let idx = selection.selected();
-                                selection.item(idx).and_then(|obj| {
-                                    obj.downcast::<gtk::StringObject>()
-                                        .ok()
-                                        .map(|s| s.string().to_string())
-                                })
-                            } else {
-                                None
-                            };
-
-                            let mut plan = compute_render_plan(&all_hits, top_hit.as_ref());
-                            // R7: a page that came back full is very
-                            // likely truncated — offer a terminal
-                            // "Show more results" row. One ×4 step;
-                            // once expanded, the row is not offered
-                            // again.
-                            let requested = last_requested_limit.get();
-                            if !claimed
-                                && !plan.hits.is_empty()
-                                && plan.hits.len() as u32 >= requested
-                                && requested < max_results.saturating_mul(4).min(1000)
-                            {
-                                let q = last_query.borrow().clone();
-                                if !q.is_empty() {
-                                    let next = max_results.saturating_mul(4).min(1000);
-                                    plan.hits
-                                        .push(crate::factory::synthetic_more_results_hit(&q, next));
-                                }
-                            }
-                            let plan = plan;
-                            let top_hit_doc_id = plan
-                                .top_hit_index
-                                .and_then(|i| plan.hits.get(i))
-                                .map(|h| h.id.0.clone());
-
-                            update_results(&model, &selection, &plan.hits, top_hit_doc_id);
-                            searching_indicator.set(false);
-
-                            filter.changed(gtk::FilterChange::Different);
-                            if !plan.hits.is_empty() {
-                                let wanted_doc = prior_selected
-                                    .clone()
-                                    .or_else(|| plan.hits.first().map(|h| h.id.0.clone()));
-                                let new_idx = wanted_doc
-                                    .as_deref()
-                                    .and_then(|want| {
-                                        (0..selection.n_items()).find(|&i| {
-                                            selection
-                                                .item(i)
-                                                .and_then(|o| {
-                                                    o.downcast::<gtk::StringObject>().ok()
-                                                })
-                                                .map(|s| s.string() == want)
-                                                .unwrap_or(false)
-                                        })
-                                    })
-                                    .unwrap_or(0);
-                                if selection.n_items() > 0 {
-                                    selection.set_selected(new_idx);
-                                    list_view.scroll_to(new_idx, gtk::ListScrollFlags::NONE, None);
-                                }
-                            }
-
-                            let has_anything = !plan.hits.is_empty();
-                            // Calculator results present as a normal hit row
-                            // (the calculator source emits the value as the
-                            // hit title); the old status-bar calculation
-                            // path was dead code and has been removed.
-                            if !has_anything {
-                                let q = last_query.borrow().clone();
-                                if !q.is_empty() {
-                                    chips_container.set_visible(true);
-                                    let category = current_category.get();
-                                    let layout = (!claimed)
-                                        .then(|| crate::layout_retry::alternative(&q))
-                                        .flatten();
-                                    if !claimed && (category.is_none() || layout.is_some()) {
-                                        let web_hit = crate::factory::synthetic_web_search_hit(
-                                            &q,
-                                            &web_engine_url,
-                                        );
-                                        let mut alternatives = Vec::new();
-                                        if let Some(text) = layout {
-                                            let mut retry = web_hit.clone();
-                                            retry.id =
-                                                lixun_core::DocId(format!("gui-layout:{text}"));
-                                            retry.title = text.clone();
-                                            retry.subtitle =
-                                                "Search using the other keyboard layout".into();
-                                            retry.icon_name =
-                                                Some("input-keyboard-symbolic".into());
-                                            retry.kind_label = None;
-                                            retry.category = category.unwrap_or(retry.category);
-                                            retry.action =
-                                                lixun_core::Action::ReplaceQuery { q: text };
-                                            alternatives.push(retry);
-                                        }
-                                        if category.is_none() {
-                                            alternatives.push(web_hit);
-                                        }
-                                        update_results(&model, &selection, &alternatives, None);
-                                        filter.changed(gtk::FilterChange::Different);
-                                        if selection.n_items() > 0 {
-                                            selection.set_selected(0);
-                                        }
-                                        scrolled.set_visible(true);
-                                        scrolled.set_vexpand(false);
-                                    } else {
-                                        scrolled.set_visible(false);
-                                        scrolled.set_vexpand(false);
-                                        selection.set_selected(gtk::INVALID_LIST_POSITION);
-                                    }
-                                    present_zero_hit_status(
-                                        &q,
-                                        claimed,
-                                        epoch,
-                                        &status,
-                                        &session_epoch,
-                                        &index_status_cache,
-                                        &index_status_inflight,
-                                        &semantic_ui,
-                                        category.map(category_chip_label),
-                                    );
-                                } else {
-                                    chips_container.set_visible(false);
-                                    scrolled.set_visible(false);
-                                    scrolled.set_vexpand(false);
-                                    status.hide();
-                                }
-                            } else {
-                                chips_container.set_visible(true);
-                                let list_has_rows = !plan.hits.is_empty();
-                                scrolled.set_visible(list_has_rows);
-                                scrolled.set_vexpand(false);
-                                // O3: replace the collapsed footer with
-                                // the persistent dimmed key hints while
-                                // results are on screen.
-                                status.show_hints(&results_hint_line);
-                            }
-                        }
-                    }
-                }
-                crate::ipc::IpcMessage::TransportFailed { epoch } => {
-                    if epoch < session_epoch.load(Ordering::SeqCst) {
-                        tracing::debug!("gui: dropping stale TransportFailed epoch={}", epoch);
-                        continue;
-                    }
-                    if let Some(id) = loading_timer.borrow_mut().take() {
-                        id.remove();
-                    }
-                    if let Some(id) = initial_timer.borrow_mut().take() {
-                        id.remove();
-                    }
-                    pending_hits.borrow_mut().clear();
-                    searching_indicator.set(false);
-                    // Keep the query and any rendered results as they
-                    // are: an actionable error plus the user's context
-                    // beats a scrubbed launcher claiming "No results".
-                    status.show_daemon_unresponsive();
-                }
-                crate::ipc::IpcMessage::SearchTimeout { epoch } => {
-                    if epoch < session_epoch.load(Ordering::SeqCst) {
-                        tracing::debug!("gui: dropping stale SearchTimeout epoch={}", epoch);
-                        continue;
-                    }
-                    // The IPC reader keeps its connection open, so a
-                    // slow Final can still land and replace this. Keep
-                    // the spinner up; just explain the wait.
-                    if let Some(id) = loading_timer.borrow_mut().take() {
-                        id.remove();
-                    }
-                    status.show_still_searching();
-                }
-            }
+            view.handle(msg);
         }
     });
+}
+
+impl SearchResultsView {
+    fn handle(self: &std::rc::Rc<Self>, msg: crate::ipc::IpcMessage) {
+        match msg {
+            crate::ipc::IpcMessage::SearchChunk {
+                epoch,
+                phase,
+                hits,
+                top_hit,
+                claimed,
+                explanations,
+            } => {
+                let current_session_epoch = self.session_epoch.load(Ordering::SeqCst);
+                if epoch < current_session_epoch {
+                    tracing::debug!(
+                        "gui: dropping stale chunk epoch={} < session_epoch={}",
+                        epoch,
+                        current_session_epoch
+                    );
+                    return;
+                }
+
+                if epoch > self.last_epoch.get() {
+                    tracing::debug!(
+                        "gui: new epoch {} > {}, clearing pending",
+                        epoch,
+                        self.last_epoch.get()
+                    );
+                    self.pending_hits.borrow_mut().clear();
+                    self.last_epoch.set(epoch);
+                }
+
+                match phase {
+                    lixun_ipc::Phase::Initial => {
+                        self.buffer_initial(epoch, hits);
+                    }
+                    lixun_ipc::Phase::Final => {
+                        self.render_final(epoch, hits, top_hit, claimed, explanations);
+                    }
+                }
+            }
+            crate::ipc::IpcMessage::TransportFailed { epoch } => {
+                if epoch < self.session_epoch.load(Ordering::SeqCst) {
+                    tracing::debug!("gui: dropping stale TransportFailed epoch={}", epoch);
+                    return;
+                }
+                if let Some(id) = self.loading_timer.borrow_mut().take() {
+                    id.remove();
+                }
+                if let Some(id) = self.initial_timer.borrow_mut().take() {
+                    id.remove();
+                }
+                self.pending_hits.borrow_mut().clear();
+                self.searching_indicator.set(false);
+                // Keep the query and any rendered results as they
+                // are: an actionable error plus the user's context
+                // beats a scrubbed launcher claiming "No results".
+                self.status.show_daemon_unresponsive();
+            }
+            crate::ipc::IpcMessage::SearchTimeout { epoch } => {
+                if epoch < self.session_epoch.load(Ordering::SeqCst) {
+                    tracing::debug!("gui: dropping stale SearchTimeout epoch={}", epoch);
+                    return;
+                }
+                // The IPC reader keeps its connection open, so a
+                // slow Final can still land and replace this. Keep
+                // the spinner up; just explain the wait.
+                if let Some(id) = self.loading_timer.borrow_mut().take() {
+                    id.remove();
+                }
+                self.status.show_still_searching();
+            }
+        }
+    }
+
+    fn buffer_initial(self: &std::rc::Rc<Self>, epoch: u64, hits: Vec<Hit>) {
+        tracing::debug!(
+            "gui: buffering Initial chunk epoch={} hits={}",
+            epoch,
+            hits.len()
+        );
+        *self.pending_hits.borrow_mut() = hits;
+        self.searching_indicator.set(true);
+
+        if let Some(id) = self.initial_timer.borrow_mut().take() {
+            id.remove();
+        }
+        let view = std::rc::Rc::clone(self);
+        let id = glib::timeout_add_local_once(Duration::from_millis(100), move || {
+            view.render_initial(epoch)
+        });
+        *self.initial_timer.borrow_mut() = Some(id);
+    }
+
+    fn render_initial(&self, epoch: u64) {
+        self.initial_timer.borrow_mut().take();
+        if self.session_epoch.load(Ordering::SeqCst) != epoch {
+            return;
+        }
+        let hits = self.pending_hits.borrow();
+        if hits.is_empty() {
+            return;
+        }
+        let prior = self.selected_doc_id();
+        let plan = compute_render_plan(&hits, None);
+        update_results(&self.model, &self.selection, &plan.hits, None);
+        self.filter.changed(gtk::FilterChange::Different);
+        self.select_doc(prior.as_deref());
+        self.chips_container.set_visible(true);
+        self.scrolled.set_visible(true);
+        self.scrolled.set_vexpand(false);
+    }
+
+    fn render_final(
+        &self,
+        epoch: u64,
+        hits: Vec<Hit>,
+        top_hit: Option<DocId>,
+        claimed: bool,
+        explanations: Vec<String>,
+    ) {
+        tracing::debug!(
+            "gui: rendering Final chunk epoch={} hits={} claimed={}",
+            epoch,
+            hits.len(),
+            claimed
+        );
+        // Final wins: never let the provisional
+        // Initial render fire after it.
+        if let Some(id) = self.initial_timer.borrow_mut().take() {
+            id.remove();
+        }
+        if let Some(id) = self.loading_timer.borrow_mut().take() {
+            id.remove();
+        }
+        // R9: associate each hit with its ranking
+        // explanation for the Get Info popover.
+        // Index-aligned only on a genuine Final;
+        // the buffered-Initial fallback below has
+        // no explanations, and the map is simply
+        // replaced empty then.
+        let explanation_map: std::collections::HashMap<String, String> =
+            if explanations.len() == hits.len() {
+                hits.iter()
+                    .map(|h| h.id.0.clone())
+                    .zip(explanations)
+                    .collect()
+            } else {
+                std::collections::HashMap::new()
+            };
+        crate::factory::cache_explanations(explanation_map);
+        let all_hits = if hits.is_empty() {
+            let pending = self.pending_hits.borrow().clone();
+            if !pending.is_empty() {
+                tracing::debug!(
+                    "gui: Final empty, falling back to {} buffered Initial hits",
+                    pending.len()
+                );
+            }
+            pending
+        } else {
+            hits
+        };
+        self.pending_hits.borrow_mut().clear();
+
+        let prior_selected = self.selected_doc_id();
+        let mut plan = compute_render_plan(&all_hits, top_hit.as_ref());
+        // R7: a page that came back full is very
+        // likely truncated — offer a terminal
+        // "Show more results" row. One ×4 step;
+        // once expanded, the row is not offered
+        // again.
+        let requested = self.last_requested_limit.get();
+        if !claimed
+            && !plan.hits.is_empty()
+            && plan.hits.len() as u32 >= requested
+            && requested < self.max_results.saturating_mul(4).min(1000)
+        {
+            let q = self.last_query.borrow().clone();
+            if !q.is_empty() {
+                let next = self.max_results.saturating_mul(4).min(1000);
+                plan.hits
+                    .push(crate::factory::synthetic_more_results_hit(&q, next));
+            }
+        }
+        let top_hit_doc_id = plan
+            .top_hit_index
+            .and_then(|i| plan.hits.get(i))
+            .map(|h| h.id.0.clone());
+
+        update_results(&self.model, &self.selection, &plan.hits, top_hit_doc_id);
+        self.searching_indicator.set(false);
+
+        self.filter.changed(gtk::FilterChange::Different);
+
+        if plan.hits.is_empty() {
+            self.show_empty(epoch, claimed);
+            return;
+        }
+        self.select_doc(
+            prior_selected
+                .as_deref()
+                .or_else(|| plan.hits.first().map(|h| h.id.0.as_str())),
+        );
+        self.chips_container.set_visible(true);
+        self.scrolled.set_visible(true);
+        self.scrolled.set_vexpand(false);
+        self.status.show_hints(&self.results_hint_line);
+    }
+
+    fn show_empty(&self, epoch: u64, claimed: bool) {
+        let q = self.last_query.borrow().clone();
+        if q.is_empty() {
+            self.chips_container.set_visible(false);
+            self.scrolled.set_visible(false);
+            self.scrolled.set_vexpand(false);
+            self.status.hide();
+            return;
+        }
+        self.chips_container.set_visible(true);
+        let category = self.current_category.get();
+        let layout = (!claimed)
+            .then(|| crate::layout_retry::alternative(&q))
+            .flatten();
+        if !claimed && (category.is_none() || layout.is_some()) {
+            let web_hit = crate::factory::synthetic_web_search_hit(&q, &self.web_engine_url);
+            let mut alternatives = Vec::new();
+            if let Some(text) = layout {
+                let mut retry = web_hit.clone();
+                retry.id = lixun_core::DocId(format!("gui-layout:{text}"));
+                retry.title = text.clone();
+                retry.subtitle = "Search using the other keyboard layout".into();
+                retry.icon_name = Some("input-keyboard-symbolic".into());
+                retry.kind_label = None;
+                retry.category = category.unwrap_or(retry.category);
+                retry.action = lixun_core::Action::ReplaceQuery { q: text };
+                alternatives.push(retry);
+            }
+            if category.is_none() {
+                alternatives.push(web_hit);
+            }
+            update_results(&self.model, &self.selection, &alternatives, None);
+            self.filter.changed(gtk::FilterChange::Different);
+            if self.selection.n_items() > 0 {
+                self.selection.set_selected(0);
+            }
+            self.scrolled.set_visible(true);
+            self.scrolled.set_vexpand(false);
+        } else {
+            self.scrolled.set_visible(false);
+            self.scrolled.set_vexpand(false);
+            self.selection.set_selected(gtk::INVALID_LIST_POSITION);
+        }
+        present_zero_hit_status(
+            &q,
+            claimed,
+            epoch,
+            &self.status,
+            &self.session_epoch,
+            &self.index_status_cache,
+            &self.index_status_inflight,
+            &self.semantic_ui,
+            category.map(category_chip_label),
+        );
+    }
+
+    fn select_doc(&self, wanted: Option<&str>) {
+        if self.selection.n_items() == 0 {
+            return;
+        }
+        let selected = wanted
+            .and_then(|id| {
+                (0..self.selection.n_items()).find(|&i| {
+                    self.selection
+                        .item(i)
+                        .and_downcast::<gtk::StringObject>()
+                        .is_some_and(|s| s.string() == id)
+                })
+            })
+            .unwrap_or(0);
+        self.selection.set_selected(selected);
+        self.list_view
+            .scroll_to(selected, gtk::ListScrollFlags::NONE, None);
+    }
+
+    fn selected_doc_id(&self) -> Option<String> {
+        if !self.user_selected_override.get() {
+            return None;
+        }
+        self.selection
+            .selected_item()
+            .and_downcast::<gtk::StringObject>()
+            .map(|s| s.string().to_string())
+    }
 }
 
 /// Cached daemon Status sample for the zero-hit path: when it was

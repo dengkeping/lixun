@@ -656,7 +656,7 @@ pub fn ocr_eligible(path: &Path, caps: &ExtractorCapabilities, min_side: u32) ->
     }
     let ext = path
         .extension()
-        .and_then(|s| s.to_str())
+        .and_then(std::ffi::OsStr::to_str)
         .unwrap_or("")
         .to_ascii_lowercase();
     if !lixun_extract::ocr::is_ocr_candidate(&ext) {

@@ -220,8 +220,6 @@ where
 
     let doc_id = row.doc_id.clone();
     let path = PathBuf::from(&row.path);
-    let expected_mtime = row.mtime;
-    let expected_size = row.size;
 
     let caps_for_ocr = caps.clone();
     let langs = cfg.langs.clone();
@@ -245,52 +243,7 @@ where
                 tracing::warn!("ocr completed but idle gate flipped; keeping row {doc_id}");
                 return TickOutcome::NoIdle;
             }
-            // AM-6: detect watcher-vs-worker races by re-stating the
-            // file. If mtime/size changed, the bytes we just OCR'd
-            // are stale — drop the result and let the watcher's next
-            // reindex re-enqueue with fresh metadata.
-            match tokio::fs::metadata(&path).await {
-                Ok(md) => {
-                    let cur_mtime = filetime_secs(&md);
-                    let cur_size = md.len();
-                    if cur_mtime == expected_mtime && cur_size == expected_size {
-                        // The enqueue-time mtime travels with the
-                        // mutation so the writer can also reject the
-                        // write-back if the *indexed* doc has moved on
-                        // (a newer upsert committed or staged while
-                        // this job was in flight).
-                        if let Err(e) = sink.upsert_body(&doc_id, &text, Some(expected_mtime)).await
-                        {
-                            tracing::warn!("ocr: upsert_body failed for {doc_id}: {e:#}");
-                            return TickOutcome::Failed {
-                                doc_id,
-                                err: format!("upsert_body: {e}"),
-                            };
-                        }
-                        if let Err(e) = queue.remove(&doc_id) {
-                            tracing::warn!("ocr: queue.remove failed for {doc_id}: {e:#}");
-                        }
-                        tracing::info!("ocr ok: {} ({} chars)", path.display(), text.len());
-                        TickOutcome::Drained { doc_id }
-                    } else {
-                        tracing::warn!(
-                            "ocr stale: {} mtime/size changed mid-OCR; dropping result",
-                            path.display()
-                        );
-                        if let Err(e) = queue.remove(&doc_id) {
-                            tracing::warn!("ocr: queue.remove failed for {doc_id}: {e:#}");
-                        }
-                        TickOutcome::StaleSkipped { doc_id }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("ocr: file gone mid-OCR {}: {e}", path.display());
-                    if let Err(e2) = queue.remove(&doc_id) {
-                        tracing::warn!("ocr: queue.remove failed for {doc_id}: {e2:#}");
-                    }
-                    TickOutcome::StaleSkipped { doc_id }
-                }
-            }
+            store_ocr_text(queue, sink, &row, &path, &text).await
         }
         Ok(None) => {
             let msg = "ocr returned empty (e.g. below min_side_px)";
@@ -310,6 +263,63 @@ where
                 doc_id,
                 err: err_str,
             }
+        }
+    }
+}
+
+async fn store_ocr_text<S: UpsertBodySink + ?Sized>(
+    queue: &OcrQueue,
+    sink: &S,
+    row: &lixun_extract::ocr_queue::OcrQueueRow,
+    path: &Path,
+    text: &str,
+) -> TickOutcome {
+    let doc_id = row.doc_id.clone();
+    let expected_mtime = row.mtime;
+    let expected_size = row.size;
+    // AM-6: detect watcher-vs-worker races by re-stating the
+    // file. If mtime/size changed, the bytes we just OCR'd
+    // are stale — drop the result and let the watcher's next
+    // reindex re-enqueue with fresh metadata.
+    match tokio::fs::metadata(path).await {
+        Ok(md) => {
+            let cur_mtime = filetime_secs(&md);
+            let cur_size = md.len();
+            if cur_mtime == expected_mtime && cur_size == expected_size {
+                // The enqueue-time mtime travels with the
+                // mutation so the writer can also reject the
+                // write-back if the *indexed* doc has moved on
+                // (a newer upsert committed or staged while
+                // this job was in flight).
+                if let Err(e) = sink.upsert_body(&doc_id, text, Some(expected_mtime)).await {
+                    tracing::warn!("ocr: upsert_body failed for {doc_id}: {e:#}");
+                    return TickOutcome::Failed {
+                        doc_id,
+                        err: format!("upsert_body: {e}"),
+                    };
+                }
+                if let Err(e) = queue.remove(&doc_id) {
+                    tracing::warn!("ocr: queue.remove failed for {doc_id}: {e:#}");
+                }
+                tracing::info!("ocr ok: {} ({} chars)", path.display(), text.len());
+                TickOutcome::Drained { doc_id }
+            } else {
+                tracing::warn!(
+                    "ocr stale: {} mtime/size changed mid-OCR; dropping result",
+                    path.display()
+                );
+                if let Err(e) = queue.remove(&doc_id) {
+                    tracing::warn!("ocr: queue.remove failed for {doc_id}: {e:#}");
+                }
+                TickOutcome::StaleSkipped { doc_id }
+            }
+        }
+        Err(e) => {
+            tracing::warn!("ocr: file gone mid-OCR {}: {e}", path.display());
+            if let Err(e2) = queue.remove(&doc_id) {
+                tracing::warn!("ocr: queue.remove failed for {doc_id}: {e2:#}");
+            }
+            TickOutcome::StaleSkipped { doc_id }
         }
     }
 }

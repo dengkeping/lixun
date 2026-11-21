@@ -60,14 +60,109 @@ struct Args {
     socket: PathBuf,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let filter = EnvFilter::try_from_env("LIXUN_LOG")
-        .or_else(|_| EnvFilter::try_from_default_env())
-        .unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+async fn open_vector_store(
+    data_root: &std::path::Path,
+    text_dim: usize,
+    image_dim: usize,
+) -> Result<Arc<VectorStore>> {
+    tokio::fs::create_dir_all(data_root).await?;
+    let vectors_dir = data_root.join("vectors");
+    // Log open failures through tracing BEFORE returning: anyhow's
+    // stderr print races the supervisor killing the child once the
+    // socket reader exits, so without this the actual LanceDB error
+    // never reaches the daemon journal and the crash loop is opaque.
+    //
+    // Self-heal on a corrupt store: the vector store is DERIVED data
+    // (re-creatable via `lixun-cli semantic backfill`), so an open
+    // failure — e.g. a zero-byte Lance manifest left by a hard kill
+    // mid-commit — must not crash-loop the worker forever behind the
+    // supervisor's backoff. Quarantine the damaged directory
+    // (reversible: rename, not delete) and start fresh; only a
+    // failure on the fresh directory is fatal.
+    match VectorStore::open(&vectors_dir, text_dim, image_dim).await {
+        Ok(s) => Ok(Arc::new(s)),
+        Err(e) => {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let quarantine = data_root.join(format!("vectors.corrupt-{ts}"));
+            tracing::error!(
+                "opening LanceDB at {} failed: {e:#}; quarantining the corrupt store to {} \
+                 and starting fresh — run `lixun-cli semantic backfill` to re-embed",
+                vectors_dir.display(),
+                quarantine.display()
+            );
+            if let Err(mv) = tokio::fs::rename(&vectors_dir, &quarantine).await {
+                tracing::error!(
+                    "FATAL: could not quarantine corrupt store: {mv}; original error: {e:#}"
+                );
+                return Err(e)
+                    .with_context(|| format!("opening LanceDB at {}", vectors_dir.display()));
+            }
+            match VectorStore::open(&vectors_dir, text_dim, image_dim).await {
+                Ok(s) => Ok(Arc::new(s)),
+                Err(e2) => {
+                    tracing::error!(
+                        "FATAL: opening a FRESH LanceDB at {} also failed: {e2:#}",
+                        vectors_dir.display()
+                    );
+                    Err(e2).with_context(|| {
+                        format!("opening fresh LanceDB at {}", vectors_dir.display())
+                    })
+                }
+            }
+        }
+    }
+}
 
-    #[cfg(feature = "jemalloc")]
+fn spawn_query_router(
+    ann_for_router: Arc<LanceDbAnnHandle>,
+    #[cfg(feature = "idle-eviction")] clip_for_router: Arc<
+        lixun_semantic_worker::supervisor::EmbedderSupervisor,
+    >,
+    #[cfg(not(feature = "idle-eviction"))] clip_for_router: Arc<
+        Mutex<lixun_semantic_worker::embedder::ClipTextEmbedder>,
+    >,
+) {
+    tokio::spawn(async move {
+        tracing::info!("embedding query router anchors...");
+        let embed_anchors = |anchors: &[&str]| -> Result<Vec<Vec<f32>>> {
+            #[cfg(feature = "idle-eviction")]
+            let handle = clip_for_router
+                .clip_text()
+                .context("loading CLIP query encoder")?;
+            #[cfg(not(feature = "idle-eviction"))]
+            let handle = &clip_for_router;
+            let texts = anchors.iter().copied().map(str::to_owned).collect();
+            handle.lock().unwrap().embed(texts)
+        };
+        let image_anchor_embeddings = match embed_anchors(QueryRouter::image_anchor_texts()) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!("failed to embed image anchors: {e:#}");
+                return;
+            }
+        };
+        let text_anchor_embeddings = match embed_anchors(QueryRouter::text_anchor_texts()) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!("failed to embed text anchors: {e:#}");
+                return;
+            }
+        };
+        let query_router = Arc::new(QueryRouter::new(
+            image_anchor_embeddings,
+            text_anchor_embeddings,
+            0.05,
+        ));
+        let _ = ann_for_router.install_query_router(query_router);
+        tracing::info!("query router ready");
+    });
+}
+
+#[cfg(feature = "jemalloc")]
+fn init_allocator_telemetry() {
     {
         // Proactive decay tuning. Empirical workspace data shows long-running
         // Rust services drop 20–50% RSS once dirty/muzzy purge windows are
@@ -90,7 +185,6 @@ async fn main() -> Result<()> {
         tracing::info!(target: "jemalloc", "jemalloc decay configured: background_thread=true dirty=5s muzzy=5s metadata_thp=auto");
     }
 
-    #[cfg(feature = "jemalloc")]
     {
         tokio::spawn(async move {
             use tikv_jemalloc_ctl::{epoch, raw};
@@ -116,15 +210,9 @@ async fn main() -> Result<()> {
             }
         });
     }
+}
 
-    let args = Args::parse();
-    tracing::info!(socket = %args.socket.display(), "semantic worker starting");
-
-    let stream = UnixStream::connect(&args.socket)
-        .await
-        .with_context(|| format!("connecting to {}", args.socket.display()))?;
-    let mut framed = Framed::new(stream, WorkerCodec::new());
-
+async fn handshake(framed: &mut Framed<UnixStream, WorkerCodec>) -> Result<()> {
     /* Handshake: the daemon speaks first. A version mismatch is
     answered with Msg::Error{code=Version} so the daemon can log a
     clear reason rather than seeing a silent EOF. */
@@ -159,7 +247,40 @@ async fn main() -> Result<()> {
             worker_version: env!("CARGO_PKG_VERSION").into(),
         })
         .await
-        .context("worker: send HandshakeOk")?;
+        .context("worker: send HandshakeOk")
+}
+
+async fn write_replies(
+    mut sink: futures::stream::SplitSink<Framed<UnixStream, WorkerCodec>, Msg>,
+    mut reply_rx: mpsc::Receiver<Msg>,
+) {
+    while let Some(msg) = reply_rx.recv().await {
+        if let Err(e) = sink.send(msg).await {
+            tracing::error!("sink write failed: {e}");
+            break;
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let filter = EnvFilter::try_from_env("LIXUN_LOG")
+        .or_else(|_| EnvFilter::try_from_default_env())
+        .unwrap_or_else(|_| EnvFilter::new("info"));
+    tracing_subscriber::fmt().with_env_filter(filter).init();
+
+    #[cfg(feature = "jemalloc")]
+    init_allocator_telemetry();
+
+    let args = Args::parse();
+    tracing::info!(socket = %args.socket.display(), "semantic worker starting");
+
+    let stream = UnixStream::connect(&args.socket)
+        .await
+        .with_context(|| format!("connecting to {}", args.socket.display()))?;
+    let mut framed = Framed::new(stream, WorkerCodec::new());
+
+    handshake(&mut framed).await?;
 
     let (data_root, cache_root) = data_and_cache_roots()?;
     let mut cfg: SemanticConfig = lixun_config::Config::load()?
@@ -217,55 +338,7 @@ async fn main() -> Result<()> {
             .join(format!("{model}-fp32"))
             .join("clip-vit-b-32"),
     };
-    std::fs::create_dir_all(&data_root)?;
-    let vectors_dir = data_root.join("vectors");
-    // Log open failures through tracing BEFORE returning: anyhow's
-    // stderr print races the supervisor killing the child once the
-    // socket reader exits, so without this the actual LanceDB error
-    // never reaches the daemon journal and the crash loop is opaque.
-    //
-    // Self-heal on a corrupt store: the vector store is DERIVED data
-    // (re-creatable via `lixun-cli semantic backfill`), so an open
-    // failure — e.g. a zero-byte Lance manifest left by a hard kill
-    // mid-commit — must not crash-loop the worker forever behind the
-    // supervisor's backoff. Quarantine the damaged directory
-    // (reversible: rename, not delete) and start fresh; only a
-    // failure on the fresh directory is fatal.
-    let store = match VectorStore::open(&vectors_dir, text_dim, image_dim).await {
-        Ok(s) => Arc::new(s),
-        Err(e) => {
-            let ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            let quarantine = data_root.join(format!("vectors.corrupt-{ts}"));
-            tracing::error!(
-                "opening LanceDB at {} failed: {e:#}; quarantining the corrupt store to {} \
-                 and starting fresh — run `lixun-cli semantic backfill` to re-embed",
-                vectors_dir.display(),
-                quarantine.display()
-            );
-            if let Err(mv) = tokio::fs::rename(&vectors_dir, &quarantine).await {
-                tracing::error!(
-                    "FATAL: could not quarantine corrupt store: {mv}; original error: {e:#}"
-                );
-                return Err(e)
-                    .with_context(|| format!("opening LanceDB at {}", vectors_dir.display()));
-            }
-            match VectorStore::open(&vectors_dir, text_dim, image_dim).await {
-                Ok(s) => Arc::new(s),
-                Err(e2) => {
-                    tracing::error!(
-                        "FATAL: opening a FRESH LanceDB at {} also failed: {e2:#}",
-                        vectors_dir.display()
-                    );
-                    return Err(e2).with_context(|| {
-                        format!("opening fresh LanceDB at {}", vectors_dir.display())
-                    });
-                }
-            }
-        }
-    };
+    let store = open_vector_store(&data_root, text_dim, image_dim).await?;
 
     let journal_path = data_root.join("semantic-backfill.sqlite");
     let journal = Arc::new(Mutex::new(
@@ -301,74 +374,13 @@ async fn main() -> Result<()> {
     #[cfg(feature = "idle-eviction")]
     let _ = ann.install_supervisor(supervisor.clone());
 
-    let ann_for_router = ann.clone();
-    #[cfg(not(feature = "idle-eviction"))]
-    let clip_for_router = clip_text_embedder.clone();
-    #[cfg(feature = "idle-eviction")]
-    let clip_for_router = supervisor.clone();
-    tokio::spawn(async move {
-        tracing::info!("embedding query router anchors...");
+    spawn_query_router(
+        ann.clone(),
         #[cfg(feature = "idle-eviction")]
-        let resolve_clip = || match clip_for_router.clip_text() {
-            Ok(h) => Some(h),
-            Err(e) => {
-                tracing::error!("failed to obtain CLIP text embedder via supervisor: {e:#}");
-                None
-            }
-        };
-
-        let image_anchor_embeddings: Vec<Vec<f32>> = {
-            #[cfg(feature = "idle-eviction")]
-            let handle = match resolve_clip() {
-                Some(h) => h,
-                None => return,
-            };
-            #[cfg(feature = "idle-eviction")]
-            let mut embedder = handle.lock().unwrap();
-            #[cfg(not(feature = "idle-eviction"))]
-            let mut embedder = clip_for_router.lock().unwrap();
-            let texts: Vec<String> = QueryRouter::image_anchor_texts()
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
-            match embedder.embed(texts) {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::error!("failed to embed image anchors: {e}");
-                    return;
-                }
-            }
-        };
-        let text_anchor_embeddings: Vec<Vec<f32>> = {
-            #[cfg(feature = "idle-eviction")]
-            let handle = match resolve_clip() {
-                Some(h) => h,
-                None => return,
-            };
-            #[cfg(feature = "idle-eviction")]
-            let mut embedder = handle.lock().unwrap();
-            #[cfg(not(feature = "idle-eviction"))]
-            let mut embedder = clip_for_router.lock().unwrap();
-            let texts: Vec<String> = QueryRouter::text_anchor_texts()
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
-            match embedder.embed(texts) {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::error!("failed to embed text anchors: {e}");
-                    return;
-                }
-            }
-        };
-        let query_router = Arc::new(QueryRouter::new(
-            image_anchor_embeddings,
-            text_anchor_embeddings,
-            0.05,
-        ));
-        let _ = ann_for_router.install_query_router(query_router);
-        tracing::info!("query router ready");
-    });
+        supervisor.clone(),
+        #[cfg(not(feature = "idle-eviction"))]
+        clip_text_embedder.clone(),
+    );
 
     /* Reads come from the dispatch loop, writes from spawned ANN
     tasks. A bounded mpsc funnels every outbound Msg through a
@@ -376,16 +388,8 @@ async fn main() -> Result<()> {
     sharing the Framed sink under a Mutex while still allowing the
     dispatch loop to issue concurrent searches. */
     let (sink, mut stream) = framed.split();
-    let (reply_tx, mut reply_rx) = mpsc::channel::<Msg>(REPLY_QUEUE_CAPACITY);
-    let writer = tokio::spawn(async move {
-        let mut sink = sink;
-        while let Some(msg) = reply_rx.recv().await {
-            if let Err(e) = sink.send(msg).await {
-                tracing::error!("sink write failed: {e}");
-                break;
-            }
-        }
-    });
+    let (reply_tx, reply_rx) = mpsc::channel::<Msg>(REPLY_QUEUE_CAPACITY);
+    let writer = tokio::spawn(write_replies(sink, reply_rx));
 
     /* The IpcDocStore proxies Tantivy reads back to the daemon over
     the same socket. Its Sender feeds the same writer funnel as

@@ -419,6 +419,64 @@ async fn wait_for_valid_config(mut error: anyhow::Error) -> Result<config::Confi
     }
 }
 
+fn open_ocr_queue(
+    config: &config::Config,
+    extract_caps: &lixun_extract::ExtractorCapabilities,
+) -> Option<Arc<lixun_extract::ocr_queue::OcrQueue>> {
+    if config.ocr.enabled && extract_caps.has_tesseract {
+        let queue_path = config.state_dir.join("ocr-queue.db");
+        match lixun_extract::ocr_queue::OcrQueue::open(queue_path.clone()) {
+            Ok(q) => Some(Arc::new(q)),
+            Err(e) => {
+                tracing::error!(
+                    "ocr queue: failed to open at {}: {e:#}; disabling deferred OCR",
+                    queue_path.display()
+                );
+                None
+            }
+        }
+    } else {
+        None
+    }
+}
+
+fn start_battery_watcher(
+    config: &config::Config,
+    profile_swap: &Arc<ArcSwap<lixun_core::ImpactProfile>>,
+) {
+    if config.impact.follow_battery {
+        let bw_swap = Arc::clone(profile_swap);
+        let on_ac = config.impact.level;
+        let on_battery = config.impact.on_battery_level;
+        let cpus = num_cpus::get();
+        let apply_swap = Arc::clone(profile_swap);
+        let hot_apply: battery::HotApplyFn = Arc::new(move |level: lixun_core::SystemImpact| {
+            let old = apply_swap.load_full();
+            if old.level == level {
+                return;
+            }
+            let new_profile = lixun_core::ImpactProfile::from_level(level, cpus);
+            let (applied_hot, requires_restart) = impact_diff_hot_cold(old.as_ref(), &new_profile);
+            sched::apply_nice_only(new_profile.daemon_nice);
+            apply_swap.store(Arc::new(new_profile.clone()));
+            tracing::info!(
+                "impact level changed (battery): {:?} -> {:?} (hot={} cold={})",
+                old.level,
+                new_profile.level,
+                applied_hot.len(),
+                requires_restart.len(),
+            );
+        });
+        tokio::spawn(async move {
+            if let Err(e) =
+                battery::watch_battery(bw_swap, on_ac, on_battery, cpus, hot_apply).await
+            {
+                tracing::warn!("battery watcher exited: {e}");
+            }
+        });
+    }
+}
+
 async fn async_main(
     config: config::Config,
     config_error: Option<String>,
@@ -456,22 +514,7 @@ async fn async_main(
     // into it. If OCR is disabled or tesseract is missing, we leave
     // the enqueue sink unset and the extraction path quietly skips
     // the enqueue step.
-    let ocr_queue: Option<Arc<lixun_extract::ocr_queue::OcrQueue>> =
-        if config.ocr.enabled && extract_caps.has_tesseract {
-            let queue_path = config.state_dir.join("ocr-queue.db");
-            match lixun_extract::ocr_queue::OcrQueue::open(queue_path.clone()) {
-                Ok(q) => Some(Arc::new(q)),
-                Err(e) => {
-                    tracing::error!(
-                        "ocr queue: failed to open at {}: {e:#}; disabling deferred OCR",
-                        queue_path.display()
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
+    let ocr_queue = open_ocr_queue(config, &extract_caps);
 
     let extract_caps_arc = Arc::new(extract_caps.clone());
     let _ = sources.extractor_caps.set(Arc::clone(&extract_caps_arc));
@@ -797,37 +840,7 @@ async fn async_main(
         });
     }
 
-    if shared_config.impact.follow_battery {
-        let bw_swap = Arc::clone(&profile_swap);
-        let on_ac = shared_config.impact.level;
-        let on_battery = shared_config.impact.on_battery_level;
-        let cpus = num_cpus::get();
-        let apply_swap = Arc::clone(&profile_swap);
-        let hot_apply: battery::HotApplyFn = Arc::new(move |level: lixun_core::SystemImpact| {
-            let old = apply_swap.load_full();
-            if old.level == level {
-                return;
-            }
-            let new_profile = lixun_core::ImpactProfile::from_level(level, cpus);
-            let (applied_hot, requires_restart) = impact_diff_hot_cold(old.as_ref(), &new_profile);
-            sched::apply_nice_only(new_profile.daemon_nice);
-            apply_swap.store(Arc::new(new_profile.clone()));
-            tracing::info!(
-                "impact level changed (battery): {:?} -> {:?} (hot={} cold={})",
-                old.level,
-                new_profile.level,
-                applied_hot.len(),
-                requires_restart.len(),
-            );
-        });
-        tokio::spawn(async move {
-            if let Err(e) =
-                battery::watch_battery(bw_swap, on_ac, on_battery, cpus, hot_apply).await
-            {
-                tracing::warn!("battery watcher exited: {e}");
-            }
-        });
-    }
+    start_battery_watcher(config, &profile_swap);
 
     let socket_path = socket_path();
     let listener = bind_control_socket()?;
@@ -846,6 +859,24 @@ async fn async_main(
         }
     });
 
+    let client_services = Arc::new(ClientServices {
+        search: ipc_search.clone(),
+        mutation_tx: mutation_tx.clone(),
+        frecency: frecency.clone(),
+        query_latch: query_latch.clone(),
+        query_log: query_log.clone(),
+        blocklist: blocklist.clone(),
+        stats: stats.clone(),
+        gui_control: gui_control.clone(),
+        preview_spawner: preview_spawner.clone(),
+        config: shared_config.clone(),
+        sources: sources.clone(),
+        registry: registry.clone(),
+        ocr_queue: ocr_queue.clone(),
+        ocr_worker_stats: ocr_worker_stats.clone(),
+        profile_swap: profile_swap.clone(),
+        runtime_info: runtime_info.clone(),
+    });
     #[allow(unreachable_code)]
     loop {
         tokio::select! {
@@ -874,25 +905,10 @@ async fn async_main(
                         continue;
                     }
                 };
-                let search = ipc_search.clone();
-                let mutation_tx = mutation_tx.clone();
-                let frecency = Arc::clone(&frecency);
-                let query_latch = Arc::clone(&query_latch);
-                let query_log = Arc::clone(&query_log);
-                let client_blocklist = Arc::clone(&blocklist);
-                let stats = Arc::clone(&stats);
-                let gui_control = Arc::clone(&gui_control);
-                let preview_spawner = Arc::clone(&preview_spawner);
-                let shared_config = Arc::clone(&shared_config);
-                let client_sources = Arc::clone(&sources);
-                let client_registry = Arc::clone(&registry);
-                let client_ocr_queue = ocr_queue.clone();
-                let client_ocr_worker_stats = Arc::clone(&ocr_worker_stats);
-                let client_profile_swap = Arc::clone(&profile_swap);
-                let client_runtime_info = Arc::clone(&runtime_info);
+                let services = Arc::clone(&client_services);
 
                 tokio::spawn(async move {
-                    if let Err(e) = handle_client(stream, search, mutation_tx, frecency, query_latch, query_log, client_blocklist, stats, gui_control, preview_spawner, shared_config, client_sources, client_registry, client_ocr_queue, client_ocr_worker_stats, client_profile_swap, client_runtime_info).await {
+                    if let Err(e) = handle_client(stream, services).await {
                         tracing::debug!("Client error: {}", e);
                     }
                 });
@@ -1481,9 +1497,7 @@ async fn read_request(
     Ok(Some((version, parsed)))
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn handle_client(
-    stream: tokio::net::UnixStream,
+struct ClientServices {
     search: Arc<ArcSwap<SearchSurface>>,
     mutation_tx: IndexMutationTx,
     frecency: Arc<RwLock<FrecencyStore>>,
@@ -1500,6 +1514,477 @@ async fn handle_client(
     ocr_worker_stats: Arc<lixun_indexer::ocr_tick::OcrWorkerStats>,
     profile_swap: Arc<ArcSwap<lixun_core::ImpactProfile>>,
     runtime_info: Arc<RuntimeInfo>,
+}
+
+impl ClientServices {
+    async fn dispatch(
+        &self,
+        req: Request,
+        conn_state: &ConnectionState,
+        write_tx: &mpsc::Sender<Response>,
+        search_tasks: &mut tokio::task::JoinSet<anyhow::Result<()>>,
+    ) -> Option<Response> {
+        let fusion = self.search.load_full();
+        Some(match req {
+            Request::Search {
+                q,
+                limit,
+                explain,
+                epoch,
+                category,
+            } => {
+                let mut slot = conn_state.active_search_slot.lock().await;
+                if let Some(prev) = slot.take() {
+                    prev.cancel.cancel();
+                    // Best-effort: short queries may still complete and emit a
+                    // SearchChunk before observing the cancel token. The GUI
+                    // tolerates a Cancelled arriving after a final chunk.
+                    let _ = write_tx
+                        .send(Response::Cancelled { epoch: prev.epoch })
+                        .await;
+                }
+                let generation = conn_state
+                    .next_search_generation
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let cancel = CancellationToken::new();
+                *slot = Some(SearchSlot {
+                    generation,
+                    epoch,
+                    cancel: cancel.clone(),
+                });
+                drop(slot);
+
+                let write_tx_c = write_tx.clone();
+                let fusion_c = Arc::clone(&fusion);
+                let frecency_c = Arc::clone(&self.frecency);
+                let query_latch_c = Arc::clone(&self.query_latch);
+                let blocklist_c = Arc::clone(&self.blocklist);
+                let config_c = Arc::clone(&self.config);
+                let registry_c = Arc::clone(&self.registry);
+                let active_slot_c = Arc::clone(&conn_state.active_search_slot);
+
+                search_tasks.spawn(handle_search(
+                    generation,
+                    cancel,
+                    write_tx_c,
+                    epoch,
+                    q,
+                    limit,
+                    explain,
+                    category,
+                    fusion_c,
+                    frecency_c,
+                    query_latch_c,
+                    blocklist_c,
+                    config_c,
+                    registry_c,
+                    active_slot_c,
+                ));
+                return None;
+            }
+            Request::Toggle => {
+                gui_result_to_response(self.gui_control.dispatch(GuiCommand::Toggle).await)
+            }
+            Request::Show => {
+                gui_result_to_response(self.gui_control.dispatch(GuiCommand::Show).await)
+            }
+            Request::Hide => {
+                gui_result_to_response(self.gui_control.dispatch(GuiCommand::Hide).await)
+            }
+            Request::Reindex { paths } => self.start_reindex(&fusion, paths).await,
+            Request::Status => self.status_response(&fusion).await,
+            Request::CleanPrivateHistory { apply } => self.clean_private_history(apply).await,
+            Request::RecordSelection { doc_id, query } => {
+                let excluded =
+                    self.registry.private_doc(&doc_id) || self.registry.private_query(&query);
+                if !excluded {
+                    let now = Utc::now().timestamp();
+                    self.frecency.write().await.record_click(&doc_id, now);
+                    if !query.trim().is_empty() {
+                        self.query_latch.write().await.record(&query, &doc_id, now);
+                        self.query_log.write().await.record_query(&query);
+                    }
+                }
+                Response::Ok
+            }
+            Request::RecordClick { doc_id } => {
+                if !self.registry.private_doc(&doc_id) {
+                    let mut frec = self.frecency.write().await;
+                    frec.record_click(&doc_id, chrono::Utc::now().timestamp());
+                }
+                Response::Ok
+            }
+            Request::RecordQuery { q } => {
+                let excluded = self.registry.private_query(&q);
+                if !excluded {
+                    let mut log = self.query_log.write().await;
+                    log.record_query(&q);
+                }
+                Response::Ok
+            }
+            Request::RecordQueryClick { doc_id, query } => {
+                let now = chrono::Utc::now().timestamp();
+                let excluded =
+                    self.registry.private_doc(&doc_id) || self.registry.private_query(&query);
+                if !excluded {
+                    self.query_latch.write().await.record(&query, &doc_id, now);
+                    let mut log = self.query_log.write().await;
+                    log.record_query(&query);
+                }
+                Response::Ok
+            }
+            Request::SearchHistory { limit } => {
+                let log = self.query_log.read().await;
+                Response::Queries(log.recent(limit as usize))
+            }
+            request @ (Request::Preview { .. } | Request::PreviewFragment { .. }) => {
+                let (hit, monitor, fragment) = match request {
+                    Request::Preview { hit, monitor } => (hit, monitor, None),
+                    Request::PreviewFragment {
+                        hit,
+                        monitor,
+                        fragment,
+                    } => (hit, monitor, Some(fragment)),
+                    _ => unreachable!(),
+                };
+                match self.preview_spawner.dispatch(*hit, monitor, fragment).await {
+                    Ok(()) => Response::Ok,
+                    Err(e) => {
+                        tracing::error!("preview_spawn: dispatch failed: {}", e);
+                        Response::Error(format!("preview dispatch failed: {}", e))
+                    }
+                }
+            }
+            Request::PreviewHide => match self.preview_spawner.hide().await {
+                Ok(()) => Response::Ok,
+                Err(e) => {
+                    tracing::error!("preview_spawn: hide failed: {}", e);
+                    Response::Error(format!("preview hide failed: {}", e))
+                }
+            },
+            Request::PreviewSetParent { handle } => {
+                self.preview_spawner.set_parent(handle).await;
+                Response::Ok
+            }
+            Request::PreviewClearParent => {
+                self.preview_spawner.clear_parent().await;
+                Response::Ok
+            }
+            Request::LauncherGeometry {
+                monitor,
+                x,
+                y,
+                w,
+                h,
+            } => {
+                tracing::debug!(
+                    "daemon: received LauncherGeometry monitor={} x={} y={} w={} h={}",
+                    monitor,
+                    x,
+                    y,
+                    w,
+                    h
+                );
+                self.preview_spawner
+                    .set_launcher_geometry(monitor, x, y, w, h)
+                    .await;
+                Response::Ok
+            }
+            Request::EnumeratePlugins => Response::PluginManifest(self.registry.cli_manifest()),
+            Request::Capabilities => {
+                let ids = self
+                    .registry
+                    .instances
+                    .iter()
+                    .filter(|entry| entry.source.relative_date_caption())
+                    .map(|entry| entry.instance_id.clone())
+                    .collect();
+                Response::Capabilities {
+                    versions: lixun_ipc::SUPPORTED_VERSIONS.to_vec(),
+                    relative_date_sources: ids,
+                    record_selection: true,
+                }
+            }
+            Request::ClaimedPrefixes => {
+                let prefixes: Vec<String> = self
+                    .registry
+                    .instances
+                    .iter()
+                    .filter_map(|e| e.source.claimed_prefix().map(|s| s.to_string()))
+                    .collect();
+                Response::ClaimedPrefixes(prefixes)
+            }
+            Request::Recents { limit } => self.recent_hits(&fusion, limit).await,
+            Request::PreviewScroll { down, pages } => {
+                self.preview_spawner.scroll(down, pages).await;
+                Response::Ok
+            }
+            Request::SetDocHidden { doc_id, hidden } => {
+                // Persist immediately: hides are rare, explicit user
+                // actions and must survive a crash (unlike the
+                // shutdown-saved frecency/latch stores).
+                let result = {
+                    let mut list = self.blocklist.write().await;
+                    let mut updated = list.clone();
+                    if updated.set_hidden(&doc_id, hidden) {
+                        updated
+                            .save(&self.config.state_dir)
+                            .map(|()| *list = updated)
+                    } else {
+                        Ok(())
+                    }
+                };
+                result.map_or_else(
+                    |e| Response::Error(format!("could not save visibility: {e}")),
+                    |()| Response::Ok,
+                )
+            }
+            Request::ResetDocRanking { doc_id } => self.reset_doc_ranking(doc_id).await,
+            Request::ListHiddenDocs => {
+                let ids = self.blocklist.read().await.list();
+                Response::HiddenDocs(ids)
+            }
+            Request::PluginCommand { verb_path, args } => {
+                match self.registry.cli_invoke(&verb_path, &args).await {
+                    Ok(value) => Response::PluginResult(value),
+                    Err(e) => Response::PluginError(format!("{e:#}")),
+                }
+            }
+            Request::ImpactGet | Request::ImpactExplain => {
+                let p = self.profile_swap.load_full();
+                Response::ImpactSnapshot {
+                    level: p.level,
+                    profile: ImpactProfileWire::from(p.as_ref()),
+                    applied_hot: Vec::new(),
+                    requires_restart: Vec::new(),
+                    persisted: false,
+                }
+            }
+            Request::ImpactSet { level, persist } => self.set_impact(level, persist),
+        })
+    }
+
+    async fn start_reindex(
+        &self,
+        fusion: &Arc<SearchSurface>,
+        paths: Vec<std::path::PathBuf>,
+    ) -> Response {
+        let already_running = {
+            let mut s = self.stats.write().await;
+            if s.reindex_in_progress {
+                true
+            } else {
+                s.reindex_in_progress = true;
+                s.reindex_started = Some(Utc::now());
+                false
+            }
+        };
+        if already_running {
+            let s = self.stats.read().await;
+            let started = s
+                .reindex_started
+                .map(|t| t.to_rfc3339())
+                .unwrap_or_else(|| "unknown".into());
+            Response::Error(format!("Reindex already in progress (started {})", started))
+        } else {
+            let search_for_task = Arc::clone(fusion);
+            let stats_for_task = Arc::clone(&self.stats);
+            let mutation_tx_for_task = self.mutation_tx.clone();
+            let sources_for_task = Arc::clone(&self.sources);
+            let registry_for_task = Arc::clone(&self.registry);
+            let state_dir_for_task = self.config.state_dir.clone();
+            tokio::spawn(async move {
+                let result = do_reindex(
+                    &search_for_task,
+                    &mutation_tx_for_task,
+                    &stats_for_task,
+                    &sources_for_task,
+                    registry_for_task.as_ref(),
+                    &state_dir_for_task,
+                    paths,
+                )
+                .await;
+                let mut s = stats_for_task.write().await;
+                s.reindex_in_progress = false;
+                s.reindex_started = None;
+                match result {
+                    Ok(count) => {
+                        tracing::info!("Background reindex complete: {} docs", count);
+                    }
+                    Err(e) => {
+                        tracing::error!("Background reindex failed: {}", e);
+                    }
+                }
+            });
+            self.status_response(fusion).await
+        }
+    }
+
+    async fn status_response(&self, fusion: &SearchSurface) -> Response {
+        let s = self.stats.read().await;
+        let (semantic, hotkey, daemon) = self.runtime_info.status_extras();
+        Response::Status {
+            indexed_docs: fusion.document_count(),
+            last_reindex: s.last_reindex,
+            errors: 0,
+            watcher: Some(collect_watcher_stats()),
+            writer: Some(collect_writer_stats()),
+            memory: Some(collect_memory_stats()),
+            reindex_in_progress: s.reindex_in_progress,
+            reindex_started: s.reindex_started,
+            ocr: collect_ocr_stats(
+                self.ocr_queue.as_deref(),
+                &self.ocr_worker_stats,
+                OCR_MAX_ATTEMPTS,
+            ),
+            semantic,
+            hotkey,
+            daemon,
+        }
+    }
+
+    async fn clean_private_history(&self, apply: bool) -> Response {
+        let exclude_query = |q: &str| self.registry.private_query(q);
+        let exclude_doc = |id: &str| self.registry.private_doc(id);
+        let mut frec = self.frecency.write().await;
+        let mut latch = self.query_latch.write().await;
+        let mut log = self.query_log.write().await;
+        let result = (|| -> Result<Response> {
+            let mut next = frec.clone();
+            let clicks = next.remove_excluded(exclude_doc);
+            if apply && clicks > 0 {
+                next.save(&self.config.state_dir)?;
+                *frec = next;
+            }
+            let mut next = latch.clone();
+            let associations = next.remove_excluded(exclude_query, exclude_doc);
+            if apply && associations > 0 {
+                next.save(&self.config.state_dir)?;
+                *latch = next;
+            }
+            let mut next = log.clone();
+            let queries = next.remove_excluded(exclude_query);
+            if apply && queries > 0 {
+                next.save(&self.config.state_dir)?;
+                *log = next;
+            }
+            Ok(Response::PrivateHistory {
+                queries,
+                clicks,
+                associations,
+            })
+        })();
+        drop(log);
+        drop(latch);
+        drop(frec);
+        result.unwrap_or_else(|e| Response::Error(format!("history cleanup failed: {e}")))
+    }
+
+    async fn recent_hits(&self, fusion: &SearchSurface, limit: u32) -> Response {
+        // Empty-launcher "Recent" section (O4): rank the
+        // frecency store, then hydrate the ids back into
+        // presentable Hits. Over-fetch 2x because deleted
+        // docs no longer hydrate; hydration preserves input
+        // order so the frecency ranking survives.
+        let limit = limit.min(self.config.max_results) as usize;
+        let now = chrono::Utc::now().timestamp();
+        let mut ids = {
+            let frec = self.frecency.read().await;
+            frec.top_docs(now, limit.saturating_mul(2))
+        };
+        // User-hidden docs never come back as Recents (C2).
+        {
+            let list = self.blocklist.read().await;
+            if !list.is_empty() {
+                ids.retain(|id| !list.contains(id));
+            }
+        }
+        let mut hits: Vec<lixun_core::Hit> = match fusion.hydrate_docs(ids).await {
+            Ok(pairs) => pairs.into_iter().map(|(h, _)| h).collect(),
+            Err(e) => {
+                tracing::debug!("recents: hydrate failed: {:#}", e);
+                Vec::new()
+            }
+        };
+        hits.truncate(limit);
+        for hit in hits.iter_mut() {
+            if hit.source_instance.is_empty() {
+                continue;
+            }
+            if let Some(menu) = self.registry.row_menu_for(&hit.source_instance) {
+                hit.row_menu = menu;
+            }
+        }
+        Response::Recents { hits }
+    }
+
+    async fn reset_doc_ranking(&self, doc_id: String) -> Response {
+        let mut frec = self.frecency.write().await;
+        let mut latch = self.query_latch.write().await;
+        let result = (|| -> Result<()> {
+            let mut next_frec = frec.clone();
+            if next_frec.remove_doc(&doc_id) {
+                next_frec.save(&self.config.state_dir)?;
+                *frec = next_frec;
+            }
+            let mut next_latch = latch.clone();
+            if next_latch.remove_doc(&doc_id) {
+                next_latch.save(&self.config.state_dir)?;
+                *latch = next_latch;
+            }
+            Ok(())
+        })();
+        drop(latch);
+        drop(frec);
+        result.map_or_else(
+            |e| Response::Error(format!("could not reset ranking: {e}")),
+            |()| Response::Ok,
+        )
+    }
+
+    fn set_impact(&self, level: lixun_core::SystemImpact, persist: bool) -> Response {
+        let old = self.profile_swap.load_full();
+        let new_profile = lixun_core::ImpactProfile::from_level(level, num_cpus::get());
+        let (applied_hot, requires_restart) = impact_diff_hot_cold(old.as_ref(), &new_profile);
+        sched::apply_nice_only(new_profile.daemon_nice);
+        self.profile_swap.store(Arc::new(new_profile.clone()));
+        let persist_outcome: Result<bool, String> = if persist {
+            match config::Config::persist_impact_level(level) {
+                Ok(path) => {
+                    tracing::info!("impact: persisted level={} to {}", level, path.display());
+                    Ok(true)
+                }
+                Err(e) => {
+                    tracing::error!("impact: persist failed: {e:#}");
+                    Err(format!("persist failed: {e}"))
+                }
+            }
+        } else {
+            Ok(false)
+        };
+        tracing::info!(
+            "impact level changed: {:?} -> {:?} (hot={} cold={})",
+            old.level,
+            new_profile.level,
+            applied_hot.len(),
+            requires_restart.len(),
+        );
+        match persist_outcome {
+            Ok(persisted) => Response::ImpactSnapshot {
+                level: new_profile.level,
+                profile: ImpactProfileWire::from(&new_profile),
+                applied_hot,
+                requires_restart,
+                persisted,
+            },
+            Err(msg) => Response::Error(msg),
+        }
+    }
+}
+
+async fn handle_client(
+    stream: tokio::net::UnixStream,
+    services: Arc<ClientServices>,
 ) -> anyhow::Result<()> {
     let (mut stream_read, stream_write) = tokio::io::split(stream);
 
@@ -1584,557 +2069,12 @@ async fn handle_client(
             }
         };
 
-        let fusion = search.load_full();
-        match req {
-            Request::Search {
-                q,
-                limit,
-                explain,
-                epoch,
-                category,
-            } => {
-                let mut slot = conn_state.active_search_slot.lock().await;
-                if let Some(prev) = slot.take() {
-                    prev.cancel.cancel();
-                    // Best-effort: short queries may still complete and emit a
-                    // SearchChunk before observing the cancel token. The GUI
-                    // tolerates a Cancelled arriving after a final chunk.
-                    let _ = write_tx
-                        .send(Response::Cancelled { epoch: prev.epoch })
-                        .await;
-                }
-                let generation = conn_state
-                    .next_search_generation
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let cancel = CancellationToken::new();
-                *slot = Some(SearchSlot {
-                    generation,
-                    epoch,
-                    cancel: cancel.clone(),
-                });
-                drop(slot);
-
-                let write_tx_c = write_tx.clone();
-                let fusion_c = Arc::clone(&fusion);
-                let frecency_c = Arc::clone(&frecency);
-                let query_latch_c = Arc::clone(&query_latch);
-                let blocklist_c = Arc::clone(&blocklist);
-                let config_c = Arc::clone(&config);
-                let registry_c = Arc::clone(&registry);
-                let active_slot_c = Arc::clone(&conn_state.active_search_slot);
-
-                search_tasks.spawn(handle_search(
-                    generation,
-                    cancel,
-                    write_tx_c,
-                    epoch,
-                    q,
-                    limit,
-                    explain,
-                    category,
-                    fusion_c,
-                    frecency_c,
-                    query_latch_c,
-                    blocklist_c,
-                    config_c,
-                    registry_c,
-                    active_slot_c,
-                ));
-            }
-            Request::Toggle => {
-                let resp = gui_result_to_response(gui_control.dispatch(GuiCommand::Toggle).await);
-                if write_tx.send(resp).await.is_err() {
-                    break;
-                }
-            }
-            Request::Show => {
-                let resp = gui_result_to_response(gui_control.dispatch(GuiCommand::Show).await);
-                if write_tx.send(resp).await.is_err() {
-                    break;
-                }
-            }
-            Request::Hide => {
-                let resp = gui_result_to_response(gui_control.dispatch(GuiCommand::Hide).await);
-                if write_tx.send(resp).await.is_err() {
-                    break;
-                }
-            }
-            Request::Reindex { paths } => {
-                let already_running = {
-                    let mut s = stats.write().await;
-                    if s.reindex_in_progress {
-                        true
-                    } else {
-                        s.reindex_in_progress = true;
-                        s.reindex_started = Some(Utc::now());
-                        false
-                    }
-                };
-                let resp = if already_running {
-                    let s = stats.read().await;
-                    let started = s
-                        .reindex_started
-                        .map(|t| t.to_rfc3339())
-                        .unwrap_or_else(|| "unknown".into());
-                    Response::Error(format!("Reindex already in progress (started {})", started))
-                } else {
-                    let search_for_task = Arc::clone(&fusion);
-                    let stats_for_task = Arc::clone(&stats);
-                    let mutation_tx_for_task = mutation_tx.clone();
-                    let sources_for_task = Arc::clone(&sources);
-                    let registry_for_task = Arc::clone(&registry);
-                    let state_dir_for_task = config.state_dir.clone();
-                    tokio::spawn(async move {
-                        let result = do_reindex(
-                            &search_for_task,
-                            &mutation_tx_for_task,
-                            &stats_for_task,
-                            &sources_for_task,
-                            registry_for_task.as_ref(),
-                            &state_dir_for_task,
-                            paths,
-                        )
-                        .await;
-                        let mut s = stats_for_task.write().await;
-                        s.reindex_in_progress = false;
-                        s.reindex_started = None;
-                        match result {
-                            Ok(count) => {
-                                tracing::info!("Background reindex complete: {} docs", count);
-                            }
-                            Err(e) => {
-                                tracing::error!("Background reindex failed: {}", e);
-                            }
-                        }
-                    });
-                    let s = stats.read().await;
-                    let (semantic, hotkey, daemon) = runtime_info.status_extras();
-                    Response::Status {
-                        indexed_docs: fusion.document_count(),
-                        last_reindex: s.last_reindex,
-                        errors: 0,
-                        watcher: Some(collect_watcher_stats()),
-                        writer: Some(collect_writer_stats()),
-                        memory: Some(collect_memory_stats()),
-                        reindex_in_progress: s.reindex_in_progress,
-                        reindex_started: s.reindex_started,
-                        ocr: collect_ocr_stats(
-                            ocr_queue.as_deref(),
-                            &ocr_worker_stats,
-                            OCR_MAX_ATTEMPTS,
-                        ),
-                        semantic,
-                        hotkey,
-                        daemon,
-                    }
-                };
-                if write_tx.send(resp).await.is_err() {
-                    break;
-                }
-            }
-            Request::Status => {
-                let s = stats.read().await;
-                let (semantic, hotkey, daemon) = runtime_info.status_extras();
-                let resp = Response::Status {
-                    indexed_docs: fusion.document_count(),
-                    last_reindex: s.last_reindex,
-                    errors: 0,
-                    watcher: Some(collect_watcher_stats()),
-                    writer: Some(collect_writer_stats()),
-                    memory: Some(collect_memory_stats()),
-                    reindex_in_progress: s.reindex_in_progress,
-                    reindex_started: s.reindex_started,
-                    ocr: collect_ocr_stats(
-                        ocr_queue.as_deref(),
-                        &ocr_worker_stats,
-                        OCR_MAX_ATTEMPTS,
-                    ),
-                    semantic,
-                    hotkey,
-                    daemon,
-                };
-                if write_tx.send(resp).await.is_err() {
-                    break;
-                }
-            }
-            Request::CleanPrivateHistory { apply } => {
-                let exclude_query = |q: &str| registry.private_query(q);
-                let exclude_doc = |id: &str| registry.private_doc(id);
-                let mut frec = frecency.write().await;
-                let mut latch = query_latch.write().await;
-                let mut log = query_log.write().await;
-                let result = (|| -> Result<Response> {
-                    let mut next = frec.clone();
-                    let clicks = next.remove_excluded(exclude_doc);
-                    if apply && clicks > 0 {
-                        next.save(&config.state_dir)?;
-                        *frec = next;
-                    }
-                    let mut next = latch.clone();
-                    let associations = next.remove_excluded(exclude_query, exclude_doc);
-                    if apply && associations > 0 {
-                        next.save(&config.state_dir)?;
-                        *latch = next;
-                    }
-                    let mut next = log.clone();
-                    let queries = next.remove_excluded(exclude_query);
-                    if apply && queries > 0 {
-                        next.save(&config.state_dir)?;
-                        *log = next;
-                    }
-                    Ok(Response::PrivateHistory {
-                        queries,
-                        clicks,
-                        associations,
-                    })
-                })();
-                drop(log);
-                drop(latch);
-                drop(frec);
-                if write_tx
-                    .send(result.unwrap_or_else(|e| {
-                        Response::Error(format!("history cleanup failed: {e}"))
-                    }))
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-            }
-            Request::RecordSelection { doc_id, query } => {
-                let excluded = registry.private_doc(&doc_id) || registry.private_query(&query);
-                if !excluded {
-                    let now = Utc::now().timestamp();
-                    frecency.write().await.record_click(&doc_id, now);
-                    if !query.trim().is_empty() {
-                        query_latch.write().await.record(&query, &doc_id, now);
-                        query_log.write().await.record_query(&query);
-                    }
-                }
-                if write_tx.send(Response::Ok).await.is_err() {
-                    break;
-                }
-            }
-            Request::RecordClick { doc_id } => {
-                if !registry.private_doc(&doc_id) {
-                    let mut frec = frecency.write().await;
-                    frec.record_click(&doc_id, chrono::Utc::now().timestamp());
-                }
-                if write_tx.send(Response::Ok).await.is_err() {
-                    break;
-                }
-            }
-            Request::RecordQuery { q } => {
-                let excluded = registry.private_query(&q);
-                if !excluded {
-                    let mut log = query_log.write().await;
-                    log.record_query(&q);
-                }
-                if write_tx.send(Response::Ok).await.is_err() {
-                    break;
-                }
-            }
-            Request::RecordQueryClick { doc_id, query } => {
-                let now = chrono::Utc::now().timestamp();
-                let excluded = registry.private_doc(&doc_id) || registry.private_query(&query);
-                if !excluded {
-                    query_latch.write().await.record(&query, &doc_id, now);
-                    let mut log = query_log.write().await;
-                    log.record_query(&query);
-                }
-                if write_tx.send(Response::Ok).await.is_err() {
-                    break;
-                }
-            }
-            Request::SearchHistory { limit } => {
-                let log = query_log.read().await;
-                let resp = Response::Queries(log.recent(limit as usize));
-                if write_tx.send(resp).await.is_err() {
-                    break;
-                }
-            }
-            request @ (Request::Preview { .. } | Request::PreviewFragment { .. }) => {
-                let (hit, monitor, fragment) = match request {
-                    Request::Preview { hit, monitor } => (hit, monitor, None),
-                    Request::PreviewFragment {
-                        hit,
-                        monitor,
-                        fragment,
-                    } => (hit, monitor, Some(fragment)),
-                    _ => unreachable!(),
-                };
-                let resp = match preview_spawner.dispatch(*hit, monitor, fragment).await {
-                    Ok(()) => Response::Ok,
-                    Err(e) => {
-                        tracing::error!("preview_spawn: dispatch failed: {}", e);
-                        Response::Error(format!("preview dispatch failed: {}", e))
-                    }
-                };
-                if write_tx.send(resp).await.is_err() {
-                    break;
-                }
-            }
-            Request::PreviewHide => {
-                let resp = match preview_spawner.hide().await {
-                    Ok(()) => Response::Ok,
-                    Err(e) => {
-                        tracing::error!("preview_spawn: hide failed: {}", e);
-                        Response::Error(format!("preview hide failed: {}", e))
-                    }
-                };
-                if write_tx.send(resp).await.is_err() {
-                    break;
-                }
-            }
-            Request::PreviewSetParent { handle } => {
-                preview_spawner.set_parent(handle).await;
-                if write_tx.send(Response::Ok).await.is_err() {
-                    break;
-                }
-            }
-            Request::PreviewClearParent => {
-                preview_spawner.clear_parent().await;
-                if write_tx.send(Response::Ok).await.is_err() {
-                    break;
-                }
-            }
-            Request::LauncherGeometry {
-                monitor,
-                x,
-                y,
-                w,
-                h,
-            } => {
-                tracing::debug!(
-                    "daemon: received LauncherGeometry monitor={} x={} y={} w={} h={}",
-                    monitor,
-                    x,
-                    y,
-                    w,
-                    h
-                );
-                preview_spawner
-                    .set_launcher_geometry(monitor, x, y, w, h)
-                    .await;
-                if write_tx.send(Response::Ok).await.is_err() {
-                    break;
-                }
-            }
-            Request::EnumeratePlugins => {
-                let resp = Response::PluginManifest(registry.cli_manifest());
-                if write_tx.send(resp).await.is_err() {
-                    break;
-                }
-            }
-            Request::Capabilities => {
-                let ids = registry
-                    .instances
-                    .iter()
-                    .filter(|entry| entry.source.relative_date_caption())
-                    .map(|entry| entry.instance_id.clone())
-                    .collect();
-                if write_tx
-                    .send(Response::Capabilities {
-                        versions: lixun_ipc::SUPPORTED_VERSIONS.to_vec(),
-                        relative_date_sources: ids,
-                        record_selection: true,
-                    })
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-            }
-            Request::ClaimedPrefixes => {
-                let prefixes: Vec<String> = registry
-                    .instances
-                    .iter()
-                    .filter_map(|e| e.source.claimed_prefix().map(|s| s.to_string()))
-                    .collect();
-                let resp = Response::ClaimedPrefixes(prefixes);
-                if write_tx.send(resp).await.is_err() {
-                    break;
-                }
-            }
-            Request::Recents { limit } => {
-                // Empty-launcher "Recent" section (O4): rank the
-                // frecency store, then hydrate the ids back into
-                // presentable Hits. Over-fetch 2x because deleted
-                // docs no longer hydrate; hydration preserves input
-                // order so the frecency ranking survives.
-                let limit = limit.min(config.max_results) as usize;
-                let now = chrono::Utc::now().timestamp();
-                let mut ids = {
-                    let frec = frecency.read().await;
-                    frec.top_docs(now, limit.saturating_mul(2))
-                };
-                // User-hidden docs never come back as Recents (C2).
-                {
-                    let list = blocklist.read().await;
-                    if !list.is_empty() {
-                        ids.retain(|id| !list.contains(id));
-                    }
-                }
-                let mut hits: Vec<lixun_core::Hit> = match fusion.hydrate_docs(ids).await {
-                    Ok(pairs) => pairs.into_iter().map(|(h, _)| h).collect(),
-                    Err(e) => {
-                        tracing::debug!("recents: hydrate failed: {:#}", e);
-                        Vec::new()
-                    }
-                };
-                hits.truncate(limit);
-                for hit in hits.iter_mut() {
-                    if hit.source_instance.is_empty() {
-                        continue;
-                    }
-                    if let Some(menu) = registry.row_menu_for(&hit.source_instance) {
-                        hit.row_menu = menu;
-                    }
-                }
-                if write_tx.send(Response::Recents { hits }).await.is_err() {
-                    break;
-                }
-            }
-            Request::PreviewScroll { down, pages } => {
-                preview_spawner.scroll(down, pages).await;
-                if write_tx.send(Response::Ok).await.is_err() {
-                    break;
-                }
-            }
-            Request::SetDocHidden { doc_id, hidden } => {
-                // Persist immediately: hides are rare, explicit user
-                // actions and must survive a crash (unlike the
-                // shutdown-saved frecency/latch stores).
-                let result = {
-                    let mut list = blocklist.write().await;
-                    let mut updated = list.clone();
-                    if updated.set_hidden(&doc_id, hidden) {
-                        updated.save(&config.state_dir).map(|()| *list = updated)
-                    } else {
-                        Ok(())
-                    }
-                };
-                let response = result.map_or_else(
-                    |e| Response::Error(format!("could not save visibility: {e}")),
-                    |()| Response::Ok,
-                );
-                if write_tx.send(response).await.is_err() {
-                    break;
-                }
-            }
-            Request::ResetDocRanking { doc_id } => {
-                let mut frec = frecency.write().await;
-                let mut latch = query_latch.write().await;
-                let result = (|| -> Result<()> {
-                    let mut next_frec = frec.clone();
-                    if next_frec.remove_doc(&doc_id) {
-                        next_frec.save(&config.state_dir)?;
-                        *frec = next_frec;
-                    }
-                    let mut next_latch = latch.clone();
-                    if next_latch.remove_doc(&doc_id) {
-                        next_latch.save(&config.state_dir)?;
-                        *latch = next_latch;
-                    }
-                    Ok(())
-                })();
-                drop(latch);
-                drop(frec);
-                let response = result.map_or_else(
-                    |e| Response::Error(format!("could not reset ranking: {e}")),
-                    |()| Response::Ok,
-                );
-                if write_tx.send(response).await.is_err() {
-                    break;
-                }
-            }
-            Request::ListHiddenDocs => {
-                let ids = blocklist.read().await.list();
-                if write_tx.send(Response::HiddenDocs(ids)).await.is_err() {
-                    break;
-                }
-            }
-            Request::PluginCommand { verb_path, args } => {
-                let resp = match registry.cli_invoke(&verb_path, &args).await {
-                    Ok(value) => Response::PluginResult(value),
-                    Err(e) => Response::PluginError(format!("{e:#}")),
-                };
-                if write_tx.send(resp).await.is_err() {
-                    break;
-                }
-            }
-            Request::ImpactGet => {
-                let p = profile_swap.load_full();
-                let resp = Response::ImpactSnapshot {
-                    level: p.level,
-                    profile: ImpactProfileWire::from(p.as_ref()),
-                    applied_hot: Vec::new(),
-                    requires_restart: Vec::new(),
-                    persisted: false,
-                };
-                if write_tx.send(resp).await.is_err() {
-                    break;
-                }
-            }
-            Request::ImpactExplain => {
-                let p = profile_swap.load_full();
-                let resp = Response::ImpactSnapshot {
-                    level: p.level,
-                    profile: ImpactProfileWire::from(p.as_ref()),
-                    applied_hot: Vec::new(),
-                    requires_restart: Vec::new(),
-                    persisted: false,
-                };
-                if write_tx.send(resp).await.is_err() {
-                    break;
-                }
-            }
-            Request::ImpactSet { level, persist } => {
-                let old = profile_swap.load_full();
-                let new_profile = lixun_core::ImpactProfile::from_level(level, num_cpus::get());
-                let (applied_hot, requires_restart) =
-                    impact_diff_hot_cold(old.as_ref(), &new_profile);
-                sched::apply_nice_only(new_profile.daemon_nice);
-                profile_swap.store(Arc::new(new_profile.clone()));
-                let persist_outcome: Result<bool, String> = if persist {
-                    match config::Config::persist_impact_level(level) {
-                        Ok(path) => {
-                            tracing::info!(
-                                "impact: persisted level={} to {}",
-                                level,
-                                path.display()
-                            );
-                            Ok(true)
-                        }
-                        Err(e) => {
-                            tracing::error!("impact: persist failed: {e:#}");
-                            Err(format!("persist failed: {e}"))
-                        }
-                    }
-                } else {
-                    Ok(false)
-                };
-                tracing::info!(
-                    "impact level changed: {:?} -> {:?} (hot={} cold={})",
-                    old.level,
-                    new_profile.level,
-                    applied_hot.len(),
-                    requires_restart.len(),
-                );
-                let resp = match persist_outcome {
-                    Ok(persisted) => Response::ImpactSnapshot {
-                        level: new_profile.level,
-                        profile: ImpactProfileWire::from(&new_profile),
-                        applied_hot,
-                        requires_restart,
-                        persisted,
-                    },
-                    Err(msg) => Response::Error(msg),
-                };
-                if write_tx.send(resp).await.is_err() {
-                    break;
-                }
-            }
+        if let Some(response) = services
+            .dispatch(req, &conn_state, &write_tx, &mut search_tasks)
+            .await
+            && write_tx.send(response).await.is_err()
+        {
+            break;
         }
 
         // Drain finished search tasks (logs panics, non-blocking).

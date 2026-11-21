@@ -149,6 +149,273 @@ enum PreviewLifecycle {
     },
 }
 
+async fn preview_ready(
+    state_arc: &Mutex<PreviewLifecycle>,
+    cmd_tx: &mpsc::Sender<PreviewCommand>,
+    pid: u32,
+    preview_pid: u32,
+) -> bool {
+    // Promote Starting → Ready and drain
+    // any buffered command in one atomic
+    // state-lock region.
+    let buffered = {
+        let mut s = state_arc.lock().await;
+        // Only promote if this supervisor
+        // still owns the current state; a
+        // shutdown() race could have
+        // already set Dead.
+        let (current_pid, current_socket) = match &*s {
+            PreviewLifecycle::Starting {
+                pid, socket_path, ..
+            } => (*pid, socket_path.clone()),
+            PreviewLifecycle::Dead => {
+                tracing::debug!(
+                    "preview_spawn: pid={} Ready arrived after shutdown, ignoring",
+                    pid
+                );
+                return false;
+            }
+            PreviewLifecycle::Ready { .. } => {
+                tracing::warn!("preview_spawn: pid={} duplicate Ready event, ignoring", pid);
+                return true;
+            }
+        };
+        if current_pid != pid {
+            tracing::warn!(
+                "preview_spawn: pid mismatch on Ready (state={} me={}), bailing",
+                current_pid,
+                pid
+            );
+            return false;
+        }
+        let old = std::mem::replace(&mut *s, PreviewLifecycle::Dead);
+        let (latest, parent, launcher_geom) = match old {
+            PreviewLifecycle::Starting {
+                latest_desired,
+                latest_parent_handle,
+                latest_launcher_geometry,
+                ..
+            } => (
+                latest_desired,
+                latest_parent_handle,
+                latest_launcher_geometry,
+            ),
+            _ => (None, None, None),
+        };
+        *s = PreviewLifecycle::Ready {
+            pid,
+            socket_path: current_socket,
+            cmd_tx: cmd_tx.clone(),
+            last_used: tokio::time::Instant::now(),
+        };
+        (latest, parent, launcher_geom)
+    };
+    tracing::info!(
+        "preview_spawn: Ready from preview pid={} (wire pid={})",
+        pid,
+        preview_pid
+    );
+    let (buffered, parent_handle, launcher_geom) = buffered;
+    if let Some(handle) = parent_handle
+        && send_or_drop(cmd_tx, PreviewCommand::SetParent { handle })
+    {
+        tracing::warn!(
+            "preview_spawn: pid={} writer gone before buffered SetParent",
+            pid
+        );
+        return false;
+    }
+    if let Some(cmd) = buffered
+        && send_or_drop(cmd_tx, cmd)
+    {
+        tracing::warn!(
+            "preview_spawn: pid={} writer gone before buffered send",
+            pid
+        );
+        return false;
+    }
+    if let Some((monitor, x, y, w, h)) = launcher_geom {
+        tracing::debug!(
+            "preview_spawn: pid={} draining buffered LauncherGeometry monitor={} x={} y={} w={} h={}",
+            pid,
+            monitor,
+            x,
+            y,
+            w,
+            h
+        );
+        if send_or_drop(
+            cmd_tx,
+            PreviewCommand::LauncherGeometry {
+                monitor,
+                x,
+                y,
+                w,
+                h,
+            },
+        ) {
+            tracing::warn!(
+                "preview_spawn: pid={} writer gone before buffered LauncherGeometry",
+                pid
+            );
+            return false;
+        }
+    } else {
+        tracing::debug!(
+            "preview_spawn: pid={} no buffered LauncherGeometry to drain",
+            pid
+        );
+    }
+    true
+}
+
+async fn handle_preview_event(
+    event: PreviewEvent,
+    pid: u32,
+    state_arc: &Mutex<PreviewLifecycle>,
+    gui_control: &Arc<GuiControl>,
+    epoch_arc: &AtomicU64,
+    cmd_tx: &mpsc::Sender<PreviewCommand>,
+) -> bool {
+    match event {
+        PreviewEvent::Ready { pid: preview_pid } => {
+            return preview_ready(state_arc, cmd_tx, pid, preview_pid).await;
+        }
+        PreviewEvent::Closed {
+            epoch,
+            activation_token,
+        } => {
+            tracing::debug!("preview_spawn: pid={} Closed epoch={}", pid, epoch);
+            // Preview hid itself (Escape/Space).
+            // Reveal launcher so the user can keep
+            // navigating. The warm process stays
+            // alive; we do NOT transition to Dead.
+            if let Err(e) = gui_control.dispatch(GuiCommand::Show).await {
+                tracing::warn!("preview_spawn: dispatch Show after Closed failed: {}", e);
+            }
+            // ExitPreviewMode MUST arrive after Show:
+            // it resets the launcher's preview_mode
+            // flag and grabs keyboard focus back to
+            // the search entry. The activation token the
+            // preview minted while it held the seat
+            // keyboard rides along so the launcher can
+            // reactivate its own surface (KWin does not
+            // hand the seat back to a layer surface on
+            // its own).
+            if let Err(e) = gui_control
+                .dispatch(GuiCommand::ExitPreviewMode { activation_token })
+                .await
+            {
+                tracing::warn!(
+                    "preview_spawn: dispatch ExitPreviewMode after Closed failed: {}",
+                    e
+                );
+            }
+        }
+        PreviewEvent::Launched { epoch } => {
+            tracing::debug!("preview_spawn: pid={} Launched epoch={}", pid, epoch);
+            if let Err(e) = gui_control.dispatch(GuiCommand::Hide).await {
+                tracing::warn!("preview_spawn: dispatch Hide after Launched failed: {}", e);
+            }
+            if let Err(e) = gui_control.dispatch(GuiCommand::ClearSession).await {
+                tracing::warn!(
+                    "preview_spawn: dispatch ClearSession after Launched failed: {}",
+                    e
+                );
+            }
+            if let Err(e) = gui_control
+                .dispatch(GuiCommand::ExitPreviewMode {
+                    activation_token: None,
+                })
+                .await
+            {
+                tracing::warn!(
+                    "preview_spawn: dispatch ExitPreviewMode after Launched failed: {}",
+                    e
+                );
+            }
+        }
+        PreviewEvent::Error { epoch, msg } => {
+            tracing::warn!(
+                "preview_spawn: pid={} plugin error epoch={} msg={}",
+                pid,
+                epoch,
+                msg
+            );
+            // A failed build for the CURRENT epoch leaves
+            // the launcher wedged in phantom preview mode:
+            // nothing appeared, yet `preview_mode_active`
+            // stays set and the first Escape is eaten (P2).
+            // Restore the launcher's state; stale-epoch
+            // errors (user already scrubbed on) are
+            // log-only, the newer dispatch owns the UI.
+            if epoch == epoch_arc.load(Ordering::Relaxed)
+                && let Err(e) = gui_control
+                    .dispatch(GuiCommand::ExitPreviewMode {
+                        activation_token: None,
+                    })
+                    .await
+            {
+                tracing::warn!(
+                    "preview_spawn: dispatch ExitPreviewMode after Error failed: {}",
+                    e
+                );
+            }
+        }
+        PreviewEvent::ParentLost => {
+            tracing::debug!(
+                "preview_spawn: pid={} parent lost; awaiting next SetParent",
+                pid
+            );
+        }
+        PreviewEvent::NavKey { epoch, delta } => {
+            tracing::debug!(
+                "preview_spawn: pid={} NavKey epoch={} delta={}",
+                pid,
+                epoch,
+                delta
+            );
+            if let Err(e) = gui_control.dispatch(GuiCommand::PreviewNav { delta }).await {
+                tracing::warn!("preview_spawn: dispatch PreviewNav failed: {}", e);
+            }
+        }
+        PreviewEvent::SetLauncherVisible { visible } => {
+            tracing::debug!(
+                "preview_spawn: pid={} SetLauncherVisible visible={}",
+                pid,
+                visible
+            );
+            // `Hide` resets the launcher's
+            // `preview_mode_active` flag — which kills the
+            // arrow-scrub selection pipeline mid-preview
+            // (P1). A genuinely covering preview needs the
+            // launcher unmapped WITHOUT ending the preview
+            // session, so route through `SoftHide`.
+            let cmd = if visible {
+                GuiCommand::Show
+            } else {
+                GuiCommand::SoftHide
+            };
+            tracing::debug!(pid, "dispatching preview event");
+            if let Err(e) = gui_control.dispatch(cmd).await {
+                tracing::warn!(
+                    "preview_spawn: pid={} SetLauncherVisible({}) dispatch failed: {}",
+                    pid,
+                    visible,
+                    e
+                );
+            } else {
+                tracing::debug!(
+                    "preview_spawn: pid={} SetLauncherVisible({}) dispatch succeeded",
+                    pid,
+                    visible
+                );
+            }
+        }
+    }
+    true
+}
+
 impl PreviewLifecycle {
     fn pid(&self) -> Option<u32> {
         match self {
@@ -606,261 +873,10 @@ impl PreviewSpawner {
                         break;
                     }
                 };
-                match event {
-                    PreviewEvent::Ready { pid: preview_pid } => {
-                        // Promote Starting → Ready and drain
-                        // any buffered command in one atomic
-                        // state-lock region.
-                        let buffered = {
-                            let mut s = state_arc.lock().await;
-                            // Only promote if this supervisor
-                            // still owns the current state; a
-                            // shutdown() race could have
-                            // already set Dead.
-                            let (current_pid, current_socket) = match &*s {
-                                PreviewLifecycle::Starting {
-                                    pid, socket_path, ..
-                                } => (*pid, socket_path.clone()),
-                                PreviewLifecycle::Dead => {
-                                    tracing::debug!(
-                                        "preview_spawn: pid={} Ready arrived after shutdown, ignoring",
-                                        pid
-                                    );
-                                    break;
-                                }
-                                PreviewLifecycle::Ready { .. } => {
-                                    tracing::warn!(
-                                        "preview_spawn: pid={} duplicate Ready event, ignoring",
-                                        pid
-                                    );
-                                    continue;
-                                }
-                            };
-                            if current_pid != pid {
-                                tracing::warn!(
-                                    "preview_spawn: pid mismatch on Ready (state={} me={}), bailing",
-                                    current_pid,
-                                    pid
-                                );
-                                break;
-                            }
-                            let old = std::mem::replace(&mut *s, PreviewLifecycle::Dead);
-                            let (latest, parent, launcher_geom) = match old {
-                                PreviewLifecycle::Starting {
-                                    latest_desired,
-                                    latest_parent_handle,
-                                    latest_launcher_geometry,
-                                    ..
-                                } => (
-                                    latest_desired,
-                                    latest_parent_handle,
-                                    latest_launcher_geometry,
-                                ),
-                                _ => (None, None, None),
-                            };
-                            *s = PreviewLifecycle::Ready {
-                                pid,
-                                socket_path: current_socket,
-                                cmd_tx: cmd_tx.clone(),
-                                last_used: tokio::time::Instant::now(),
-                            };
-                            (latest, parent, launcher_geom)
-                        };
-                        tracing::info!(
-                            "preview_spawn: Ready from preview pid={} (wire pid={})",
-                            pid,
-                            preview_pid
-                        );
-                        let (buffered, parent_handle, launcher_geom) = buffered;
-                        if let Some(handle) = parent_handle
-                            && send_or_drop(&cmd_tx, PreviewCommand::SetParent { handle })
-                        {
-                            tracing::warn!(
-                                "preview_spawn: pid={} writer gone before buffered SetParent",
-                                pid
-                            );
-                            break;
-                        }
-                        if let Some(cmd) = buffered
-                            && send_or_drop(&cmd_tx, cmd)
-                        {
-                            tracing::warn!(
-                                "preview_spawn: pid={} writer gone before buffered send",
-                                pid
-                            );
-                            break;
-                        }
-                        if let Some((monitor, x, y, w, h)) = launcher_geom {
-                            tracing::debug!(
-                                "preview_spawn: pid={} draining buffered LauncherGeometry monitor={} x={} y={} w={} h={}",
-                                pid,
-                                monitor,
-                                x,
-                                y,
-                                w,
-                                h
-                            );
-                            if send_or_drop(
-                                &cmd_tx,
-                                PreviewCommand::LauncherGeometry {
-                                    monitor,
-                                    x,
-                                    y,
-                                    w,
-                                    h,
-                                },
-                            ) {
-                                tracing::warn!(
-                                    "preview_spawn: pid={} writer gone before buffered LauncherGeometry",
-                                    pid
-                                );
-                                break;
-                            }
-                        } else {
-                            tracing::debug!(
-                                "preview_spawn: pid={} no buffered LauncherGeometry to drain",
-                                pid
-                            );
-                        }
-                    }
-                    PreviewEvent::Closed {
-                        epoch,
-                        activation_token,
-                    } => {
-                        tracing::debug!("preview_spawn: pid={} Closed epoch={}", pid, epoch);
-                        // Preview hid itself (Escape/Space).
-                        // Reveal launcher so the user can keep
-                        // navigating. The warm process stays
-                        // alive; we do NOT transition to Dead.
-                        if let Err(e) = gui_control.dispatch(GuiCommand::Show).await {
-                            tracing::warn!(
-                                "preview_spawn: dispatch Show after Closed failed: {}",
-                                e
-                            );
-                        }
-                        // ExitPreviewMode MUST arrive after Show:
-                        // it resets the launcher's preview_mode
-                        // flag and grabs keyboard focus back to
-                        // the search entry. The activation token the
-                        // preview minted while it held the seat
-                        // keyboard rides along so the launcher can
-                        // reactivate its own surface (KWin does not
-                        // hand the seat back to a layer surface on
-                        // its own).
-                        if let Err(e) = gui_control
-                            .dispatch(GuiCommand::ExitPreviewMode { activation_token })
-                            .await
-                        {
-                            tracing::warn!(
-                                "preview_spawn: dispatch ExitPreviewMode after Closed failed: {}",
-                                e
-                            );
-                        }
-                    }
-                    PreviewEvent::Launched { epoch } => {
-                        tracing::debug!("preview_spawn: pid={} Launched epoch={}", pid, epoch);
-                        if let Err(e) = gui_control.dispatch(GuiCommand::Hide).await {
-                            tracing::warn!(
-                                "preview_spawn: dispatch Hide after Launched failed: {}",
-                                e
-                            );
-                        }
-                        if let Err(e) = gui_control.dispatch(GuiCommand::ClearSession).await {
-                            tracing::warn!(
-                                "preview_spawn: dispatch ClearSession after Launched failed: {}",
-                                e
-                            );
-                        }
-                        if let Err(e) = gui_control
-                            .dispatch(GuiCommand::ExitPreviewMode {
-                                activation_token: None,
-                            })
-                            .await
-                        {
-                            tracing::warn!(
-                                "preview_spawn: dispatch ExitPreviewMode after Launched failed: {}",
-                                e
-                            );
-                        }
-                    }
-                    PreviewEvent::Error { epoch, msg } => {
-                        tracing::warn!(
-                            "preview_spawn: pid={} plugin error epoch={} msg={}",
-                            pid,
-                            epoch,
-                            msg
-                        );
-                        // A failed build for the CURRENT epoch leaves
-                        // the launcher wedged in phantom preview mode:
-                        // nothing appeared, yet `preview_mode_active`
-                        // stays set and the first Escape is eaten (P2).
-                        // Restore the launcher's state; stale-epoch
-                        // errors (user already scrubbed on) are
-                        // log-only, the newer dispatch owns the UI.
-                        if epoch == epoch_arc.load(Ordering::Relaxed)
-                            && let Err(e) = gui_control
-                                .dispatch(GuiCommand::ExitPreviewMode {
-                                    activation_token: None,
-                                })
-                                .await
-                        {
-                            tracing::warn!(
-                                "preview_spawn: dispatch ExitPreviewMode after Error failed: {}",
-                                e
-                            );
-                        }
-                    }
-                    PreviewEvent::ParentLost => {
-                        tracing::debug!(
-                            "preview_spawn: pid={} parent lost; awaiting next SetParent",
-                            pid
-                        );
-                    }
-                    PreviewEvent::NavKey { epoch, delta } => {
-                        tracing::debug!(
-                            "preview_spawn: pid={} NavKey epoch={} delta={}",
-                            pid,
-                            epoch,
-                            delta
-                        );
-                        if let Err(e) = gui_control.dispatch(GuiCommand::PreviewNav { delta }).await
-                        {
-                            tracing::warn!("preview_spawn: dispatch PreviewNav failed: {}", e);
-                        }
-                    }
-                    PreviewEvent::SetLauncherVisible { visible } => {
-                        tracing::debug!(
-                            "preview_spawn: pid={} SetLauncherVisible visible={}",
-                            pid,
-                            visible
-                        );
-                        // `Hide` resets the launcher's
-                        // `preview_mode_active` flag — which kills the
-                        // arrow-scrub selection pipeline mid-preview
-                        // (P1). A genuinely covering preview needs the
-                        // launcher unmapped WITHOUT ending the preview
-                        // session, so route through `SoftHide`.
-                        let cmd = if visible {
-                            GuiCommand::Show
-                        } else {
-                            GuiCommand::SoftHide
-                        };
-                        tracing::debug!(pid, "dispatching preview event");
-                        if let Err(e) = gui_control.dispatch(cmd).await {
-                            tracing::warn!(
-                                "preview_spawn: pid={} SetLauncherVisible({}) dispatch failed: {}",
-                                pid,
-                                visible,
-                                e
-                            );
-                        } else {
-                            tracing::debug!(
-                                "preview_spawn: pid={} SetLauncherVisible({}) dispatch succeeded",
-                                pid,
-                                visible
-                            );
-                        }
-                    }
+                if !handle_preview_event(event, pid, &state_arc, &gui_control, &epoch_arc, &cmd_tx)
+                    .await
+                {
+                    break;
                 }
             }
 

@@ -30,7 +30,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       - run: cargo build --release --locked -p lixun-daemon -p lixun-cli -p lixun-semantic-worker
       - name: Fetch the labelled corpus
-        run: curl --fail --location --retry 3 https://www.robots.ox.ac.uk/~vgg/data/pets/data/images.tar.gz -o /tmp/pets.tar.gz
+        run: curl --proto '=https' --proto-redir '=https' --fail --location --retry 3 https://www.robots.ox.ac.uk/~vgg/data/pets/data/images.tar.gz -o /tmp/pets.tar.gz
       - name: Exercise the production models with both corpus sizes
         run: |
           for skew in 6 60; do

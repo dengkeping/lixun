@@ -1,5 +1,7 @@
-use super::*;
+use super::decode_scaled;
+use gtk::prelude::TextureExt;
 use image::{ImageEncoder, Rgb, RgbImage, codecs::jpeg::JpegEncoder};
+use std::path::Path;
 
 fn write_jpeg(path: &Path, width: u32, height: u32, orientation: Option<u8>) {
     // Asymmetric quadrants make rotations and reflections distinguishable.
