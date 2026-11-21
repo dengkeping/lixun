@@ -5,6 +5,7 @@
 [![platform](https://img.shields.io/badge/platform-Linux-lightgrey)]()
 [![rust](https://img.shields.io/badge/rust-2024-orange)](https://www.rust-lang.org/)
 [![status](https://img.shields.io/badge/status-active%20development-yellow)]()
+[![SonarQube Quality Gate](https://sonarcloud.io/api/project_badges/measure?project=dengkeping_lixun&metric=alert_status)](https://sonarcloud.io/project/overview?id=dengkeping_lixun)
 
 > **Status — active development.** Lixun is under heavy development. Expect
 > rough edges, occasional regressions, and breaking changes between minor
