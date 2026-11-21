@@ -8,6 +8,8 @@ license.workspace = true
 lixun-core = { path = "../lixun-core" }
 anyhow.workspace = true
 tantivy.workspace = true
+gio = "0.22"
+mime_guess = "2"
 serde_json.workspace = true
 tracing.workspace = true
 chrono.workspace = true

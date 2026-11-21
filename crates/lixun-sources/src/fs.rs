@@ -949,7 +949,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(doc.icon_name.as_deref(), Some("text-x-generic"));
-        assert_eq!(doc.kind_label.as_deref(), Some("Octet Stream"));
+        assert_eq!(doc.kind_label.as_deref(), Some("File"));
     }
 
     fn write_png(path: &Path, w: u32, h: u32) {

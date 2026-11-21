@@ -27,44 +27,13 @@ pub fn human_kind(mime: &Mime) -> String {
         _ if mime.type_() == mime_guess::mime::IMAGE => "Image".into(),
         _ if mime.type_() == mime_guess::mime::VIDEO => "Video".into(),
         _ if mime.type_() == mime_guess::mime::AUDIO => "Audio".into(),
-        _ => titleize_subtype(mime.subtype().as_str()),
+        "application/octet-stream" => "File".into(),
+        _ => gio::content_type_from_mime_type(mime.essence_str())
+            .map(|kind| gio::content_type_get_description(&kind))
+            .filter(|label| !label.is_empty() && !label.contains('/'))
+            .map(|label| label.to_string())
+            .unwrap_or_else(|| "File".into()),
     }
-}
-
-fn titleize_subtype(subtype: &str) -> String {
-    let mut words = Vec::new();
-    let mut current = String::new();
-
-    for ch in subtype.chars() {
-        if ch.is_ascii_alphanumeric() {
-            current.push(ch);
-        } else if !current.is_empty() {
-            words.push(capitalize(&current));
-            current.clear();
-        }
-    }
-
-    if !current.is_empty() {
-        words.push(capitalize(&current));
-    }
-
-    if words.is_empty() {
-        "Unknown".into()
-    } else {
-        words.join(" ")
-    }
-}
-
-fn capitalize(word: &str) -> String {
-    let mut chars = word.chars();
-    let Some(first) = chars.next() else {
-        return String::new();
-    };
-
-    let mut out = String::new();
-    out.extend(first.to_uppercase());
-    out.push_str(chars.as_str());
-    out
 }
 
 #[cfg(test)]
@@ -123,7 +92,16 @@ mod tests {
         assert_eq!(human_kind(&mime("application/zip")), "Archive");
         assert_eq!(human_kind(&mime("application/x-tar")), "Archive");
         assert_eq!(human_kind(&mime("inode/directory")), "Folder");
-        assert_eq!(human_kind(&mime("text/html")), "Html");
-        assert_eq!(human_kind(&mime("application/xml")), "Xml");
+        assert_eq!(human_kind(&mime("application/octet-stream")), "File");
+        assert_eq!(human_kind(&mime("application/x-lixun-unknown")), "File");
+        for ext in [
+            "xlsx", "docx", "pptx", "ods", "odt", "csv", "html", "xml", "7z",
+        ] {
+            let mime = mime_guess::from_ext(ext).first_or_octet_stream();
+            let label = human_kind(&mime);
+            assert_ne!(label, "File", "{ext}");
+            assert!(!label.to_lowercase().contains("vnd"), "{ext}: {label}");
+            assert!(!label.contains('/'), "{ext}: {label}");
+        }
     }
 }

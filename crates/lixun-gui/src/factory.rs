@@ -1018,6 +1018,26 @@ pub(crate) fn create_list_factory(ctx: RowFactoryCtx) -> gtk::SignalListItemFact
     factory
 }
 
+fn subtitle_passage<'a>(
+    title: &str,
+    subtitle: &str,
+    body: Option<&'a str>,
+    query: &str,
+) -> Option<(&'a str, lixun_core::fragment::TextFragment)> {
+    let body = body?;
+    let query = query.trim();
+    if query.is_empty() {
+        return None;
+    }
+    if subtitle.starts_with('/') {
+        let (needle, _) = fold_with_map(query);
+        if !needle.is_empty() && fold_with_map(title).0.contains(&needle) {
+            return None;
+        }
+    }
+    lixun_core::fragment::PassageMatcher::new(query)?.find(body)
+}
+
 fn bind_row_labels(
     row: &gtk::Box,
     hit: &Hit,
@@ -1050,8 +1070,9 @@ fn bind_row_labels(
     // disambiguating deep directories survive, full path on
     // the row tooltip. Non-path subtitles (mail authors,
     // "Recent search") keep the plain end-ellipsized text.
-    let passage = lixun_core::fragment::PassageMatcher::new(query);
-    if let Some((text, fragment)) = hit.body.as_deref().and_then(|b| passage.as_ref()?.find(b)) {
+    if let Some((text, fragment)) =
+        subtitle_passage(&hit.title, &hit.subtitle, hit.body.as_deref(), query)
+    {
         let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
         subtitle.set_text(&line);
         apply_highlight(&subtitle, &line, &fragment.quote);
@@ -1729,6 +1750,24 @@ mod tests {
             }],
         };
         assert!(!menu_has_conditional_secondary(&def));
+    }
+
+    #[test]
+    fn file_subtitle_prefers_path_for_a_literal_title_match() {
+        let title = "Project AB-CD report.xlsx";
+        let path = "/docs/Project AB-CD report.xlsx";
+        let body = Some("Formula references AB-CD and forecast totals");
+        assert!(subtitle_passage(title, path, body, " ab-cd ").is_none());
+        assert!(subtitle_passage(title, path, None, "ab-cd").is_none());
+        assert_eq!(
+            subtitle_passage(title, path, body, "forecast")
+                .unwrap()
+                .1
+                .quote,
+            "forecast"
+        );
+        assert!(subtitle_passage(title, path, body, "ab-cd forecast").is_some());
+        assert!(subtitle_passage(title, "Sender", body, "ab-cd").is_some());
     }
 
     #[test]

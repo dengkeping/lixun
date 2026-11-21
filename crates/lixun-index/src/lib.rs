@@ -514,7 +514,7 @@ impl LixunIndex {
                 .to_string();
 
             let icon_name = stored_optional_text(&doc, s.icon_name);
-            let kind_label = stored_optional_text(&doc, s.kind_label);
+            let (kind_label, mime) = stored_type_metadata(&doc, s);
 
             let action_json = doc
                 .get_first(s.action)
@@ -558,7 +558,6 @@ impl LixunIndex {
                 .and_then(|value| value.as_str())
                 .unwrap_or("")
                 .to_string();
-            let mime = stored_optional_text(&doc, s.mime);
             let size = doc.get_first(s.size).and_then(|value| value.as_u64());
 
             // Coordination (Wave B T2): reward docs whose title contains
@@ -934,7 +933,7 @@ impl LixunIndex {
             .unwrap_or("")
             .to_string();
         let icon_name = stored_optional_text(&doc, s.icon_name);
-        let kind_label = stored_optional_text(&doc, s.kind_label);
+        let (kind_label, mime) = stored_type_metadata(&doc, s);
         let action_json = doc
             .get_first(s.action)
             .and_then(|v| v.as_str())
@@ -964,7 +963,6 @@ impl LixunIndex {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let mime = stored_optional_text(&doc, s.mime);
         let mtime = doc.get_first(s.mtime).and_then(|v| v.as_i64()).unwrap_or(0);
         let size = doc.get_first(s.size).and_then(|v| v.as_u64());
 
@@ -1097,7 +1095,7 @@ impl LixunIndex {
             .unwrap_or("")
             .to_string();
         let icon_name = stored_optional_text(tdoc, s.icon_name);
-        let kind_label = stored_optional_text(tdoc, s.kind_label);
+        let (kind_label, mime) = stored_type_metadata(tdoc, s);
         let body = stored_optional_text(tdoc, s.body);
         let path = tdoc
             .get_first(s.path)
@@ -1184,7 +1182,7 @@ impl LixunIndex {
             source_instance,
             extra,
             secondary_action,
-            mime: None,
+            mime,
         }
     }
 
@@ -1205,6 +1203,49 @@ impl LixunIndex {
         let writer = self.index.writer_with_num_threads(num_threads, heap_size)?;
         Ok(writer)
     }
+}
+
+/// Older indexes stored a title-cased vendor MIME subtype as the visible kind.
+fn stored_type_metadata(
+    doc: &TantivyDocument,
+    schema: &LixunSchema,
+) -> (Option<String>, Option<String>) {
+    let mime = stored_optional_text(doc, schema.mime);
+    let label = stored_optional_text(doc, schema.kind_label);
+    let replacement = label.as_deref().and_then(|label| {
+        let kind = label.rsplit(" · ").next()?;
+        if !kind.starts_with("Vnd ") {
+            return None;
+        }
+        let parsed = mime
+            .as_deref()
+            .and_then(|s| s.parse::<mime_guess::Mime>().ok())
+            .or_else(|| {
+                let title = doc.get_first(schema.title)?.as_str()?;
+                mime_guess::from_path(title).first()
+            })?;
+        let mut words = parsed
+            .subtype()
+            .as_str()
+            .split(|ch: char| !ch.is_ascii_alphanumeric())
+            .filter(|s| !s.is_empty());
+        if !kind
+            .split_whitespace()
+            .all(|word| words.next().is_some_and(|s| s.eq_ignore_ascii_case(word)))
+            || words.next().is_some()
+        {
+            return None;
+        }
+        let system_type = gio::content_type_from_mime_type(parsed.essence_str())?;
+        let description = gio::content_type_get_description(&system_type);
+        let display = if description.is_empty() || description.contains('/') {
+            "File"
+        } else {
+            description.as_str()
+        };
+        Some(format!("{}{display}", label.strip_suffix(kind)?))
+    });
+    (replacement.or(label), mime)
 }
 
 fn stored_optional_text(doc: &TantivyDocument, field: tantivy::schema::Field) -> Option<String> {
@@ -1702,6 +1743,47 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].icon_name.as_deref(), Some("application-pdf"));
         assert_eq!(results[0].kind_label.as_deref(), Some("PDF Document"));
+    }
+
+    #[test]
+    fn legacy_vendor_kind_is_readable_across_index_read_paths() {
+        let mime = mime_guess::from_ext("xlsx").first().unwrap();
+        let description = gio::content_type_get_description(mime.essence_str()).to_string();
+        let old = "Vnd Openxmlformats Officedocument Spreadsheetml Sheet";
+        for (label, stored_mime, expected) in [
+            (old.to_string(), Some(mime.to_string()), description.clone()),
+            (
+                format!("Attachment · {old}"),
+                None,
+                format!("Attachment · {description}"),
+            ),
+            (
+                "Custom workbook".into(),
+                Some(mime.to_string()),
+                "Custom workbook".into(),
+            ),
+        ] {
+            let mut doc = sample_document("sheet", "sample.xlsx", "cells");
+            doc.kind_label = Some(label);
+            doc.mime = stored_mime.clone();
+            let (_tmp, index) = create_index_with_docs(&[doc]);
+            assert_eq!(
+                search(&index, "sample")[0].kind_label.as_deref(),
+                Some(expected.as_str())
+            );
+            assert_eq!(
+                index
+                    .hydrate_doc_by_id("sheet")
+                    .unwrap()
+                    .unwrap()
+                    .0
+                    .kind_label,
+                Some(expected.clone())
+            );
+            let loaded = index.get_doc_by_id("sheet").unwrap().unwrap();
+            assert_eq!(loaded.kind_label, Some(expected));
+            assert_eq!(loaded.mime, stored_mime);
+        }
     }
 
     #[test]
