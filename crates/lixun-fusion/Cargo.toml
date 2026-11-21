@@ -10,6 +10,7 @@ path = "src/lib.rs"
 
 [dependencies]
 lixun-core = { path = "../lixun-core" }
+lixun-index = { path = "../lixun-index" }
 lixun-indexer = { path = "../lixun-indexer" }
 lixun-mutation = { path = "../lixun-mutation" }
 anyhow.workspace = true

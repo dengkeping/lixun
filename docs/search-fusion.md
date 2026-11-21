@@ -2,18 +2,7 @@
 
 ## Overview
 
-Lixun's search uses a **Spotlight-style fan-out-and-merge** architecture:
-every query runs in parallel against three retrieval backends (BM25 lexical,
-text semantic, image semantic), then merges the results via Reciprocal Rank
-Fusion (RRF). This design eliminates the need for query classification —
-instead of trying to guess whether a short keyword is a text query or an
-image query, we let all three backends compete and let RRF pick the best
-results from each.
-
-This architecture matches Apple Spotlight (WWDC24 "Support semantic search
-with Core Spotlight") and Microsoft Windows Search/Recall. The key insight:
-**fan-out is cheaper than classification**, especially when classification
-is unreliable (short queries, code identifiers, ambiguous natural language).
+Ordinary searches return an initial lexical page, then combine BM25, text vectors and image vectors using weighted Reciprocal Rank Fusion. The worker classifies intent to help choose weights. Explicit photo and article requests in English, Russian and Chinese override ambiguous classifications. Queries containing phrases, field constraints or Boolean operators preserve the lexical parser's result set on both pages. Category filters apply before the page limit.
 
 ## Three retrieval paths
 
@@ -44,7 +33,7 @@ computational cost (~20-30ms per query).
 
 ### 3. Image semantic (opt-in, requires lixun-semantic-worker)
 
-Cross-modal text→image retrieval via CLIP (`clip-vit-b-32`, 512-dim). Embeds
+Cross-modal text→image retrieval via CLIP (multilingual query encoder, 512 dimensions). Embeds
 the query with CLIP's text encoder and searches the `image_vectors` table
 (populated by CLIP's vision encoder) for nearest neighbors.
 
@@ -61,7 +50,7 @@ or non-visual queries return noise.
 RRF merges three ranked lists into one. For each document, compute:
 
 ```
-rrf_score = sum over all lists where doc appears: 1 / (k + rank_in_that_list)
+rrf_score = sum over all lists where doc appears: channel_weight / (k + rank_in_that_list)
 ```
 
 Default `k = 60` (Microsoft Azure AI Search standard). Higher `k` flattens
@@ -81,14 +70,13 @@ the curve (more democratic), lower `k` amplifies top-ranked hits.
 
 Canonical RRF is modality-blind, so a query router classifies each query
 (Text / Image / Both) and scales the per-channel reciprocal contributions —
-`(1.0, 0.8, 1.8)` for image-intent, `(1.0, 1.0, 1.3)` for mixed, strictly
-neutral `(1.0, 1.0, 1.0)` for text or when the router is unavailable.
+`(1.0, 0.8, 2.0)` for image intent and `(1.0, 1.0, 1.0)` for text intent. For mixed intent each vector channel's weight increases with the separation of its top neighbour from the following neighbours. The [mixed corpus report](search-quality.md) shows the effect on both pages.
 Weighting introduces a failure mode the neutral math didn't have: a
 single-leg CLIP hit earns `w_image/(k+1)`, which beats the BM25 #1's
 `w_bm25/(k+1)` whenever `w_image > w_bm25` — so an exact filename query
 ("golf-cart-vvp") can be buried under ~`k·(w_image−1)` photos *of* golf
 carts unless the doc's own text embedding rescues it (and mid-backfill it
-can't). Two guard rails close this:
+can't). The following rules cover searches by name:
 
 1. **Navigational pin** (`handle.rs::looks_navigational`): a single-token
    query joined by `-`/`_`/`.`/`/` names a document, not a scene — the
@@ -103,6 +91,11 @@ can't). Two guard rails close this:
    precision match pass through untouched — genuinely semantic queries
    are unaffected. This also covers un-hyphenated navigational queries
    ("golf cart vvp") that the pin cannot detect.
+3. For a single word matching a complete token in a filename stem, full
+   lexical title-prefix and exact-title matches come first, followed by
+   matching filenames in order of the word's position. Ties retain fusion
+   order. Hyphens and underscores delimit words. The final extension is
+   excluded. The existing application priority applies above these groups.
 
 ## Hydration and score preservation
 
@@ -177,9 +170,7 @@ comparing its CLIP text embedding to both anchor groups.
    even if one backend returns garbage, RRF demotes it because it only
    appears in one list at low ranks.
 
-The anchor classifier remains in the codebase (worker's `query_router.rs`,
-`AnnHandle::classify_query()` trait method) but is unused. Fusion calls all
-three backends unconditionally.
+The current router supplies a weighting hint for ordinary queries. All three retrieval channels remain eligible.
 
 ## Comparison to other systems
 

@@ -9,6 +9,8 @@ name = "lixun-cli"
 path = "src/main.rs"
 
 [dependencies]
+lixun-extract = { path = "../lixun-extract" }
+walkdir.workspace = true
 lixun-core = { path = "../lixun-core" }
 lixun-ipc = { path = "../lixun-ipc" }
 lixun-mutation = { path = "../lixun-mutation" }

@@ -113,10 +113,6 @@ const CONNECT_POLL_INTERVAL: Duration = Duration::from_millis(15);
 /// `shutdown()` can SIGTERM the child without waiting for the
 /// state to progress.
 #[derive(Default)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "one lifecycle per daemon, including its single buffered request"
-)]
 enum PreviewLifecycle {
     #[default]
     Dead,
@@ -127,7 +123,7 @@ enum PreviewLifecycle {
         /// `u64` is the epoch we already assigned; the reader
         /// task replays it verbatim so epoch ordering is
         /// preserved across the state transition.
-        latest_desired: Option<(u64, Hit, Option<String>)>,
+        latest_desired: Option<PreviewCommand>,
         /// Latest-wins buffer for the launcher's exported
         /// xdg-foreign-v2 handle. Drained alongside
         /// `latest_desired` when `Ready` arrives, and replayed
@@ -216,8 +212,19 @@ impl PreviewSpawner {
     /// Never blocks on preview rendering: returns as soon as the
     /// command is buffered (Starting) or handed off to the
     /// writer task (Ready).
-    pub async fn dispatch(&self, hit: Hit, monitor: Option<String>) -> anyhow::Result<()> {
+    pub async fn dispatch(
+        &self,
+        hit: Hit,
+        monitor: Option<String>,
+        fragment: Option<lixun_core::fragment::TextFragment>,
+    ) -> anyhow::Result<()> {
         let epoch = self.epoch.fetch_add(1, Ordering::Relaxed) + 1;
+        let cmd = PreviewCommand::ShowOrUpdate {
+            epoch,
+            hit: Box::new(hit),
+            monitor,
+            fragment,
+        };
         let mut state = self.state.lock().await;
 
         match &mut *state {
@@ -233,7 +240,7 @@ impl PreviewSpawner {
                 *state = PreviewLifecycle::Starting {
                     pid,
                     socket_path: socket_path.clone(),
-                    latest_desired: Some((epoch, hit, monitor)),
+                    latest_desired: Some(cmd),
                     latest_parent_handle: None,
                     latest_launcher_geometry: cached_geom,
                 };
@@ -247,17 +254,12 @@ impl PreviewSpawner {
                 // Latest-wins: overwrite any prior buffered
                 // command with the newer one. The epoch is
                 // always fresher because we just incremented it.
-                *latest_desired = Some((epoch, hit, monitor));
+                *latest_desired = Some(cmd);
                 Ok(())
             }
             PreviewLifecycle::Ready {
                 cmd_tx, last_used, ..
             } => {
-                let cmd = PreviewCommand::ShowOrUpdate {
-                    epoch,
-                    hit: Box::new(hit),
-                    monitor,
-                };
                 if send_or_drop(cmd_tx, cmd) {
                     // Writer task gone — process effectively
                     // dead. Transition and cold-start anew by
@@ -679,19 +681,14 @@ impl PreviewSpawner {
                             );
                             break;
                         }
-                        if let Some((epoch, hit, monitor)) = buffered {
-                            let cmd = PreviewCommand::ShowOrUpdate {
-                                epoch,
-                                hit: Box::new(hit),
-                                monitor,
-                            };
-                            if send_or_drop(&cmd_tx, cmd) {
-                                tracing::warn!(
-                                    "preview_spawn: pid={} writer gone before buffered send",
-                                    pid
-                                );
-                                break;
-                            }
+                        if let Some(cmd) = buffered
+                            && send_or_drop(&cmd_tx, cmd)
+                        {
+                            tracing::warn!(
+                                "preview_spawn: pid={} writer gone before buffered send",
+                                pid
+                            );
+                            break;
                         }
                         if let Some((monitor, x, y, w, h)) = launcher_geom {
                             tracing::debug!(
@@ -1041,7 +1038,12 @@ mod tests {
         let s = PreviewLifecycle::Starting {
             pid: 1234,
             socket_path: PathBuf::from("/tmp/lixun-preview-1234.sock"),
-            latest_desired: Some((7, fake_hit(), Some("eDP-1".into()))),
+            latest_desired: Some(PreviewCommand::ShowOrUpdate {
+                epoch: 7,
+                hit: Box::new(fake_hit()),
+                monitor: Some("eDP-1".into()),
+                fragment: None,
+            }),
             latest_parent_handle: Some("export-handle-xyz".into()),
             latest_launcher_geometry: None,
         };
@@ -1063,7 +1065,12 @@ mod tests {
         *spawner.state.lock().await = PreviewLifecycle::Starting {
             pid: 1234,
             socket_path: PathBuf::from("/tmp/lixun-preview-1234.sock"),
-            latest_desired: Some((7, fake_hit(), Some("eDP-1".into()))),
+            latest_desired: Some(PreviewCommand::ShowOrUpdate {
+                epoch: 7,
+                hit: Box::new(fake_hit()),
+                monitor: Some("eDP-1".into()),
+                fragment: None,
+            }),
             latest_parent_handle: Some("export-handle-xyz".into()),
             latest_launcher_geometry: None,
         };

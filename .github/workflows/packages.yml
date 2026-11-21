@@ -9,6 +9,9 @@ permissions:
   contents: read
 
 jobs:
+  search-quality:
+    uses: ./.github/workflows/search-quality.yml
+
   build:
     name: Build and install on ${{ matrix.target }}
     runs-on: ubuntu-24.04
@@ -64,7 +67,7 @@ jobs:
 
   publish:
     name: Publish verified packages
-    needs: build
+    needs: [build, search-quality]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     permissions:

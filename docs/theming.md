@@ -30,20 +30,20 @@ Activate a theme by adding its folder name to `config.toml`:
 theme = "tokyo-night"
 ```
 
-Set `theme = ""` or remove the key to fall back to the built-in
-stylesheet. The folder name must match the `theme` value exactly.
-Missing themes are logged as a warning and the launcher continues
-with no theme applied.
+**Tokyo Night is the packaged default.** An empty or omitted `theme` key
+uses the embedded theme. With `theme = "tokyo-night"`, a local theme of
+that name takes precedence if present. A missing custom theme falls back
+to the embedded Tokyo Night theme and logs a warning.
 
 ## Stylesheet cascade
 
-Lixun installs up to four `GtkCssProvider`s at fixed priorities.
+Lixun loads GTK stylesheets in the following order.
 Later layers override earlier ones, GTK's normal specificity rules
 apply within each layer.
 
 | Layer | Path | GTK priority | Hot reload |
 |-------|------|--------------|------------|
-| 1. Built-in | embedded `crates/lixun-gui/style.css` | `APPLICATION` | no |
+| 1. Built-in | shared `crates/lixun-gui/style.css`, then [Tokyo Night](../crates/lixun-gui/assets/themes/tokyo-night.css) when using the default | `APPLICATION` | no |
 | 2. User override | `~/.config/lixun/style.css` | `APPLICATION + 1` | yes |
 | 3. Theme | `~/.config/lixun/themes/<name>/style.css` | `APPLICATION + 2` | yes |
 | 4. Matugen colours | `~/.config/lixun/colors.css` | `APPLICATION + 3` | yes |
@@ -116,7 +116,7 @@ that builds result rows lives in
 ### Window chrome
 
 - `.lixun-window` — the main launcher surface. The default theme
-  paints a translucent dark glass with `border-radius: 14px`.
+  paints a 70% opaque surface with square corners and a gradient border.
 - `.lixun-window.lixun-no-blur` — added automatically when blur is
   disabled (config `[gui] blur = false`) or the compositor does not
   support `org_kde_kwin_blur`. Use this to raise the background
@@ -126,14 +126,13 @@ that builds result rows lives in
   class-removal timer in `window.rs`).
 - `.lixun-light` — toggled on the root `window` when the freedesktop
   appearance portal reports a light colour scheme. The built-in theme
-  swaps the `--lixun-*` palette and flips its white-alpha overlays to
-  black-alpha under this class; prefix your own rules with
+  swaps to its Tokyo Night Day palette under this class; prefix your own rules with
   `.lixun-light` for light-only styling.
-- `window`, `window.background`, `.background`, `#lixun-root` — must
-  stay fully transparent so `.lixun-window`'s rounded corners
-  actually round. The default theme uses
-  `background: transparent !important;` here; GTK4 logs two harmless
-  parser warnings about `!important` on every reload — ignore them.
+- `#lixun-root` and `.lixun-window` identify the same GTK window.
+  Paint the panel on `.lixun-window`. GTK clips its background to
+  the border radius. A transparent background on `#lixun-root` or
+  `window.background` can override that fill and leave result text
+  directly over the desktop.
 
 ### Search entry
 
@@ -151,9 +150,8 @@ that builds result rows lives in
 - `#lixun-chips` / `.lixun-chips` — the horizontal `Box` holding the
   category filter chips, between the entry and the results list.
 - `.lixun-chip` — each chip (a `ToggleButton`). The built-in theme
-  styles them as outlined pills; `:checked` marks the active filter
-  and takes an accent tint (`alpha(var(--lixun-primary), 0.25)`),
-  `:hover` a faint neutral backdrop.
+  uses outlined buttons. The active filter takes an accent border and tint,
+  and a lighter tint marks hover.
 
 ### Results list
 
@@ -189,8 +187,7 @@ specificity trap section below.
 - `.lixun-top-hit` — added to the row that holds the keyboard
   selection cursor. **This is your selection cue**, not
   `listview row:selected`. It tracks arrow-key navigation. The
-  built-in theme paints it as an accent-tinted fill
-  (`alpha(var(--lixun-primary), 0.15)`) plus an inset left accent
+  built-in theme paints it with a tinted surface plus an inset left accent
   bar (`box-shadow: inset 3px 0 0 0 var(--lixun-primary)`), with a
   bolder (not bigger) title. Keep its box model identical to
   `.lixun-hit` when you restyle it — see step 7 below.
@@ -200,7 +197,7 @@ specificity trap section below.
   row 0, styled as a card (neutral fill plus a
   `var(--lixun-outline-variant)` border). It may stack with
   `.lixun-top-hit` on the same row, in which case the hero card
-  keeps its fill and the selection contributes the accent bar.
+  keeps its frame and the selection supplies the fill and accent bar.
 
 ### Row labels
 
@@ -210,7 +207,7 @@ specificity trap section below.
 - `.lixun-top-hit-hero .lixun-title` — bigger title on the hero row
   (safe: the hero row is row 0 and has its own height).
 - `.lixun-top-hit .lixun-title` — the selected row's title. The
-  built-in theme bumps `font-weight` to 600 here, **not**
+  built-in theme bumps `font-weight` to 700 here, **not**
   `font-size`: a size bump changes the row's natural height and
   clips the last visible row (see step 7 below).
 
@@ -288,8 +285,7 @@ higher-specificity selector elsewhere — usually `#lixun-hit`.
 ## Recommended structure for a new theme
 
 1. Pick a palette and write it as a comment block at the top.
-2. Reset window chrome: transparent `window/.background/#lixun-root`,
-   then paint `.lixun-window` with your surface colour and border.
+2. Paint `.lixun-window` with your surface colour and border.
 3. Style `.lixun-entry` and its `placeholder` / `image` children.
 4. Make `scrolledwindow`, `listview` transparent.
 5. Stomp `listview row, listview row:selected*` flat.
@@ -328,7 +324,7 @@ specifically so this rule can target it.
 
 When blur is disabled or unsupported, the `.lixun-window.lixun-no-blur`
 class is added so your stylesheet can paint a heavier background
-instead. The built-in theme uses `alpha(var(--lixun-surface), 0.92)`
+instead. The built-in theme uses `alpha(var(--lixun-surface), 0.94)`
 for that state.
 
 ## Matugen integration
@@ -383,9 +379,8 @@ so themes that want to use any of the remaining tokens
 (`--lixun-secondary*`, `--lixun-tertiary*`, all
 `--lixun-surface-container*` shades, `--lixun-inverse-*`, etc.) can
 reference them directly with `var(--lixun-<token>)` once matugen has
-populated `colors.css`. Pure glass overlays (white-alpha hairlines,
-hover backgrounds, selection backgrounds) stay hard-coded so they
-remain palette-independent.
+populated `colors.css`. Tokyo Night derives its hover and selection fills
+from the surface and accent tokens.
 
 When `colors.css` is absent the built-in stylesheet's own
 `window, popover { --lixun-*: …; }` fallback block paints the
@@ -457,9 +452,8 @@ and matugen has nothing to override.
 
 The built-in stylesheet
 ([`crates/lixun-gui/style.css`](../crates/lixun-gui/style.css))
-is the reference: it pairs `var(--lixun-*)` for palette-driven
-surfaces with literal `rgba(255, 255, 255, …)` for palette-independent
-glass overlays. Copy that pattern.
+provides the shared widget styles. [Tokyo Night](../crates/lixun-gui/assets/themes/tokyo-night.css)
+uses those tokens to colour the panel, text and selection.
 
 ### A note on the user override
 

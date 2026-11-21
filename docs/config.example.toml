@@ -423,9 +423,9 @@ global_toggle = "Super+space"
 # blur to stay legible), higher is more opaque.
 # opacity = 0.70
 
-# Named theme: loads ~/.config/lixun/themes/<name>/style.css instead of
-# the built-in stylesheet. Empty or absent = built-in style (plus the
-# optional user-wide override at ~/.config/lixun/style.css).
+# Tokyo Night is built into the launcher and is the default on a fresh
+# install. Set a theme name to load ~/.config/lixun/themes/<name>/style.css.
+# User-wide overrides live at ~/.config/lixun/style.css.
 # theme = "midnight"
 
 # Matugen (Material You) color integration. Opt-in: requires matugen
@@ -492,9 +492,8 @@ max_file_size_mb = 200
 # you can configure multiple if you have e.g. personal + work accounts
 # in separate maildir roots.
 #
-# Triggers a full index wipe + rebuild the first time you add, remove,
-# or change which maildir sources are enabled (schema fingerprint
-# changes).
+# A schema fingerprint change builds a separate generation and publishes it
+# after the new index passes validation. See the README upgrade notes.
 #
 # Search with typed fields:
 #   folder:INBOX
@@ -742,12 +741,14 @@ max_file_size_mb = 200
 # by visual content), fused with BM25 via Reciprocal Rank Fusion.
 #
 # OPT-IN: requires the separate `lixun-semantic-worker` sidecar binary,
-# and first use downloads ~400 MB of embedding models. The daemon
+# and first use downloads the configured embedding models. The daemon
 # locates the worker via $LIXUN_SEMANTIC_WORKER, then $PATH, then
 # /usr/lib/lixun/lixun-semantic-worker (where the lixun-semantic Arch
 # package installs it).
 [semantic]
 enabled = false
+# text_model = "bge-small-en-v1.5"   # bge-m3 uses a separate store and backfill
+# image_model = "clip-vit-b-32-multilingual"   # shares vision vectors with clip-vit-b-32
 
 # -----------------------------------------------------------------------------
 # [impact] — system-impact preset: one knob controlling thread pools,

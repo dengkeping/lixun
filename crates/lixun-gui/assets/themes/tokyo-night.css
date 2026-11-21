@@ -1,0 +1,262 @@
+/* Built-in Tokyo Night launcher theme. Matugen can override the palette. */
+window, popover {
+  --lixun-secondary-text: mix(var(--lixun-on-surface-variant), var(--lixun-on-surface), 0.75);
+  --lixun-primary:               #7aa2f7;
+  --lixun-on-primary:            #1a1b26;
+  --lixun-primary-container:     #bb9af7;
+  --lixun-on-primary-container:  #e7ebff;
+  --lixun-surface:               #1a1b26;
+  --lixun-on-surface:            #e7ebff;
+  --lixun-on-surface-variant:    #a9b1d6;
+  --lixun-outline:               #565f89;
+  --lixun-outline-variant:       #414868;
+  --lixun-error:                 #f7768e;
+  --lixun-on-error:              #1a1b26;
+}
+
+/* Root surface */
+
+.lixun-window {
+  background-color: alpha(var(--lixun-surface), 0.70);
+  background-image: none;
+  border-radius: 0;
+  border: 2px solid transparent;
+  border-image: linear-gradient(45deg, var(--lixun-primary), var(--lixun-primary-container)) 1;
+  box-shadow: none;
+  padding: 0;
+  min-width: 480px;
+  color: var(--lixun-secondary-text);
+}
+
+/* Search entry */
+
+.lixun-entry {
+  background: transparent;
+  background-image: none;
+  border: none;
+  border-radius: 0;
+  box-shadow: none;
+  color: var(--lixun-on-surface);
+  caret-color: var(--lixun-primary);
+  font-size: 16.5pt;
+  font-weight: 400;
+  padding: 14px 16px;
+  min-height: 0;
+}
+
+.lixun-entry:focus,
+.lixun-entry:focus-within {
+  outline: none;
+  box-shadow: none;
+  border: none;
+}
+
+.lixun-entry placeholder,
+.lixun-entry text placeholder {
+  color: var(--lixun-secondary-text);
+  opacity: 1;
+}
+
+.lixun-entry image {
+  color: var(--lixun-primary);
+  -gtk-icon-size: 24px;
+  margin-right: 8px;
+}
+
+/* Category chips */
+
+.lixun-chips {
+  background: transparent;
+  padding: 0 12px 6px 12px;
+}
+
+.lixun-chip {
+  background-color: alpha(var(--lixun-outline-variant), 0.45);
+  color: var(--lixun-secondary-text);
+  border: 1px solid var(--lixun-outline-variant);
+  border-radius: 0;
+  padding: 2px 10px;
+  font-size: 8.25pt;
+  font-weight: 500;
+}
+
+.lixun-chip:hover {
+  background-color: alpha(var(--lixun-primary), 0.18);
+  color: var(--lixun-on-surface);
+  border-color: var(--lixun-primary);
+}
+
+.lixun-chip:checked,
+.lixun-chip.active {
+  background-color: alpha(var(--lixun-primary), 0.30);
+  color: var(--lixun-on-surface);
+  border-color: var(--lixun-primary);
+}
+
+/* Results list */
+
+#lixun-results-scroll,
+#lixun-results,
+.lixun-results,
+scrolledwindow,
+scrolledwindow viewport,
+listview {
+  background: transparent;
+  background-image: none;
+  border: none;
+}
+
+/* Stomp Breeze (and any other GTK theme) selection styling
+ * so our own .lixun-top-hit class is the only selection cue. */
+listview row,
+listview row:selected,
+listview row:selected:hover,
+listview row:active,
+listview row:selected:focus {
+  background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+  outline: none;
+}
+
+.lixun-hit {
+  background-color: transparent;
+  border-radius: 0;
+  padding: 8px 12px;
+  margin: 0;
+  color: var(--lixun-secondary-text);
+}
+
+.lixun-hit:hover {
+  background-color: alpha(mix(var(--lixun-surface), var(--lixun-primary), 0.15), 0.30);
+}
+
+/* The best match keeps its frame when selection moves to another row.
+ * Only the keyboard selection gets the accent bar. */
+.lixun-hit.lixun-top-hit-hero {
+  background-color: alpha(mix(var(--lixun-surface), var(--lixun-primary), 0.15), 0.30);
+  border: 1px solid var(--lixun-outline-variant);
+  padding: 9px 11px;
+}
+
+.lixun-hit.lixun-top-hit,
+.lixun-hit.lixun-top-hit:hover {
+  background-color: alpha(mix(var(--lixun-surface), var(--lixun-primary), 0.21), 0.65);
+  box-shadow: inset 3px 0 0 0 var(--lixun-primary);
+}
+
+/* Row labels */
+
+.lixun-title {
+  color: var(--lixun-on-surface);
+  font-size: 10.5pt;
+  font-weight: 500;
+}
+
+.lixun-top-hit .lixun-title {
+  font-weight: 700;
+  color: var(--lixun-on-surface);
+}
+
+.lixun-subtitle {
+  color: var(--lixun-secondary-text);
+  font-size: 8.25pt;
+  font-weight: 400;
+}
+
+.lixun-kind {
+  color: var(--lixun-secondary-text);
+  font-size: 7.5pt;
+  font-weight: 500;
+  margin-right: 6px;
+  text-transform: uppercase;
+}
+
+/* Status bar */
+
+.lixun-status {
+  background-color: alpha(var(--lixun-outline-variant), 0.25);
+  border-top: 1px solid var(--lixun-outline-variant);
+  border-radius: 0;
+  padding: 6px 12px;
+  margin-top: 0;
+}
+
+.lixun-status-label {
+  color: var(--lixun-secondary-text);
+  font-size: 9pt;
+}
+
+.lixun-status-calc {
+  color: var(--lixun-on-surface);
+  font-size: 10.5pt;
+  font-weight: 500;
+  font-family: "JetBrainsMono Nerd Font", "JetBrains Mono", ui-monospace, monospace;
+}
+
+.lixun-status-action {
+  background-color: alpha(var(--lixun-primary), 0.22);
+  color: var(--lixun-on-primary-container);
+  border: 1px solid var(--lixun-primary);
+  border-radius: 0;
+  padding: 2px 10px;
+  font-size: 8.25pt;
+  font-weight: 500;
+}
+
+.lixun-status-action:hover {
+  background-color: alpha(var(--lixun-primary), 0.38);
+  color: var(--lixun-on-primary-container);
+  border-color: var(--lixun-primary-container);
+}
+
+/* Right-click / action popover menu */
+
+popover.menu,
+popover.menu > contents,
+popover.menu > arrow {
+  background-color: alpha(var(--lixun-surface), 0.93);
+  background-image: none;
+  border: 1px solid var(--lixun-outline-variant);
+  border-radius: 0;
+  box-shadow: none;
+  color: var(--lixun-secondary-text);
+}
+
+popover.menu modelbutton {
+  background: transparent;
+  color: var(--lixun-secondary-text);
+  border-radius: 0;
+  padding: 4px 12px;
+  min-height: 28px;
+}
+
+popover.menu modelbutton:hover {
+  background-color: alpha(var(--lixun-primary), 0.18);
+  color: var(--lixun-on-surface);
+}
+
+popover.menu separator {
+  background-color: var(--lixun-outline-variant);
+  min-height: 1px;
+}
+
+/* Tokyo Night Day follows the desktop light preference. */
+window.lixun-light,
+popover.lixun-light {
+  --lixun-primary:               #2959aa;
+  --lixun-on-primary:            #ffffff;
+  --lixun-primary-container:     #9854f1;
+  --lixun-on-primary-container:  #3760bf;
+  --lixun-surface:               #e1e2e7;
+  --lixun-on-surface:            #182741;
+  --lixun-on-surface-variant:    #39496e;
+  --lixun-outline:               #8990b3;
+  --lixun-outline-variant:       #b6b8c7;
+  --lixun-error:                 #f52a65;
+  --lixun-on-error:              #ffffff;
+}
+
+.lixun-window.lixun-no-blur {
+  background-color: alpha(var(--lixun-surface), 0.94);
+}

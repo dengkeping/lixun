@@ -544,11 +544,30 @@ async fn async_main(
     )?;
 
     let index_path = config.state_dir.join("index");
-    let (index, rebuilt_from_scratch) = lixun_index::LixunIndex::create_or_open_with_plugins(
+    let (index, pending_generation) = lixun_index::LixunIndex::prepare_generation(
         &index_path,
         &registry.plugin_fields_by_kind,
         config.ranking_config(),
     )?;
+
+    let rebuilt_from_scratch = pending_generation.is_some();
+    let previous = if let Some(pending) = &pending_generation {
+        lixun_index::LixunIndex::previous_reader(
+            pending.previous(),
+            &registry.plugin_fields_by_kind,
+            config.ranking_config(),
+        )
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "previous generation could not be opened during rebuild");
+            None
+        })
+    } else {
+        None
+    };
+    let incompatible_generation = previous.is_none()
+        && pending_generation
+            .as_ref()
+            .is_some_and(|p| p.previous().join("meta.json").exists());
 
     let stats = Arc::new(RwLock::new(IndexStats::default()));
     let ocr_worker_stats = Arc::new(lixun_indexer::ocr_tick::OcrWorkerStats::default());
@@ -680,8 +699,18 @@ async fn async_main(
     let indexer_state_dir = state_dir.clone();
     let indexer_sources = Arc::clone(&sources);
     let indexer_registry = Arc::clone(&registry);
-    tokio::spawn(async move {
-        if let Err(e) = run_incremental_indexer(
+    let next_surface = Arc::new(ipc_search);
+    let initial_surface = previous.map(|index| {
+        Arc::new(HybridSearchHandle::new_lexical_only(SearchHandle::new(
+            Arc::new(index),
+        )))
+    });
+    let ipc_search = Arc::new(ArcSwap::from(
+        initial_surface.unwrap_or_else(|| next_surface.clone()),
+    ));
+    let publication = ipc_search.clone();
+    let indexing = async move {
+        run_incremental_indexer(
             indexer_mutation,
             indexer_search,
             indexer_stats,
@@ -690,11 +719,22 @@ async fn async_main(
             indexer_registry,
             rebuilt_from_scratch,
         )
-        .await
-        {
-            tracing::error!("Incremental indexer error: {}", e);
+        .await?;
+        if let Some(pending) = pending_generation {
+            tokio::task::spawn_blocking(move || pending.publish()).await??;
+            publication.store(next_surface);
         }
-    });
+        Ok::<(), anyhow::Error>(())
+    };
+    if incompatible_generation {
+        indexing.await?;
+    } else {
+        tokio::spawn(async move {
+            if let Err(e) = indexing.await {
+                tracing::error!("Incremental indexer error: {e:#}");
+            }
+        });
+    }
 
     let watcher_search = search.clone();
     let watcher_mutation = mutation_tx.clone();
@@ -1444,7 +1484,7 @@ async fn read_request(
 #[allow(clippy::too_many_arguments)]
 async fn handle_client(
     stream: tokio::net::UnixStream,
-    search: SearchSurface,
+    search: Arc<ArcSwap<SearchSurface>>,
     mutation_tx: IndexMutationTx,
     frecency: Arc<RwLock<FrecencyStore>>,
     query_latch: Arc<RwLock<QueryLatchStore>>,
@@ -1496,8 +1536,6 @@ async fn handle_client(
     let mut writer_finished = false;
     let mut search_tasks = tokio::task::JoinSet::<anyhow::Result<()>>::new();
 
-    let fusion = Arc::new(search);
-
     let mut pending_first: Option<Request> = Some(first_req);
 
     loop {
@@ -1546,6 +1584,7 @@ async fn handle_client(
             }
         };
 
+        let fusion = search.load_full();
         match req {
             Request::Search {
                 q,
@@ -1814,8 +1853,17 @@ async fn handle_client(
                     break;
                 }
             }
-            Request::Preview { hit, monitor } => {
-                let resp = match preview_spawner.dispatch(*hit, monitor).await {
+            request @ (Request::Preview { .. } | Request::PreviewFragment { .. }) => {
+                let (hit, monitor, fragment) = match request {
+                    Request::Preview { hit, monitor } => (hit, monitor, None),
+                    Request::PreviewFragment {
+                        hit,
+                        monitor,
+                        fragment,
+                    } => (hit, monitor, Some(fragment)),
+                    _ => unreachable!(),
+                };
+                let resp = match preview_spawner.dispatch(*hit, monitor, fragment).await {
                     Ok(()) => Response::Ok,
                     Err(e) => {
                         tracing::error!("preview_spawn: dispatch failed: {}", e);

@@ -26,13 +26,13 @@
  *
  * ----- Selector reference (launcher) --------------------------------
  *
- *   #lixun-root            - the window itself (layer-shell surface);
- *                            must stay transparent (rounded corners)
- *   .lixun-window          - the visible glass surface
+ *   #lixun-root            - the launcher window
+ *   .lixun-window          - class on that same window; paint the panel
+ *                            here and GTK clips it to the border radius
  *   .lixun-window.lixun-no-blur
  *                          - added when compositor blur is off or
  *                            unavailable; built-in raises the surface
- *                            alpha to 0.92 here (0.70 with blur)
+ *                            alpha to 0.94 here (0.70 with blur)
  *   window.lixun-light / .lixun-light
  *                          - toggled on the root window when the
  *                            desktop reports a light colour scheme;
@@ -158,7 +158,7 @@ window, popover {
 /* ----- Light-mode-only tweaks ------------------------------------ *
  * .lixun-light is toggled on the root window from the freedesktop
  * appearance portal; prefix any rule with it for light-only styling.
-.lixun-light .lixun-window {
+.lixun-window.lixun-light {
     border: 0.5px solid rgba(0, 0, 0, 0.25);
 }
 */

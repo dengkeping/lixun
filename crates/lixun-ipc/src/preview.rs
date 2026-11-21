@@ -102,6 +102,8 @@ pub enum PreviewCommand {
     ShowOrUpdate {
         epoch: u64,
         hit: Box<Hit>,
+        #[serde(default)]
+        fragment: Option<lixun_core::fragment::TextFragment>,
         monitor: Option<String>,
     },
     /// Hide the preview window but keep the process alive. Called
@@ -525,6 +527,7 @@ mod tests {
         let cmd = PreviewCommand::ShowOrUpdate {
             epoch: 7,
             hit: Box::new(sample_hit()),
+            fragment: None,
             monitor: Some("eDP-1".into()),
         };
         peer.encode(cmd.clone(), &mut buf).unwrap();
@@ -533,6 +536,7 @@ mod tests {
             PreviewCommand::ShowOrUpdate {
                 epoch,
                 hit,
+                fragment: _,
                 monitor,
             } => {
                 assert_eq!(epoch, 7);

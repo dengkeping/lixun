@@ -152,7 +152,8 @@ pub(crate) fn open_row_info(doc_id: &str) -> bool {
 /// searches, the web-search fallback, "Show more results"). These
 /// never exist in the index, so click recording skips them.
 pub(crate) fn is_synthetic_doc_id(doc_id: &str) -> bool {
-    doc_id.starts_with("history:")
+    doc_id.starts_with("gui-layout:")
+        || doc_id.starts_with("history:")
         || doc_id.starts_with("gui-web:")
         || doc_id.starts_with("gui-more:")
 }
@@ -871,6 +872,7 @@ pub(crate) fn create_list_factory(ctx: RowFactoryCtx) -> gtk::SignalListItemFact
         });
         group.add_action(&copy);
 
+        let quick_entry = setup_entry.clone();
         let quick_state = Rc::clone(&state);
         let quick_row = row.clone();
         let quick = gio::SimpleAction::new("quicklook", None);
@@ -884,7 +886,7 @@ pub(crate) fn create_list_factory(ctx: RowFactoryCtx) -> gtk::SignalListItemFact
                     .root()
                     .and_then(|r| r.downcast::<gtk::ApplicationWindow>().ok())
                     .and_then(|w| crate::ipc::current_monitor_connector(&w));
-                send_preview_request(&hit, monitor);
+                send_preview_request(&hit, monitor, &quick_entry.text());
             }
         });
         group.add_action(&quick);
@@ -1285,7 +1287,16 @@ fn on_item_notify(
             // disambiguating deep directories survive, full path on
             // the row tooltip. Non-path subtitles (mail authors,
             // "Recent search") keep the plain end-ellipsized text.
-            if hit.subtitle.starts_with('/') {
+            let passage = lixun_core::fragment::PassageMatcher::new(&query);
+            if let Some((text, fragment)) =
+                hit.body.as_deref().and_then(|b| passage.as_ref()?.find(b))
+            {
+                let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                subtitle.set_text(&line);
+                apply_highlight(&subtitle, &line, &fragment.quote);
+                subtitle.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                row.set_tooltip_text(Some(&hit.subtitle));
+            } else if hit.subtitle.starts_with('/') {
                 let displayed = display_path_subtitle(&hit.subtitle, dirs::home_dir().as_deref());
                 subtitle.set_text(&displayed);
                 apply_highlight(&subtitle, &displayed, &query);

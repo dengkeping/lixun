@@ -167,7 +167,20 @@ pub fn decode_to_dynamic_image(path: &Path) -> Result<image::DynamicImage> {
         "cr2" | "cr3" | "nef" | "nrw" | "arw" | "srf" | "sr2" | "dng" | "raf" | "orf" | "rw2"
         | "pef" => decode_raw_direct(path),
 
-        _ => image::open(path).context("Failed to open image"),
+        _ => {
+            use image::{DynamicImage, ImageDecoder, ImageReader, Limits, metadata::Orientation};
+
+            let mut decoder = ImageReader::open(path)?.into_decoder()?;
+            // Preserve ImageReader::decode's allocation budget for the output pixels.
+            let mut limits = Limits::default();
+            limits.reserve(decoder.total_bytes())?;
+            decoder.set_limits(limits)?;
+            let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+            let mut image =
+                DynamicImage::from_decoder(decoder).context("Failed to decode image")?;
+            image.apply_orientation(orientation);
+            Ok(image)
+        }
     }
 }
 

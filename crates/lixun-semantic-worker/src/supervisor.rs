@@ -40,7 +40,7 @@ use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
 use crate::embedder::{
-    ClipTextEmbedder, ImageEmbedder, TextEmbedder, load_clip_text_embedder, load_image_embedder,
+    ClipTextEmbedder, ImageEmbedder, TextEmbedder, load_clip_query_encoder, load_image_embedder,
     load_text_embedder,
 };
 
@@ -196,7 +196,12 @@ impl EmbedderSupervisor {
             )
         });
         let load_clip_text: ClipTextLoader = Box::new(move || {
-            load_clip_text_embedder(&cache_for_clip, onnx_intra_threads, onnx_inter_threads)
+            load_clip_query_encoder(
+                &image_model_arc,
+                &cache_for_clip,
+                onnx_intra_threads,
+                onnx_inter_threads,
+            )
         });
 
         Self::new(SupervisorInit {

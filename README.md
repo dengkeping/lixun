@@ -204,6 +204,13 @@ lixun-cli impact set medium [--persist]  # change level (hot+cold knobs)
 lixun-cli impact explain                 # preview changes without applying
 ```
 
+### Working with search results
+
+- A body-text match shows the surrounding passage under the title. Press **Space** on a matching PDF to open its preview on the first occurrence with the quote highlighted. Enter opens the usual file handler.
+- Open the launcher menu and choose **Saved searches…** to name the current query and category. Choosing a saved name searches the current index again.
+- Run `lixun-cli preview-root /path/to/folder` before adding an indexing root. The command checks installed extractors, size limits, OCR eligibility and exclusion rules. Excluded directories appear once with the matching rule. OCR candidates depend on successful recognition when indexed.
+- When an ordinary query returns zero results, the launcher can offer the same keystrokes in the other Russian/English layout. Select the suggestion and press **Enter** to search again.
+
 ### Preview pane
 
 Press **Space** on any focused result to open the preview overlay.
@@ -416,20 +423,14 @@ reference.
 
 ## Theming
 
-Lixun is fully themable via GTK4 CSS. Drop a `style.css` at
-`~/.config/lixun/style.css`; it loads at `APPLICATION+1` priority on top
-of the built-in theme, so every declaration you write overrides the
-default. Restart the daemon (or the GUI) to apply:
+The launcher ships with Tokyo Night, including a light palette that follows
+the desktop colour preference. It works on a fresh installation with no
+theme files or configuration. Place CSS overrides in
+`~/.config/lixun/style.css`, or select a named theme under `[gui]`.
+The launcher reloads edits while it runs.
 
-```sh
-systemctl --user restart lixund
-```
-
-See [`docs/style.example.css`](docs/style.example.css) for the full
-selector reference (window, entry, result rows, status bar, …) plus
-ready-made recipes for a light theme, an alternate accent colour,
-bigger text, and denser rows. The file doubles as a copy of the
-default stylesheet, so you can fork it and tweak.
+See [the theming guide](docs/theming.md) for the stylesheet cascade and
+[the example stylesheet](docs/style.example.css) for customisation recipes.
 
 Inspect the live widget tree with:
 
@@ -444,7 +445,7 @@ all widgets of a kind.
 
 ### Compositor blur (liquid-glass look)
 
-The default theme is translucent (background alpha `0.35`) so that a
+The default panel is 70% opaque so that a
 blurred backdrop can shine through. The launcher window asks the
 compositor to blur whatever is behind it on supported compositors:
 
@@ -460,12 +461,9 @@ compositor to blur whatever is behind it on supported compositors:
   ```
 
 - **sway, niri, GNOME** — no blur protocol available; the window
-  degrades to plain translucency, still readable on a mid-tone
-  wallpaper.
+  uses a denser, 94% opaque tint when blur is unavailable.
 
-Bumping the `.lixun-window` background alpha back up to `0.92` or `1.0`
-in your `style.css` opts out of the glass look entirely (no
-see-through, no blur dependency).
+Set `[gui] opacity` to adjust the tint while blur is active.
 
 ---
 
@@ -658,13 +656,7 @@ existing codebase teaches us.
 
 ### Preview parity (Phase 1)
 
-The preview window works, but is not at QuickLook parity yet. Missing:
-
-- Pan / zoom / paginate for images and PDFs.
-- Text selection inside preview (copy quote out without opening the file).
-- Image-region selection (drag a rectangle, copy as PNG).
-- A stable plugin API for third-party preview plugins (the current trait
-  is internal-only).
+The PDF plugin supports page navigation, zoom, text selection and copying, in-document search, and highlighted search passages. The image plugin supports panning, zoom and copying a selected region. A stable API for third-party preview plugins remains open.
 
 Open architectural question: whether the preview window stays on GTK4 +
 `wlr-layer-shell`, moves to GTK4 + `xdg-toplevel` (~1 week, keeps the
@@ -736,12 +728,11 @@ stays a personal tool or grows an ecosystem.
 
 ## Upgrade notes
 
-The on-disk search index is versioned by `INDEX_VERSION` in
-`crates/lixun-index/src/lib.rs`. When this version bumps, the daemon
-detects the mismatch on startup and re-indexes from scratch; the old
-index stays queryable until the rebuild finishes, so there is no
-user-visible search downtime. Expect transient CPU and I/O for the
-duration of the reindex (minutes on typical home corpora).
+A change to `INDEX_VERSION` or the plugin schema fingerprint starts a replacement Tantivy generation under the index directory. The previous directory stays in place. If its field layout is readable by this build, it continues to answer lexical searches while the sources are indexed. An incompatible layout delays search startup until the replacement is ready.
+
+After the source walk and writer commit, the daemon checks that every filesystem manifest entry is present. If an indexed volume is unavailable, reconnect it and restart the daemon to resume. The daemon then opens a reader, checks the segment checksums and atomically publishes the `CURRENT` pointer. A restart before publication can resume the matching `PENDING` generation. Legacy installations with no pointer use the original directory as their previous generation. Allow disk space for both generations. Old generations are retained.
+
+The [search quality report](docs/search-quality.md) records the semantic model changes, measurements, and vector backfill requirements.
 
 Recent version bumps:
 
@@ -768,7 +759,7 @@ Recent version bumps:
   short queries — fan-out-and-merge is more robust). **INDEX_VERSION bump:**
   Tantivy schema gained a `mime` field needed for routing image documents into
   the CLIP image embedder. Daemon detects the mismatch on startup and reindexes
-  from scratch; existing index stays queryable until rebuild completes. See
+  from source. See the generation compatibility notes above and
   `docs/search-fusion.md` for architecture details.
 
 - **v0.5.1** (packaging hardening). Fixed Arch makepkg link failure (LTO

@@ -9,7 +9,7 @@ fn default_text_model() -> String {
 }
 
 fn default_image_model() -> String {
-    "clip-vit-b-32".into()
+    crate::embedder::MULTILINGUAL_CLIP.into()
 }
 
 fn default_flush_ms() -> u64 {

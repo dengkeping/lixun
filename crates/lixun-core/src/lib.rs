@@ -4,10 +4,25 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 pub mod embedded;
+pub mod fragment;
 pub mod impact;
 pub mod paths;
 
 pub use impact::{ImpactProfile, SystemImpact};
+
+/// True when the query uses tantivy query-parser syntax (exclusion,
+/// phrase quotes, field scoping, boolean operators). Such queries
+/// express precise intent: the incremental-typing prefix clause and
+/// the disjunctive refill pass are both skipped so they cannot
+/// resurrect documents the operators excluded.
+pub fn query_uses_operators(text: &str) -> bool {
+    if text.contains('"') || text.contains(':') || text.contains('|') {
+        return true;
+    }
+    text.split_whitespace().any(|w| {
+        (w.len() > 1 && (w.starts_with('-') || w.starts_with('+'))) || w == "OR" || w == "AND"
+    })
+}
 
 /// Categories of searchable items.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

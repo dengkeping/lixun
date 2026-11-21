@@ -24,3 +24,7 @@ image-decode = ["lixun-image-decode"]
 [lib]
 name = "lixun_preview_image"
 path = "src/lib.rs"
+
+[dev-dependencies]
+image.workspace = true
+tempfile = "3"

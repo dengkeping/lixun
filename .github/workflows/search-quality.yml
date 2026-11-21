@@ -1,0 +1,43 @@
+name: Real-model search quality
+
+on:
+  workflow_call:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/lixun-semantic-worker/**'
+      - 'crates/lixun-fusion/**'
+      - 'tests/search-quality/**'
+      - '.github/workflows/search-quality.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  mixed-corpus:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - run: pacman -Syu --noconfirm --needed git clang cmake protobuf gtk4 gtk4-layer-shell poppler-glib libheif openssl pkgconf python-pillow python-reportlab curl
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+      - run: cargo build --release --locked -p lixun-daemon -p lixun-cli -p lixun-semantic-worker
+      - name: Fetch the labelled corpus
+        run: curl --fail --location --retry 3 https://www.robots.ox.ac.uk/~vgg/data/pets/data/images.tar.gz -o /tmp/pets.tar.gz
+      - name: Exercise the production models with both corpus sizes
+        run: |
+          for skew in 6 60; do
+            python tests/search-quality/mixed.py --allow-download --bin target/release --cache /tmp/models --pets /tmp/pets.tar.gz --split all --skew "$skew" --output "quality-$skew.json" --gate || exit 1
+          done
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: search-quality-reports
+          path: quality-*.json

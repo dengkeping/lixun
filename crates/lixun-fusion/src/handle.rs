@@ -202,6 +202,17 @@ impl HybridSearchHandle {
             })
             .await;
 
+        // Only the lexical parser can enforce scoped terms, phrases and exclusions.
+        if lixun_core::query_uses_operators(&query.text) {
+            let _ = tx
+                .send(FusionChunk {
+                    phase: Phase::Final,
+                    hits: lex_pairs,
+                })
+                .await;
+            return Ok(());
+        }
+
         // Phase 2: ANN in parallel (text + image) plus query-modality
         // classification, cancellable. Classification shares the CLIP
         // query embedding with the image search (worker-side cache), so
@@ -307,18 +318,7 @@ impl HybridSearchHandle {
         } else {
             modality_res.unwrap_or(lixun_mutation::Modality::Text)
         };
-        let weights = match modality {
-            lixun_mutation::Modality::Image => (1.0, 0.8, 1.8),
-            // A rank-one neighbour exists even for a channel with no clear
-            // match. For ambiguous intent use the separation of the leading
-            // neighbours within each channel, not raw cross-model distances.
-            lixun_mutation::Modality::Both => (
-                1.0,
-                1.0 + lead_separation(&text_hits),
-                1.0 + 1.3 * lead_separation(&image_hits),
-            ),
-            lixun_mutation::Modality::Text => (1.0, 1.0, 1.0),
-        };
+        let weights = channel_weights(&query.text, modality, &text_hits, &image_hits);
         tracing::debug!(
             target: "lixun_fusion",
             ?modality,
@@ -349,6 +349,17 @@ impl HybridSearchHandle {
         let lexical_ids: std::collections::HashSet<String> =
             bm25_ranked.iter().map(|(id, _)| id.clone()).collect();
         let mut fused = crate::rrf::precision_first(fused, &precision_ids, &lexical_ids);
+        prioritize_filename_words(
+            &mut fused,
+            &query.text,
+            lex_pairs
+                .iter()
+                .filter(|(hit, bd)| {
+                    hit.category == lixun_core::Category::File && !bd.lexical_fallback
+                })
+                .map(|(hit, _)| (hit.id.0.as_str(), hit.title.as_str())),
+            &precision_ids,
+        );
 
         // Preserve category priority before the fused page is truncated.
         // Only full lexical matches carry priority: a semantic neighbour
@@ -378,6 +389,11 @@ impl HybridSearchHandle {
             .map(|(_, bd)| bd.final_score)
             .collect();
         ladder.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        // Equal lexical scores are common in repetitive corpora. Preserve the
+        // fused order through the final score sort, including tied BM25 slots.
+        for i in 1..ladder.len() {
+            ladder[i] = ladder[i].min(ladder[i - 1].next_down());
+        }
         let score_for_rank = |pos: usize, rrf_score: f32| -> f32 {
             if let Some(s) = ladder.get(pos) {
                 *s
@@ -484,6 +500,21 @@ impl HybridSearchHandle {
             }
         }
 
+        if tracing::enabled!(target: "lixun_fusion::ranks", tracing::Level::TRACE) {
+            let ranks: Vec<_> = out
+                .iter()
+                .map(|(hit, _)| {
+                    let rank = |channel: &[(String, f32)]| {
+                        channel
+                            .iter()
+                            .position(|(id, _)| id == &hit.id.0)
+                            .map_or(0, |i| i + 1)
+                    };
+                    [rank(&bm25_ranked), rank(&text_ranked), rank(&image_ranked)]
+                })
+                .collect();
+            tracing::trace!(target: "lixun_fusion::ranks", ?ranks, "post-fusion positions");
+        }
         let _ = tx
             .send(FusionChunk {
                 phase: Phase::Final,
@@ -492,6 +523,42 @@ impl HybridSearchHandle {
             .await;
 
         Ok(())
+    }
+}
+
+/// A single word in a filename can identify the file even when its semantic
+/// embedding is missing. Earlier words take precedence over later ones.
+fn prioritize_filename_words<'a>(
+    fused: &mut [(String, f32)],
+    query: &str,
+    filenames: impl Iterator<Item = (&'a str, &'a str)>,
+    precision_ids: &std::collections::HashSet<String>,
+) {
+    use lixun_index::normalize::normalize_for_match;
+    let word = normalize_for_match(query);
+    if word.is_empty() || !word.chars().all(char::is_alphanumeric) {
+        return;
+    }
+    let positions: std::collections::HashMap<_, _> = filenames
+        .filter_map(|(id, title)| {
+            let stem = std::path::Path::new(title).file_stem()?.to_str()?;
+            let position = normalize_for_match(stem)
+                .split(|ch: char| !ch.is_alphanumeric())
+                .filter(|token| !token.is_empty())
+                .position(|token| token == word)?;
+            Some((id, position))
+        })
+        .collect();
+    if !positions.is_empty() {
+        fused.sort_by_key(|(id, _)| {
+            if precision_ids.contains(id) {
+                (0, 0)
+            } else if let Some(&position) = positions.get(id.as_str()) {
+                (1, position)
+            } else {
+                (2, 0)
+            }
+        });
     }
 }
 
@@ -529,9 +596,125 @@ fn looks_navigational(query: &str) -> bool {
     !t.is_empty() && !t.contains(char::is_whitespace) && t.contains(['-', '_', '.', '/'])
 }
 
+fn channel_weights(
+    query: &str,
+    modality: lixun_mutation::Modality,
+    text_hits: &[lixun_mutation::AnnHit],
+    image_hits: &[lixun_mutation::AnnHit],
+) -> (f32, f32, f32) {
+    match explicit_media_intent(query).unwrap_or(modality) {
+        lixun_mutation::Modality::Image => (1.0, 0.8, 2.0),
+        // A rank-one neighbour exists even for a channel with no clear
+        // match. For ambiguous intent use the separation of the leading
+        // neighbours within each channel, not raw cross-model distances.
+        lixun_mutation::Modality::Both => (
+            1.0,
+            1.0 + lead_separation(text_hits),
+            1.0 + 1.3 * lead_separation(image_hits),
+        ),
+        lixun_mutation::Modality::Text => (1.0, 1.0, 1.0),
+    }
+}
+
+fn explicit_media_intent(query: &str) -> Option<lixun_mutation::Modality> {
+    let text = query.trim().to_lowercase();
+    if looks_navigational(&text) {
+        return None;
+    }
+    let photos = [
+        "photo of ",
+        "photos of ",
+        "photograph of ",
+        "photographs of ",
+        "pictures of ",
+        "picture of ",
+        "фото ",
+        "фотография ",
+        "фотографии ",
+    ];
+    if photos.iter().any(|prefix| text.starts_with(prefix)) || text.ends_with("的照片") {
+        Some(lixun_mutation::Modality::Image)
+    } else if [
+        "article about ",
+        "articles about ",
+        "статья о ",
+        "статья об ",
+    ]
+    .iter()
+    .any(|prefix| text.starts_with(prefix))
+        || text.ends_with("的文章")
+    {
+        Some(lixun_mutation::Modality::Text)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{looks_navigational, prioritize_fused};
+
+    #[test]
+    fn single_word_in_filename_survives_semantic_fusion() {
+        let files = [
+            ("suffix", "outline.маяк"),
+            ("substring", "У_маяка.txt"),
+            ("copy", "2.Карта-маяк_севера.pdf"),
+            ("original", "Карта-маяк_севера.pdf"),
+            ("prefix", "Маяк севера.pdf"),
+        ];
+        let initial: Vec<_> = [
+            "semantic",
+            "suffix",
+            "substring",
+            "copy",
+            "original",
+            "prefix",
+        ]
+        .into_iter()
+        .map(|id| (id.to_owned(), 1.0))
+        .collect();
+        let precision = ["prefix".to_owned()].into();
+        let mut fused = initial.clone();
+        super::prioritize_filename_words(&mut fused, " МАЯК ", files.into_iter(), &precision);
+        let ids: Vec<_> = fused.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "prefix",
+                "original",
+                "copy",
+                "semantic",
+                "suffix",
+                "substring"
+            ]
+        );
+        for query in ["фото маяка", "pdf", "мая"] {
+            let mut fused = initial.clone();
+            super::prioritize_filename_words(&mut fused, query, files.into_iter(), &precision);
+            assert_eq!(fused, initial);
+        }
+    }
+
+    #[test]
+    fn explicit_photo_intent_beats_duplicate_text_votes() {
+        use lixun_mutation::Modality;
+        for q in ["Photos of birds", "фото птиц", "鸟的照片"] {
+            let weights = super::channel_weights(q, Modality::Both, &[], &[]);
+            let text = vec![(String::from("article"), 1.0)];
+            let images: Vec<_> = (0..5).map(|i| (format!("photo-{i}"), 1.0)).collect();
+            let ordered = crate::rrf::rrf_fuse_3way_weighted(&text, &text, &images, 60.0, weights);
+            assert!(
+                ordered[..5].iter().all(|(id, _)| id.starts_with("photo-")),
+                "{q}"
+            );
+        }
+        assert_eq!(super::explicit_media_intent("photo.jpg"), None);
+        assert_eq!(
+            super::explicit_media_intent("article about photographs"),
+            Some(Modality::Text)
+        );
+    }
 
     #[test]
     fn priority_match_survives_semantic_page_cutoff() {

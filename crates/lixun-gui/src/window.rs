@@ -1266,6 +1266,7 @@ fn popup_settings_menu(
     let menu = gtk::PopoverMenu::from_model(None::<&gtk::gio::MenuModel>);
     let menu_model = gtk::gio::Menu::new();
 
+    menu_model.append(Some("Saved searches…"), Some("app.saved-searches"));
     menu_model.append(Some("Relaunch Daemon"), Some("app.relaunch"));
 
     // Label from LIVE daemon status when available (F6): config-
@@ -1740,6 +1741,14 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
     window.set_child(Some(&vbox));
 
     let chips_rc = std::rc::Rc::new(chips);
+    crate::saved_searches::install(
+        app,
+        &entry,
+        chips_rc.clone(),
+        current_category.clone(),
+        &daemon_config.state_dir,
+        row_popover_open.clone(),
+    );
     let pending_debounce: std::rc::Rc<std::cell::RefCell<Option<glib::SourceId>>> =
         std::rc::Rc::new(std::cell::RefCell::new(None));
     let loading_timer: std::rc::Rc<std::cell::RefCell<Option<glib::SourceId>>> =
@@ -1924,7 +1933,11 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
                 let monitor = crate::ipc::current_monitor_connector(&window_inner);
                 crate::factory::with_cached_hits(|hits| {
                     if let Some(hit) = hits.iter().find(|h| h.id.0 == doc_id) {
-                        crate::ipc::send_preview_request(hit, monitor.clone());
+                        crate::ipc::send_preview_request(
+                            hit,
+                            monitor.clone(),
+                            &controller_inner.entry.text(),
+                        );
                     }
                 });
                 // Keep keyboard focus in the search entry so the
@@ -2785,21 +2798,34 @@ fn install_response_handler(
                                 if !q.is_empty() {
                                     chips_container.set_visible(true);
                                     let category = current_category.get();
-                                    // C3c: on an unfiltered zero-hit,
-                                    // render the web-search fallback
-                                    // as a selectable synthetic row so
-                                    // it is Enter-able, not only a
-                                    // status-bar button. With a chip
-                                    // filter active the row (a File-
-                                    // category synthetic) would be
-                                    // filtered out — show the
-                                    // category-aware message instead.
-                                    if !claimed && category.is_none() {
+                                    let layout = (!claimed)
+                                        .then(|| crate::layout_retry::alternative(&q))
+                                        .flatten();
+                                    if !claimed && (category.is_none() || layout.is_some()) {
                                         let web_hit = crate::factory::synthetic_web_search_hit(
                                             &q,
                                             &web_engine_url,
                                         );
-                                        update_results(&model, &selection, &[web_hit], None);
+                                        let mut alternatives = Vec::new();
+                                        if let Some(text) = layout {
+                                            let mut retry = web_hit.clone();
+                                            retry.id =
+                                                lixun_core::DocId(format!("gui-layout:{text}"));
+                                            retry.title = text.clone();
+                                            retry.subtitle =
+                                                "Search using the other keyboard layout".into();
+                                            retry.icon_name =
+                                                Some("input-keyboard-symbolic".into());
+                                            retry.kind_label = None;
+                                            retry.category = category.unwrap_or(retry.category);
+                                            retry.action =
+                                                lixun_core::Action::ReplaceQuery { q: text };
+                                            alternatives.push(retry);
+                                        }
+                                        if category.is_none() {
+                                            alternatives.push(web_hit);
+                                        }
+                                        update_results(&model, &selection, &alternatives, None);
                                         filter.changed(gtk::FilterChange::Different);
                                         if selection.n_items() > 0 {
                                             selection.set_selected(0);

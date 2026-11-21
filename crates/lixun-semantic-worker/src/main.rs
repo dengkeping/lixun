@@ -30,7 +30,7 @@ use lixun_semantic_proto::{Cmd, ErrorCode, Msg, PROTOCOL_VERSION, WorkerCodec};
 use lixun_semantic_worker::ann::LanceDbAnnHandle;
 use lixun_semantic_worker::config::SemanticConfig;
 use lixun_semantic_worker::embedder::{
-    load_clip_text_embedder, load_image_embedder, load_text_embedder,
+    load_clip_query_encoder, load_image_embedder, load_text_embedder,
 };
 use lixun_semantic_worker::ipc_doc_store::IpcDocStore;
 use lixun_semantic_worker::journal::BackfillJournal;
@@ -162,11 +162,13 @@ async fn main() -> Result<()> {
         .context("worker: send HandshakeOk")?;
 
     let (data_root, cache_root) = data_and_cache_roots()?;
-    /* Phase 1 ships with the daemon's defaults. A future Cmd will
-    let the daemon push the live `[semantic]` config block; any such
-    config must pass through `sanitize_model_ids` before reaching the
-    embedder loaders. */
-    let mut cfg = SemanticConfig::default();
+    let mut cfg: SemanticConfig = lixun_config::Config::load()?
+        .plugin_sections
+        .remove("semantic")
+        .map(|value| value.try_into())
+        .transpose()
+        .context("reading [semantic] configuration")?
+        .unwrap_or_default();
     cfg.sanitize_model_ids();
 
     let cache_dir = cache_root.join(&cfg.cache_subdir);
@@ -174,8 +176,8 @@ async fn main() -> Result<()> {
         .with_context(|| format!("loading text embedder '{}'", cfg.text_model))?;
     let image_embedder = load_image_embedder(&cfg.image_model, &cache_dir, 1, 1)
         .with_context(|| format!("loading image embedder '{}'", cfg.image_model))?;
-    let clip_text_embedder =
-        load_clip_text_embedder(&cache_dir, 1, 1).context("loading CLIP text embedder")?;
+    let clip_text_embedder = load_clip_query_encoder(&cfg.image_model, &cache_dir, 1, 1)
+        .context("loading CLIP text embedder")?;
     let text_dim = text_embedder.dim();
     let image_dim = image_embedder.dim();
 
@@ -203,6 +205,19 @@ async fn main() -> Result<()> {
     #[cfg(not(feature = "idle-eviction"))]
     let clip_text_embedder = Arc::new(Mutex::new(clip_text_embedder));
 
+    tracing::info!(text = %cfg.text_model, image = %cfg.image_model, text_dim, image_dim,
+        document_text_int8 = cfg.text_model == "bge-small-en-v1.5" && cfg!(feature = "quantized-embedders"), "loaded retrieval models");
+    // The multilingual CLIP variant replaces only the query tower. Both
+    // variants index images with exactly the same vision model, so upgrades
+    // can immediately search every legacy image and its backfill journal.
+    let data_root = match cfg.text_model.as_str() {
+        "bge-small-en-v1.5" if cfg!(feature = "quantized-embedders") => data_root,
+        model => data_root
+            .join("models")
+            .join(format!("{model}-fp32"))
+            .join("clip-vit-b-32"),
+    };
+    std::fs::create_dir_all(&data_root)?;
     let vectors_dir = data_root.join("vectors");
     // Log open failures through tracing BEFORE returning: anyhow's
     // stderr print races the supervisor killing the child once the

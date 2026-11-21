@@ -17,6 +17,7 @@ xvfb-run -a env DBUS_SESSION_BUS_ADDRESS=unix:path=/dev/null GDK_BACKEND=x11 GSK
 
 socket_tests=$(cargo test --locked -p lixun-daemon --test cancellation --no-run --message-format=json |
     python -c 'import json,sys; print(next(row["executable"] for row in map(json.loads,sys.stdin) if row.get("executable") and row["target"]["name"]=="cancellation"))')
+python tests/search-quality/upgrade.py --bin target/release
 python tests/daemon-regressions.py --binaries target/release --socket-tests "$socket_tests"
 
 echo '==> step 4: AGENTS §1 host-crate grep'

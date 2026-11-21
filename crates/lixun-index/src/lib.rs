@@ -1,5 +1,7 @@
 //! Lixun Index — Tantivy wrapper: schema, writer, searcher.
 
+mod generation;
+pub use generation::PendingGeneration;
 pub mod normalize;
 pub mod plugin_schema;
 pub mod scoring;
@@ -222,7 +224,7 @@ impl LixunIndex {
     /// Open or create the index.
     ///
     /// Returns `(index, rebuilt_from_scratch)`. `rebuilt_from_scratch` is
-    /// `true` when the on-disk directory was missing or wiped (INDEX_VERSION
+    /// `true` when a new generation was needed (INDEX_VERSION
     /// change, schema fingerprint change, or missing meta.json). The daemon
     /// uses this flag to decide whether to re-emit every non-fs source's
     /// `reindex_full` on startup; when `false`, sources catch up via
@@ -232,40 +234,68 @@ impl LixunIndex {
         plugin_fields_by_kind: &BTreeMap<&'static str, &'static [PluginFieldSpec]>,
         ranking: RankingConfig,
     ) -> Result<(Self, bool)> {
+        let (index, pending) =
+            Self::prepare_generation(index_path, plugin_fields_by_kind, ranking)?;
+        let rebuilt = pending.is_some();
+        if let Some(pending) = pending {
+            pending.publish()?;
+        }
+        Ok((index, rebuilt))
+    }
+
+    /// Open the active index, or prepare a separate writer directory. The
+    /// daemon publishes a replacement only after the source walk commits.
+    pub fn prepare_generation(
+        index_path: impl AsRef<Path>,
+        plugin_fields_by_kind: &BTreeMap<&'static str, &'static [PluginFieldSpec]>,
+        ranking: RankingConfig,
+    ) -> Result<(Self, Option<PendingGeneration>)> {
         let (schema, plugins) = LixunSchema::build_with_plugins(plugin_fields_by_kind)?;
-        let index_dir = index_path.as_ref().to_path_buf();
-        let version_path = index_dir.join(INDEX_VERSION_FILE);
-        let meta_path = index_dir.join("meta.json");
-
         let fingerprint = plugin_schema::compute_fingerprint(INDEX_VERSION, plugin_fields_by_kind);
-        let on_disk_fp = plugin_schema::read_fingerprint(&index_dir);
-        let version_matches = read_index_version(&version_path) == Some(INDEX_VERSION);
-        let fingerprint_matches = on_disk_fp.as_deref() == Some(fingerprint.as_str());
-        let has_meta = meta_path.exists();
-
-        let needs_rebuild = !version_matches || !fingerprint_matches || !has_meta;
-
-        let index = if !needs_rebuild {
-            Index::open_in_dir(&index_dir)?
+        let (dir, pending) = generation::prepare(index_path.as_ref(), &fingerprint)?;
+        let index = if dir.join("meta.json").exists() {
+            Index::open_in_dir(&dir)?
         } else {
-            if index_dir.exists() && !fingerprint_matches && version_matches {
-                tracing::info!(
-                    path = %index_dir.display(),
-                    "Schema fingerprint changed; wiping and rebuilding index"
-                );
-            }
-            recreate_index_dir(&index_dir, read_index_version_string(&version_path))?;
-            let dir = MmapDirectory::open(&index_dir)?;
             let index = Index::create(
-                dir,
+                MmapDirectory::open(&dir)?,
                 schema.schema.clone(),
                 tantivy::IndexSettings::default(),
             )?;
-            std::fs::write(&version_path, INDEX_VERSION.to_string())?;
-            plugin_schema::write_fingerprint(&index_dir, &fingerprint)?;
+            std::fs::write(dir.join(INDEX_VERSION_FILE), INDEX_VERSION.to_string())?;
+            plugin_schema::write_fingerprint(&dir, &fingerprint)?;
             index
         };
+        anyhow::ensure!(index.schema() == schema.schema, "unexpected index schema");
+        Ok((
+            Self::from_open_index(index, schema, plugins, ranking)?,
+            pending,
+        ))
+    }
 
+    /// Only expose an old reader when its actual field layout is readable
+    /// with this build. Source reconstruction still targets the new directory.
+    pub fn previous_reader(
+        dir: &Path,
+        plugin_fields: &BTreeMap<&'static str, &'static [PluginFieldSpec]>,
+        ranking: RankingConfig,
+    ) -> Result<Option<Self>> {
+        if !dir.join("meta.json").exists() {
+            return Ok(None);
+        }
+        let old = Index::open_in_dir(dir)?;
+        let (schema, plugins) = LixunSchema::build_with_plugins(plugin_fields)?;
+        if old.schema() != schema.schema {
+            return Ok(None);
+        }
+        Self::from_open_index(old, schema, plugins, ranking).map(Some)
+    }
+
+    fn from_open_index(
+        index: Index,
+        schema: LixunSchema,
+        plugins: CompiledPluginSchema,
+        ranking: RankingConfig,
+    ) -> Result<Self> {
         tokenizer::register_spotlight_tokenizer(&index);
 
         let warmer = FastFieldWarmer::from_schema(&schema.schema);
@@ -276,18 +306,15 @@ impl LixunIndex {
             .warmers(vec![warmer_weak])
             .try_into()?;
 
-        Ok((
-            Self {
-                index,
-                schema,
-                plugins,
-                ranking,
-                reader,
-                _warmer: warmer,
-                reload_epoch: std::sync::atomic::AtomicU64::new(0),
-            },
-            needs_rebuild,
-        ))
+        Ok(Self {
+            index,
+            schema,
+            plugins,
+            ranking,
+            reader,
+            _warmer: warmer,
+            reload_epoch: std::sync::atomic::AtomicU64::new(0),
+        })
     }
 
     /// Borrow the cached [`IndexReader`]. Use this when you need
@@ -483,20 +510,21 @@ impl LixunIndex {
             .map(|(s, _)| *s)
             .fold(0.0_f32, f32::max)
             .max(1.0);
-        let exact_addrs: Vec<(f32, DocAddress)> = if !q_norm.is_empty() {
-            let term = Term::from_field_text(s.title_exact, &q_norm);
-            let tq = TermQuery::new(term, IndexRecordOption::Basic);
-            searcher
-                .search(
-                    &restrict_category(Box::new(tq), category),
-                    &TopDocs::with_limit(limit).order_by_score(),
-                )?
-                .into_iter()
-                .map(|(_, addr)| (max_top_score, addr))
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let exact_addrs: Vec<(f32, DocAddress)> =
+            if !q_norm.is_empty() && !lixun_core::query_uses_operators(&query.text) {
+                let term = Term::from_field_text(s.title_exact, &q_norm);
+                let tq = TermQuery::new(term, IndexRecordOption::Basic);
+                searcher
+                    .search(
+                        &restrict_category(Box::new(tq), category),
+                        &TopDocs::with_limit(limit).order_by_score(),
+                    )?
+                    .into_iter()
+                    .map(|(_, addr)| (max_top_score, addr))
+                    .collect()
+            } else {
+                Vec::new()
+            };
 
         let mut seen_addrs: HashSet<DocAddress> = top_docs.iter().map(|(_, a)| *a).collect();
         let mut merged: Vec<(f32, DocAddress)> = top_docs;
@@ -523,7 +551,9 @@ impl LixunIndex {
         // and exclude other categories before their ranking multipliers apply.
         // Probe each category independently, with a bounded quota and the same
         // synthetic base score as the exact-title fast path above.
-        if q_norm.chars().count() >= MIN_QUERY_PREFIX_LEN && !query_uses_operators(&query.text) {
+        if q_norm.chars().count() >= MIN_QUERY_PREFIX_LEN
+            && !lixun_core::query_uses_operators(&query.text)
+        {
             let categories = [
                 Category::App,
                 Category::File,
@@ -564,7 +594,10 @@ impl LixunIndex {
         // fusion layer keeps them out of RRF standing — a page of docs
         // that merely contain "of" must not crowd out semantic hits.
         let mut fallback_addrs: HashSet<DocAddress> = HashSet::new();
-        if merged.len() < limit && q_tokens.len() >= 2 && !query_uses_operators(&query.text) {
+        if merged.len() < limit
+            && q_tokens.len() >= 2
+            && !lixun_core::query_uses_operators(&query.text)
+        {
             let or_query = build_search_query(
                 &query.text,
                 &self.index,
@@ -583,6 +616,7 @@ impl LixunIndex {
             }
         }
 
+        let passage = lixun_core::fragment::PassageMatcher::new(&query.text);
         let mut results: Vec<(Hit, ScoreBreakdown)> = Vec::new();
         for (score, doc_address) in merged {
             let doc: TantivyDocument = searcher.doc(doc_address)?;
@@ -652,7 +686,15 @@ impl LixunIndex {
 
             let sender = stored_optional_text(&doc, s.sender);
             let recipients = stored_optional_text(&doc, s.recipients);
-            let body = stored_optional_text(&doc, s.body).map(truncate_hit_body);
+            let body = stored_optional_text(&doc, s.body).map(|body| {
+                if body.len() > MAX_HIT_BODY_BYTES
+                    && let Some((context, _)) = passage.as_ref().and_then(|p| p.find(&body))
+                    && !body[..body.floor_char_boundary(MAX_HIT_BODY_BYTES)].contains(context)
+                {
+                    return context.to_owned();
+                }
+                truncate_hit_body(body)
+            });
 
             let source_instance = doc
                 .get_first(s.source_instance)
@@ -1167,47 +1209,11 @@ fn read_index_version(path: &Path) -> Option<u32> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
-fn read_index_version_string(path: &Path) -> Option<String> {
-    std::fs::read_to_string(path)
-        .ok()
-        .map(|contents| contents.trim().to_string())
-        .filter(|contents| !contents.is_empty())
-}
-
-fn recreate_index_dir(index_dir: &Path, old_version: Option<String>) -> Result<()> {
-    if index_dir.exists() {
-        tracing::info!(
-            path = %index_dir.display(),
-            old_version = old_version.as_deref().unwrap_or("missing"),
-            new_version = INDEX_VERSION,
-            "Wiping stale index directory"
-        );
-        std::fs::remove_dir_all(index_dir)?;
-    }
-
-    std::fs::create_dir_all(index_dir)?;
-    Ok(())
-}
-
 /// Minimum length of the trailing query token before the query-time
 /// prefix clause activates. Length-1 prefixes would walk enormous
 /// term-dictionary ranges on every keystroke; single letters are
 /// already served by `title_initials`.
 const MIN_QUERY_PREFIX_LEN: usize = 2;
-
-/// True when the query uses tantivy query-parser syntax (exclusion,
-/// phrase quotes, field scoping, boolean operators). Such queries
-/// express precise intent: the incremental-typing prefix clause and
-/// the disjunctive refill pass are both skipped so they cannot
-/// resurrect documents the operators excluded.
-fn query_uses_operators(text: &str) -> bool {
-    if text.contains('"') || text.contains(':') || text.contains('|') {
-        return true;
-    }
-    text.split_whitespace().any(|w| {
-        (w.len() > 1 && (w.starts_with('-') || w.starts_with('+'))) || w == "OR" || w == "AND"
-    })
-}
 
 fn build_search_query(
     text: &str,
@@ -1280,7 +1286,7 @@ fn build_search_query(
 
     // Operator queries keep strict parser semantics: the parsed query
     // stays a Must gate and no recall clauses are added beside it.
-    let operators = query_uses_operators(text);
+    let operators = lixun_core::query_uses_operators(text);
 
     let mut clauses: Vec<(Occur, Box<dyn tantivy::query::Query>)> = vec![(
         if operators {
@@ -2096,9 +2102,13 @@ mod tests {
             LixunIndex::create_or_open(tmp.path().to_str().unwrap(), RankingConfig::default())
                 .unwrap();
         assert_eq!(
-            std::fs::read_to_string(tmp.path().join(INDEX_VERSION_FILE))
-                .unwrap()
-                .trim(),
+            std::fs::read_to_string(
+                generation::active(tmp.path())
+                    .unwrap()
+                    .join(INDEX_VERSION_FILE)
+            )
+            .unwrap()
+            .trim(),
             INDEX_VERSION.to_string()
         );
 
@@ -2136,15 +2146,21 @@ mod tests {
         drop(idx);
 
         assert_eq!(
-            std::fs::read_to_string(tmp.path().join(INDEX_VERSION_FILE))
-                .unwrap()
-                .trim(),
+            std::fs::read_to_string(
+                generation::active(tmp.path())
+                    .unwrap()
+                    .join(INDEX_VERSION_FILE)
+            )
+            .unwrap()
+            .trim(),
             INDEX_VERSION.to_string(),
             "version file should hold current INDEX_VERSION after create"
         );
 
         std::fs::write(
-            tmp.path().join(INDEX_VERSION_FILE),
+            generation::active(tmp.path())
+                .unwrap()
+                .join(INDEX_VERSION_FILE),
             (INDEX_VERSION - 1).to_string(),
         )
         .unwrap();
@@ -2160,9 +2176,13 @@ mod tests {
             "downgraded version file → rebuilt_from_scratch must be true"
         );
         assert_eq!(
-            std::fs::read_to_string(tmp.path().join(INDEX_VERSION_FILE))
-                .unwrap()
-                .trim(),
+            std::fs::read_to_string(
+                generation::active(tmp.path())
+                    .unwrap()
+                    .join(INDEX_VERSION_FILE)
+            )
+            .unwrap()
+            .trim(),
             INDEX_VERSION.to_string(),
             "rebuild must restore current INDEX_VERSION on disk"
         );

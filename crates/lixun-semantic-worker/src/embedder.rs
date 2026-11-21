@@ -16,7 +16,10 @@ pub struct ImageEmbedder {
     dim: usize,
 }
 
+pub const MULTILINGUAL_CLIP: &str = "clip-vit-b-32-multilingual";
+
 pub struct ClipTextEmbedder {
+    projection: Option<Vec<f32>>,
     inner: TextEmbedding,
     dim: usize,
 }
@@ -59,6 +62,9 @@ pub fn load_text_embedder(
 ) -> Result<TextEmbedder> {
     let (model, dim) = resolve_text_model(model_name)?;
     apply_onnx_thread_env(onnx_intra_threads, onnx_inter_threads);
+    if model == EmbeddingModel::BGEM3 {
+        prepare_external_model_files(cache_dir, &model)?;
+    }
     let inner = TextEmbedding::try_new(
         InitOptions::new(model)
             .with_cache_dir(cache_dir.to_path_buf())
@@ -66,6 +72,36 @@ pub fn load_text_embedder(
     )
     .with_context(|| format!("fastembed: text embedder init for '{model_name}'"))?;
     Ok(TextEmbedder { inner, dim })
+}
+
+fn model_repository(cache_dir: &Path, repo_id: &str) -> Result<hf_hub::api::sync::ApiRepo> {
+    let cache_dir = std::env::var_os("HF_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| cache_dir.to_owned());
+    let api = hf_hub::api::sync::ApiBuilder::from_env()
+        .with_cache_dir(cache_dir)
+        .with_progress(false)
+        .build()?;
+    Ok(api.model(repo_id.to_owned()))
+}
+
+// ONNX Runtime requires external tensors beside the model. Standard hub
+// snapshot symlinks resolve outside that directory. Replace just those
+// directory entries with atomic hard links to the same immutable blobs.
+fn prepare_external_model_files(cache_dir: &Path, model: &EmbeddingModel) -> Result<()> {
+    let info = TextEmbedding::get_model_info(model)?;
+    let repo = model_repository(cache_dir, &info.model_code)?;
+    for name in std::iter::once(&info.model_file).chain(&info.additional_files) {
+        let path = repo.get(name)?;
+        if path.is_symlink() {
+            let parent = path.parent().context("missing snapshot directory")?;
+            let staging = tempfile::tempdir_in(parent)?;
+            let link = staging.path().join("tensor");
+            std::fs::hard_link(path.canonicalize()?, &link)?;
+            std::fs::rename(link, path)?;
+        }
+    }
+    Ok(())
 }
 
 pub fn load_image_embedder(
@@ -90,6 +126,24 @@ pub fn load_clip_text_embedder(
     onnx_intra_threads: usize,
     onnx_inter_threads: usize,
 ) -> Result<ClipTextEmbedder> {
+    load_clip_query_encoder(
+        "clip-vit-b-32",
+        cache_dir,
+        onnx_intra_threads,
+        onnx_inter_threads,
+    )
+}
+
+pub fn load_clip_query_encoder(
+    model_name: &str,
+    cache_dir: &Path,
+    onnx_intra_threads: usize,
+    onnx_inter_threads: usize,
+) -> Result<ClipTextEmbedder> {
+    if model_name == MULTILINGUAL_CLIP {
+        apply_onnx_thread_env(onnx_intra_threads, onnx_inter_threads);
+        return multilingual_clip(cache_dir);
+    }
     let model = EmbeddingModel::ClipVitB32;
     let dim = 512;
     apply_onnx_thread_env(onnx_intra_threads, onnx_inter_threads);
@@ -99,7 +153,53 @@ pub fn load_clip_text_embedder(
             .with_show_download_progress(false),
     )
     .context("fastembed: CLIP text embedder init")?;
-    Ok(ClipTextEmbedder { inner, dim })
+    Ok(ClipTextEmbedder {
+        inner,
+        dim,
+        projection: None,
+    })
+}
+
+// The distilled multilingual query tower projects mean-pooled tokens into the
+// same normalized 512-dimensional space as the existing CLIP vision tower.
+fn multilingual_clip(cache_dir: &Path) -> Result<ClipTextEmbedder> {
+    use fastembed::{InitOptionsUserDefined, Pooling, TokenizerFiles, UserDefinedEmbeddingModel};
+    let repo = model_repository(
+        cache_dir,
+        "sentence-transformers/clip-ViT-B-32-multilingual-v1",
+    )?;
+    let read = |name: &str| -> Result<Vec<u8>> { Ok(std::fs::read(repo.get(name)?)?) };
+    let tokenizer = TokenizerFiles {
+        tokenizer_file: read("tokenizer.json")?,
+        config_file: read("config.json")?,
+        special_tokens_map_file: read("special_tokens_map.json")?,
+        tokenizer_config_file: read("tokenizer_config.json")?,
+    };
+    let model = UserDefinedEmbeddingModel::new(read("onnx/model_quint8_avx2.onnx")?, tokenizer)
+        .with_pooling(Pooling::Mean);
+    let inner = TextEmbedding::try_new_from_user_defined(
+        model,
+        InitOptionsUserDefined::default().with_max_length(128),
+    )?;
+    let bytes = read("2_Dense/model.safetensors")?;
+    let weights = safetensors::SafeTensors::deserialize(&bytes)?;
+    let matrix = weights.tensor("linear.weight")?;
+    anyhow::ensure!(
+        matrix.shape() == [512, 768] && matrix.dtype() == safetensors::Dtype::F32,
+        "incompatible CLIP projection"
+    );
+    let projection = matrix
+        .data()
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes(*b))
+        .collect();
+    Ok(ClipTextEmbedder {
+        inner,
+        dim: 512,
+        projection: Some(projection),
+    })
 }
 
 impl TextEmbedder {
@@ -132,9 +232,30 @@ impl ClipTextEmbedder {
     }
 
     pub fn embed(&mut self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
-        self.inner
+        let mut embeddings = self
+            .inner
             .embed(texts, None)
-            .context("fastembed: CLIP text embed batch")
+            .context("fastembed: CLIP text embed batch")?;
+        if let Some(matrix) = &self.projection {
+            for embedding in &mut embeddings {
+                anyhow::ensure!(embedding.len() == 768, "incompatible CLIP hidden dimension");
+                let mut projected: Vec<f32> = matrix
+                    .as_chunks::<768>()
+                    .0
+                    .iter()
+                    .map(|row| row.iter().zip(embedding.iter()).map(|(w, x)| w * x).sum())
+                    .collect();
+                let norm = projected
+                    .iter()
+                    .map(|x| x * x)
+                    .sum::<f32>()
+                    .sqrt()
+                    .max(f32::EPSILON);
+                projected.iter_mut().for_each(|x| *x /= norm);
+                *embedding = projected;
+            }
+        }
+        Ok(embeddings)
     }
 }
 
@@ -153,25 +274,8 @@ pub fn is_supported_image_model(name: &str) -> bool {
 
 fn resolve_text_model(name: &str) -> Result<(EmbeddingModel, usize)> {
     match name {
-        // BAAI bge-small-en-v1.5. Output dimension stays 384 in both
-        // the FP32 and statically-quantized branches, so on-disk
-        // LanceDB tables and the ANN store are bit-compatible across a
-        // feature flip. The `quantized-embedders` cargo feature picks
-        // between two pre-converted ONNX weight files at compile
-        // time:
-        //
-        // - OFF: `EmbeddingModel::BGESmallENV15` — fp32 weights,
-        //   ~130 MB on disk, baseline MTEB scores.
-        // - ON:  `EmbeddingModel::BGESmallENV15Q` — int8-quantized
-        //   weights, ~33 MB on disk (~4× weight reduction). Published
-        //   MTEB loss vs fp32 is < 1% for typical English retrieval
-        //   tasks per the BGE int8 release notes; this matches the
-        //   acceptance window the plan calls out before B2 may flip
-        //   to default-on.
-        //
-        // Runtime quality is otherwise identical: tokenizer, max
-        // sequence length, normalization, and the post-processing
-        // path in `TextEmbedding::embed` are unchanged.
+        // Both builds emit 384 dimensions. Keep separate vector stores for
+        // the int8 and fp32 document encoders when switching builds.
         "bge-small-en-v1.5" => {
             #[cfg(feature = "quantized-embedders")]
             {
@@ -205,10 +309,10 @@ fn resolve_image_model(name: &str) -> Result<(ImageEmbeddingModel, usize)> {
         // and the CLIP int8 gap is tracked in
         // `.workspace-local/notepads/launcher-perf-and-semantic-memory/decisions.md`
         // under "B2 partial: only BGE int8 available".
-        "clip-vit-b-32" => Ok((ImageEmbeddingModel::ClipVitB32, 512)),
+        "clip-vit-b-32" | MULTILINGUAL_CLIP => Ok((ImageEmbeddingModel::ClipVitB32, 512)),
         other => anyhow::bail!(
             "semantic.image_model='{other}' not supported in v1 \
-             (allowed: clip-vit-b-32)"
+             (allowed: clip-vit-b-32, clip-vit-b-32-multilingual)"
         ),
     }
 }

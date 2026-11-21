@@ -269,20 +269,14 @@ mod tests {
         let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempdir().unwrap();
         let prev_xdg = std::env::var_os("XDG_CACHE_HOME");
-        let prev_home = std::env::var_os("HOME");
         unsafe {
             std::env::set_var("XDG_CACHE_HOME", tmp.path());
-            std::env::set_var("HOME", tmp.path());
         }
         let result = f(tmp.path());
         unsafe {
             match prev_xdg {
                 Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
                 None => std::env::remove_var("XDG_CACHE_HOME"),
-            }
-            match prev_home {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
             }
         }
         result

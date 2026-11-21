@@ -108,6 +108,14 @@ glib::wrapper! {
 }
 
 impl PdfView {
+    /// Select the first matching passage and scroll it into view.
+    pub fn find_quote(&self, text: &str) {
+        if let Some(bar) = self.imp().search_bar.borrow().as_ref() {
+            bar.set_visible(true);
+            bar.set_query(text);
+        }
+    }
+
     /// Construct a rich PDF view rooted at `path`.
     ///
     /// `path` must point to a readable PDF file on disk. The

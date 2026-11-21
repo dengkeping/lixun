@@ -625,11 +625,22 @@ pub(crate) fn current_monitor_connector(window: &gtk::ApplicationWindow) -> Opti
     monitor.connector().map(|s| String::from(s.as_str()))
 }
 
-pub(crate) fn send_preview_request(hit: &Hit, monitor: Option<String>) {
-    send_request_fire_and_forget(&Request::Preview {
-        hit: Box::new(hit.clone()),
-        monitor,
+pub(crate) fn send_preview_request(hit: &Hit, monitor: Option<String>, query: &str) {
+    let fragment = hit.body.as_deref().and_then(|body| {
+        lixun_core::fragment::PassageMatcher::new(query)?
+            .find(body)
+            .map(|(_, f)| f)
     });
+    let hit = Box::new(hit.clone());
+    let request = match fragment {
+        Some(fragment) => Request::PreviewFragment {
+            hit,
+            monitor,
+            fragment,
+        },
+        None => Request::Preview { hit, monitor },
+    };
+    send_request_fire_and_forget(&request);
 }
 
 pub(crate) fn send_launcher_geometry(monitor: String, x: i32, y: i32, w: i32, h: i32) {

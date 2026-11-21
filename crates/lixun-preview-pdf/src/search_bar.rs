@@ -167,6 +167,12 @@ impl PdfSearchBar {
         }
     }
 
+    pub fn set_query(&self, text: &str) {
+        if let Some(entry) = self.imp().entry.borrow().as_ref() {
+            entry.set_text(text);
+        }
+    }
+
     pub fn clear_query(&self) {
         if let Some(entry) = self.imp().entry.borrow().as_ref() {
             entry.set_text("");

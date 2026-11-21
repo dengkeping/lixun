@@ -404,8 +404,17 @@ fn decode_scaled(path: &Path) -> anyhow::Result<(gdk::Texture, (i32, i32))> {
         } else {
             Pixbuf::from_file(path)?
         };
-        let intrinsic = if intrinsic == (0, 0) {
+        let swaps_axes = matches!(
+            pixbuf.option("orientation").as_deref(),
+            Some("5" | "6" | "7" | "8")
+        );
+        let pixbuf = pixbuf
+            .apply_embedded_orientation()
+            .ok_or_else(|| anyhow::anyhow!("Failed to orient preview pixels"))?;
+        let intrinsic = if !needs_scale {
             (pixbuf.width(), pixbuf.height())
+        } else if swaps_axes {
+            (intrinsic.1, intrinsic.0)
         } else {
             intrinsic
         };
@@ -902,3 +911,6 @@ mod tests {
         assert!(s.contains("KiB"));
     }
 }
+
+#[cfg(test)]
+mod orientation_tests;

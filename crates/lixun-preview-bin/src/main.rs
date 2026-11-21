@@ -383,6 +383,7 @@ fn push_standalone_command(tx: &async_channel::Sender<InboundMsg>, path: PathBuf
     let _ = tx.send_blocking(InboundMsg::Cmd(PreviewCommand::ShowOrUpdate {
         epoch: 1,
         hit: Box::new(hit),
+        fragment: None,
         monitor: None,
     }));
 }
@@ -537,6 +538,7 @@ fn handle_command(
         PreviewCommand::ShowOrUpdate {
             epoch,
             hit,
+            fragment,
             monitor,
         } => {
             state.current_epoch.set(epoch);
@@ -556,6 +558,12 @@ fn handle_command(
                     epoch,
                     msg: format!("{e:#}"),
                 });
+            } else if let (Some(address), Some(widget), Some(plugin)) = (
+                fragment.as_ref(),
+                state.current_widget.borrow().as_ref(),
+                state.current_plugin.borrow().as_ref(),
+            ) {
+                plugin.reveal_fragment(widget, address);
             }
         }
         PreviewCommand::Close { epoch } => {

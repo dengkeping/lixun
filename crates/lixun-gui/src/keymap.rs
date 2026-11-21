@@ -329,6 +329,12 @@ pub(crate) fn install_keyboard_handler(
         #[strong]
         shortcuts_overlay,
         move |_, key, _keycode, state| {
+            if gtk::prelude::RootExt::focus(&window)
+                .and_then(|widget| widget.ancestor(gtk::Popover::static_type()))
+                .is_some_and(|popup| popup.widget_name() == "saved-searches")
+            {
+                return glib::signal::Propagation::Proceed;
+            }
             // A focused button (category chip ToggleButton — a Button
             // subclass — or the status bar's "Search the web") must stay
             // activatable from the keyboard: without this, the capture-
@@ -418,7 +424,7 @@ pub(crate) fn install_keyboard_handler(
                 controller.set_preview_mode_active(true);
                 let monitor = current_monitor_connector(&window);
                 selected_hit_in(&selection, &filter_model, |hit| {
-                    send_preview_request(hit, monitor.clone());
+                    send_preview_request(hit, monitor.clone(), &entry.text());
                 });
                 // Same focus re-assert as the quick_look branch below.
                 entry.grab_focus();
@@ -818,7 +824,7 @@ pub(crate) fn install_keyboard_handler(
                 controller.set_preview_mode_active(true);
                 let monitor = current_monitor_connector(&window);
                 selected_hit_in(&selection, &filter_model, |hit| {
-                    send_preview_request(hit, monitor.clone());
+                    send_preview_request(hit, monitor.clone(), &entry.text());
                 });
                 // Re-assert keyboard focus on the search entry.
                 // The preview window presents itself on a layer-

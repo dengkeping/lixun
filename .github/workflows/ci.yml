@@ -48,5 +48,8 @@ jobs:
       - run: bash scripts/qa-wave-d.sh
       - name: Exercise the launcher on headless Wayland
         run: |
-          export PATH="$GITHUB_WORKSPACE/target/release:$PATH"
+          # Headless Sway needs no hardware privileges. Arch's file capabilities
+          # otherwise prevent exec under the container's capability bounding set.
+          install -m755 /usr/bin/sway /usr/local/bin/sway
+          export PATH="$GITHUB_WORKSPACE/target/release:/usr/local/bin:$PATH"
           runuser -u nobody --preserve-environment -- bash tests/desktop-smoke.sh

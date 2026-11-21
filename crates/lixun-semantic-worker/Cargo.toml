@@ -16,6 +16,7 @@ path = "benches/memory_states.rs"
 required-features = ["bench-harness"]
 
 [dependencies]
+lixun-config = { path = "../lixun-config" }
 lixun-core = { path = "../lixun-core" }
 lixun-mutation = { path = "../lixun-mutation" }
 lixun-semantic-proto = { path = "../lixun-semantic-proto" }
@@ -23,6 +24,8 @@ lixun-image-decode = { path = "../lixun-image-decode", optional = true }
 
 # Heavy ML stack — same workspace pins as the in-process plugin.
 fastembed = { workspace = true }
+hf-hub = { version = "0.5", default-features = false, features = ["ureq"] }
+safetensors = "0.7"
 lancedb = { workspace = true }
 arrow = { workspace = true }
 arrow-array = { workspace = true }

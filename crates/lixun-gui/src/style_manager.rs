@@ -1,6 +1,6 @@
 //! GTK CSS provider stack for the launcher window.
 //!
-//! The launcher composes up to four providers, layered by GTK's
+//! The launcher composes stylesheets, layered by GTK's
 //! standard priority constants. The stack puts the matugen palette
 //! at the very top so that an automated colour source recolours
 //! every layer beneath it whenever it is enabled. Themes and user
@@ -10,11 +10,12 @@
 //! consumes via `var()`.
 //!
 //! 1. **Embedded** — `STYLE_PROVIDER_PRIORITY_APPLICATION`. Loaded
-//!    from `include_str!("../style.css")` at compile time. Never
+//!    from `style.css` at compile time. Never
 //!    swapped at runtime. Acts as the irreducible default — every
 //!    rule the launcher needs to function lives here, including the
 //!    `--lixun-*` custom property fallbacks that keep the window
-//!    visible when no other layer is present.
+//!    visible when no other layer is present. The built-in Tokyo Night
+//!    theme follows at the same priority when no named stylesheet resolves.
 //! 2. **User override** — `APPLICATION + 1`. Loaded from
 //!    `${config_dir}/lixun/style.css`. A permanent manual override
 //!    of the embedded defaults, applied whether or not a theme is
@@ -50,6 +51,8 @@ use crate::theme::ThemeResolver;
 
 const EMBEDDED_STYLESHEET: &str = include_str!("../style.css");
 
+const TOKYO_NIGHT_STYLESHEET: &str = include_str!("../assets/themes/tokyo-night.css");
+
 /// The layered CSS provider stack installed on the default GDK
 /// display. Construct with [`Self::install`]; drive at runtime with
 /// [`Self::apply_theme`], [`Self::reload_user_css`], and
@@ -62,13 +65,12 @@ const EMBEDDED_STYLESHEET: &str = include_str!("../style.css");
 pub(crate) struct StyleManager {
     #[allow(dead_code)]
     embedded_provider: gtk::CssProvider,
+    default_theme_provider: gtk::CssProvider,
     /// `[gui] opacity` override layer (A4b): a generated rule that
     /// re-declares `.lixun-window`'s blur-on background with the
     /// configured surface alpha. Registered at the SAME priority as
     /// the embedded sheet but AFTER it, so it wins by order while
-    /// every higher layer (user/theme/matugen) and every
-    /// higher-specificity rule (`.lixun-no-blur`, `.lixun-light`)
-    /// still override it. Empty (a true no-op) while the configured
+    /// higher layers can still override it. Empty (a true no-op) while the configured
     /// value equals the shipped default, so default installs carry
     /// zero risk of divergence from style.css.
     opacity_provider: gtk::CssProvider,
@@ -88,13 +90,7 @@ fn surface_opacity_css(opacity: f64) -> Option<String> {
     }
     let alpha = opacity.clamp(0.0, 1.0);
     Some(format!(
-        ".lixun-window {{\n\
-         \x20   background:\n\
-         \x20       linear-gradient(180deg,\n\
-         \x20           rgba(255, 255, 255, 0.035) 0%,\n\
-         \x20           rgba(255, 255, 255, 0.0)  50%),\n\
-         \x20       alpha(var(--lixun-surface), {alpha});\n\
-         }}\n"
+        ".lixun-window:not(.lixun-no-blur) {{ background-color: alpha(var(--lixun-surface), {alpha}); }}"
     ))
 }
 
@@ -124,6 +120,13 @@ impl StyleManager {
         gtk::style_context_add_provider_for_display(
             display,
             &embedded_provider,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+
+        let default_theme_provider = gtk::CssProvider::new();
+        gtk::style_context_add_provider_for_display(
+            display,
+            &default_theme_provider,
             gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
 
@@ -166,6 +169,7 @@ impl StyleManager {
 
         let manager = Self {
             embedded_provider,
+            default_theme_provider,
             opacity_provider,
             theme_provider,
             user_provider,
@@ -198,10 +202,12 @@ impl StyleManager {
         match self.resolver.resolve(theme) {
             Some(path) => {
                 tracing::info!("loading theme stylesheet from {}", path.display());
+                self.default_theme_provider.load_from_string("");
                 self.theme_provider.load_from_path(&path);
             }
             None => {
-                if theme.is_some() {
+                let name = theme.unwrap_or_default().trim();
+                if !name.is_empty() && name != "tokyo-night" {
                     tracing::warn!(
                         "theme {:?} not found at {}; falling back to embedded stylesheet",
                         theme,
@@ -213,6 +219,9 @@ impl StyleManager {
                     );
                 }
                 self.theme_provider.load_from_string("");
+                self.default_theme_provider
+                    .load_from_string(TOKYO_NIGHT_STYLESHEET);
+                tracing::debug!("loaded built-in Tokyo Night theme");
             }
         }
     }

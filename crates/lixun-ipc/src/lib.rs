@@ -552,6 +552,11 @@ pub enum Request {
     CleanPrivateHistory {
         apply: bool,
     },
+    PreviewFragment {
+        hit: Box<Hit>,
+        monitor: Option<String>,
+        fragment: lixun_core::fragment::TextFragment,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

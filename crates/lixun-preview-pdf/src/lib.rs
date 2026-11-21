@@ -92,6 +92,12 @@ impl PreviewPlugin for PdfPreview {
         }
     }
 
+    fn reveal_fragment(&self, widget: &gtk::Widget, fragment: &lixun_core::fragment::TextFragment) {
+        if let Some(view) = widget.downcast_ref::<PdfView>() {
+            view.find_quote(&fragment.quote);
+        }
+    }
+
     fn update(&self, hit: &Hit, widget: &gtk::Widget) -> anyhow::Result<()> {
         let new_path = match &hit.action {
             Action::OpenFile { path } | Action::ShowInFileManager { path } => path.clone(),

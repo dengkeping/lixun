@@ -228,6 +228,22 @@ pub async fn run_incremental(
         0
     };
 
+    if rebuilt_from_scratch {
+        // The manifest retains entries on unavailable mounts. A staging
+        // generation starts empty and cannot publish until these are restored.
+        mutation_tx.commit_now().await?;
+        let committed = search.all_doc_ids().await?;
+        let missing = manifest
+            .known_paths()
+            .filter(|path| {
+                !committed.contains(&lixun_core::paths::canonical_fs_doc_id_from_str(path))
+            })
+            .count();
+        anyhow::ensure!(
+            missing == 0,
+            "replacement missing {missing} filesystem entries; restore source availability and restart to resume"
+        );
+    }
     manifest.save_checked(state_dir)?;
     Ok((fs_count, other_count))
 }

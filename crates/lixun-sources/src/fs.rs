@@ -650,6 +650,29 @@ impl crate::source::IndexerSource for FsSource {
 /// on either axis is orders of magnitude above this threshold.
 const MIN_IMAGE_BYTES_FOR_PROBE: u64 = 64;
 
+pub fn ocr_eligible(path: &Path, caps: &ExtractorCapabilities, min_side: u32) -> bool {
+    if !caps.ocr_enabled || !caps.has_tesseract {
+        return false;
+    }
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !lixun_extract::ocr::is_ocr_candidate(&ext) {
+        return false;
+    }
+    if ext == "pdf" {
+        return caps.has_pdftoppm;
+    }
+    min_side == 0
+        || (path
+            .metadata()
+            .is_ok_and(|m| m.len() >= MIN_IMAGE_BYTES_FOR_PROBE)
+            && !std::fs::read(path)
+                .is_ok_and(|bytes| lixun_extract::ocr::image_too_small(&bytes, min_side)))
+}
+
 fn maybe_enqueue_ocr(
     path: &Path,
     caps: &ExtractorCapabilities,
@@ -658,14 +681,7 @@ fn maybe_enqueue_ocr(
     min_image_side_px: u32,
 ) {
     let Some(enqueuer) = enqueue else { return };
-    if !caps.has_tesseract || !caps.ocr_enabled {
-        return;
-    }
-    let ext = path
-        .extension()
-        .map(|e| e.to_string_lossy().to_lowercase())
-        .unwrap_or_default();
-    if !lixun_extract::ocr::is_ocr_candidate(&ext) {
+    if !ocr_eligible(path, caps, min_image_side_px) {
         return;
     }
     let doc_id = canonical_fs_doc_id(path);
@@ -686,34 +702,17 @@ fn maybe_enqueue_ocr(
             return;
         }
     };
-    // v1.2 Finding 3: drop icon-sized rasters before they reach the
-    // OCR queue. PDFs never dimension-filter here — pdftoppm rasterises
-    // pages at its own DPI so the file size on disk tells nothing about
-    // the usable page bitmap. All failure modes fail open: the OCR
-    // worker keeps its own dim check as defence-in-depth.
-    if min_image_side_px > 0 && ext != "pdf" {
-        if meta.len() < MIN_IMAGE_BYTES_FOR_PROBE {
-            tracing::debug!(
-                "ocr enqueue: skipping {doc_id}, file {} bytes below probe threshold",
-                meta.len()
-            );
-            return;
-        }
-        if let Ok(bytes) = std::fs::read(path)
-            && lixun_extract::ocr::image_too_small(&bytes, min_image_side_px)
-        {
-            tracing::debug!(
-                "ocr enqueue: skipping {doc_id}, both axes below {min_image_side_px}px"
-            );
-            return;
-        }
-    }
     let mtime = meta
         .modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
+    let ext = path
+        .extension()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_ascii_lowercase();
     if let Err(e) = enqueuer.enqueue(&doc_id, path, mtime, meta.len(), &ext) {
         tracing::warn!("ocr enqueue for {} failed: {e}", path.display());
     }

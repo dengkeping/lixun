@@ -3,16 +3,15 @@
 > **See also:** [`docs/search-fusion.md`](search-fusion.md) — the Spotlight-style
 > 3-way fan-out + RRF architecture (BM25 + text semantic + image semantic),
 > shipped in v0.6.0. This document focuses on worker setup, model management,
-> and operations; `search-fusion.md` covers the fusion layer and why we don't
-> use a query classifier.
+> and operations; `search-fusion.md` covers how query intent influences the fusion weights.
 
 ## Overview
 
 Lixun's hybrid search combines three retrieval paths: lexical scoring
 (BM25 over Tantivy, always on), dense-vector text semantic similarity
 (opt-in, `bge-small-en-v1.5`), and dense-vector cross-modal image
-semantic similarity (opt-in, CLIP `clip-vit-b-32`). When semantic is
-enabled, all three paths run in parallel for every query and the daemon
+semantic similarity (opt-in, CLIP `clip-vit-b-32-multilingual`). When semantic is
+enabled, ordinary searches use all three paths and the daemon
 fuses their results with Reciprocal Rank Fusion (RRF, default `k = 60`)
 — same architecture Apple Spotlight and Microsoft Windows Search use.
 A hit ranked well by any of the three backends surfaces in the merged
@@ -58,7 +57,7 @@ path on startup):
 [semantic]
 enabled = true
 text_model = "bge-small-en-v1.5"
-image_model = "clip-vit-b-32"
+image_model = "clip-vit-b-32-multilingual"
 batch_size = 32
 flush_ms = 2000
 min_image_side_px = 300
@@ -73,10 +72,9 @@ Restart the daemon after editing:
 systemctl --user restart lixund
 ```
 
-On the next start, the semantic plugin opens the vector store under
-`~/.local/share/lixun/semantic/vectors/`, downloads the configured models
-into `$FASTEMBED_CACHE_DIR` if they are not yet cached, and starts
-embedding new documents as the indexer commits them.
+The worker reads the same configuration and logs the loaded model IDs, dimensions and document text quantization. By default it downloads models under `$XDG_CACHE_HOME/lixun/fastembed` and stores vectors under `$XDG_DATA_HOME/lixun/semantic/vectors`. Standard XDG defaults apply.
+
+The default multilingual query encoder searches the existing 512-dimensional CLIP vision vectors. Switching to or from `clip-vit-b-32` reuses the existing image vectors. Selecting `text_model = "bge-m3"` creates a separate 1024-dimensional vector store and backfill journal. Run `lixun-cli semantic backfill` after switching document models. A worker built without the quantized-embedders feature also uses a separate store for its fp32 document encoder. Old stores remain available if the configuration is switched back. See the [measured language and memory trade-offs](search-quality.md).
 
 ## First-run backfill
 

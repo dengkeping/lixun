@@ -5288,7 +5288,7 @@ checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 
 [[package]]
 name = "lixun-cli"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "anyhow",
  "bytes",
@@ -5299,6 +5299,7 @@ dependencies = [
  "futures",
  "lixun-core",
  "lixun-daemon",
+ "lixun-extract",
  "lixun-index",
  "lixun-indexer",
  "lixun-ipc",
@@ -5313,11 +5314,12 @@ dependencies = [
  "tokio-util",
  "toml 0.8.23",
  "toml_edit 0.22.27",
+ "walkdir",
 ]
 
 [[package]]
 name = "lixun-config"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -5334,12 +5336,13 @@ dependencies = [
 
 [[package]]
 name = "lixun-core"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
  "chrono",
  "quoted_printable",
+ "regex",
  "serde",
  "serde_json",
  "shell-words",
@@ -5348,7 +5351,7 @@ dependencies = [
 
 [[package]]
 name = "lixun-daemon"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -5396,7 +5399,7 @@ dependencies = [
 
 [[package]]
 name = "lixun-extract"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "anyhow",
  "blake3",
@@ -5419,11 +5422,12 @@ dependencies = [
 
 [[package]]
 name = "lixun-fusion"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "anyhow",
  "async-trait",
  "lixun-core",
+ "lixun-index",
  "lixun-indexer",
  "lixun-mutation",
  "serde",
@@ -5434,7 +5438,7 @@ dependencies = [
 
 [[package]]
 name = "lixun-gui"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -5454,6 +5458,7 @@ dependencies = [
  "md5",
  "notify",
  "opener",
+ "serde",
  "serde_json",
  "tempfile",
  "toml_edit 0.22.27",
@@ -5468,7 +5473,7 @@ dependencies = [
 
 [[package]]
 name = "lixun-image-decode"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "anyhow",
  "image 0.25.10",
@@ -5482,7 +5487,7 @@ dependencies = [
 
 [[package]]
 name = "lixun-index"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5496,7 +5501,7 @@ dependencies = [
 
 [[package]]
 name = "lixun-indexer"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -5519,7 +5524,7 @@ dependencies = [
 
 [[package]]
 name = "lixun-ipc"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "bytes",
  "chrono",
@@ -5537,7 +5542,7 @@ dependencies = [
 
 [[package]]
 name = "lixun-mutation"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5548,7 +5553,7 @@ dependencies = [
 
 [[package]]
 name = "lixun-plugin-bundle"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "lixun-source-calculator",
  "lixun-source-command",
@@ -5560,7 +5565,7 @@ dependencies = [
 
 [[package]]
 name = "lixun-preview"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "anyhow",
  "dirs 5.0.1",
@@ -5574,7 +5579,7 @@ dependencies = [
 
 [[package]]
 name = "lixun-preview-archive"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "anyhow",
  "bzip2 0.5.2",
@@ -5592,7 +5597,7 @@ dependencies = [
 
 [[package]]
 name = "lixun-preview-av"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "anyhow",
  "gtk4",
@@ -5604,7 +5609,7 @@ dependencies = [
 
 [[package]]
 name = "lixun-preview-bin"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -5630,7 +5635,7 @@ dependencies = [
 
 [[package]]
 name = "lixun-preview-bundle"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "lixun-core",
  "lixun-preview",
@@ -5648,7 +5653,7 @@ dependencies = [
 
 [[package]]
 name = "lixun-preview-code"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "anyhow",
  "gtk4",
@@ -5662,7 +5667,7 @@ dependencies = [
 
 [[package]]
 name = "lixun-preview-email"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "anyhow",
  "gtk4",
@@ -5676,7 +5681,7 @@ dependencies = [
 
 [[package]]
 name = "lixun-preview-folder"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "anyhow",
  "gtk4",
@@ -5688,7 +5693,7 @@ dependencies = [
 
 [[package]]
 name = "lixun-preview-image"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -5696,16 +5701,18 @@ dependencies = [
  "gdk4",
  "gio",
  "gtk4",
+ "image 0.25.10",
  "inventory",
  "lixun-core",
  "lixun-image-decode",
  "lixun-preview",
+ "tempfile",
  "tracing",
 ]
 
 [[package]]
 name = "lixun-preview-info"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5718,7 +5725,7 @@ dependencies = [
 
 [[package]]
 name = "lixun-preview-office"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -5737,7 +5744,7 @@ dependencies = [
 
 [[package]]
 name = "lixun-preview-pdf"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -5758,7 +5765,7 @@ dependencies = [
 
 [[package]]
 name = "lixun-preview-text"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "anyhow",
  "gtk4",
@@ -5770,7 +5777,7 @@ dependencies = [
 
 [[package]]
 name = "lixun-semantic-proto"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "bytes",
  "lixun-core",
@@ -5782,7 +5789,7 @@ dependencies = [
 
 [[package]]
 name = "lixun-semantic-worker"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -5795,14 +5802,17 @@ dependencies = [
  "dirs 5.0.1",
  "fastembed",
  "futures",
+ "hf-hub",
  "image 0.25.10",
  "lancedb",
  "libc",
+ "lixun-config",
  "lixun-core",
  "lixun-image-decode",
  "lixun-mutation",
  "lixun-semantic-proto",
  "rusqlite",
+ "safetensors",
  "serde",
  "serde_json",
  "tempfile",
@@ -5816,7 +5826,7 @@ dependencies = [
 
 [[package]]
 name = "lixun-source-calculator"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "anyhow",
  "lixun-core",
@@ -5829,7 +5839,7 @@ dependencies = [
 
 [[package]]
 name = "lixun-source-command"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "anyhow",
  "dirs 5.0.1",
@@ -5844,7 +5854,7 @@ dependencies = [
 
 [[package]]
 name = "lixun-source-keyword"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "anyhow",
  "lixun-core",
@@ -5856,7 +5866,7 @@ dependencies = [
 
 [[package]]
 name = "lixun-source-maildir"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "anyhow",
  "lixun-core",
@@ -5871,7 +5881,7 @@ dependencies = [
 
 [[package]]
 name = "lixun-source-semantic-stub"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5892,7 +5902,7 @@ dependencies = [
 
 [[package]]
 name = "lixun-source-shell"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "anyhow",
  "dirs 5.0.1",
@@ -5906,7 +5916,7 @@ dependencies = [
 
 [[package]]
 name = "lixun-source-thunderbird"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -5927,7 +5937,7 @@ dependencies = [
 
 [[package]]
 name = "lixun-sources"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "anyhow",
  "dirs 5.0.1",

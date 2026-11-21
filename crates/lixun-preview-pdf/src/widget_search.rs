@@ -29,17 +29,21 @@ pub(super) fn wire_search(
     let worker = SearchWorker::new(Rc::clone(session), tx);
     state.borrow_mut().worker = Some(worker);
 
-    wire_result_pump(canvas, bar, Rc::clone(&state), rx);
+    wire_result_pump(scroll, session, canvas, bar, Rc::clone(&state), rx);
     wire_bar_signals(scroll, canvas, bar, Rc::clone(&state), session);
     wire_search_keys(view, canvas, bar);
 }
 
 fn wire_result_pump(
+    scroll: &gtk::ScrolledWindow,
+    session: &Rc<DocumentSession>,
     canvas: &PdfCanvas,
     bar: &PdfSearchBar,
     state: Rc<RefCell<SearchState>>,
     rx: async_channel::Receiver<PageSearchResult>,
 ) {
+    let scroll = scroll.downgrade();
+    let session = Rc::clone(session);
     let canvas_weak = canvas.downgrade();
     let bar_weak = bar.downgrade();
     glib::MainContext::default().spawn_local(async move {
@@ -50,6 +54,7 @@ fn wire_result_pump(
             let Some(bar) = bar_weak.upgrade() else {
                 break;
             };
+            let first = state.borrow().query.current.is_none();
             let accepted = state.borrow_mut().query.merge_page_result(result);
             if !accepted {
                 continue;
@@ -61,6 +66,12 @@ fn wire_result_pump(
             canvas.replace_search_results(results);
             canvas.set_current_match(current);
             bar.set_counter_text(&counter);
+            if first
+                && let Some((page, rect)) = state.borrow().query.current_rect()
+                && let Some(scroll) = scroll.upgrade()
+            {
+                scroll_to_match(&canvas, &scroll, &session, page, &rect);
+            }
         }
     });
 }
@@ -106,7 +117,7 @@ fn wire_bar_signals(
         let canvas_weak = canvas.downgrade();
         let bar_weak = bar.downgrade();
         let state = Rc::clone(&state);
-        let n_pages = session.n_pages();
+        let session = Rc::clone(session);
         bar.connect_closure(
             "query-changed",
             false,
@@ -117,6 +128,7 @@ fn wire_bar_signals(
                 let Some(bar) = bar_weak.upgrade() else {
                     return;
                 };
+                let n_pages = session.n_pages();
                 let mut s = state.borrow_mut();
                 s.query.generation = s.query.generation.saturating_add(1);
                 s.query.query = query.to_string();
@@ -315,6 +327,7 @@ pub(super) fn reset_for_path(
     if let Some(worker) = s.worker.as_ref() {
         worker.replace_path(session.path());
     }
+    drop(s);
     canvas.clear_search_results();
     bar.clear_query();
     bar.set_visible(false);

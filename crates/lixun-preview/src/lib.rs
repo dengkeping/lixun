@@ -182,6 +182,14 @@ pub trait PreviewPlugin: Send + Sync + 'static {
 
     fn build(&self, hit: &Hit, cfg: &PreviewPluginCfg<'_>) -> anyhow::Result<gtk::Widget>;
 
+    /// Reveal a text-quote address in an already mounted document.
+    fn reveal_fragment(
+        &self,
+        _widget: &gtk::Widget,
+        _fragment: &lixun_core::fragment::TextFragment,
+    ) {
+    }
+
     /// Update an already-built widget in place for a new hit.
     ///
     /// Called by the preview host when the launcher's selection

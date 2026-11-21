@@ -15,6 +15,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
 mod dashboard;
+mod scope;
 
 const BUILTIN_VERBS: &[&str] = &[
     "toggle",
@@ -25,6 +26,7 @@ const BUILTIN_VERBS: &[&str] = &[
     "status",
     "impact",
     "check-exclude",
+    "preview-root",
     "clean-private-history",
     "dashboard",
     "hidden",
@@ -221,6 +223,15 @@ fn root_command(plugin_verbs: &[CliVerb]) -> Command {
                 ),
         )
         .subcommand(
+            Command::new("preview-root")
+                .about("Preview the indexing scope before adding a directory.")
+                .arg(
+                    Arg::new("path")
+                        .required(true)
+                        .value_parser(clap::value_parser!(PathBuf)),
+                ),
+        )
+        .subcommand(
             Command::new("check-exclude")
                 .about("Check if a path would be excluded by current config.")
                 .arg(Arg::new("path").required(true).help("Path to check")),
@@ -411,6 +422,7 @@ async fn main() -> Result<()> {
             }
             handle_response(response, false);
         }
+        "preview-root" => scope::preview(sub_matches.get_one::<PathBuf>("path").unwrap())?,
         "check-exclude" => {
             let path = sub_matches
                 .get_one::<String>("path")
