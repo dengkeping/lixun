@@ -53,8 +53,7 @@ pub fn split_identifiers(input: &str) -> String {
                     let next = chars.get(index + 1).copied();
                     let starts_new_word = previous.is_lowercase()
                         || previous.is_ascii_digit()
-                        || (previous.is_uppercase()
-                            && next.is_some_and(|next| next.is_lowercase()));
+                        || (previous.is_uppercase() && next.is_some_and(char::is_lowercase));
 
                     if starts_new_word && !output.ends_with(' ') {
                         output.push(' ');

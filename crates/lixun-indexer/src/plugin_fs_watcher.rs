@@ -53,31 +53,7 @@ pub async fn start(registry: Arc<SourceRegistry>, sink: Arc<WriterSink>) -> Resu
     }
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(EVENT_CHANNEL_CAP);
-    let tx_cb = tx.clone();
-    let dropped_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let dropped_cb = Arc::clone(&dropped_counter);
-    let mut watcher = RecommendedWatcher::new(
-        move |res: notify::Result<Event>| {
-            let event = match res {
-                Ok(event) => event,
-                Err(e) => {
-                    tracing::error!("plugin fs watcher error (events may be lost): {}", e);
-                    return;
-                }
-            };
-            if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) = tx_cb.try_send(event) {
-                let prev = dropped_cb.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if prev == 0 || prev.is_multiple_of(100) {
-                    tracing::warn!(
-                        "plugin fs watcher: event queue full (cap={}), dropping event (total dropped={})",
-                        EVENT_CHANNEL_CAP,
-                        prev + 1
-                    );
-                }
-            }
-        },
-        Config::default(),
-    )?;
+    let mut watcher = create_event_watcher(tx)?;
 
     let mut instances_watched: std::collections::HashSet<usize> = std::collections::HashSet::new();
     for (path, (idx, recursive)) in &route {
@@ -101,8 +77,6 @@ pub async fn start(registry: Arc<SourceRegistry>, sink: Arc<WriterSink>) -> Resu
         instances_watched.len()
     );
 
-    drop(tx);
-
     let mut last_dispatch: HashMap<usize, Instant> = HashMap::new();
 
     loop {
@@ -115,19 +89,7 @@ pub async fn start(registry: Arc<SourceRegistry>, sink: Arc<WriterSink>) -> Resu
             batch.push(e);
         }
 
-        let mut per_instance: HashMap<usize, Vec<SourceEvent>> = HashMap::new();
-        for event in batch {
-            let mapped_kind = map_notify_kind(&event);
-            for path in &event.paths {
-                if let Some(idx) = longest_prefix_instance(&route, path) {
-                    per_instance.entry(idx).or_default().push(SourceEvent {
-                        path: path.clone(),
-                        kind: mapped_kind.clone(),
-                    });
-                }
-            }
-        }
-
+        let per_instance = route_events(batch, &route);
         for (idx, events) in per_instance {
             let now = Instant::now();
             let in_cooldown = last_dispatch
@@ -192,6 +154,53 @@ fn longest_prefix_instance(route: &HashMap<PathBuf, (usize, bool)>, path: &Path)
         .filter(|(root, _)| path.starts_with(root))
         .max_by_key(|(root, _)| root.components().count())
         .map(|(_, (idx, _))| *idx)
+}
+
+fn route_events(
+    batch: Vec<Event>,
+    route: &HashMap<PathBuf, (usize, bool)>,
+) -> HashMap<usize, Vec<SourceEvent>> {
+    let mut per_instance: HashMap<usize, Vec<SourceEvent>> = HashMap::new();
+    for event in batch {
+        let mapped_kind = map_notify_kind(&event);
+        for path in &event.paths {
+            if let Some(idx) = longest_prefix_instance(route, path) {
+                per_instance.entry(idx).or_default().push(SourceEvent {
+                    path: path.clone(),
+                    kind: mapped_kind.clone(),
+                });
+            }
+        }
+    }
+    per_instance
+}
+
+fn create_event_watcher(
+    tx_cb: tokio::sync::mpsc::Sender<Event>,
+) -> notify::Result<RecommendedWatcher> {
+    let dropped_cb = std::sync::atomic::AtomicU64::new(0);
+    RecommendedWatcher::new(
+        move |res: notify::Result<Event>| {
+            let event = match res {
+                Ok(event) => event,
+                Err(e) => {
+                    tracing::error!("plugin fs watcher error (events may be lost): {}", e);
+                    return;
+                }
+            };
+            if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) = tx_cb.try_send(event) {
+                let prev = dropped_cb.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if prev == 0 || prev.is_multiple_of(100) {
+                    tracing::warn!(
+                        "plugin fs watcher: event queue full (cap={}), dropping event (total dropped={})",
+                        EVENT_CHANNEL_CAP,
+                        prev + 1
+                    );
+                }
+            }
+        },
+        Config::default(),
+    )
 }
 
 #[cfg(test)]

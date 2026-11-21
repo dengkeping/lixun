@@ -1219,60 +1219,7 @@ async fn process_search_chunk(
         }
 
         if phase == lixun_fusion::Phase::Final {
-            // Fan-out plugin hits do not share a score scale with
-            // BM25 × multiplier × stage-2 lexical scores. Contract: a
-            // fan-out plugin's score is a relative confidence in [0, 1],
-            // mapped onto the local result distribution (score of the
-            // current best hit). Claiming plugins (calculator, shell)
-            // are unaffected — they replace the result set wholesale.
-            let max_lexical_score = pairs
-                .iter()
-                .map(|(h, _)| h.score)
-                .fold(0.0_f32, f32::max)
-                .max(1.0);
-            let mut plugin_tasks = Vec::new();
-            for entry in &registry.instances {
-                let plugin = entry.source.clone();
-                let q_str = q.to_string();
-                let instance_id = entry.instance_id.clone();
-                let state_dir = entry.state_dir.clone();
-                let cancel_probe = cancel.clone();
-                plugin_tasks.push(tokio::task::spawn_blocking(move || {
-                    if cancel_probe.is_cancelled() {
-                        return Vec::new();
-                    }
-                    let is_cancelled = move || cancel_probe.is_cancelled();
-                    let ctx = QueryContext {
-                        instance_id: &instance_id,
-                        state_dir: &state_dir,
-                        cancel: Some(&is_cancelled),
-                    };
-                    let start = std::time::Instant::now();
-                    let result = plugin.on_query(&q_str, &ctx);
-                    let elapsed = start.elapsed();
-                    if elapsed > PLUGIN_BUDGET {
-                        tracing::warn!(
-                            instance = %instance_id,
-                            elapsed_ms = elapsed.as_millis(),
-                            "plugin on_query exceeded budget"
-                        );
-                    }
-                    result
-                }));
-            }
-            for task in plugin_tasks {
-                let mut plugin_hits = match task.await {
-                    Ok(h) => h,
-                    Err(_) => continue,
-                };
-                if !hidden.is_empty() {
-                    plugin_hits.retain(|h| !hidden.contains(&h.id.0));
-                }
-                for h in &mut plugin_hits {
-                    h.score = h.score.clamp(0.0, 1.0) * max_lexical_score;
-                }
-                pairs.extend(plugin_hits.into_iter().map(plugin_hit_with_breakdown));
-            }
+            append_plugin_hits(&mut pairs, registry, q, cancel, &hidden).await;
         }
     }
 
@@ -2424,6 +2371,69 @@ fn resolve_ocr_langs(configured: &[String], available: &[String]) -> Vec<String>
         out.push("eng".into());
     }
     out
+}
+
+async fn append_plugin_hits(
+    pairs: &mut Vec<(lixun_core::Hit, lixun_core::ScoreBreakdown)>,
+    registry: &lixun_indexer::SourceRegistry,
+    q: &str,
+    cancel: &CancellationToken,
+    hidden: &std::collections::HashSet<String>,
+) {
+    // Fan-out plugin hits do not share a score scale with
+    // BM25 × multiplier × stage-2 lexical scores. Contract: a
+    // fan-out plugin's score is a relative confidence in [0, 1],
+    // mapped onto the local result distribution (score of the
+    // current best hit). Claiming plugins (calculator, shell)
+    // are unaffected — they replace the result set wholesale.
+    let max_lexical_score = pairs
+        .iter()
+        .map(|(h, _)| h.score)
+        .fold(0.0_f32, f32::max)
+        .max(1.0);
+    let mut plugin_tasks = Vec::new();
+    for entry in &registry.instances {
+        let plugin = entry.source.clone();
+        let q_str = q.to_string();
+        let instance_id = entry.instance_id.clone();
+        let state_dir = entry.state_dir.clone();
+        let cancel_probe = cancel.clone();
+        plugin_tasks.push(tokio::task::spawn_blocking(move || {
+            if cancel_probe.is_cancelled() {
+                return Vec::new();
+            }
+            let is_cancelled = move || cancel_probe.is_cancelled();
+            let ctx = QueryContext {
+                instance_id: &instance_id,
+                state_dir: &state_dir,
+                cancel: Some(&is_cancelled),
+            };
+            let start = std::time::Instant::now();
+            let result = plugin.on_query(&q_str, &ctx);
+            let elapsed = start.elapsed();
+            if elapsed > PLUGIN_BUDGET {
+                tracing::warn!(
+                    instance = %instance_id,
+                    elapsed_ms = elapsed.as_millis(),
+                    "plugin on_query exceeded budget"
+                );
+            }
+            result
+        }));
+    }
+    for task in plugin_tasks {
+        let mut plugin_hits = match task.await {
+            Ok(h) => h,
+            Err(_) => continue,
+        };
+        if !hidden.is_empty() {
+            plugin_hits.retain(|h| !hidden.contains(&h.id.0));
+        }
+        for h in &mut plugin_hits {
+            h.score = h.score.clamp(0.0, 1.0) * max_lexical_score;
+        }
+        pairs.extend(plugin_hits.into_iter().map(plugin_hit_with_breakdown));
+    }
 }
 
 #[cfg(test)]

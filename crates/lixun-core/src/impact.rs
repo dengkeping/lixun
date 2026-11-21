@@ -20,7 +20,7 @@ pub enum SystemImpact {
 
 impl SystemImpact {
     /// Every level, in canonical CLI listing order.
-    pub const ALL: &'static [SystemImpact] = &[
+    pub const ALL: &[SystemImpact] = &[
         SystemImpact::Unlimited,
         SystemImpact::High,
         SystemImpact::Medium,

@@ -135,46 +135,7 @@ pub fn sweep_once(cfg: &CacheSweepCfg, reaper: Option<&dyn ZombieReaper>) -> Res
         }
     }
 
-    if cfg.max_bytes > 0 {
-        let mut regular: Vec<&CacheFile> = files.iter().filter(|f| !f.is_tmp).collect();
-        let total_bytes: u64 = regular.iter().map(|f| f.size).sum();
-
-        if total_bytes > cfg.max_bytes {
-            regular.sort_by_key(|f| f.mtime_secs);
-            let mut remaining = total_bytes;
-            for f in regular {
-                if remaining <= cfg.max_bytes {
-                    break;
-                }
-                match std::fs::remove_file(&f.path) {
-                    Ok(()) => {
-                        outcome.evicted_files += 1;
-                        outcome.evicted_bytes += f.size;
-                        remaining = remaining.saturating_sub(f.size);
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        remaining = remaining.saturating_sub(f.size);
-                    }
-                    Err(e) => {
-                        tracing::warn!("cache sweep: failed to evict {}: {e}", f.path.display())
-                    }
-                }
-            }
-
-            if outcome.evicted_files > 0 {
-                let freed_mb = outcome.evicted_bytes / (1024 * 1024);
-                let total_mb = total_bytes / (1024 * 1024);
-                let cap_mb = cfg.max_bytes / (1024 * 1024);
-                tracing::info!(
-                    "cache sweep: evicted {} files, freed {} MB (was {} MB, cap {} MB)",
-                    outcome.evicted_files,
-                    freed_mb,
-                    total_mb,
-                    cap_mb
-                );
-            }
-        }
-    }
+    evict_over_budget(&files, cfg, &mut outcome);
 
     if let Some(r) = reaper {
         let cutoff = now_secs.saturating_sub(cfg.zombie_max_age.as_secs() as i64);
@@ -227,6 +188,49 @@ pub fn spawn(cfg: CacheSweepCfg, reaper: Option<Arc<dyn ZombieReaper>>) -> JoinH
             }
         }
     })
+}
+
+fn evict_over_budget(files: &[CacheFile], cfg: &CacheSweepCfg, outcome: &mut SweepOutcome) {
+    if cfg.max_bytes > 0 {
+        let mut regular: Vec<&CacheFile> = files.iter().filter(|f| !f.is_tmp).collect();
+        let total_bytes: u64 = regular.iter().map(|f| f.size).sum();
+
+        if total_bytes > cfg.max_bytes {
+            regular.sort_by_key(|f| f.mtime_secs);
+            let mut remaining = total_bytes;
+            for f in regular {
+                if remaining <= cfg.max_bytes {
+                    break;
+                }
+                match std::fs::remove_file(&f.path) {
+                    Ok(()) => {
+                        outcome.evicted_files += 1;
+                        outcome.evicted_bytes += f.size;
+                        remaining = remaining.saturating_sub(f.size);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        remaining = remaining.saturating_sub(f.size);
+                    }
+                    Err(e) => {
+                        tracing::warn!("cache sweep: failed to evict {}: {e}", f.path.display())
+                    }
+                }
+            }
+
+            if outcome.evicted_files > 0 {
+                let freed_mb = outcome.evicted_bytes / (1024 * 1024);
+                let total_mb = total_bytes / (1024 * 1024);
+                let cap_mb = cfg.max_bytes / (1024 * 1024);
+                tracing::info!(
+                    "cache sweep: evicted {} files, freed {} MB (was {} MB, cap {} MB)",
+                    outcome.evicted_files,
+                    freed_mb,
+                    total_mb,
+                    cap_mb
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]

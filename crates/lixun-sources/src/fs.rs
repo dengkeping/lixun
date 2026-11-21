@@ -265,6 +265,108 @@ impl FsSource {
     {
         let max_size = self.max_file_size_mb * 1024 * 1024;
 
+        let (mut changed_metas, deleted_ids) = self.scan_manifest(manifest, indexed_ids);
+
+        for path in &deleted_ids {
+            manifest.remove(path.strip_prefix("fs:").unwrap());
+        }
+
+        if changed_metas.is_empty() {
+            if !deleted_ids.is_empty() {
+                tracing::info!(
+                    "Filesystem: {} deleted, nothing to extract",
+                    deleted_ids.len()
+                );
+            } else {
+                tracing::info!("Filesystem: no changes detected");
+            }
+            return Ok(deleted_ids);
+        }
+
+        tracing::info!(
+            "Filesystem: {} changed/new files, {} deleted, extracting in parallel (batch={})...",
+            changed_metas.len(),
+            deleted_ids.len(),
+            Self::BATCH_SIZE,
+        );
+
+        let pool = Self::build_pool(self.rayon_threads);
+        let total = changed_metas.len();
+        let mut extract_fails: u64 = 0;
+        let mut processed: usize = 0;
+        let caps = Arc::clone(&self.caps);
+        let enqueue = self.ocr_enqueue.clone();
+        let body_checker = self.body_checker.clone();
+        let min_image_side_px = self.min_image_side_px;
+        while !changed_metas.is_empty() {
+            let take_n = Self::BATCH_SIZE.min(changed_metas.len());
+            let chunk: Vec<FileMeta> = changed_metas.drain(..take_n).collect();
+            let caps_loop = Arc::clone(&caps);
+            let enqueue_loop = enqueue.clone();
+            let body_checker_loop = body_checker.clone();
+            let docs: Vec<Document> = pool.install(|| {
+                chunk
+                    .into_par_iter()
+                    .map(|meta| {
+                        // Directories: skip content extraction (no body
+                        // to extract, only name is indexed for matching).
+                        let (body, extract_fail) = if meta.is_dir {
+                            (None, false)
+                        } else if meta.size <= max_size {
+                            let enq_ref =
+                                enqueue_loop.as_ref().map(|a| a.as_ref() as &dyn OcrEnqueue);
+                            let body_ref = body_checker_loop
+                                .as_ref()
+                                .map(|a| a.as_ref() as &dyn HasBody);
+                            match Self::extract_content(
+                                &meta.path,
+                                &caps_loop,
+                                enq_ref,
+                                body_ref,
+                                min_image_side_px,
+                            ) {
+                                Ok(Some(text)) => (Some(text), false),
+                                Ok(None) => (None, false),
+                                Err(_) => (None, true),
+                            }
+                        } else {
+                            (None, false)
+                        };
+
+                        Self::build_document(meta, body, extract_fail)
+                    })
+                    .collect()
+            });
+
+            for doc in &docs {
+                manifest.update(doc.path.clone(), doc.mtime);
+                if doc.extract_fail {
+                    extract_fails += 1;
+                }
+            }
+            processed += docs.len();
+            on_batch(docs)?;
+            tracing::info!(
+                "Filesystem incremental: flushed batch, {}/{} files processed",
+                processed,
+                total,
+            );
+        }
+
+        tracing::info!(
+            "Filesystem incremental: {} docs indexed across batches, {} deleted ({} extract failures)",
+            processed,
+            deleted_ids.len(),
+            extract_fails,
+        );
+        Ok(deleted_ids)
+    }
+
+    fn scan_manifest(
+        &self,
+        manifest: &mut Manifest,
+        indexed_ids: &HashSet<String>,
+    ) -> (Vec<FileMeta>, Vec<String>) {
         let mut current_files: HashSet<String> = HashSet::new();
         let mut changed_metas: Vec<FileMeta> = Vec::new();
         let mut resurrected: u64 = 0;
@@ -360,100 +462,7 @@ impl FsSource {
             })
             .map(|p| format!("fs:{p}"))
             .collect();
-
-        for path in &deleted_ids {
-            manifest.remove(path.strip_prefix("fs:").unwrap());
-        }
-
-        if changed_metas.is_empty() {
-            if !deleted_ids.is_empty() {
-                tracing::info!(
-                    "Filesystem: {} deleted, nothing to extract",
-                    deleted_ids.len()
-                );
-            } else {
-                tracing::info!("Filesystem: no changes detected");
-            }
-            return Ok(deleted_ids);
-        }
-
-        tracing::info!(
-            "Filesystem: {} changed/new files, {} deleted, extracting in parallel (batch={})...",
-            changed_metas.len(),
-            deleted_ids.len(),
-            Self::BATCH_SIZE,
-        );
-
-        let pool = Self::build_pool(self.rayon_threads);
-        let total = changed_metas.len();
-        let mut extract_fails: u64 = 0;
-        let mut processed: usize = 0;
-        let caps = Arc::clone(&self.caps);
-        let enqueue = self.ocr_enqueue.clone();
-        let body_checker = self.body_checker.clone();
-        let min_image_side_px = self.min_image_side_px;
-        while !changed_metas.is_empty() {
-            let take_n = Self::BATCH_SIZE.min(changed_metas.len());
-            let chunk: Vec<FileMeta> = changed_metas.drain(..take_n).collect();
-            let caps_loop = Arc::clone(&caps);
-            let enqueue_loop = enqueue.clone();
-            let body_checker_loop = body_checker.clone();
-            let docs: Vec<Document> = pool.install(|| {
-                chunk
-                    .into_par_iter()
-                    .map(|meta| {
-                        // Directories: skip content extraction (no body
-                        // to extract, only name is indexed for matching).
-                        let (body, extract_fail) = if meta.is_dir {
-                            (None, false)
-                        } else if meta.size <= max_size {
-                            let enq_ref =
-                                enqueue_loop.as_ref().map(|a| a.as_ref() as &dyn OcrEnqueue);
-                            let body_ref = body_checker_loop
-                                .as_ref()
-                                .map(|a| a.as_ref() as &dyn HasBody);
-                            match Self::extract_content(
-                                &meta.path,
-                                &caps_loop,
-                                enq_ref,
-                                body_ref,
-                                min_image_side_px,
-                            ) {
-                                Ok(Some(text)) => (Some(text), false),
-                                Ok(None) => (None, false),
-                                Err(_) => (None, true),
-                            }
-                        } else {
-                            (None, false)
-                        };
-
-                        Self::build_document(meta, body, extract_fail)
-                    })
-                    .collect()
-            });
-
-            for doc in &docs {
-                manifest.update(doc.path.clone(), doc.mtime);
-                if doc.extract_fail {
-                    extract_fails += 1;
-                }
-            }
-            processed += docs.len();
-            on_batch(docs)?;
-            tracing::info!(
-                "Filesystem incremental: flushed batch, {}/{} files processed",
-                processed,
-                total,
-            );
-        }
-
-        tracing::info!(
-            "Filesystem incremental: {} docs indexed across batches, {} deleted ({} extract failures)",
-            processed,
-            deleted_ids.len(),
-            extract_fails,
-        );
-        Ok(deleted_ids)
+        (changed_metas, deleted_ids)
     }
 }
 

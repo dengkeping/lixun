@@ -357,7 +357,7 @@ fn push_standalone_command(tx: &async_channel::Sender<InboundMsg>, path: PathBuf
         .and_then(|m| m.modified().ok())
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs() as i64);
-    let size = meta.as_ref().map(|m| m.len());
+    let size = meta.as_ref().map(std::fs::Metadata::len);
 
     let hit = Hit {
         id: DocId("standalone".into()),
@@ -777,37 +777,7 @@ fn show_or_update(
             }
         };
 
-        // Detach the previously-mounted widget from whichever
-        // container owns it. Mirrors the mount branch below: an
-        // OwnsScroll widget sits directly in vbox; everything else
-        // sits inside content_scroll. Without this cleanup a plugin
-        // switch from OwnsScroll → FixedCap (or vice versa) would
-        // leak the old widget into vbox alongside the new one.
-        let prev_owns_scroll = state.current_widget_owns_scroll.get();
-        if let Some(prev_widget) = state.current_widget.borrow_mut().take() {
-            if prev_owns_scroll {
-                if let Some(vbox) = state.vbox.borrow().as_ref() {
-                    vbox.remove(&prev_widget);
-                }
-            } else if let Some(scroll) = state.content_scroll.borrow().as_ref() {
-                scroll.set_child(gtk::Widget::NONE);
-            }
-        }
-
-        let owns_scroll = matches!(plugin.sizing(), SizingPreference::OwnsScroll);
-        if owns_scroll {
-            if let Some(vbox) = state.vbox.borrow().as_ref() {
-                new_widget.set_hexpand(true);
-                new_widget.set_vexpand(true);
-                vbox.append(&new_widget);
-            }
-        } else if let Some(scroll) = state.content_scroll.borrow().as_ref() {
-            scroll.set_child(Some(&new_widget));
-        }
-        state.current_widget_owns_scroll.set(owns_scroll);
-        *state.current_widget.borrow_mut() = Some(new_widget);
-        *state.current_plugin_id.borrow_mut() = Some(plugin_id.clone());
-        *state.current_plugin.borrow_mut() = Some(Rc::clone(&plugin));
+        mount_preview_widget(state, new_widget, &plugin);
     }
 
     *state.current_hit.borrow_mut() = Some(hit.clone());
@@ -1922,6 +1892,44 @@ fn cancel_idle(state: &Rc<PreviewState>) {
     if let Some(id) = state.idle_source.borrow_mut().take() {
         id.remove();
     }
+}
+
+fn mount_preview_widget(
+    state: &PreviewState,
+    new_widget: gtk::Widget,
+    plugin: &Rc<dyn PreviewPlugin>,
+) {
+    // Detach the previously-mounted widget from whichever
+    // container owns it. Mirrors the mount branch below: an
+    // OwnsScroll widget sits directly in vbox; everything else
+    // sits inside content_scroll. Without this cleanup a plugin
+    // switch from OwnsScroll → FixedCap (or vice versa) would
+    // leak the old widget into vbox alongside the new one.
+    let prev_owns_scroll = state.current_widget_owns_scroll.get();
+    if let Some(prev_widget) = state.current_widget.borrow_mut().take() {
+        if prev_owns_scroll {
+            if let Some(vbox) = state.vbox.borrow().as_ref() {
+                vbox.remove(&prev_widget);
+            }
+        } else if let Some(scroll) = state.content_scroll.borrow().as_ref() {
+            scroll.set_child(gtk::Widget::NONE);
+        }
+    }
+
+    let owns_scroll = matches!(plugin.sizing(), SizingPreference::OwnsScroll);
+    if owns_scroll {
+        if let Some(vbox) = state.vbox.borrow().as_ref() {
+            new_widget.set_hexpand(true);
+            new_widget.set_vexpand(true);
+            vbox.append(&new_widget);
+        }
+    } else if let Some(scroll) = state.content_scroll.borrow().as_ref() {
+        scroll.set_child(Some(&new_widget));
+    }
+    state.current_widget_owns_scroll.set(owns_scroll);
+    *state.current_widget.borrow_mut() = Some(new_widget);
+    *state.current_plugin_id.borrow_mut() = Some(plugin.id().to_owned());
+    *state.current_plugin.borrow_mut() = Some(Rc::clone(plugin));
 }
 
 #[cfg(test)]

@@ -418,12 +418,14 @@ popover.menu modelbutton:hover {
 /* Durations must match the class-removal timers in window.rs
    (120 ms) — a longer animation gets cut off mid-flight when the
    class is removed. */
-.lixun-showing {
-    animation: lixun-fade-slide-in 120ms ease-out;
-}
+@media (prefers-reduced-motion: no-preference) {
+    .lixun-showing {
+        animation: lixun-fade-slide-in 120ms ease-out;
+    }
 
-.lixun-hiding {
-    animation: lixun-fade-slide-out 120ms ease-in;
+    .lixun-hiding {
+        animation: lixun-fade-slide-out 120ms ease-in;
+    }
 }
 
 /* When compositor blur is unavailable or disabled, raise the panel's

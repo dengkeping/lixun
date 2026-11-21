@@ -49,107 +49,108 @@ impl ThunderbirdAttachmentsSource {
                 .into_iter()
                 .filter_map(|e| e.ok())
             {
-                let path = entry.path();
-                if !path.is_file() {
-                    continue;
-                }
-                let name = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                if name.ends_with(".msf") || name.starts_with('.') {
-                    continue;
-                }
-
-                let Ok(mbox_bytes) = std::fs::read(path) else {
-                    continue;
-                };
-                let Ok(parts) = mbox::parse_mbox_parts_from_bytes(&mbox_bytes, path) else {
-                    continue;
-                };
-
-                for part in parts {
-                    let id = DocId(format!(
-                        "att:{}#{}",
-                        part.message_id.clone().unwrap_or_else(|| mbox::fallback_id(
-                            &part.mbox_path,
-                            part.msg_byte_offset
-                        )),
-                        part.part_index
-                    ));
-
-                    let (body, extract_fail) = if part.part_body_length > self.max_attachment_bytes
-                    {
-                        (None, true)
-                    } else {
-                        let start = part.part_body_byte_offset as usize;
-                        let end = start + part.part_body_length as usize;
-                        if end > mbox_bytes.len() {
-                            (None, true)
-                        } else {
-                            let raw = &mbox_bytes[start..end];
-                            match mbox::decode_bytes(raw, part.encoding) {
-                                Ok(decoded) => {
-                                    let ext_hint = std::path::Path::new(&part.filename)
-                                        .extension()
-                                        .and_then(|ext| ext.to_str());
-                                    match lixun_extract::cache::cached_extract_bytes(
-                                        &decoded,
-                                        ext_hint,
-                                        &lixun_extract::capabilities(),
-                                    ) {
-                                        Ok(Some(text)) => (Some(text), false),
-                                        Ok(None) => (None, false),
-                                        Err(_) => (None, true),
-                                    }
-                                }
-                                Err(_) => (None, true),
-                            }
-                        }
-                    };
-                    let (icon_name, kind_label) = attachment_metadata(&part.mime);
-
-                    docs.push(Document {
-                        id,
-                        category: Category::Attachment,
-                        title: part.filename.clone(),
-                        subtitle: part
-                            .subject
-                            .clone()
-                            .unwrap_or_else(|| "(no subject)".into()),
-                        icon_name,
-                        kind_label,
-                        body,
-                        path: part.mbox_path.to_string_lossy().to_string(),
-                        // Parent message date (R4): drives the GUI's
-                        // relative-date column and the recency ranking
-                        // multiplier. 0 = header absent/unparseable.
-                        mtime: part.date.unwrap_or(0),
-                        size: part.part_body_length,
-                        action: Action::OpenEmbedded {
-                            container: part.mbox_path.clone(),
-                            byte_offset: part.part_body_byte_offset,
-                            length: part.part_body_length,
-                            mime: part.mime.clone(),
-                            encoding: part.encoding.as_mime_str().to_string(),
-                            suggested_filename: part.filename.clone(),
-                        },
-                        extract_fail,
-                        sender: None,
-                        recipients: None,
-                        mime: Some(part.mime.clone()),
-                        source_instance: "builtin:tb_attachments".into(),
-                        secondary_action: part.message_id.as_ref().map(|mid| Action::OpenUri {
-                            uri: format!("mid:{mid}"),
-                        }),
-                        extra: Vec::new(),
-                    });
-                }
+                self.index_mailbox(entry.path(), &mut docs);
             }
         }
 
         tracing::info!("Thunderbird attachments: {} documents", docs.len());
         Ok(docs)
+    }
+
+    fn index_mailbox(&self, path: &std::path::Path, docs: &mut Vec<Document>) {
+        if !path.is_file() {
+            return;
+        }
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if name.ends_with(".msf") || name.starts_with('.') {
+            return;
+        }
+
+        let Ok(mbox_bytes) = std::fs::read(path) else {
+            return;
+        };
+        let Ok(parts) = mbox::parse_mbox_parts_from_bytes(&mbox_bytes, path) else {
+            return;
+        };
+
+        for part in parts {
+            let id = DocId(format!(
+                "att:{}#{}",
+                part.message_id
+                    .clone()
+                    .unwrap_or_else(|| mbox::fallback_id(&part.mbox_path, part.msg_byte_offset)),
+                part.part_index
+            ));
+
+            let (body, extract_fail) = if part.part_body_length > self.max_attachment_bytes {
+                (None, true)
+            } else {
+                let start = part.part_body_byte_offset as usize;
+                let end = start + part.part_body_length as usize;
+                if end > mbox_bytes.len() {
+                    (None, true)
+                } else {
+                    let raw = &mbox_bytes[start..end];
+                    match mbox::decode_bytes(raw, part.encoding) {
+                        Ok(decoded) => {
+                            let ext_hint = std::path::Path::new(&part.filename)
+                                .extension()
+                                .and_then(std::ffi::OsStr::to_str);
+                            match lixun_extract::cache::cached_extract_bytes(
+                                &decoded,
+                                ext_hint,
+                                &lixun_extract::capabilities(),
+                            ) {
+                                Ok(Some(text)) => (Some(text), false),
+                                Ok(None) => (None, false),
+                                Err(_) => (None, true),
+                            }
+                        }
+                        Err(_) => (None, true),
+                    }
+                }
+            };
+            let (icon_name, kind_label) = attachment_metadata(&part.mime);
+
+            docs.push(Document {
+                id,
+                category: Category::Attachment,
+                title: part.filename.clone(),
+                subtitle: part
+                    .subject
+                    .clone()
+                    .unwrap_or_else(|| "(no subject)".into()),
+                icon_name,
+                kind_label,
+                body,
+                path: part.mbox_path.to_string_lossy().to_string(),
+                // Parent message date (R4): drives the GUI's
+                // relative-date column and the recency ranking
+                // multiplier. 0 = header absent/unparseable.
+                mtime: part.date.unwrap_or(0),
+                size: part.part_body_length,
+                action: Action::OpenEmbedded {
+                    container: part.mbox_path.clone(),
+                    byte_offset: part.part_body_byte_offset,
+                    length: part.part_body_length,
+                    mime: part.mime.clone(),
+                    encoding: part.encoding.as_mime_str().to_string(),
+                    suggested_filename: part.filename.clone(),
+                },
+                extract_fail,
+                sender: None,
+                recipients: None,
+                mime: Some(part.mime.clone()),
+                source_instance: "builtin:tb_attachments".into(),
+                secondary_action: part.message_id.as_ref().map(|mid| Action::OpenUri {
+                    uri: format!("mid:{mid}"),
+                }),
+                extra: Vec::new(),
+            });
+        }
     }
 }
 

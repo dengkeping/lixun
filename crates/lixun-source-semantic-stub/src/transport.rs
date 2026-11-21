@@ -75,7 +75,7 @@ impl SemanticConnection {
     pub fn writer(&self) -> mpsc::Sender<Cmd> {
         self.writer
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
 
@@ -84,7 +84,7 @@ impl SemanticConnection {
         *self
             .writer
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = writer;
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = writer;
     }
 
     pub fn register_search(&self, req_id: u64, tx: oneshot::Sender<SearchReply>) {

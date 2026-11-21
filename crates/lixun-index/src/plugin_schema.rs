@@ -71,58 +71,7 @@ pub fn add_plugin_fields_to_schema(
     let mut default_query_fields: Vec<(tantivy::schema::Field, f32)> = Vec::new();
 
     for (_kind, spec) in flat {
-        let field = match spec.ty {
-            PluginFieldType::Text { tokenizer } => {
-                let tok_name = match tokenizer {
-                    TextTokenizer::Default => "default",
-                    TextTokenizer::Raw => "raw",
-                    TextTokenizer::Spotlight => "spotlight",
-                };
-                let indexing = TextFieldIndexing::default()
-                    .set_tokenizer(tok_name)
-                    .set_index_option(IndexRecordOption::WithFreqsAndPositions);
-                let mut opts = TextOptions::default().set_indexing_options(indexing);
-                if spec.stored {
-                    opts = opts.set_stored();
-                }
-                builder.add_text_field(spec.schema_name, opts)
-            }
-            PluginFieldType::Keyword => {
-                let opts = if spec.stored { STRING | STORED } else { STRING };
-                builder.add_text_field(spec.schema_name, opts)
-            }
-            PluginFieldType::I64 => {
-                let opts = if spec.stored {
-                    NumericOptions::default()
-                        .set_indexed()
-                        .set_stored()
-                        .set_fast()
-                } else {
-                    NumericOptions::default().set_indexed().set_fast()
-                };
-                builder.add_i64_field(spec.schema_name, opts)
-            }
-            PluginFieldType::U64 => {
-                let opts = if spec.stored {
-                    NumericOptions::default()
-                        .set_indexed()
-                        .set_stored()
-                        .set_fast()
-                } else {
-                    NumericOptions::default().set_indexed().set_fast()
-                };
-                builder.add_u64_field(spec.schema_name, opts)
-            }
-            PluginFieldType::Bool => {
-                let _ = FAST;
-                let opts = if spec.stored {
-                    STORED.into()
-                } else {
-                    NumericOptions::default()
-                };
-                builder.add_bool_field(spec.schema_name, opts)
-            }
-        };
+        let field = add_field(builder, &spec);
 
         if let Some(alias) = spec.query_alias {
             query_aliases.insert(alias, spec.schema_name);
@@ -205,6 +154,61 @@ pub fn rewrite_query_aliases(text: &str, aliases: &HashMap<&'static str, &'stati
     }
     out.push_str(&text[copied..]);
     out
+}
+
+fn add_field(builder: &mut SchemaBuilder, spec: &PluginFieldSpec) -> tantivy::schema::Field {
+    match spec.ty {
+        PluginFieldType::Text { tokenizer } => {
+            let tok_name = match tokenizer {
+                TextTokenizer::Default => "default",
+                TextTokenizer::Raw => "raw",
+                TextTokenizer::Spotlight => "spotlight",
+            };
+            let indexing = TextFieldIndexing::default()
+                .set_tokenizer(tok_name)
+                .set_index_option(IndexRecordOption::WithFreqsAndPositions);
+            let mut opts = TextOptions::default().set_indexing_options(indexing);
+            if spec.stored {
+                opts = opts.set_stored();
+            }
+            builder.add_text_field(spec.schema_name, opts)
+        }
+        PluginFieldType::Keyword => {
+            let opts = if spec.stored { STRING | STORED } else { STRING };
+            builder.add_text_field(spec.schema_name, opts)
+        }
+        PluginFieldType::I64 => {
+            let opts = if spec.stored {
+                NumericOptions::default()
+                    .set_indexed()
+                    .set_stored()
+                    .set_fast()
+            } else {
+                NumericOptions::default().set_indexed().set_fast()
+            };
+            builder.add_i64_field(spec.schema_name, opts)
+        }
+        PluginFieldType::U64 => {
+            let opts = if spec.stored {
+                NumericOptions::default()
+                    .set_indexed()
+                    .set_stored()
+                    .set_fast()
+            } else {
+                NumericOptions::default().set_indexed().set_fast()
+            };
+            builder.add_u64_field(spec.schema_name, opts)
+        }
+        PluginFieldType::Bool => {
+            let _ = FAST;
+            let opts = if spec.stored {
+                STORED.into()
+            } else {
+                NumericOptions::default()
+            };
+            builder.add_bool_field(spec.schema_name, opts)
+        }
+    }
 }
 
 #[cfg(test)]

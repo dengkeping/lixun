@@ -907,8 +907,9 @@ async fn connect_with_backoff(path: &std::path::Path) -> anyhow::Result<UnixStre
         }
     }
     match last_err {
-        Some(e) => Err(anyhow::Error::from(e)
-            .context(format!("connect to preview socket {:?} timed out", path))),
+        Some(e) => {
+            Err(e).with_context(|| format!("connect to preview socket {:?} timed out", path))
+        }
         None => anyhow::bail!("connect loop exited without attempting (budget=0?)"),
     }
 }

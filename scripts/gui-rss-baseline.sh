@@ -118,11 +118,12 @@ sample_proc_status() {
     fi
 
     local vm_rss vm_size rss_anon rss_file rss_shmem
-    vm_rss=$(grep -m1 '^VmRSS:' "$status_file" | awk '{print $2}')
-    vm_size=$(grep -m1 '^VmSize:' "$status_file" | awk '{print $2}')
-    rss_anon=$(grep -m1 '^RssAnon:' "$status_file" | awk '{print $2}')
-    rss_file=$(grep -m1 '^RssFile:' "$status_file" | awk '{print $2}')
-    rss_shmem=$(grep -m1 '^RssShmem:' "$status_file" | awk '{print $2}')
+    local field='{print $2}'
+    vm_rss=$(grep -m1 '^VmRSS:' "$status_file" | awk "$field")
+    vm_size=$(grep -m1 '^VmSize:' "$status_file" | awk "$field")
+    rss_anon=$(grep -m1 '^RssAnon:' "$status_file" | awk "$field")
+    rss_file=$(grep -m1 '^RssFile:' "$status_file" | awk "$field")
+    rss_shmem=$(grep -m1 '^RssShmem:' "$status_file" | awk "$field")
 
     vm_rss="${vm_rss:-0}"
     vm_size="${vm_size:-0}"
@@ -344,6 +345,10 @@ main() {
                 printf 'Usage: %s [--compare-with=OLD.json]\n' "$0"
                 printf '  Runs a fresh RSS baseline and optionally compares it to OLD.json.\n'
                 exit 0
+                ;;
+            *)
+                printf 'Unknown argument: %s\n' "$arg" >&2
+                return 2
                 ;;
         esac
     done

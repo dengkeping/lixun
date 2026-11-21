@@ -582,6 +582,19 @@ fn wire_canvas_gestures(canvas: &ImageCanvas, scroll: &gtk::ScrolledWindow) {
     }
     scroll.add_controller(pan);
 
+    install_marquee(canvas);
+
+    install_canvas_keys(canvas, scroll);
+
+    let canvas_weak = canvas.downgrade();
+    scroll.connect_map(move |_| {
+        if let Some(canvas) = canvas_weak.upgrade() {
+            canvas.grab_focus();
+        }
+    });
+}
+
+fn install_marquee(canvas: &ImageCanvas) {
     // Primary-button drag draws a selection marquee; a stationary click outside
     // an existing marquee releases it. Capture phase so the gesture pre-empts the
     // ScrolledWindow's built-in drag. Panning lives on the middle button / scroll.
@@ -629,7 +642,9 @@ fn wire_canvas_gestures(canvas: &ImageCanvas, scroll: &gtk::ScrolledWindow) {
         });
     }
     canvas.add_controller(select);
+}
 
+fn install_canvas_keys(canvas: &ImageCanvas, scroll: &gtk::ScrolledWindow) {
     // Keyboard: Ctrl +/-/0 zoom, R / Shift+R rotate, Ctrl+C copies the marquee.
     let key = gtk::EventControllerKey::new();
     key.set_propagation_phase(gtk::PropagationPhase::Capture);
@@ -676,13 +691,6 @@ fn wire_canvas_gestures(canvas: &ImageCanvas, scroll: &gtk::ScrolledWindow) {
         });
     }
     scroll.add_controller(key);
-
-    let canvas_weak = canvas.downgrade();
-    scroll.connect_map(move |_| {
-        if let Some(canvas) = canvas_weak.upgrade() {
-            canvas.grab_focus();
-        }
-    });
 }
 
 /// Set `canvas` zoom to `new_zoom`, keeping the cursor point (or the

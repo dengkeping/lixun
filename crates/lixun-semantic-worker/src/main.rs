@@ -353,14 +353,14 @@ async fn main() -> Result<()> {
         store.clone(),
         journal.clone(),
         runtime,
-        #[cfg(not(feature = "idle-eviction"))]
-        text_embedder.clone(),
-        #[cfg(not(feature = "idle-eviction"))]
-        image_embedder.clone(),
-        #[cfg(not(feature = "idle-eviction"))]
-        clip_text_embedder.clone(),
-        #[cfg(feature = "idle-eviction")]
-        supervisor.clone(),
+        lixun_semantic_worker::worker::WorkerModels {
+            #[cfg(not(feature = "idle-eviction"))]
+            text_embedder: text_embedder.clone(),
+            #[cfg(not(feature = "idle-eviction"))]
+            image_embedder: image_embedder.clone(),
+            #[cfg(feature = "idle-eviction")]
+            supervisor: supervisor.clone(),
+        },
     )
     .context("spawning embed worker thread")?;
     let embed_tx = worker_handle.sender();

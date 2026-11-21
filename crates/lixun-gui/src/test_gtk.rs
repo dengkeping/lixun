@@ -60,7 +60,7 @@ pub(crate) fn run_gtk<F: FnOnce() + Send + 'static>(f: F) -> bool {
     };
     let (done_tx, done_rx) = channel();
     tx.lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .send((Box::new(f), done_tx))
         .expect("gtk-test thread alive");
     match done_rx.recv().expect("gtk-test thread returned a result") {

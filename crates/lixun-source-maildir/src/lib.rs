@@ -67,7 +67,7 @@ impl MaildirSource {
         self.roots
             .iter()
             .find(|r| msg_path.starts_with(r))
-            .map(|p| p.as_path())
+            .map(std::path::PathBuf::as_path)
     }
 
     fn parse_message(&self, root: &Path, msg_path: &Path) -> Result<Option<Document>> {
@@ -116,7 +116,7 @@ impl MaildirSource {
 
         let filename_str = msg_path
             .file_name()
-            .and_then(|s| s.to_str())
+            .and_then(std::ffi::OsStr::to_str)
             .unwrap_or("")
             .to_string();
         let folder = walk::derive_folder(root, msg_path);

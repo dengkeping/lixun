@@ -31,7 +31,7 @@ pub fn is_message_path(path: &Path) -> bool {
 }
 
 fn is_tmp_dir(path: &Path) -> bool {
-    path.file_name().and_then(|s| s.to_str()) == Some("tmp")
+    path.file_name().and_then(std::ffi::OsStr::to_str) == Some("tmp")
 }
 
 pub fn derive_folder(root: &Path, message_path: &Path) -> String {

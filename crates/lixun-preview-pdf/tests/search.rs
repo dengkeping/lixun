@@ -24,7 +24,7 @@ fn open_doc() -> Document {
 fn first_word_of_at_least(text: &str, min_len: usize) -> Option<String> {
     text.split(|c: char| !c.is_alphabetic())
         .find(|w| w.chars().count() >= min_len)
-        .map(|w| w.to_string())
+        .map(ToString::to_string)
 }
 
 #[test]

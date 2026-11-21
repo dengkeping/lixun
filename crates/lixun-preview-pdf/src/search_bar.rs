@@ -16,7 +16,10 @@ use std::cell::RefCell;
 use std::sync::OnceLock;
 
 mod imp {
-    use super::*;
+    use super::{
+        BoxImpl, ObjectImpl, ObjectImplExt, ObjectSubclass, ObjectSubclassExt, OnceLock, RefCell,
+        Signal, StaticType, WidgetImpl, glib,
+    };
 
     #[derive(Default)]
     pub struct PdfSearchBar {
@@ -29,7 +32,7 @@ mod imp {
 
     #[glib::object_subclass]
     impl ObjectSubclass for PdfSearchBar {
-        const NAME: &'static str = "LixunPdfSearchBar";
+        const NAME: &str = "LixunPdfSearchBar";
         type Type = super::PdfSearchBar;
         type ParentType = gtk::Box;
     }

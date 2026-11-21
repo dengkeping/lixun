@@ -547,3 +547,92 @@ Exercise:
 - Row factory: [`crates/lixun-gui/src/factory.rs`](../crates/lixun-gui/src/factory.rs)
 - Style manager: [`crates/lixun-gui/src/style_manager.rs`](../crates/lixun-gui/src/style_manager.rs)
 - Live-reload watcher: [`crates/lixun-gui/src/style_watcher.rs`](../crates/lixun-gui/src/style_watcher.rs)
+
+## Custom stylesheet recipes
+
+Copy the rules you want into `~/.config/lixun/style.css`. Lixun reloads the file when you save it.
+
+### Swap the accent colour everywhere (purple)
+
+Redeclaring the token recolours the caret, selection fill and accent bar, checked chips, and status-bar action buttons in one go. (If matugen is enabled its palette still wins — it loads above this file on purpose.)
+
+```css
+window, popover {
+    --lixun-primary: #a36bff;
+}
+```
+
+### More opaque window (less glass)
+
+```css
+.lixun-window {
+    background: alpha(var(--lixun-surface), 0.92);
+}
+```
+
+### Fully opaque when blur is unavailable
+
+```css
+.lixun-window.lixun-no-blur {
+    background: var(--lixun-surface);
+}
+```
+
+### Quieter selected row
+
+Keep padding identical to .lixun-hit and paint with background / box-shadow only — a border or padding change breaks ListView's cached row height and clips the last visible row.
+
+```css
+.lixun-top-hit {
+    background-color: alpha(var(--lixun-primary), 0.08);
+    box-shadow: inset 2px 0 0 0 var(--lixun-primary);
+}
+```
+
+### Chip accent
+
+```css
+.lixun-chip:checked {
+    background-color: alpha(var(--lixun-primary), 0.40);
+    color: var(--lixun-on-primary-container);
+}
+```
+
+### Bigger text (accessibility / 4K displays)
+
+Font sizes are in pt so GTK's Large Text / xft-dpi scaling already multiplies them; only override if you want MORE than the system-wide factor.
+
+```css
+.lixun-entry            { font-size: 21pt; }
+.lixun-title            { font-size: 12pt; }
+.lixun-top-hit-hero .lixun-title { font-size: 13.5pt; }
+.lixun-subtitle         { font-size: 9.75pt; }
+.lixun-kind             { font-size: 9pt; }
+.lixun-status-label     { font-size: 10.5pt; }
+```
+
+### Tighter / denser rows
+
+Keep .lixun-hit and .lixun-top-hit padding IDENTICAL (BUG-6: ListView measures row height once; a selected row that grows clips the last visible row).
+
+```css
+.lixun-hit     { padding: 4px 10px; }
+.lixun-top-hit { padding: 4px 10px; }
+```
+
+### Light-mode-only tweaks
+
+.lixun-light is toggled on the root window from the freedesktop appearance portal; prefix any rule with it for light-only styling.
+
+```css
+.lixun-window.lixun-light {
+    border: 0.5px solid rgba(0, 0, 0, 0.25);
+}
+```
+
+### Disable entrance / exit animation
+
+```css
+.lixun-showing { animation: none; }
+.lixun-hiding  { animation: none; }
+```

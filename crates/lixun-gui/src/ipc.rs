@@ -134,33 +134,13 @@ pub(crate) fn start_ipc_thread(
 
             // Try the live connection first; on write failure (daemon
             // restarted, socket dropped) reconnect once and retry.
-            let mut sent = false;
-            for _attempt in 0..2 {
-                // A dead reader leaves a writable socket behind, so drop the
-                // connection here rather than waiting for a write to fail.
-                if conn
-                    .as_ref()
-                    .is_some_and(|c| !c.reader_alive.load(Ordering::SeqCst))
-                {
-                    tracing::debug!("ipc: reader thread gone, reconnecting");
-                    conn = None;
-                }
-                if conn.is_none() {
-                    conn = connect_with_reader(&session_epoch, &event_tx, &last_sent_epoch);
-                    if conn.is_none() {
-                        break;
-                    }
-                }
-                if let Some(c) = conn.as_mut() {
-                    if c.stream.write_all(&frame).is_ok() {
-                        sent = true;
-                        break;
-                    }
-                    tracing::debug!("ipc: write failed, reconnecting");
-                    conn = None;
-                }
-            }
-
+            let sent = send_search_frame(
+                &mut conn,
+                &frame,
+                &session_epoch,
+                &event_tx,
+                &last_sent_epoch,
+            );
             if !sent {
                 tracing::error!("ipc: failed to send search request to daemon");
                 // Tell the GUI the transport is down for the current
@@ -664,6 +644,41 @@ pub(crate) fn send_launcher_geometry(monitor: String, x: i32, y: i32, w: i32, h:
 pub(crate) fn send_preview_hide_request() {
     tracing::info!("gui: send_preview_hide_request");
     send_request_fire_and_forget(&Request::PreviewHide);
+}
+
+fn send_search_frame(
+    conn: &mut Option<Conn>,
+    frame: &[u8],
+    session_epoch: &Arc<AtomicU64>,
+    event_tx: &async_channel::Sender<IpcMessage>,
+    last_sent_epoch: &Arc<AtomicU64>,
+) -> bool {
+    for _attempt in 0..2 {
+        // A dead reader leaves a writable socket behind, so drop the
+        // connection here rather than waiting for a write to fail.
+        if conn
+            .as_ref()
+            .is_some_and(|c| !c.reader_alive.load(Ordering::SeqCst))
+        {
+            tracing::debug!("ipc: reader thread gone, reconnecting");
+            *conn = None;
+        }
+        if conn.is_none() {
+            *conn = connect_with_reader(session_epoch, event_tx, last_sent_epoch);
+            if conn.is_none() {
+                break;
+            }
+        }
+        if let Some(c) = conn.as_mut() {
+            if c.stream.write_all(frame).is_ok() {
+                return true;
+            }
+            tracing::debug!("ipc: write failed, reconnecting");
+            *conn = None;
+        }
+    }
+
+    false
 }
 
 #[cfg(test)]

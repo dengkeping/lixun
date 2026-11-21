@@ -1407,117 +1407,7 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
         gui_max_content_height = daemon_config.gui.max_height_px;
     }
 
-    let style_manager = crate::style_manager::StyleManager::install(
-        &display,
-        daemon_config.gui.theme.as_deref(),
-        daemon_config.gui.matugen.enabled,
-        daemon_config.gui.matugen.colors_path.clone(),
-        daemon_config.gui.opacity,
-    );
-
-    // Spawn the live-reload pipeline: a notify watcher posts
-    // ConfigChanged / UserCssChanged / ThemeCssChanged events to a
-    // glib-friendly async_channel. The pump below reapplies the
-    // appropriate provider (or toggles the blur controller) on the
-    // GTK main thread. When the active theme path changes the
-    // watcher is rebuilt so the new theme directory is observed.
-    let config_path = dirs::config_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-        .join("lixun/config.toml");
-    let (style_tx, style_rx) = async_channel::unbounded::<crate::style_watcher::StyleEvent>();
-    let initial_theme_css = style_manager
-        .resolver
-        .active_css_path(daemon_config.gui.theme.as_deref());
-    let initial_colors_css = daemon_config.gui.matugen.colors_path.clone();
-    let initial_watcher = crate::style_watcher::spawn(
-        config_path.clone(),
-        style_manager.resolver.user_override(),
-        initial_colors_css.clone(),
-        initial_theme_css.clone(),
-        style_tx.clone(),
-    );
-    match initial_watcher {
-        Ok(watcher) => {
-            let mut current_theme_css = initial_theme_css;
-            let mut current_colors_css = initial_colors_css;
-            let mut current_watcher = watcher;
-            let style_manager = style_manager;
-            let blur = blur;
-            let style_tx_pump = style_tx.clone();
-            let config_path_pump = config_path.clone();
-            glib::MainContext::default().spawn_local(async move {
-                while let Ok(event) = style_rx.recv().await {
-                    use crate::style_watcher::StyleEvent;
-                    match event {
-                        StyleEvent::ConfigChanged => match lixun_config::Config::load() {
-                            Ok(cfg) => {
-                                let theme = cfg.gui.theme.as_deref();
-                                style_manager.apply_theme(theme);
-                                style_manager.set_surface_opacity(cfg.gui.opacity);
-                                blur.set_mode(cfg.gui.blur);
-                                let new_theme_css = style_manager.resolver.active_css_path(theme);
-                                let new_colors_css = cfg.gui.matugen.colors_path.clone();
-                                if new_theme_css != current_theme_css
-                                    || new_colors_css != current_colors_css
-                                {
-                                    match crate::style_watcher::spawn(
-                                        config_path_pump.clone(),
-                                        style_manager.resolver.user_override(),
-                                        new_colors_css.clone(),
-                                        new_theme_css.clone(),
-                                        style_tx_pump.clone(),
-                                    ) {
-                                        Ok(w) => {
-                                            current_watcher = w;
-                                            current_theme_css = new_theme_css;
-                                            current_colors_css = new_colors_css;
-                                        }
-                                        Err(e) => tracing::warn!(
-                                            error = %e,
-                                            "failed to rebuild style watcher after path change",
-                                        ),
-                                    }
-                                }
-                            }
-                            Err(e) => tracing::warn!(
-                                error = %e,
-                                "failed to reload config after change",
-                            ),
-                        },
-                        StyleEvent::ColorsCssChanged => {
-                            style_manager.reload_colors_css();
-                        }
-                        StyleEvent::ThemeCssChanged => {
-                            // Reload the active theme by re-resolving from current config.
-                            if let Ok(cfg) = lixun_config::Config::load() {
-                                style_manager.apply_theme(cfg.gui.theme.as_deref());
-                            }
-                        }
-                        StyleEvent::UserCssChanged => {
-                            style_manager.reload_user_css();
-                        }
-                    }
-                }
-                // Receiver closed: drop the watcher explicitly so the
-                // backing notify thread tears down before this task ends.
-                drop(current_watcher);
-            });
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to start style watcher; live reload disabled");
-            // Without a watcher the StyleManager and BlurController still
-            // need to stay alive for the lifetime of the window. Leak them
-            // into the application's MainContext by holding them in a
-            // never-completing task.
-            let style_manager = style_manager;
-            let blur = blur;
-            glib::MainContext::default().spawn_local(async move {
-                std::future::pending::<()>().await;
-                drop(style_manager);
-                drop(blur);
-            });
-        }
-    }
+    install_theme_watcher(&display, &daemon_config.gui, blur);
 
     let vbox = gtk::Box::new(gtk::Orientation::Vertical, 6);
     vbox.set_margin_start(16);
@@ -1535,48 +1425,7 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
     // GtkEntry exposes no label of its own.
     entry.update_property(&[gtk::accessible::Property::Label("Search")]);
 
-    let logo_light = gtk::gdk::Texture::from_bytes(&glib::Bytes::from_static(LOGO_LIGHT_SVG))
-        .inspect_err(|e| tracing::warn!("failed to decode embedded light logo: {}", e))
-        .ok();
-    let logo_dark = gtk::gdk::Texture::from_bytes(&glib::Bytes::from_static(LOGO_DARK_SVG))
-        .inspect_err(|e| tracing::warn!("failed to decode embedded dark logo: {}", e))
-        .ok();
-    let initial_logo = if initial_scheme_is_light {
-        &logo_dark
-    } else {
-        &logo_light
-    };
-    if let Some(icon) = initial_logo {
-        entry.set_icon_from_paintable(gtk::EntryIconPosition::Primary, Some(icon));
-        entry.set_icon_activatable(gtk::EntryIconPosition::Primary, true);
-    }
-
-    // Track live scheme changes: skin class on the window, matching
-    // logo variant on the entry (light logo on the dark skin and
-    // vice versa).
-    {
-        let window_for_scheme = window.clone();
-        let entry_for_scheme = entry.clone();
-        let logo_light = logo_light.clone();
-        let logo_dark = logo_dark.clone();
-        glib::MainContext::default().spawn_local(async move {
-            while let Ok(scheme) = color_scheme_rx.recv().await {
-                if scheme.is_light() {
-                    window_for_scheme.add_css_class("lixun-light");
-                    if let Some(logo) = logo_dark.as_ref() {
-                        entry_for_scheme
-                            .set_icon_from_paintable(gtk::EntryIconPosition::Primary, Some(logo));
-                    }
-                } else {
-                    window_for_scheme.remove_css_class("lixun-light");
-                    if let Some(logo) = logo_light.as_ref() {
-                        entry_for_scheme
-                            .set_icon_from_paintable(gtk::EntryIconPosition::Primary, Some(logo));
-                    }
-                }
-            }
-        });
-    }
+    install_scheme_icons(&window, &entry, initial_scheme_is_light, color_scheme_rx);
 
     // "Configured" is a config-file guess used only until the first
     // live Status reply lands in `semantic_ui` (F6): section presence
@@ -1594,33 +1443,7 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
     // The settings menu opens from two affordances: right-click over
     // the logo area (x < 60) and a plain click on the logo icon
     // itself (the icon is activatable above).
-    let entry_for_menu = entry.clone();
-    let semantic_ui_for_gesture = std::rc::Rc::clone(&semantic_ui);
-    let gesture = gtk::GestureClick::new();
-    gesture.set_button(3);
-    gesture.connect_pressed(move |_gesture, _n_press, x, _y| {
-        if x < 60.0 {
-            popup_settings_menu(
-                &entry_for_menu,
-                &semantic_ui_for_gesture,
-                semantic_configured,
-                ocr_enabled,
-            );
-        }
-    });
-    entry.add_controller(gesture);
-
-    let semantic_ui_for_icon = std::rc::Rc::clone(&semantic_ui);
-    entry.connect_icon_press(move |entry, pos| {
-        if pos == gtk::EntryIconPosition::Primary {
-            popup_settings_menu(
-                entry,
-                &semantic_ui_for_icon,
-                semantic_configured,
-                ocr_enabled,
-            );
-        }
-    });
+    install_settings_menu_gestures(&entry, &semantic_ui, semantic_configured, ocr_enabled);
 
     vbox.append(&entry);
 
@@ -1761,79 +1584,21 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
     // daemon-side config parse error that would otherwise stay
     // journal-only (O2 — the daemon now survives a bad config on
     // built-in defaults and reports the error via Status).
-    {
-        let semantic_ui = std::rc::Rc::clone(&semantic_ui);
-        let status_for_startup = std::rc::Rc::clone(&status_bar);
-        crate::ipc::fetch_daemon_status_async(move |snap| {
-            if let Some(snap) = snap {
-                *semantic_ui.borrow_mut() = snap.semantic.clone();
-                if let Some(err) = snap.config_error {
-                    status_for_startup
-                        .show_error(&format!("Config error \u{2014} using defaults: {err}"));
-                }
-            }
-        });
-    }
+    fetch_startup_status(semantic_ui.clone(), status_bar.clone());
 
     // Rotating idle placeholder (O3): cycle discoverability hints
     // through the entry's placeholder while the query is empty. The
     // placeholder only paints on an empty entry, so rotation while
     // text is present is invisible by construction; we still skip
     // the churn in that case.
-    {
-        let hints = build_placeholder_hints(&claimed_prefixes);
-        let entry_for_hints = entry.clone();
-        let idx = std::rc::Rc::new(std::cell::Cell::new(0usize));
-        glib::timeout_add_seconds_local(4, move || {
-            if entry_for_hints.text().is_empty() {
-                idx.set((idx.get() + 1) % hints.len());
-                entry_for_hints.set_placeholder_text(Some(&hints[idx.get()]));
-            }
-            glib::ControlFlow::Continue
-        });
-    }
+    install_rotating_hints(&entry, &claimed_prefixes);
 
     // A1: announce the SETTLED selection to screen readers. Focus
     // stays parked on the entry while arrows move the selection, so
     // Orca never hears the cursor move; announce() (v4_16 API) fills
     // that gap. Debounced 150 ms so holding an arrow key announces
     // the landing row, not every intermediate one.
-    {
-        let announce_debounce: std::rc::Rc<std::cell::RefCell<Option<glib::SourceId>>> =
-            std::rc::Rc::new(std::cell::RefCell::new(None));
-        let list_view_for_announce = list_view.clone();
-        selection.connect_selected_notify(move |sel| {
-            let idx = sel.selected();
-            if idx == gtk::INVALID_LIST_POSITION {
-                return;
-            }
-            let Some(doc_id) = sel
-                .item(idx)
-                .and_then(|o| o.downcast::<gtk::StringObject>().ok())
-                .map(|s| s.string().to_string())
-            else {
-                return;
-            };
-            if let Some(id) = announce_debounce.borrow_mut().take() {
-                id.remove();
-            }
-            let list_view = list_view_for_announce.clone();
-            let slot = std::rc::Rc::clone(&announce_debounce);
-            let id = glib::timeout_add_local_once(Duration::from_millis(150), move || {
-                *slot.borrow_mut() = None;
-                crate::factory::with_cached_hits(|hits| {
-                    if let Some(hit) = hits.iter().find(|h| h.id.0 == doc_id) {
-                        gtk::prelude::AccessibleExt::announce(
-                            &list_view,
-                            &hit.title,
-                            gtk::AccessibleAnnouncementPriority::Medium,
-                        );
-                    }
-                });
-            });
-            *announce_debounce.borrow_mut() = Some(id);
-        });
-    }
+    announce_selection(&selection, &list_view);
     let last_query: std::rc::Rc<std::cell::RefCell<String>> =
         std::rc::Rc::new(std::cell::RefCell::new(String::new()));
     let just_showed_until: std::rc::Rc<std::cell::Cell<Instant>> =
@@ -1905,50 +1670,7 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
     });
     app.add_action(&close_action);
 
-    {
-        let controller_for_sel = std::rc::Rc::clone(&controller);
-        let window_for_sel = window.clone();
-        selection.connect_selected_notify(move |sel| {
-            if !controller_for_sel.preview_mode_active() {
-                return;
-            }
-            let idx = sel.selected();
-            if idx == gtk::INVALID_LIST_POSITION {
-                return;
-            }
-            let Some(obj) = sel.item(idx) else { return };
-            let Some(str_obj) = obj.downcast_ref::<gtk::StringObject>() else {
-                return;
-            };
-            let doc_id = str_obj.string().to_string();
-
-            controller_for_sel.cancel_preview_debounce();
-            let controller_inner = std::rc::Rc::clone(&controller_for_sel);
-            let window_inner = window_for_sel.clone();
-            let id = glib::timeout_add_local_once(Duration::from_millis(50), move || {
-                *controller_inner.preview_debounce.borrow_mut() = None;
-                if !controller_inner.preview_mode_active() {
-                    return;
-                }
-                let monitor = crate::ipc::current_monitor_connector(&window_inner);
-                crate::factory::with_cached_hits(|hits| {
-                    if let Some(hit) = hits.iter().find(|h| h.id.0 == doc_id) {
-                        crate::ipc::send_preview_request(
-                            hit,
-                            monitor.clone(),
-                            &controller_inner.entry.text(),
-                        );
-                    }
-                });
-                // Keep keyboard focus in the search entry so the
-                // next arrow press is delivered to the launcher,
-                // not stolen by the preview surface the compositor
-                // may have just focused.
-                controller_inner.entry.grab_focus();
-            });
-            *controller_for_sel.preview_debounce.borrow_mut() = Some(id);
-        });
-    }
+    follow_preview_selection(&selection, &window, controller.clone());
 
     let clear_action = gio::SimpleAction::new("clear-and-hide-launcher", None);
     let controller_for_clear = std::rc::Rc::clone(&controller);
@@ -1968,31 +1690,15 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
     // R7: activating the synthetic "Show more results" row re-issues
     // the current query with a ×4 limit (one step; the daemon caps at
     // max_results × 4 bounded by 1000).
-    {
-        let entry_for_more = entry.clone();
-        let ipc_for_more = ipc.clone();
-        let epoch_for_more = Arc::clone(&session_epoch);
-        let category_for_more = std::rc::Rc::clone(&current_category);
-        let limit_for_more = std::rc::Rc::clone(&last_requested_limit);
-        let more_action = gio::SimpleAction::new("show-more-results", None);
-        more_action.connect_activate(move |_, _| {
-            let q = entry_for_more.text().to_string();
-            if q.is_empty() {
-                return;
-            }
-            let next_limit = max_results.saturating_mul(4).min(1000);
-            limit_for_more.set(next_limit);
-            let epoch = epoch_for_more.load(Ordering::SeqCst);
-            tracing::info!(
-                "gui: show-more-results → re-issuing query with limit={}",
-                next_limit
-            );
-            let _ = ipc_for_more
-                .request_tx
-                .send((q, next_limit, epoch, category_for_more.get()));
-        });
-        app.add_action(&more_action);
-    }
+    install_show_more_action(
+        app,
+        entry.clone(),
+        ipc.clone(),
+        session_epoch.clone(),
+        current_category.clone(),
+        last_requested_limit.clone(),
+        max_results,
+    );
 
     // R5: a chip toggle re-issues the current query with the active
     // category so the daemon filters PRE-limit — matching mail
@@ -2046,74 +1752,12 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
         }
     }
 
-    let relaunch_action = gio::SimpleAction::new("relaunch", None);
-    relaunch_action.connect_activate(move |_, _| {
-        let _ = std::process::Command::new("systemctl")
-            .args(["--user", "restart", "lixund.service"])
-            .spawn();
-    });
-    app.add_action(&relaunch_action);
-
-    let toggle_semantic_action = gio::SimpleAction::new("toggle-semantic", None);
-    let semantic_current = semantic_configured;
-    let status_for_semantic = std::rc::Rc::clone(&status_bar);
-    toggle_semantic_action.connect_activate(move |_, _| {
-        let Some(mut doc) = load_config_document(&status_for_semantic) else {
-            return;
-        };
-        if semantic_current {
-            doc.remove("semantic");
-        } else {
-            let mut table = toml_edit::Table::new();
-            table.insert("enabled", toml_edit::value(true));
-            doc.insert("semantic", toml_edit::Item::Table(table));
-        }
-        if !write_config_document(&doc, &status_for_semantic) {
-            return;
-        }
-
-        let _ = std::process::Command::new("systemctl")
-            .args(["--user", "restart", "lixund.service"])
-            .spawn();
-    });
-    app.add_action(&toggle_semantic_action);
-
-    let toggle_ocr_action = gio::SimpleAction::new("toggle-ocr", None);
-    let ocr_current = daemon_config.ocr.enabled;
-    let status_for_ocr = std::rc::Rc::clone(&status_bar);
-    toggle_ocr_action.connect_activate(move |_, _| {
-        let Some(mut doc) = load_config_document(&status_for_ocr) else {
-            return;
-        };
-        if let Some(ocr_table) = doc.get_mut("ocr").and_then(|v| v.as_table_mut()) {
-            ocr_table.insert("enabled", toml_edit::value(!ocr_current));
-        } else {
-            let mut table = toml_edit::Table::new();
-            table.insert("enabled", toml_edit::value(!ocr_current));
-            doc.insert("ocr", toml_edit::Item::Table(table));
-        }
-        if !write_config_document(&doc, &status_for_ocr) {
-            return;
-        }
-
-        let _ = std::process::Command::new("systemctl")
-            .args(["--user", "restart", "lixund.service"])
-            .spawn();
-    });
-    app.add_action(&toggle_ocr_action);
-
-    let open_config_action = gio::SimpleAction::new("open-config", None);
-    open_config_action.connect_activate(move |_, _| {
-        let config_path = user_config_path();
-        // xdg-utils' xdg-open rejects any argv that begins with '-' including
-        // the conventional GNU end-of-options separator. See the docstring on
-        // crates/lixun-gui/src/actions.rs::xdg_open_command for the protocol
-        // detail. Pass the target path directly.
-        let _ = std::process::Command::new("xdg-open")
-            .arg(&config_path)
-            .spawn();
-    });
-    app.add_action(&open_config_action);
+    install_settings_actions(
+        app,
+        &status_bar,
+        semantic_configured,
+        daemon_config.ocr.enabled,
+    );
 
     install_response_handler(
         ipc_event_rx,
@@ -2217,54 +1861,13 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
         std::rc::Rc::clone(&controller),
     );
 
-    let focus_ctrl = gtk::EventControllerFocus::new();
-    let entry_for_focus_enter = entry.clone();
-    focus_ctrl.connect_enter(move |_| {
-        tracing::info!("gui: focus_ctrl ENTER, calling entry.grab_focus()");
-        entry_for_focus_enter.grab_focus();
-    });
-    let controller_for_leave = std::rc::Rc::clone(&controller);
-    let just_showed_for_leave = std::rc::Rc::clone(&just_showed_until);
-    let popover_open_for_leave = std::rc::Rc::clone(&row_popover_open);
-    focus_ctrl.connect_leave(move |_| {
-        tracing::info!("gui: focus_ctrl LEAVE fired, just_showed_until check");
-        if Instant::now() < just_showed_for_leave.get() {
-            tracing::info!("gui: spurious leave during show transition, ignored");
-            return;
-        }
-        // K11: an open row popover (context menu / Get Info) with the
-        // default autohide takes an xdg_popup grab — keyboard focus
-        // moves to the popup surface and this leave fires. Hiding
-        // here would unmap the launcher and kill the popover with it
-        // (the trap that bit the ?/F1 overlay). Gate on the mapped-
-        // popover counter, mirroring the preview_mode gate below;
-        // both mouse- and keyboard-opened popovers pass through the
-        // same map/unmap counting.
-        if popover_open_for_leave.get() > 0 {
-            tracing::info!("gui: focus_ctrl LEAVE with row popover open → ignored");
-            return;
-        }
-        // While the preview window is open, the compositor will hand
-        // keyboard focus to it (the preview is now a regular
-        // xdg-toplevel, not a layer-shell surface, so it can take
-        // focus). That LEAVE event is expected and benign — the
-        // launcher must stay visible so the user can keep navigating
-        // results and see the preview update live. Preview dismissal
-        // is driven exclusively by explicit user input handled in
-        // keymap.rs (Space / Escape) and by the preview window's own
-        // close controllers (X button, launch action). Auto-closing
-        // here would defeat the "launcher + preview side-by-side"
-        // workflow.
-        if controller_for_leave.preview_mode_active() {
-            tracing::info!(
-                "gui: focus_ctrl LEAVE in preview mode → ignored (preview drives dismissal)"
-            );
-            return;
-        }
-        tracing::info!("gui: focus_ctrl LEAVE → controller.hide()");
-        controller_for_leave.hide();
-    });
-    window.add_controller(focus_ctrl);
+    install_focus_controller(
+        &window,
+        &entry,
+        controller.clone(),
+        just_showed_until.clone(),
+        row_popover_open.clone(),
+    );
 
     install_drag_gesture(&window);
 
@@ -3304,6 +2907,472 @@ fn build_category_chips(
         container,
         buttons: buttons_arr,
     }
+}
+
+fn install_theme_watcher(
+    display: &gtk::gdk::Display,
+    gui: &lixun_config::GuiConfig,
+    blur: crate::kde_blur::BlurController,
+) {
+    let style_manager = crate::style_manager::StyleManager::install(
+        display,
+        gui.theme.as_deref(),
+        gui.matugen.enabled,
+        gui.matugen.colors_path.clone(),
+        gui.opacity,
+    );
+
+    // Spawn the live-reload pipeline: a notify watcher posts
+    // ConfigChanged / UserCssChanged / ThemeCssChanged events to a
+    // glib-friendly async_channel. The pump below reapplies the
+    // appropriate provider (or toggles the blur controller) on the
+    // GTK main thread. When the active theme path changes the
+    // watcher is rebuilt so the new theme directory is observed.
+    let config_path = dirs::config_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+        .join("lixun/config.toml");
+    let (style_tx, style_rx) = async_channel::unbounded::<crate::style_watcher::StyleEvent>();
+    let initial_theme_css = style_manager.resolver.active_css_path(gui.theme.as_deref());
+    let initial_colors_css = gui.matugen.colors_path.clone();
+    let initial_watcher = crate::style_watcher::spawn(
+        config_path.clone(),
+        style_manager.resolver.user_override(),
+        initial_colors_css.clone(),
+        initial_theme_css.clone(),
+        style_tx.clone(),
+    );
+    match initial_watcher {
+        Ok(watcher) => {
+            let mut current_theme_css = initial_theme_css;
+            let mut current_colors_css = initial_colors_css;
+            let mut current_watcher = watcher;
+            let style_manager = style_manager;
+            let blur = blur;
+            let style_tx_pump = style_tx.clone();
+            let config_path_pump = config_path.clone();
+            glib::MainContext::default().spawn_local(async move {
+                while let Ok(event) = style_rx.recv().await {
+                    use crate::style_watcher::StyleEvent;
+                    match event {
+                        StyleEvent::ConfigChanged => match lixun_config::Config::load() {
+                            Ok(cfg) => {
+                                let theme = cfg.gui.theme.as_deref();
+                                style_manager.apply_theme(theme);
+                                style_manager.set_surface_opacity(cfg.gui.opacity);
+                                blur.set_mode(cfg.gui.blur);
+                                let new_theme_css = style_manager.resolver.active_css_path(theme);
+                                let new_colors_css = cfg.gui.matugen.colors_path.clone();
+                                if new_theme_css != current_theme_css
+                                    || new_colors_css != current_colors_css
+                                {
+                                    match crate::style_watcher::spawn(
+                                        config_path_pump.clone(),
+                                        style_manager.resolver.user_override(),
+                                        new_colors_css.clone(),
+                                        new_theme_css.clone(),
+                                        style_tx_pump.clone(),
+                                    ) {
+                                        Ok(w) => {
+                                            current_watcher = w;
+                                            current_theme_css = new_theme_css;
+                                            current_colors_css = new_colors_css;
+                                        }
+                                        Err(e) => tracing::warn!(
+                                            error = %e,
+                                            "failed to rebuild style watcher after path change",
+                                        ),
+                                    }
+                                }
+                            }
+                            Err(e) => tracing::warn!(
+                                error = %e,
+                                "failed to reload config after change",
+                            ),
+                        },
+                        StyleEvent::ColorsCssChanged => {
+                            style_manager.reload_colors_css();
+                        }
+                        StyleEvent::ThemeCssChanged => {
+                            // Reload the active theme by re-resolving from current config.
+                            if let Ok(cfg) = lixun_config::Config::load() {
+                                style_manager.apply_theme(cfg.gui.theme.as_deref());
+                            }
+                        }
+                        StyleEvent::UserCssChanged => {
+                            style_manager.reload_user_css();
+                        }
+                    }
+                }
+                // Receiver closed: drop the watcher explicitly so the
+                // backing notify thread tears down before this task ends.
+                drop(current_watcher);
+            });
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to start style watcher; live reload disabled");
+            // Without a watcher the StyleManager and BlurController still
+            // need to stay alive for the lifetime of the window. Leak them
+            // into the application's MainContext by holding them in a
+            // never-completing task.
+            let style_manager = style_manager;
+            let blur = blur;
+            glib::MainContext::default().spawn_local(async move {
+                std::future::pending::<()>().await;
+                drop(style_manager);
+                drop(blur);
+            });
+        }
+    }
+}
+
+fn install_scheme_icons(
+    window: &gtk::ApplicationWindow,
+    entry: &gtk::Entry,
+    initial_scheme_is_light: bool,
+    color_scheme_rx: async_channel::Receiver<crate::color_scheme::ColorScheme>,
+) {
+    let logo_light = gtk::gdk::Texture::from_bytes(&glib::Bytes::from_static(LOGO_LIGHT_SVG))
+        .inspect_err(|e| tracing::warn!("failed to decode embedded light logo: {}", e))
+        .ok();
+    let logo_dark = gtk::gdk::Texture::from_bytes(&glib::Bytes::from_static(LOGO_DARK_SVG))
+        .inspect_err(|e| tracing::warn!("failed to decode embedded dark logo: {}", e))
+        .ok();
+    let initial_logo = if initial_scheme_is_light {
+        &logo_dark
+    } else {
+        &logo_light
+    };
+    if let Some(icon) = initial_logo {
+        entry.set_icon_from_paintable(gtk::EntryIconPosition::Primary, Some(icon));
+        entry.set_icon_activatable(gtk::EntryIconPosition::Primary, true);
+    }
+
+    // Track live scheme changes: skin class on the window, matching
+    // logo variant on the entry (light logo on the dark skin and
+    // vice versa).
+    {
+        let window_for_scheme = window.clone();
+        let entry_for_scheme = entry.clone();
+        glib::MainContext::default().spawn_local(async move {
+            while let Ok(scheme) = color_scheme_rx.recv().await {
+                if scheme.is_light() {
+                    window_for_scheme.add_css_class("lixun-light");
+                    if let Some(logo) = logo_dark.as_ref() {
+                        entry_for_scheme
+                            .set_icon_from_paintable(gtk::EntryIconPosition::Primary, Some(logo));
+                    }
+                } else {
+                    window_for_scheme.remove_css_class("lixun-light");
+                    if let Some(logo) = logo_light.as_ref() {
+                        entry_for_scheme
+                            .set_icon_from_paintable(gtk::EntryIconPosition::Primary, Some(logo));
+                    }
+                }
+            }
+        });
+    }
+}
+
+fn fetch_startup_status(semantic_ui: SemanticUiState, status_for_startup: std::rc::Rc<StatusBar>) {
+    crate::ipc::fetch_daemon_status_async(move |snap| {
+        if let Some(snap) = snap {
+            *semantic_ui.borrow_mut() = snap.semantic.clone();
+            if let Some(err) = snap.config_error {
+                status_for_startup
+                    .show_error(&format!("Config error \u{2014} using defaults: {err}"));
+            }
+        }
+    });
+}
+
+fn install_rotating_hints(entry: &gtk::Entry, claimed_prefixes: &[String]) {
+    let hints = build_placeholder_hints(claimed_prefixes);
+    let entry_for_hints = entry.clone();
+    let idx = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    glib::timeout_add_seconds_local(4, move || {
+        if entry_for_hints.text().is_empty() {
+            idx.set((idx.get() + 1) % hints.len());
+            entry_for_hints.set_placeholder_text(Some(&hints[idx.get()]));
+        }
+        glib::ControlFlow::Continue
+    });
+}
+
+fn announce_selection(selection: &gtk::SingleSelection, list_view: &gtk::ListView) {
+    let announce_debounce: std::rc::Rc<std::cell::RefCell<Option<glib::SourceId>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
+    let list_view_for_announce = list_view.clone();
+    selection.connect_selected_notify(move |sel| {
+        let idx = sel.selected();
+        if idx == gtk::INVALID_LIST_POSITION {
+            return;
+        }
+        let Some(doc_id) = sel
+            .item(idx)
+            .and_then(|o| o.downcast::<gtk::StringObject>().ok())
+            .map(|s| s.string().to_string())
+        else {
+            return;
+        };
+        if let Some(id) = announce_debounce.borrow_mut().take() {
+            id.remove();
+        }
+        let list_view = list_view_for_announce.clone();
+        let slot = std::rc::Rc::clone(&announce_debounce);
+        let id = glib::timeout_add_local_once(Duration::from_millis(150), move || {
+            *slot.borrow_mut() = None;
+            crate::factory::with_cached_hits(|hits| {
+                if let Some(hit) = hits.iter().find(|h| h.id.0 == doc_id) {
+                    gtk::prelude::AccessibleExt::announce(
+                        &list_view,
+                        &hit.title,
+                        gtk::AccessibleAnnouncementPriority::Medium,
+                    );
+                }
+            });
+        });
+        *announce_debounce.borrow_mut() = Some(id);
+    });
+}
+
+fn follow_preview_selection(
+    selection: &gtk::SingleSelection,
+    window: &gtk::ApplicationWindow,
+    controller_for_sel: std::rc::Rc<LauncherController>,
+) {
+    let window_for_sel = window.clone();
+    selection.connect_selected_notify(move |sel| {
+        if !controller_for_sel.preview_mode_active() {
+            return;
+        }
+        let idx = sel.selected();
+        if idx == gtk::INVALID_LIST_POSITION {
+            return;
+        }
+        let Some(obj) = sel.item(idx) else { return };
+        let Some(str_obj) = obj.downcast_ref::<gtk::StringObject>() else {
+            return;
+        };
+        let doc_id = str_obj.string().to_string();
+
+        controller_for_sel.cancel_preview_debounce();
+        let controller_inner = std::rc::Rc::clone(&controller_for_sel);
+        let window_inner = window_for_sel.clone();
+        let id = glib::timeout_add_local_once(Duration::from_millis(50), move || {
+            *controller_inner.preview_debounce.borrow_mut() = None;
+            if !controller_inner.preview_mode_active() {
+                return;
+            }
+            let monitor = crate::ipc::current_monitor_connector(&window_inner);
+            crate::factory::with_cached_hits(|hits| {
+                if let Some(hit) = hits.iter().find(|h| h.id.0 == doc_id) {
+                    crate::ipc::send_preview_request(
+                        hit,
+                        monitor.clone(),
+                        &controller_inner.entry.text(),
+                    );
+                }
+            });
+            // Keep keyboard focus in the search entry so the
+            // next arrow press is delivered to the launcher,
+            // not stolen by the preview surface the compositor
+            // may have just focused.
+            controller_inner.entry.grab_focus();
+        });
+        *controller_for_sel.preview_debounce.borrow_mut() = Some(id);
+    });
+}
+
+fn install_settings_actions(
+    app: &gtk::Application,
+    status_bar: &std::rc::Rc<StatusBar>,
+    semantic_current: bool,
+    ocr_current: bool,
+) {
+    let relaunch_action = gio::SimpleAction::new("relaunch", None);
+    relaunch_action.connect_activate(move |_, _| {
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "restart", "lixund.service"])
+            .spawn();
+    });
+    app.add_action(&relaunch_action);
+
+    let toggle_semantic_action = gio::SimpleAction::new("toggle-semantic", None);
+    let status_for_semantic = std::rc::Rc::clone(status_bar);
+    toggle_semantic_action.connect_activate(move |_, _| {
+        let Some(mut doc) = load_config_document(&status_for_semantic) else {
+            return;
+        };
+        if semantic_current {
+            doc.remove("semantic");
+        } else {
+            let mut table = toml_edit::Table::new();
+            table.insert("enabled", toml_edit::value(true));
+            doc.insert("semantic", toml_edit::Item::Table(table));
+        }
+        if !write_config_document(&doc, &status_for_semantic) {
+            return;
+        }
+
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "restart", "lixund.service"])
+            .spawn();
+    });
+    app.add_action(&toggle_semantic_action);
+
+    let toggle_ocr_action = gio::SimpleAction::new("toggle-ocr", None);
+    let status_for_ocr = std::rc::Rc::clone(status_bar);
+    toggle_ocr_action.connect_activate(move |_, _| {
+        let Some(mut doc) = load_config_document(&status_for_ocr) else {
+            return;
+        };
+        if let Some(ocr_table) = doc.get_mut("ocr").and_then(|v| v.as_table_mut()) {
+            ocr_table.insert("enabled", toml_edit::value(!ocr_current));
+        } else {
+            let mut table = toml_edit::Table::new();
+            table.insert("enabled", toml_edit::value(!ocr_current));
+            doc.insert("ocr", toml_edit::Item::Table(table));
+        }
+        if !write_config_document(&doc, &status_for_ocr) {
+            return;
+        }
+
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "restart", "lixund.service"])
+            .spawn();
+    });
+    app.add_action(&toggle_ocr_action);
+
+    let open_config_action = gio::SimpleAction::new("open-config", None);
+    open_config_action.connect_activate(move |_, _| {
+        let config_path = user_config_path();
+        // xdg-utils' xdg-open rejects any argv that begins with '-' including
+        // the conventional GNU end-of-options separator. See the docstring on
+        // crates/lixun-gui/src/actions.rs::xdg_open_command for the protocol
+        // detail. Pass the target path directly.
+        let _ = std::process::Command::new("xdg-open")
+            .arg(&config_path)
+            .spawn();
+    });
+    app.add_action(&open_config_action);
+}
+
+fn install_focus_controller(
+    window: &gtk::ApplicationWindow,
+    entry: &gtk::Entry,
+    controller_for_leave: std::rc::Rc<LauncherController>,
+    just_showed_for_leave: std::rc::Rc<std::cell::Cell<Instant>>,
+    popover_open_for_leave: std::rc::Rc<std::cell::Cell<u32>>,
+) {
+    let focus_ctrl = gtk::EventControllerFocus::new();
+    let entry_for_focus_enter = entry.clone();
+    focus_ctrl.connect_enter(move |_| {
+        tracing::info!("gui: focus_ctrl ENTER, calling entry.grab_focus()");
+        entry_for_focus_enter.grab_focus();
+    });
+    focus_ctrl.connect_leave(move |_| {
+        tracing::info!("gui: focus_ctrl LEAVE fired, just_showed_until check");
+        if Instant::now() < just_showed_for_leave.get() {
+            tracing::info!("gui: spurious leave during show transition, ignored");
+            return;
+        }
+        // K11: an open row popover (context menu / Get Info) with the
+        // default autohide takes an xdg_popup grab — keyboard focus
+        // moves to the popup surface and this leave fires. Hiding
+        // here would unmap the launcher and kill the popover with it
+        // (the trap that bit the ?/F1 overlay). Gate on the mapped-
+        // popover counter, mirroring the preview_mode gate below;
+        // both mouse- and keyboard-opened popovers pass through the
+        // same map/unmap counting.
+        if popover_open_for_leave.get() > 0 {
+            tracing::info!("gui: focus_ctrl LEAVE with row popover open → ignored");
+            return;
+        }
+        // While the preview window is open, the compositor will hand
+        // keyboard focus to it (the preview is now a regular
+        // xdg-toplevel, not a layer-shell surface, so it can take
+        // focus). That LEAVE event is expected and benign — the
+        // launcher must stay visible so the user can keep navigating
+        // results and see the preview update live. Preview dismissal
+        // is driven exclusively by explicit user input handled in
+        // keymap.rs (Space / Escape) and by the preview window's own
+        // close controllers (X button, launch action). Auto-closing
+        // here would defeat the "launcher + preview side-by-side"
+        // workflow.
+        if controller_for_leave.preview_mode_active() {
+            tracing::info!(
+                "gui: focus_ctrl LEAVE in preview mode → ignored (preview drives dismissal)"
+            );
+            return;
+        }
+        tracing::info!("gui: focus_ctrl LEAVE → controller.hide()");
+        controller_for_leave.hide();
+    });
+    window.add_controller(focus_ctrl);
+}
+
+fn install_show_more_action(
+    app: &gtk::Application,
+    entry_for_more: gtk::Entry,
+    ipc_for_more: IpcClient,
+    epoch_for_more: Arc<AtomicU64>,
+    category_for_more: CategoryFilter,
+    limit_for_more: std::rc::Rc<std::cell::Cell<u32>>,
+    max_results: u32,
+) {
+    let more_action = gio::SimpleAction::new("show-more-results", None);
+    more_action.connect_activate(move |_, _| {
+        let q = entry_for_more.text().to_string();
+        if q.is_empty() {
+            return;
+        }
+        let next_limit = max_results.saturating_mul(4).min(1000);
+        limit_for_more.set(next_limit);
+        let epoch = epoch_for_more.load(Ordering::SeqCst);
+        tracing::info!(
+            "gui: show-more-results → re-issuing query with limit={}",
+            next_limit
+        );
+        let _ = ipc_for_more
+            .request_tx
+            .send((q, next_limit, epoch, category_for_more.get()));
+    });
+    app.add_action(&more_action);
+}
+
+fn install_settings_menu_gestures(
+    entry: &gtk::Entry,
+    semantic_ui: &SemanticUiState,
+    semantic_configured: bool,
+    ocr_enabled: bool,
+) {
+    let entry_for_menu = entry.clone();
+    let semantic_ui_for_gesture = std::rc::Rc::clone(semantic_ui);
+    let gesture = gtk::GestureClick::new();
+    gesture.set_button(3);
+    gesture.connect_pressed(move |_gesture, _n_press, x, _y| {
+        if x < 60.0 {
+            popup_settings_menu(
+                &entry_for_menu,
+                &semantic_ui_for_gesture,
+                semantic_configured,
+                ocr_enabled,
+            );
+        }
+    });
+    entry.add_controller(gesture);
+
+    let semantic_ui_for_icon = std::rc::Rc::clone(semantic_ui);
+    entry.connect_icon_press(move |entry, pos| {
+        if pos == gtk::EntryIconPosition::Primary {
+            popup_settings_menu(
+                entry,
+                &semantic_ui_for_icon,
+                semantic_configured,
+                ocr_enabled,
+            );
+        }
+    });
 }
 
 #[cfg(test)]

@@ -1,7 +1,10 @@
 //! Tests for [`super::PdfCanvas`]. Lives in a sibling file so
 //! `canvas.rs` stays under the 500-line cap.
 
-use super::*;
+use super::{
+    DocumentSession, MAX_ZOOM, MIN_ZOOM, ObjectSubclassIsExt, PdfCanvas, Rc, accessibility,
+    fit_to_page, fit_to_width, zoomed_in, zoomed_out,
+};
 use crate::worker::RenderResult;
 use std::path::PathBuf;
 

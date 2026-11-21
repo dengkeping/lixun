@@ -11,7 +11,7 @@
 //! Lives in a sibling file so `canvas.rs` stays close to its size
 //! cap, mirroring `canvas_scrollable.rs` / `canvas_search.rs`.
 
-use super::*;
+use super::{AccessibleExtManual, ObjectExt, PdfCanvas, glib};
 
 /// Character cap for the accessible description sourced from page
 /// text. Screen readers read descriptions linearly; a few hundred

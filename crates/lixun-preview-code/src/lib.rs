@@ -181,7 +181,7 @@ fn read_capped(path: &std::path::Path) -> anyhow::Result<(String, bool)> {
 }
 
 fn pick_syntax<'a>(set: &'a SyntaxSet, path: &std::path::Path, body: &str) -> &'a SyntaxReference {
-    if let Some(ext) = path.extension().and_then(|e| e.to_str())
+    if let Some(ext) = path.extension().and_then(std::ffi::OsStr::to_str)
         && let Some(syntax) = set.find_syntax_by_extension(&ext.to_ascii_lowercase())
     {
         return syntax;

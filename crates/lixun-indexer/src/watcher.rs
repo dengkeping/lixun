@@ -487,69 +487,14 @@ async fn resolver_task(
                 if directory_stream.is_some() {
                     continue;
                 }
-                let (tx, stream) = mpsc::channel(32);
-                directory_stream = Some(stream);
-                let rules = Arc::clone(&env.exclude);
-                let controls = ctrl_tx.clone();
-                tokio::task::spawn_blocking(move || {
-                    for entry in WalkDir::new(&path)
-                        .follow_links(false)
-                        .into_iter()
-                        .filter_entry(|entry| rules.allows_walk_entry(entry.path(), &path))
-                        .flatten()
-                    {
-                        if entry.file_type().is_dir() {
-                            if controls
-                                .send(Control::AddWatch(entry.path().to_owned()))
-                                .is_err()
-                            {
-                                break;
-                            }
-                        } else if !entry.file_type().is_file() {
-                            continue;
-                        }
-                        if entry.depth() > 0 && tx.blocking_send(entry.into_path()).is_err() {
-                            break;
-                        }
-                    }
-                });
+                directory_stream = Some(stream_directory(
+                    path,
+                    Arc::clone(&env.exclude),
+                    ctrl_tx.clone(),
+                ));
             }
             Resolved::Gone => {
-                if !env.exclude.root_available_for(&path) {
-                    continue;
-                }
-                // Key convention: the alias map is keyed on
-                // the raw observed path string, the same
-                // value `fs_doc_id` falls back to when
-                // `canonicalize` fails on a vanished path.
-                // If a prior index_file recorded an alias,
-                // recover the canonical id and forget the
-                // entry; otherwise fall back to the raw id.
-                let observed = path.to_string_lossy().to_string();
-                let id = match env.alias_noter.as_ref() {
-                    Some(noter) => match noter.resolve(&observed) {
-                        Some(canonical) => {
-                            noter.forget(&canonical);
-                            if canonical
-                                .strip_prefix("fs:")
-                                .is_some_and(|p| Path::new(p).exists())
-                            {
-                                continue;
-                            }
-                            canonical
-                        }
-                        None => fs_doc_id(&path),
-                    },
-                    None => fs_doc_id(&path),
-                };
-                if let Err(e) = mutation_tx.send(Mutation::DeleteSubtree(id.clone())).await {
-                    tracing::debug!(
-                        "resolver[{}]: send gone-delete-subtree {} failed: {}",
-                        worker_id,
-                        id,
-                        e
-                    );
-                }
+                delete_missing_path(worker_id, &path, &env, &mutation_tx).await;
             }
             Resolved::Skip => {}
         }
@@ -621,6 +566,80 @@ fn resolve_refresh(
         Resolved::Directory(doc)
     } else {
         Resolved::Skip
+    }
+}
+
+fn stream_directory(
+    path: PathBuf,
+    rules: Arc<ExcludeSet>,
+    controls: std::sync::mpsc::SyncSender<Control>,
+) -> mpsc::Receiver<PathBuf> {
+    let (tx, stream) = mpsc::channel(32);
+    tokio::task::spawn_blocking(move || {
+        for entry in WalkDir::new(&path)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|entry| rules.allows_walk_entry(entry.path(), &path))
+            .flatten()
+        {
+            if entry.file_type().is_dir() {
+                if controls
+                    .send(Control::AddWatch(entry.path().to_owned()))
+                    .is_err()
+                {
+                    break;
+                }
+            } else if !entry.file_type().is_file() {
+                continue;
+            }
+            if entry.depth() > 0 && tx.blocking_send(entry.into_path()).is_err() {
+                break;
+            }
+        }
+    });
+    stream
+}
+
+async fn delete_missing_path(
+    worker_id: usize,
+    path: &Path,
+    env: &ResolverEnv,
+    mutation_tx: &IndexMutationTx,
+) {
+    if !env.exclude.root_available_for(path) {
+        return;
+    }
+    // Key convention: the alias map is keyed on
+    // the raw observed path string, the same
+    // value `fs_doc_id` falls back to when
+    // `canonicalize` fails on a vanished path.
+    // If a prior index_file recorded an alias,
+    // recover the canonical id and forget the
+    // entry; otherwise fall back to the raw id.
+    let observed = path.to_string_lossy().to_string();
+    let id = match env.alias_noter.as_ref() {
+        Some(noter) => match noter.resolve(&observed) {
+            Some(canonical) => {
+                noter.forget(&canonical);
+                if canonical
+                    .strip_prefix("fs:")
+                    .is_some_and(|p| Path::new(p).exists())
+                {
+                    return;
+                }
+                canonical
+            }
+            None => fs_doc_id(path),
+        },
+        None => fs_doc_id(path),
+    };
+    if let Err(e) = mutation_tx.send(Mutation::DeleteSubtree(id.clone())).await {
+        tracing::debug!(
+            "resolver[{}]: send gone-delete-subtree {} failed: {}",
+            worker_id,
+            id,
+            e
+        );
     }
 }
 

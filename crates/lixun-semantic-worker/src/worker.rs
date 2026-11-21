@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 
 use crate::config::SemanticConfig;
 #[cfg(not(feature = "idle-eviction"))]
-use crate::embedder::{ClipTextEmbedder, ImageEmbedder, TextEmbedder};
+use crate::embedder::{ImageEmbedder, TextEmbedder};
 use crate::journal::BackfillJournal;
 use crate::store::VectorStore;
 #[cfg(feature = "idle-eviction")]
@@ -41,6 +41,15 @@ impl WorkerHandle {
     }
 }
 
+pub struct WorkerModels {
+    #[cfg(not(feature = "idle-eviction"))]
+    pub text_embedder: Arc<Mutex<TextEmbedder>>,
+    #[cfg(not(feature = "idle-eviction"))]
+    pub image_embedder: Arc<Mutex<ImageEmbedder>>,
+    #[cfg(feature = "idle-eviction")]
+    pub supervisor: Arc<EmbedderSupervisor>,
+}
+
 /// Spawns the synchronous embedder thread.
 ///
 /// Embedders are loaded by the caller and shared via `Arc<Mutex<…>>`
@@ -57,10 +66,7 @@ pub fn spawn_worker(
     store: Arc<VectorStore>,
     journal: Arc<Mutex<BackfillJournal>>,
     runtime: tokio::runtime::Handle,
-    #[cfg(not(feature = "idle-eviction"))] text_embedder: Arc<Mutex<TextEmbedder>>,
-    #[cfg(not(feature = "idle-eviction"))] image_embedder: Arc<Mutex<ImageEmbedder>>,
-    #[cfg(not(feature = "idle-eviction"))] clip_text_embedder: Arc<Mutex<ClipTextEmbedder>>,
-    #[cfg(feature = "idle-eviction")] supervisor: Arc<EmbedderSupervisor>,
+    models: WorkerModels,
 ) -> Result<WorkerHandle> {
     let (tx, rx) = mpsc::channel::<EmbedJob>(QUEUE_CAPACITY);
 
@@ -71,13 +77,11 @@ pub fn spawn_worker(
         journal,
         runtime: runtime.clone(),
         #[cfg(not(feature = "idle-eviction"))]
-        text: text_embedder,
+        text: models.text_embedder,
         #[cfg(not(feature = "idle-eviction"))]
-        image: image_embedder,
-        #[cfg(not(feature = "idle-eviction"))]
-        clip_text: clip_text_embedder,
+        image: models.image_embedder,
         #[cfg(feature = "idle-eviction")]
-        supervisor,
+        supervisor: models.supervisor,
         rx,
         pending_text: Vec::new(),
         pending_images: Vec::new(),
@@ -104,8 +108,6 @@ struct WorkerThread {
     text: Arc<Mutex<TextEmbedder>>,
     #[cfg(not(feature = "idle-eviction"))]
     image: Arc<Mutex<ImageEmbedder>>,
-    #[cfg(not(feature = "idle-eviction"))]
-    clip_text: Arc<Mutex<ClipTextEmbedder>>,
     #[cfg(feature = "idle-eviction")]
     supervisor: Arc<EmbedderSupervisor>,
     rx: mpsc::Receiver<EmbedJob>,

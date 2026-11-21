@@ -32,7 +32,10 @@ use crate::selection::{
 use crate::worker::RenderJob;
 
 mod imp {
-    use super::*;
+    use super::{
+        Cell, DocumentSession, ObjectImpl, ObjectSubclass, ObjectSubclassExt, Rc, RefCell,
+        WidgetImpl, glib,
+    };
 
     pub struct PdfPageWidget {
         pub page_index: Cell<u32>,
@@ -60,7 +63,7 @@ mod imp {
 
     #[glib::object_subclass]
     impl ObjectSubclass for PdfPageWidget {
-        const NAME: &'static str = "LixunPdfPageWidget";
+        const NAME: &str = "LixunPdfPageWidget";
         type Type = super::PdfPageWidget;
         type ParentType = gtk::Widget;
     }

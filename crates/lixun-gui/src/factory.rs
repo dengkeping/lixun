@@ -814,161 +814,10 @@ pub(crate) fn create_list_factory(ctx: RowFactoryCtx) -> gtk::SignalListItemFact
         // orphan ActionGroup can accumulate.
         let group = gio::SimpleActionGroup::new();
 
-        let open_state = Rc::clone(&state);
-        let open_entry = setup_entry.clone();
-        let open_status = setup_status.clone();
-        let open = gio::SimpleAction::new("open", None);
-        open.connect_activate(move |_, _| {
-            let Some(doc_id) = open_state.borrow().doc_id.clone() else {
-                tracing::debug!("row.open fired on unbound row");
-                return;
-            };
-            if is_more_results_doc_id(&doc_id) {
-                if let Some(app) = gio::Application::default() {
-                    app.activate_action("show-more-results", None);
-                }
-                return;
-            }
-            if let Some(hit) = cached_hit_by_id(&doc_id) {
-                dispatch_click_pair(&hit.id.0, open_entry.text().as_str());
-                if let Err(e) = execute_action(&hit) {
-                    tracing::error!("Failed to launch selected action");
-                    // Same visibility rule as the Enter path (keymap):
-                    // a silent failure is indistinguishable from
-                    // success.
-                    open_status.show_error(&format!("Couldn't open “{}”: {}", hit.title, e));
-                }
-            }
-        });
-        group.add_action(&open);
+        let secondary = install_row_actions(&group, &state, &setup_entry, &setup_status);
 
-        let secondary_state = Rc::clone(&state);
-        let secondary_status = setup_status.clone();
-        let secondary = gio::SimpleAction::new("secondary", None);
-        secondary.connect_activate(move |_, _| {
-            let Some(doc_id) = secondary_state.borrow().doc_id.clone() else {
-                tracing::debug!("row.secondary fired on unbound row");
-                return;
-            };
-            if let Some(hit) = cached_hit_by_id(&doc_id)
-                && let Err(e) = execute_secondary_action(&hit)
-            {
-                tracing::error!("Secondary action failed: {}", e);
-                secondary_status.show_error(&format!("Couldn't open “{}”: {}", hit.title, e));
-            }
-        });
-        group.add_action(&secondary);
-
-        let copy_state = Rc::clone(&state);
-        let copy = gio::SimpleAction::new("copy", None);
-        copy.connect_activate(move |_, _| {
-            let Some(doc_id) = copy_state.borrow().doc_id.clone() else {
-                tracing::debug!("row.copy fired on unbound row");
-                return;
-            };
-            if let Some(hit) = cached_hit_by_id(&doc_id) {
-                copy_to_clipboard(&hit);
-            }
-        });
-        group.add_action(&copy);
-
-        let quick_entry = setup_entry.clone();
-        let quick_state = Rc::clone(&state);
-        let quick_row = row.clone();
-        let quick = gio::SimpleAction::new("quicklook", None);
-        quick.connect_activate(move |_, _| {
-            let Some(doc_id) = quick_state.borrow().doc_id.clone() else {
-                tracing::debug!("row.quicklook fired on unbound row");
-                return;
-            };
-            if let Some(hit) = cached_hit_by_id(&doc_id) {
-                let monitor = quick_row
-                    .root()
-                    .and_then(|r| r.downcast::<gtk::ApplicationWindow>().ok())
-                    .and_then(|w| crate::ipc::current_monitor_connector(&w));
-                send_preview_request(&hit, monitor, &quick_entry.text());
-            }
-        });
-        group.add_action(&quick);
-
-        // ===== "Open With <app>" (C1) =====
-        // Shared action taking the desktop id as its target; the
-        // per-hit submenu items carry the id as pure data. Launch is
-        // mime-registry driven — the host names no application.
-        let openwith_state = Rc::clone(&state);
-        let openwith_entry = setup_entry.clone();
-        let openwith_status = setup_status.clone();
-        let openwith = gio::SimpleAction::new("openwith", Some(glib::VariantTy::STRING));
-        openwith.connect_activate(move |_, param| {
-            let Some(doc_id) = openwith_state.borrow().doc_id.clone() else {
-                tracing::debug!("row.openwith fired on unbound row");
-                return;
-            };
-            let Some(app_id) = param.and_then(|v| v.get::<String>()) else {
-                return;
-            };
-            if let Some(hit) = cached_hit_by_id(&doc_id) {
-                let Some(path) = hit_file_path(&hit) else {
-                    return;
-                };
-                dispatch_click_pair(&hit.id.0, openwith_entry.text().as_str());
-                if let Err(e) = crate::actions::launch_with_app_id(&app_id, &path) {
-                    tracing::error!("open-with failed: {}", e);
-                    openwith_status.show_error(&format!(
-                        "Couldn't open \u{201c}{}\u{201d}: {}",
-                        hit.title, e
-                    ));
-                }
-            }
-        });
-        group.add_action(&openwith);
-
-        // ===== Ranking controls (C2) =====
-        let hide_state = Rc::clone(&state);
-        let hide_status = setup_status.clone();
-        let hide_model = setup_model.clone();
-        let hide = gio::SimpleAction::new("hide", None);
-        hide.connect_activate(move |_, _| {
-            let Some(doc_id) = hide_state.borrow().doc_id.clone() else {
-                tracing::debug!("row.hide fired on unbound row");
-                return;
-            };
-            if is_synthetic_doc_id(&doc_id) {
-                return;
-            }
-            crate::ipc::send_set_doc_hidden(&doc_id, true);
-            // Remove the row locally so the hide is visible without
-            // a search round-trip.
-            let n = hide_model.n_items();
-            for i in 0..n {
-                if hide_model.string(i).is_some_and(|s| s == doc_id) {
-                    hide_model.remove(i);
-                    break;
-                }
-            }
-            CACHED_HITS.with(|c| c.borrow_mut().retain(|h| h.id.0 != doc_id));
-            hide_status.show_toast("Hidden from results \u{2014} undo with `lixun-cli hidden`");
-        });
-        group.add_action(&hide);
-
-        let reset_state = Rc::clone(&state);
-        let reset_status = setup_status.clone();
-        let reset = gio::SimpleAction::new("reset-rank", None);
-        reset.connect_activate(move |_, _| {
-            let Some(doc_id) = reset_state.borrow().doc_id.clone() else {
-                tracing::debug!("row.reset-rank fired on unbound row");
-                return;
-            };
-            if is_synthetic_doc_id(&doc_id) {
-                return;
-            }
-            crate::ipc::send_reset_doc_ranking(&doc_id);
-            let title = cached_hit_by_id(&doc_id)
-                .map(|h| h.title)
-                .unwrap_or_else(|| doc_id.clone());
-            reset_status.show_toast(&format!("Ranking reset for \u{201c}{}\u{201d}", title));
-        });
-        group.add_action(&reset);
+        install_row_preview_actions(&group, &state, &row, &setup_entry, &setup_status);
+        install_row_ranking_actions(&group, &state, &setup_status, &setup_model);
 
         // ===== Info popover (persistent child of the row) =====
         // Parented once via set_parent(&row). popdown() hides it;
@@ -1059,58 +908,13 @@ pub(crate) fn create_list_factory(ctx: RowFactoryCtx) -> gtk::SignalListItemFact
         });
         group.add_action(&menu_action);
 
-        // ===== Double-click primary = launch + clear-and-hide =====
-        let dblclick_state = Rc::clone(&state);
-        let dblclick_entry = setup_entry.clone();
-        let dblclick_status = setup_status.clone();
-        let dblclick_user_selected = Rc::clone(&setup_user_selected);
-        let dblclick_gesture = gtk::GestureClick::new();
-        dblclick_gesture.set_button(gdk::BUTTON_PRIMARY);
-        dblclick_gesture.connect_pressed(move |_g, n_press, _x, _y| {
-            if n_press == 1 {
-                // K10: a plain click is explicit user selection —
-                // protect it from a late Final chunk snapping the
-                // cursor back to row 0 (and swapping the preview
-                // under the user in preview mode).
-                dblclick_user_selected.set(true);
-                return;
-            }
-            if n_press != 2 {
-                return;
-            }
-            let Some(doc_id) = dblclick_state.borrow().doc_id.clone() else {
-                tracing::debug!("double-click fired on unbound row");
-                return;
-            };
-            // R7: the terminal "Show more results" row re-issues the
-            // query with a larger limit instead of launching.
-            if is_more_results_doc_id(&doc_id) {
-                if let Some(app) = gio::Application::default() {
-                    app.activate_action("show-more-results", None);
-                }
-                return;
-            }
-            if let Some(hit) = cached_hit_by_id(&doc_id) {
-                dispatch_click_pair(&hit.id.0, dblclick_entry.text().as_str());
-                if let Err(e) = execute_action(&hit) {
-                    tracing::error!("double-click open failed: {}", e);
-                    // The launcher stays up (no clear-and-hide below),
-                    // so the status bar can say what went wrong.
-                    dblclick_status.show_error(&format!("Couldn't open “{}”: {}", hit.title, e));
-                    return;
-                }
-                // Double-click = launch-completing action;
-                // drop the launcher session cache via the
-                // "clear-and-hide-launcher" app action. Safe
-                // now because we're no longer inside a
-                // CACHED_HITS borrow (cached_hit_by_id drops
-                // it before returning).
-                if let Some(app) = gio::Application::default() {
-                    app.activate_action("clear-and-hide-launcher", None);
-                }
-            }
-        });
-        row.add_controller(dblclick_gesture);
+        install_row_activation(
+            &row,
+            &state,
+            &setup_entry,
+            &setup_status,
+            &setup_user_selected,
+        );
 
         // ===== Drag source (permanent row controller) =====
         // For non-file rows, connect_prepare returns None, which
@@ -1486,6 +1290,246 @@ fn apply_top_hit_styling(list_item: &gtk::ListItem) {
             }
         }
     });
+}
+
+fn install_row_actions(
+    group: &gio::SimpleActionGroup,
+    state: &Rc<RefCell<RowState>>,
+    setup_entry: &gtk::Entry,
+    setup_status: &Rc<StatusBar>,
+) -> gio::SimpleAction {
+    let open_state = Rc::clone(state);
+    let open_entry = setup_entry.clone();
+    let open_status = setup_status.clone();
+    let open = gio::SimpleAction::new("open", None);
+    open.connect_activate(move |_, _| {
+        let Some(doc_id) = open_state.borrow().doc_id.clone() else {
+            tracing::debug!("row.open fired on unbound row");
+            return;
+        };
+        if is_more_results_doc_id(&doc_id) {
+            if let Some(app) = gio::Application::default() {
+                app.activate_action("show-more-results", None);
+            }
+            return;
+        }
+        if let Some(hit) = cached_hit_by_id(&doc_id) {
+            dispatch_click_pair(&hit.id.0, open_entry.text().as_str());
+            if let Err(e) = execute_action(&hit) {
+                tracing::error!("Failed to launch selected action");
+                // Same visibility rule as the Enter path (keymap):
+                // a silent failure is indistinguishable from
+                // success.
+                open_status.show_error(&format!("Couldn't open “{}”: {}", hit.title, e));
+            }
+        }
+    });
+    group.add_action(&open);
+
+    let secondary_state = Rc::clone(state);
+    let secondary_status = setup_status.clone();
+    let secondary = gio::SimpleAction::new("secondary", None);
+    secondary.connect_activate(move |_, _| {
+        let Some(doc_id) = secondary_state.borrow().doc_id.clone() else {
+            tracing::debug!("row.secondary fired on unbound row");
+            return;
+        };
+        if let Some(hit) = cached_hit_by_id(&doc_id)
+            && let Err(e) = execute_secondary_action(&hit)
+        {
+            tracing::error!("Secondary action failed: {}", e);
+            secondary_status.show_error(&format!("Couldn't open “{}”: {}", hit.title, e));
+        }
+    });
+    group.add_action(&secondary);
+
+    let copy_state = Rc::clone(state);
+    let copy = gio::SimpleAction::new("copy", None);
+    copy.connect_activate(move |_, _| {
+        let Some(doc_id) = copy_state.borrow().doc_id.clone() else {
+            tracing::debug!("row.copy fired on unbound row");
+            return;
+        };
+        if let Some(hit) = cached_hit_by_id(&doc_id) {
+            copy_to_clipboard(&hit);
+        }
+    });
+    group.add_action(&copy);
+    secondary
+}
+
+fn install_row_preview_actions(
+    group: &gio::SimpleActionGroup,
+    state: &Rc<RefCell<RowState>>,
+    row: &gtk::Box,
+    setup_entry: &gtk::Entry,
+    setup_status: &Rc<StatusBar>,
+) {
+    let quick_entry = setup_entry.clone();
+    let quick_state = Rc::clone(state);
+    let quick_row = row.clone();
+    let quick = gio::SimpleAction::new("quicklook", None);
+    quick.connect_activate(move |_, _| {
+        let Some(doc_id) = quick_state.borrow().doc_id.clone() else {
+            tracing::debug!("row.quicklook fired on unbound row");
+            return;
+        };
+        if let Some(hit) = cached_hit_by_id(&doc_id) {
+            let monitor = quick_row
+                .root()
+                .and_then(|r| r.downcast::<gtk::ApplicationWindow>().ok())
+                .and_then(|w| crate::ipc::current_monitor_connector(&w));
+            send_preview_request(&hit, monitor, &quick_entry.text());
+        }
+    });
+    group.add_action(&quick);
+
+    // ===== "Open With <app>" (C1) =====
+    // Shared action taking the desktop id as its target; the
+    // per-hit submenu items carry the id as pure data. Launch is
+    // mime-registry driven — the host names no application.
+    let openwith_state = Rc::clone(state);
+    let openwith_entry = setup_entry.clone();
+    let openwith_status = setup_status.clone();
+    let openwith = gio::SimpleAction::new("openwith", Some(glib::VariantTy::STRING));
+    openwith.connect_activate(move |_, param| {
+        let Some(doc_id) = openwith_state.borrow().doc_id.clone() else {
+            tracing::debug!("row.openwith fired on unbound row");
+            return;
+        };
+        let Some(app_id) = param.and_then(|v| v.get::<String>()) else {
+            return;
+        };
+        if let Some(hit) = cached_hit_by_id(&doc_id) {
+            let Some(path) = hit_file_path(&hit) else {
+                return;
+            };
+            dispatch_click_pair(&hit.id.0, openwith_entry.text().as_str());
+            if let Err(e) = crate::actions::launch_with_app_id(&app_id, &path) {
+                tracing::error!("open-with failed: {}", e);
+                openwith_status.show_error(&format!(
+                    "Couldn't open \u{201c}{}\u{201d}: {}",
+                    hit.title, e
+                ));
+            }
+        }
+    });
+    group.add_action(&openwith);
+}
+
+fn install_row_ranking_actions(
+    group: &gio::SimpleActionGroup,
+    state: &Rc<RefCell<RowState>>,
+    setup_status: &Rc<StatusBar>,
+    setup_model: &gtk::StringList,
+) {
+    // ===== Ranking controls (C2) =====
+    let hide_state = Rc::clone(state);
+    let hide_status = setup_status.clone();
+    let hide_model = setup_model.clone();
+    let hide = gio::SimpleAction::new("hide", None);
+    hide.connect_activate(move |_, _| {
+        let Some(doc_id) = hide_state.borrow().doc_id.clone() else {
+            tracing::debug!("row.hide fired on unbound row");
+            return;
+        };
+        if is_synthetic_doc_id(&doc_id) {
+            return;
+        }
+        crate::ipc::send_set_doc_hidden(&doc_id, true);
+        // Remove the row locally so the hide is visible without
+        // a search round-trip.
+        let n = hide_model.n_items();
+        for i in 0..n {
+            if hide_model.string(i).is_some_and(|s| s == doc_id) {
+                hide_model.remove(i);
+                break;
+            }
+        }
+        CACHED_HITS.with(|c| c.borrow_mut().retain(|h| h.id.0 != doc_id));
+        hide_status.show_toast("Hidden from results \u{2014} undo with `lixun-cli hidden`");
+    });
+    group.add_action(&hide);
+
+    let reset_state = Rc::clone(state);
+    let reset_status = setup_status.clone();
+    let reset = gio::SimpleAction::new("reset-rank", None);
+    reset.connect_activate(move |_, _| {
+        let Some(doc_id) = reset_state.borrow().doc_id.clone() else {
+            tracing::debug!("row.reset-rank fired on unbound row");
+            return;
+        };
+        if is_synthetic_doc_id(&doc_id) {
+            return;
+        }
+        crate::ipc::send_reset_doc_ranking(&doc_id);
+        let title = cached_hit_by_id(&doc_id)
+            .map(|h| h.title)
+            .unwrap_or_else(|| doc_id.clone());
+        reset_status.show_toast(&format!("Ranking reset for \u{201c}{}\u{201d}", title));
+    });
+    group.add_action(&reset);
+}
+
+fn install_row_activation(
+    row: &gtk::Box,
+    state: &Rc<RefCell<RowState>>,
+    setup_entry: &gtk::Entry,
+    setup_status: &Rc<StatusBar>,
+    setup_user_selected: &Rc<std::cell::Cell<bool>>,
+) {
+    // ===== Double-click primary = launch + clear-and-hide =====
+    let dblclick_state = Rc::clone(state);
+    let dblclick_entry = setup_entry.clone();
+    let dblclick_status = setup_status.clone();
+    let dblclick_user_selected = Rc::clone(setup_user_selected);
+    let dblclick_gesture = gtk::GestureClick::new();
+    dblclick_gesture.set_button(gdk::BUTTON_PRIMARY);
+    dblclick_gesture.connect_pressed(move |_g, n_press, _x, _y| {
+        if n_press == 1 {
+            // K10: a plain click is explicit user selection —
+            // protect it from a late Final chunk snapping the
+            // selection back to row 0 (and swapping the preview
+            // under the user in preview mode).
+            dblclick_user_selected.set(true);
+            return;
+        }
+        if n_press != 2 {
+            return;
+        }
+        let Some(doc_id) = dblclick_state.borrow().doc_id.clone() else {
+            tracing::debug!("double-click fired on unbound row");
+            return;
+        };
+        // R7: the terminal "Show more results" row re-issues the
+        // query with a larger limit instead of launching.
+        if is_more_results_doc_id(&doc_id) {
+            if let Some(app) = gio::Application::default() {
+                app.activate_action("show-more-results", None);
+            }
+            return;
+        }
+        if let Some(hit) = cached_hit_by_id(&doc_id) {
+            dispatch_click_pair(&hit.id.0, dblclick_entry.text().as_str());
+            if let Err(e) = execute_action(&hit) {
+                tracing::error!("double-click open failed: {}", e);
+                // The launcher stays up (no clear-and-hide below),
+                // so the status bar can say what went wrong.
+                dblclick_status.show_error(&format!("Couldn't open “{}”: {}", hit.title, e));
+                return;
+            }
+            // Double-click = launch-completing action;
+            // drop the launcher session cache via the
+            // "clear-and-hide-launcher" app action. Safe
+            // now because we're no longer inside a
+            // CACHED_HITS borrow (cached_hit_by_id drops
+            // it before returning).
+            if let Some(app) = gio::Application::default() {
+                app.activate_action("clear-and-hide-launcher", None);
+            }
+        }
+    });
+    row.add_controller(dblclick_gesture);
 }
 
 #[cfg(test)]

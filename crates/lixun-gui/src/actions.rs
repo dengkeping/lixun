@@ -147,51 +147,14 @@ fn dispatch_action(action: &Action) -> Result<()> {
                 }
             }
 
-            let Some((program, args)) = launch_argv(exec) else {
-                anyhow::bail!("Action::Launch has empty exec");
-            };
-            if *terminal {
-                let spawn = terminal_spawn();
-                let mut builder = std::process::Command::new(&spawn.program);
-                builder.args(&spawn.args_before_exec);
-                builder.arg(program);
-                builder.args(args);
-                spawn_reaped(&mut builder)?;
-            } else {
-                let mut builder = std::process::Command::new(program);
-                builder.args(args);
-                if let Some(dir) = working_dir {
-                    builder.current_dir(dir);
-                }
-                spawn_reaped(&mut builder)?;
-            }
-            Ok(())
+            launch_command(exec, *terminal, working_dir.as_deref())
         }
         Action::OpenFile { path } => {
             let mut builder = xdg_open_command(path);
             spawn_reaped(&mut builder)?;
             Ok(())
         }
-        Action::ShowInFileManager { path } => {
-            if path.is_dir() {
-                let mut builder = xdg_open_command(path);
-                spawn_reaped(&mut builder)?;
-            } else {
-                match show_in_file_manager(path) {
-                    Ok(()) => {}
-                    Err(e) => {
-                        tracing::debug!(
-                            "FileManager1 DBus call failed: {e}; falling back to xdg-open"
-                        );
-                        if let Some(parent) = path.parent() {
-                            let mut builder = xdg_open_command(parent);
-                            spawn_reaped(&mut builder)?;
-                        }
-                    }
-                }
-            }
-            Ok(())
-        }
+        Action::ShowInFileManager { path } => reveal_in_file_manager(path),
         Action::OpenEmbedded {
             container,
             byte_offset,
@@ -379,6 +342,51 @@ fn run_and_capture_blocking(
             Err(_) => return None,
         }
     }
+}
+
+fn launch_command(
+    exec: &[String],
+    terminal: bool,
+    working_dir: Option<&std::path::Path>,
+) -> Result<()> {
+    let Some((program, args)) = launch_argv(exec) else {
+        anyhow::bail!("Action::Launch has empty exec");
+    };
+    if terminal {
+        let spawn = terminal_spawn();
+        let mut builder = std::process::Command::new(&spawn.program);
+        builder.args(&spawn.args_before_exec);
+        builder.arg(program);
+        builder.args(args);
+        spawn_reaped(&mut builder)?;
+    } else {
+        let mut builder = std::process::Command::new(program);
+        builder.args(args);
+        if let Some(dir) = working_dir {
+            builder.current_dir(dir);
+        }
+        spawn_reaped(&mut builder)?;
+    }
+    Ok(())
+}
+
+fn reveal_in_file_manager(path: &std::path::Path) -> Result<()> {
+    if path.is_dir() {
+        let mut builder = xdg_open_command(path);
+        spawn_reaped(&mut builder)?;
+    } else {
+        match show_in_file_manager(path) {
+            Ok(()) => {}
+            Err(e) => {
+                tracing::debug!("FileManager1 DBus call failed: {e}; falling back to xdg-open");
+                if let Some(parent) = path.parent() {
+                    let mut builder = xdg_open_command(parent);
+                    spawn_reaped(&mut builder)?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

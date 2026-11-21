@@ -51,7 +51,10 @@ needs_rebuild() {
     local out="$1" stamp="$2"
     [[ ! -f "$out" ]] || [[ ! -f "$out.stamp" ]] || [[ "$(cat "$out.stamp")" != "$stamp" ]]
 }
-mark_built() { printf '%s' "$2" > "$1.stamp"; }
+mark_built() {
+    local output=$1 stamp=$2
+    printf '%s' "$stamp" > "$output.stamp"
+}
 
 # ---- pdf -------------------------------------------------------------------
 
@@ -351,7 +354,7 @@ MD
 
 build_sample_rs() {
     local out="$CODE/sample.rs"
-    local stamp="v1"
+    local stamp="v2"
     if ! needs_rebuild "$out" "$stamp"; then return; fi
     log "building $out"
     cat >"$out" <<'RS'
@@ -371,20 +374,20 @@ pub fn fizzbuzz(n: u32) -> Vec<String> {
         .collect()
 }
 
+#[allow(dead_code)]
+fn _padding() -> HashMap<&'static str, u32> {
+    HashMap::new()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::fizzbuzz;
 
     #[test]
     fn first_15() {
         let v = fizzbuzz(15);
         assert_eq!(v.last().unwrap(), "fizzbuzz");
     }
-}
-
-#[allow(dead_code)]
-fn _padding() -> HashMap<&'static str, u32> {
-    HashMap::new()
 }
 RS
     mark_built "$out" "$stamp"

@@ -42,7 +42,7 @@ pub fn is_ocr_candidate(ext: &str) -> bool {
 /// tag is stable for a given install.
 pub fn engine_tag(caps: &ExtractorCapabilities, langs: &[String]) -> String {
     let version = tesseract_version_from_caps(caps);
-    let mut sorted: Vec<&str> = langs.iter().map(|s| s.as_str()).collect();
+    let mut sorted: Vec<&str> = langs.iter().map(String::as_str).collect();
     sorted.sort_unstable();
     sorted.dedup();
     let langs_part = sorted.join("+");

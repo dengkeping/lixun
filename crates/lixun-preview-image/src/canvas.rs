@@ -60,7 +60,9 @@ pub fn fit_zoom(w: i32, h: i32, vw: i32, vh: i32) -> f64 {
 }
 
 mod imp {
-    use super::*;
+    use super::{
+        Cell, ObjectImpl, ObjectSubclass, ObjectSubclassExt, RefCell, WidgetImpl, glib, graphene,
+    };
 
     pub struct ImageCanvas {
         /// The decoded image, or `None` until [`super::ImageCanvas::set_texture`].
@@ -92,7 +94,7 @@ mod imp {
 
     #[glib::object_subclass]
     impl ObjectSubclass for ImageCanvas {
-        const NAME: &'static str = "LixunImageCanvas";
+        const NAME: &str = "LixunImageCanvas";
         type Type = super::ImageCanvas;
         type ParentType = gtk::Widget;
     }

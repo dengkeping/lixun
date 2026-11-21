@@ -18,8 +18,8 @@ HEAPTRACK="${HEAPTRACK:-heaptrack}"
 HEAPTRACK_PRINT="${HEAPTRACK_PRINT:-heaptrack_print}"
 
 if ! command -v "$HEAPTRACK" >/dev/null 2>&1; then
-    echo "Error: heaptrack not found. Install it with:"
-    echo "  sudo apt install heaptrack"
+    echo "Error: heaptrack not found. Install it with:" >&2
+    echo "  sudo apt install heaptrack" >&2
     exit 1
 fi
 

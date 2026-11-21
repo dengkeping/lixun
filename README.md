@@ -430,8 +430,8 @@ theme files or configuration. Place CSS overrides in
 `~/.config/lixun/style.css`, or select a named theme under `[gui]`.
 The launcher reloads edits while it runs.
 
-See [the theming guide](docs/theming.md) for the stylesheet cascade and
-[the example stylesheet](docs/style.example.css) for customisation recipes.
+Start with [the example stylesheet](docs/style.example.css) and copy the overrides
+you need from [the theming guide](docs/theming.md#custom-stylesheet-recipes).
 
 Inspect the live widget tree with:
 

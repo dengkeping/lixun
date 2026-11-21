@@ -72,7 +72,10 @@ pub struct SearchState {
 }
 
 mod imp {
-    use super::*;
+    use super::{
+        BoxImpl, Cell, DocumentSession, ObjectImpl, ObjectSubclass, PdfCanvas, PdfSearchBar, Rc,
+        RefCell, SearchState, WidgetImpl, glib,
+    };
 
     #[derive(Default)]
     pub struct PdfView {
@@ -88,7 +91,7 @@ mod imp {
 
     #[glib::object_subclass]
     impl ObjectSubclass for PdfView {
-        const NAME: &'static str = "LixunPdfView";
+        const NAME: &str = "LixunPdfView";
         type Type = super::PdfView;
         type ParentType = gtk::Box;
     }

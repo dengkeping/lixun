@@ -48,7 +48,7 @@ const COMMIT_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 /// at 4 so single-core dev machines still parallelise BM25/ANN fan-out.
 fn default_search_concurrency() -> usize {
     (std::thread::available_parallelism()
-        .map(|n| n.get())
+        .map(std::num::NonZeroUsize::get)
         .unwrap_or(4)
         * 2)
     .max(4)
@@ -627,87 +627,14 @@ async fn writer_loop(
 
     tracing::info!("IndexService: shutdown, draining and committing");
     while let Ok(mutation) = rx.try_recv() {
-        match mutation {
-            Mutation::Upsert(doc) => {
-                if !discard_removed_document(&doc, &subtree_tombstones, &mut pending_batch)
-                    && apply_upsert(&shared, &mut writer, doc.as_ref()).is_ok()
-                {
-                    pending_batch.upserts.push(upserted_doc_from(doc.as_ref()));
-                }
-                dirty = true;
-            }
-            Mutation::UpsertMany(docs) => {
-                for doc in &docs {
-                    if !discard_removed_document(doc, &subtree_tombstones, &mut pending_batch)
-                        && apply_upsert(&shared, &mut writer, doc).is_ok()
-                    {
-                        pending_batch.upserts.push(upserted_doc_from(doc));
-                    }
-                    dirty = true;
-                }
-            }
-            Mutation::Delete(id) => {
-                if apply_delete(&shared, &mut writer, &id).is_ok() {
-                    pending_batch.deletes.push(id);
-                }
-                dirty = true;
-            }
-            Mutation::DeleteMany(ids) => {
-                dirty |= apply_deletes(&shared, &mut writer, &mut pending_batch, ids);
-            }
-            Mutation::ReconcileFiles(mut ids, policy) => {
-                ids.retain(|id| {
-                    id.strip_prefix("fs:")
-                        .is_some_and(|p| policy.should_remove(std::path::Path::new(p)))
-                });
-                dirty |= apply_deletes(&shared, &mut writer, &mut pending_batch, ids);
-            }
-
-            Mutation::DeleteSubtree(prefix) => {
-                let matched = collect_subtree_ids(&shared, &pending_batch, &prefix);
-                pending_batch
-                    .upserts
-                    .retain(|u| !id_in_subtree(&u.doc_id, &prefix));
-                for id in matched {
-                    if apply_delete(&shared, &mut writer, &id).is_ok() {
-                        pending_batch.deletes.push(id);
-                    }
-                    dirty = true;
-                }
-                if !subtree_tombstones.contains(&prefix) {
-                    subtree_tombstones.push(prefix);
-                }
-            }
-            Mutation::DeleteSourceInstance { instance_id } => {
-                let _ = apply_delete_source_instance(&shared, &mut writer, &instance_id);
-                dirty = true;
-            }
-            Mutation::UpsertBody {
-                doc_id,
-                body,
-                expected_mtime,
-            } => {
-                if !id_tombstoned(&doc_id, &subtree_tombstones)
-                    && let Ok(Some(updated)) = apply_upsert_body(
-                        &shared,
-                        &mut writer,
-                        &pending_batch,
-                        &doc_id,
-                        body,
-                        expected_mtime,
-                    )
-                {
-                    pending_batch.upserts.push(upserted_doc_from(&updated));
-                    dirty = true;
-                }
-            }
-            Mutation::Barrier(reply) => pending_barriers.push(reply),
-            Mutation::Applied(reply) => {
-                let _ = reply.send(());
-            }
-            Mutation::CommitNow(reply) => pending_barriers.push(reply),
-            Mutation::Shutdown => {}
-        }
+        dirty |= drain_mutation(
+            mutation,
+            &shared,
+            &mut writer,
+            &mut pending_batch,
+            &mut pending_barriers,
+            &mut subtree_tombstones,
+        );
     }
     if dirty {
         let _ = do_commit(
@@ -1085,6 +1012,93 @@ pub fn index_file(
         }),
         extra: Vec::new(),
     })
+}
+
+fn drain_mutation(
+    mutation: Mutation,
+    shared: &LixunIndex,
+    writer: &mut TantivyIndexWriter<TantivyDoc>,
+    pending_batch: &mut MutationBatch,
+    pending_barriers: &mut Vec<oneshot::Sender<u64>>,
+    subtree_tombstones: &mut Vec<String>,
+) -> bool {
+    let mut dirty = false;
+    match mutation {
+        Mutation::Upsert(doc) => {
+            if !discard_removed_document(&doc, subtree_tombstones, pending_batch)
+                && apply_upsert(shared, writer, doc.as_ref()).is_ok()
+            {
+                pending_batch.upserts.push(upserted_doc_from(doc.as_ref()));
+            }
+            dirty = true;
+        }
+        Mutation::UpsertMany(docs) => {
+            for doc in &docs {
+                if !discard_removed_document(doc, subtree_tombstones, pending_batch)
+                    && apply_upsert(shared, writer, doc).is_ok()
+                {
+                    pending_batch.upserts.push(upserted_doc_from(doc));
+                }
+                dirty = true;
+            }
+        }
+        Mutation::Delete(id) => {
+            if apply_delete(shared, writer, &id).is_ok() {
+                pending_batch.deletes.push(id);
+            }
+            dirty = true;
+        }
+        Mutation::DeleteMany(ids) => {
+            dirty |= apply_deletes(shared, writer, pending_batch, ids);
+        }
+        Mutation::ReconcileFiles(mut ids, policy) => {
+            ids.retain(|id| {
+                id.strip_prefix("fs:")
+                    .is_some_and(|p| policy.should_remove(std::path::Path::new(p)))
+            });
+            dirty |= apply_deletes(shared, writer, pending_batch, ids);
+        }
+
+        Mutation::DeleteSubtree(prefix) => {
+            let matched = collect_subtree_ids(shared, pending_batch, &prefix);
+            pending_batch
+                .upserts
+                .retain(|u| !id_in_subtree(&u.doc_id, &prefix));
+            for id in matched {
+                if apply_delete(shared, writer, &id).is_ok() {
+                    pending_batch.deletes.push(id);
+                }
+                dirty = true;
+            }
+            if !subtree_tombstones.contains(&prefix) {
+                subtree_tombstones.push(prefix);
+            }
+        }
+        Mutation::DeleteSourceInstance { instance_id } => {
+            let _ = apply_delete_source_instance(shared, writer, &instance_id);
+            dirty = true;
+        }
+        Mutation::UpsertBody {
+            doc_id,
+            body,
+            expected_mtime,
+        } => {
+            if !id_tombstoned(&doc_id, subtree_tombstones)
+                && let Ok(Some(updated)) =
+                    apply_upsert_body(shared, writer, pending_batch, &doc_id, body, expected_mtime)
+            {
+                pending_batch.upserts.push(upserted_doc_from(&updated));
+                dirty = true;
+            }
+        }
+        Mutation::Barrier(reply) => pending_barriers.push(reply),
+        Mutation::Applied(reply) => {
+            let _ = reply.send(());
+        }
+        Mutation::CommitNow(reply) => pending_barriers.push(reply),
+        Mutation::Shutdown => {}
+    }
+    dirty
 }
 
 #[cfg(test)]

@@ -14,18 +14,18 @@ pub fn fizzbuzz(n: u32) -> Vec<String> {
         .collect()
 }
 
+#[allow(dead_code)]
+fn _padding() -> HashMap<&'static str, u32> {
+    HashMap::new()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::fizzbuzz;
 
     #[test]
     fn first_15() {
         let v = fizzbuzz(15);
         assert_eq!(v.last().unwrap(), "fizzbuzz");
     }
-}
-
-#[allow(dead_code)]
-fn _padding() -> HashMap<&'static str, u32> {
-    HashMap::new()
 }

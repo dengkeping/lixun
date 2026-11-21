@@ -175,7 +175,7 @@ fn build_header(path: &Path, is_audio: bool) -> gtk::Box {
 
     let title = gtk::Label::new(Some(
         path.file_name()
-            .and_then(|n| n.to_str())
+            .and_then(std::ffi::OsStr::to_str)
             .unwrap_or("(unknown)"),
     ));
     title.set_xalign(0.0);
@@ -200,8 +200,8 @@ fn is_video(path: &Path) -> bool {
 
 fn ext_matches(path: &Path, set: &[&str]) -> bool {
     path.extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase())
+        .and_then(std::ffi::OsStr::to_str)
+        .map(str::to_ascii_lowercase)
         .is_some_and(|e| set.iter().any(|&s| s == e))
 }
 

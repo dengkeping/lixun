@@ -34,10 +34,12 @@ const BUILTIN_VERBS: &[&str] = &[
 
 async fn open_daemon_stream() -> Result<UnixStream> {
     let socket_path = lixun_ipc::socket_path();
-    let stream = UnixStream::connect(&socket_path).await.context(format!(
-        "lixund not running; start with: systemctl --user start lixund\n(socket: {:?})",
-        socket_path
-    ))?;
+    let stream = UnixStream::connect(&socket_path).await.with_context(|| {
+        format!(
+            "lixund not running; start with: systemctl --user start lixund\n(socket: {:?})",
+            socket_path
+        )
+    })?;
     Ok(stream)
 }
 
@@ -479,10 +481,7 @@ async fn main() -> Result<()> {
 
 async fn dashboard_main() -> Result<()> {
     use dashboard::{App, EventHandler, event::Event, tui, ui};
-    use std::process::Stdio;
     use std::time::Duration;
-    use tokio::io::{AsyncBufReadExt, BufReader};
-    use tokio::process::Command;
     use tokio::sync::mpsc;
 
     let config = lixun_daemon::config::Config::load()
@@ -493,37 +492,7 @@ async fn dashboard_main() -> Result<()> {
 
     let (log_tx, log_rx) = mpsc::unbounded_channel();
 
-    let mut child = Command::new("journalctl")
-        .args([
-            "--user",
-            "-u",
-            "lixund",
-            "--follow",
-            "--lines=100",
-            "--output=json",
-            "--output-fields=MESSAGE,PRIORITY",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn();
-
-    if let Ok(ref mut child) = child {
-        if let Some(stdout) = child.stdout.take() {
-            tokio::spawn(async move {
-                let mut lines = BufReader::new(stdout).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    if let Some(entry) = dashboard::LogEntry::parse(&line)
-                        && log_tx.send(entry).is_err()
-                    {
-                        break;
-                    }
-                }
-            });
-        }
-    } else {
-        eprintln!("Failed to spawn journalctl subprocess; logs will be unavailable");
-    }
+    let _journal = follow_dashboard_logs(log_tx);
 
     let mut events = EventHandler::new(Duration::from_millis(250), Some(log_rx));
     let mut app = App::new();
@@ -572,153 +541,15 @@ async fn dashboard_main() -> Result<()> {
                     }
                 }
 
-                if app.restart_pending {
-                    app.restart_pending = false;
-                    app.restart_status = dashboard::app::RestartStatus::Restarting;
-                    app.connected = false;
-                    app.push_log_message(
-                        "Restarting daemon...".to_string(),
-                        dashboard::LogLevel::Info,
-                    );
-
-                    let restart_result = Command::new("systemctl")
-                        .args(["--user", "restart", "lixund.service"])
-                        .output()
-                        .await;
-
-                    if let Err(e) = restart_result {
-                        app.restart_status = dashboard::app::RestartStatus::Failed(format!(
-                            "systemctl failed: {}",
-                            e
-                        ));
-                        app.push_log_message(
-                            format!("Failed to restart daemon: {}", e),
-                            dashboard::LogLevel::Error,
-                        );
-                        continue;
-                    }
-
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-
-                    app.restart_status = dashboard::app::RestartStatus::Reconnecting;
-                    let mut reconnected = false;
-                    for attempt in 1..=30 {
-                        app.push_log_message(
-                            format!("Reconnecting... (attempt {}/30)", attempt),
-                            dashboard::LogLevel::Info,
-                        );
-                        if let Ok(mut s) = open_daemon_stream().await
-                            && let Ok(_) = write_request(&mut s, &Request::Status).await
-                            && let Ok(Response::Status {
-                                indexed_docs,
-                                memory,
-                                watcher,
-                                writer,
-                                ocr,
-                                ..
-                            }) = read_response_frame(&mut s).await
-                        {
-                            app.indexed_docs = indexed_docs;
-                            app.memory = memory;
-                            app.watcher = watcher;
-                            app.writer = writer;
-                            app.ocr_stats = ocr;
-                            app.connected = true;
-                            app.restart_status = dashboard::app::RestartStatus::Idle;
-                            app.update_semantic_status();
-                            app.push_log_message(
-                                "Daemon restarted successfully".to_string(),
-                                dashboard::LogLevel::Info,
-                            );
-                            reconnected = true;
-                            break;
-                        }
-                        tokio::time::sleep(Duration::from_millis(500)).await;
-                    }
-
-                    if !reconnected {
-                        // One last probe before declaring failure: the
-                        // daemon may have come up in the instant after
-                        // attempt 30's sleep elapsed.
-                        let mut final_probe_ok = false;
-                        if let Ok(mut s) = open_daemon_stream().await
-                            && write_request(&mut s, &Request::Status).await.is_ok()
-                            && matches!(
-                                read_response_frame(&mut s).await,
-                                Ok(Response::Status { .. })
-                            )
-                        {
-                            final_probe_ok = true;
-                        }
-                        if final_probe_ok {
-                            app.connected = true;
-                            app.restart_status = dashboard::app::RestartStatus::Idle;
-                            app.push_log_message(
-                                "Daemon restarted successfully (final probe)".to_string(),
-                                dashboard::LogLevel::Info,
-                            );
-                        } else {
-                            app.restart_status = dashboard::app::RestartStatus::Failed(
-                                "timeout waiting for daemon".to_string(),
-                            );
-                            app.push_log_message(
-                                "Failed to reconnect after 30 attempts".to_string(),
-                                dashboard::LogLevel::Error,
-                            );
-                        }
-                    }
+                if app.restart_pending && !restart_from_dashboard(&mut app).await {
+                    continue;
                 }
 
                 if app.search_pending {
-                    app.search_pending = false;
-                    if let Ok(mut s) = open_daemon_stream().await {
-                        let _ = write_request(
-                            &mut s,
-                            &Request::Search {
-                                q: app.query_input.clone(),
-                                limit: config.max_results,
-                                explain: false,
-                                epoch: 1,
-                                category: None,
-                            },
-                        )
-                        .await;
-
-                        let mut results = Vec::new();
-                        while let Ok(frame) = read_response_frame(&mut s).await {
-                            match frame {
-                                Response::SearchChunk { hits, phase, .. } => {
-                                    results.extend(hits);
-                                    if phase == Phase::Final {
-                                        break;
-                                    }
-                                }
-                                _ => break,
-                            }
-                        }
-                        app.set_search_results(results);
-                    }
+                    run_dashboard_search(&mut app, config.max_results).await;
                 }
 
-                if let Ok(mut s) = open_daemon_stream().await {
-                    let _ = write_request(&mut s, &Request::Status).await;
-                    if let Ok(Response::Status {
-                        indexed_docs,
-                        memory,
-                        watcher,
-                        writer,
-                        ocr,
-                        ..
-                    }) = read_response_frame(&mut s).await
-                    {
-                        app.indexed_docs = indexed_docs;
-                        app.memory = memory;
-                        app.watcher = watcher;
-                        app.writer = writer;
-                        app.ocr_stats = ocr;
-                        app.connected = true;
-                    }
-                }
+                refresh_dashboard_status(&mut app).await;
             }
             _ => {}
         }
@@ -1097,6 +928,181 @@ fn format_bytes(bytes: u64) -> String {
     } else {
         format!("{:.1} {}", v, UNITS[i])
     }
+}
+
+async fn restart_from_dashboard(app: &mut dashboard::App) -> bool {
+    app.restart_pending = false;
+    app.restart_status = dashboard::app::RestartStatus::Restarting;
+    app.connected = false;
+    app.push_log_message(
+        "Restarting daemon...".to_string(),
+        dashboard::LogLevel::Info,
+    );
+
+    let restart_result = tokio::process::Command::new("systemctl")
+        .args(["--user", "restart", "lixund.service"])
+        .output()
+        .await;
+
+    if let Err(e) = restart_result {
+        app.restart_status =
+            dashboard::app::RestartStatus::Failed(format!("systemctl failed: {}", e));
+        app.push_log_message(
+            format!("Failed to restart daemon: {}", e),
+            dashboard::LogLevel::Error,
+        );
+        return false;
+    }
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    app.restart_status = dashboard::app::RestartStatus::Reconnecting;
+    let mut reconnected = false;
+    for attempt in 1..=30 {
+        app.push_log_message(
+            format!("Reconnecting... (attempt {}/30)", attempt),
+            dashboard::LogLevel::Info,
+        );
+        if refresh_dashboard_status(app).await {
+            app.restart_status = dashboard::app::RestartStatus::Idle;
+            app.update_semantic_status();
+            app.push_log_message(
+                "Daemon restarted successfully".to_string(),
+                dashboard::LogLevel::Info,
+            );
+            reconnected = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    if !reconnected {
+        // One last probe before declaring failure: the
+        // daemon may have come up in the instant after
+        // attempt 30's sleep elapsed.
+        let mut final_probe_ok = false;
+        if let Ok(mut s) = open_daemon_stream().await
+            && write_request(&mut s, &Request::Status).await.is_ok()
+            && matches!(
+                read_response_frame(&mut s).await,
+                Ok(Response::Status { .. })
+            )
+        {
+            final_probe_ok = true;
+        }
+        if final_probe_ok {
+            app.connected = true;
+            app.restart_status = dashboard::app::RestartStatus::Idle;
+            app.push_log_message(
+                "Daemon restarted successfully (final probe)".to_string(),
+                dashboard::LogLevel::Info,
+            );
+        } else {
+            app.restart_status =
+                dashboard::app::RestartStatus::Failed("timeout waiting for daemon".to_string());
+            app.push_log_message(
+                "Failed to reconnect after 30 attempts".to_string(),
+                dashboard::LogLevel::Error,
+            );
+        }
+    }
+    true
+}
+
+async fn refresh_dashboard_status(app: &mut dashboard::App) -> bool {
+    if let Ok(mut s) = open_daemon_stream().await {
+        if write_request(&mut s, &Request::Status).await.is_err() {
+            return false;
+        }
+        if let Ok(Response::Status {
+            indexed_docs,
+            memory,
+            watcher,
+            writer,
+            ocr,
+            ..
+        }) = read_response_frame(&mut s).await
+        {
+            app.indexed_docs = indexed_docs;
+            app.memory = memory;
+            app.watcher = watcher;
+            app.writer = writer;
+            app.ocr_stats = ocr;
+            app.connected = true;
+            return true;
+        }
+    }
+    false
+}
+
+async fn run_dashboard_search(app: &mut dashboard::App, limit: u32) {
+    app.search_pending = false;
+    if let Ok(mut s) = open_daemon_stream().await {
+        let _ = write_request(
+            &mut s,
+            &Request::Search {
+                q: app.query_input.clone(),
+                limit,
+                explain: false,
+                epoch: 1,
+                category: None,
+            },
+        )
+        .await;
+
+        let mut results = Vec::new();
+        while let Ok(frame) = read_response_frame(&mut s).await {
+            match frame {
+                Response::SearchChunk { hits, phase, .. } => {
+                    results.extend(hits);
+                    if phase == Phase::Final {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        app.set_search_results(results);
+    }
+}
+
+fn follow_dashboard_logs(
+    log_tx: tokio::sync::mpsc::UnboundedSender<dashboard::LogEntry>,
+) -> Option<tokio::process::Child> {
+    use std::process::Stdio;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let mut child = tokio::process::Command::new("journalctl")
+        .args([
+            "--user",
+            "-u",
+            "lixund",
+            "--follow",
+            "--lines=100",
+            "--output=json",
+            "--output-fields=MESSAGE,PRIORITY",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn();
+
+    if let Ok(ref mut child) = child {
+        if let Some(stdout) = child.stdout.take() {
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(stdout).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    if let Some(entry) = dashboard::LogEntry::parse(&line)
+                        && log_tx.send(entry).is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+        }
+    } else {
+        eprintln!("Failed to spawn journalctl subprocess; logs will be unavailable");
+    }
+    child.ok()
 }
 
 #[cfg(test)]

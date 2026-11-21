@@ -18,7 +18,7 @@ pub fn prepare_batch(paths: &[PathBuf]) -> Result<(Vec<PathBuf>, Vec<TempFile>)>
     for path in paths {
         let ext = path
             .extension()
-            .and_then(|s| s.to_str())
+            .and_then(std::ffi::OsStr::to_str)
             .unwrap_or("")
             .to_ascii_lowercase();
 
@@ -152,7 +152,7 @@ fn decode_raw_to_temp(raw_path: &Path) -> Result<TempFile> {
 pub fn decode_to_dynamic_image(path: &Path) -> Result<image::DynamicImage> {
     let ext = path
         .extension()
-        .and_then(|s| s.to_str())
+        .and_then(std::ffi::OsStr::to_str)
         .unwrap_or("")
         .to_ascii_lowercase();
 

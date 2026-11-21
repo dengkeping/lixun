@@ -1000,28 +1000,7 @@ impl Config {
             .and_then(|c| c.max_file_size_mb)
             .is_some();
         if let Some(core) = parsed.core {
-            if let Some(roots) = core.roots {
-                cfg.roots = roots.iter().map(|s| expand_tilde(s)).collect();
-            }
-            if let Some(extra) = core.exclude {
-                cfg.exclude.extend(extra);
-            }
-            if let Some(patterns) = core.exclude_regex {
-                for pat in patterns {
-                    cfg.exclude_regex.push(regex::Regex::new(&pat).map_err(|_| {
-                        anyhow::anyhow!("invalid regular expression in core.exclude_regex")
-                    })?);
-                }
-            }
-            if let Some(max) = core.max_file_size_mb {
-                cfg.max_file_size_mb = max;
-            }
-            if let Some(timeout) = core.extractor_timeout_secs {
-                cfg.extractor_timeout_secs = timeout;
-            }
-            if let Some(n) = core.max_results {
-                cfg.max_results = n;
-            }
+            cfg.apply_core(core)?;
         }
         if let Some(ranking) = parsed.ranking {
             cfg.ranking_apps = ranking.apps.unwrap_or(1.3);
@@ -1041,66 +1020,7 @@ impl Config {
             cfg.ranking_strong_latch_threshold = ranking.strong_latch_threshold.unwrap_or(3);
         }
         if let Some(bindings) = parsed.keybindings {
-            if let Some(v) = bindings.close {
-                cfg.keybindings.close = v;
-            }
-            if let Some(v) = bindings.primary_action {
-                cfg.keybindings.primary_action = v;
-            }
-            if let Some(v) = bindings.secondary_action {
-                cfg.keybindings.secondary_action = v;
-            }
-            if let Some(v) = bindings.copy {
-                cfg.keybindings.copy = v;
-            }
-            if let Some(v) = bindings.quick_look {
-                cfg.keybindings.quick_look = v;
-            }
-            if let Some(v) = bindings.quick_look_alt {
-                cfg.keybindings.quick_look_alt = v;
-            }
-            if let Some(v) = bindings.history_up {
-                cfg.keybindings.history_up = v;
-            }
-            if let Some(v) = bindings.next_result {
-                cfg.keybindings.next_result = v;
-            }
-            if let Some(v) = bindings.previous_result {
-                cfg.keybindings.previous_result = v;
-            }
-            if let Some(v) = bindings.next_category {
-                cfg.keybindings.next_category = v;
-            }
-            if let Some(v) = bindings.previous_category {
-                cfg.keybindings.previous_category = v;
-            }
-            if let Some(v) = bindings.filter_all {
-                cfg.keybindings.filter_all = v;
-            }
-            if let Some(v) = bindings.filter_apps {
-                cfg.keybindings.filter_apps = v;
-            }
-            if let Some(v) = bindings.filter_files {
-                cfg.keybindings.filter_files = v;
-            }
-            if let Some(v) = bindings.filter_mail {
-                cfg.keybindings.filter_mail = v;
-            }
-            if let Some(v) = bindings.filter_attachments {
-                cfg.keybindings.filter_attachments = v;
-            }
-            if let Some(v) = bindings.global_toggle {
-                cfg.keybindings.global_toggle = v;
-            }
-            if let Some(v) = bindings.reset_gui_position {
-                cfg.keybindings.reset_gui_position = v;
-            }
-            if let Some(v) = bindings.actions_menu {
-                cfg.keybindings.actions_menu = v;
-            }
-            if let Some(v) = bindings.info {
-                cfg.keybindings.info = v;
-            }
+            cfg.apply_keybindings(bindings);
         }
         // Warn-only duplicate scan over the resolved bindings: a
         // collision (e.g. filter_all = "<Ctrl>0" vs the default
@@ -1110,81 +1030,10 @@ impl Config {
             tracing::warn!("{warning}");
         }
         if let Some(preview) = parsed.preview {
-            if let Some(v) = preview.enabled {
-                cfg.preview.enabled = v;
-            }
-            if let Some(v) = preview.default_format {
-                cfg.preview.default_format = v;
-            }
-            if let Some(v) = preview.max_file_size_mb {
-                cfg.preview.max_file_size_mb = v;
-            }
-            if let Some(v) = preview.cache_dir {
-                cfg.preview.cache_dir = expand_tilde(&v);
-            }
+            cfg.apply_preview(preview);
         }
         if let Some(gui) = parsed.gui {
-            if let Some(v) = gui.width_percent {
-                cfg.gui.width_percent = v.clamp(10, 95);
-            }
-            if let Some(v) = gui.height_percent {
-                cfg.gui.height_percent = v.clamp(10, 95);
-            }
-            if let Some(v) = gui.max_width_px {
-                cfg.gui.max_width_px = v.max(200);
-            }
-            if let Some(v) = gui.max_height_px {
-                cfg.gui.max_height_px = v.max(200);
-            }
-            if let Some(v) = gui.preview_width_percent {
-                cfg.gui.preview_width_percent = v.clamp(10, 95);
-            }
-            if let Some(v) = gui.preview_height_percent {
-                cfg.gui.preview_height_percent = v.clamp(10, 95);
-            }
-            if let Some(v) = gui.preview_max_width_px {
-                cfg.gui.preview_max_width_px = v.max(400);
-            }
-            if let Some(v) = gui.preview_max_height_px {
-                cfg.gui.preview_max_height_px = v.max(400);
-            }
-            if let Some(v) = gui.preview_placement {
-                cfg.gui.preview_placement = v;
-            }
-            if let Some(v) = gui.blur {
-                cfg.gui.blur = v.into();
-            }
-            if let Some(v) = gui.opacity {
-                let clamped = v.clamp(0.0, 1.0);
-                if (clamped - v).abs() > f64::EPSILON {
-                    tracing::warn!(
-                        "[gui].opacity = {} out of 0.0..=1.0, clamped to {}",
-                        v,
-                        clamped
-                    );
-                }
-                cfg.gui.opacity = clamped;
-            }
-            if let Some(v) = gui.show_recents {
-                cfg.gui.show_recents = v;
-            }
-            if let Some(theme) = gui.theme {
-                let trimmed = theme.trim();
-                cfg.gui.theme = if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed.to_string())
-                };
-            }
-            if let Some(v) = gui.matugen {
-                cfg.gui.matugen.enabled = v;
-            }
-            if let Some(path) = gui.matugen_colors_path {
-                let trimmed = path.trim();
-                if !trimmed.is_empty() {
-                    cfg.gui.matugen.colors_path = expand_tilde(trimmed);
-                }
-            }
+            cfg.apply_gui(gui);
         }
         if let Some(search_toml) = parsed.search
             && let Some(url) = search_toml.web_engine_url
@@ -1242,92 +1091,269 @@ impl Config {
         cfg.ocr.nice_level = profile_seed.ocr_nice_level;
         cfg.ocr.io_class_idle = profile_seed.ocr_io_class_idle;
         if let Some(ocr) = parsed.ocr {
-            if let Some(v) = ocr.enabled {
-                cfg.ocr.enabled = v;
-            }
-            if let Some(v) = ocr.languages {
-                cfg.ocr.languages = v;
-            }
-            if let Some(v) = ocr.max_pages_per_pdf {
-                cfg.ocr.max_pages_per_pdf = Some(v);
-            }
-            if let Some(v) = ocr.min_image_side_px {
-                cfg.ocr.min_image_side_px = v;
-            }
-            if let Some(v) = ocr.timeout_secs {
-                cfg.ocr.timeout_secs = v;
-            }
-            if let Some(v) = ocr.worker_interval_secs {
-                cfg.ocr.worker_interval_secs = v;
-            }
-            if let Some(v) = ocr.jobs_per_tick {
-                cfg.ocr.jobs_per_tick = v;
-            }
-            if let Some(v) = ocr.adaptive_throttle {
-                cfg.ocr.adaptive_throttle = v;
-            }
-            if let Some(v) = ocr.max_cpu_pressure_avg10 {
-                cfg.ocr.max_cpu_pressure_avg10 = v;
-            }
-            if let Some(v) = ocr.nice_level {
-                cfg.ocr.nice_level = v;
-            }
-            if let Some(v) = ocr.io_class_idle {
-                cfg.ocr.io_class_idle = v;
-            }
+            cfg.apply_ocr(ocr);
         }
         cfg.validate_and_normalize();
 
-        let known: HashSet<&'static str> = KNOWN_TOP_LEVEL_KEYS.iter().copied().collect();
-        let known_preview: HashSet<&'static str> = KNOWN_PREVIEW_KEYS.iter().copied().collect();
-        let raw: toml::Value = toml::from_str(content)?;
-        if let toml::Value::Table(mut top) = raw {
-            // Uniform warn-and-continue unknown-key sweep (O2): a
-            // misspelled key inside any built-in section is reported
-            // once and ignored, matching the legacy-top-level-key
-            // pattern below. Previously `[core]` hard-errored via
-            // deny_unknown_fields while `[gui]`/`[ranking]` silently
-            // dropped typos.
-            for (section, known_keys) in KNOWN_SECTION_KEYS {
-                if let Some(toml::Value::Table(table)) = top.get(*section) {
-                    for key in table.keys() {
-                        if !known_keys.contains(&key.as_str()) {
-                            tracing::warn!(
-                                "config: unknown key `{key}` in [{section}]; ignored. Typo?"
-                            );
-                        }
-                    }
-                }
-            }
-            if let Some(toml::Value::Table(preview_table)) = top.remove("preview") {
-                for (key, value) in preview_table {
-                    if known_preview.contains(key.as_str()) {
-                        continue;
-                    }
-                    cfg.preview.plugin_sections.insert(key, value);
-                }
-            }
-            // Must precede the `plugin_sections` sweep below;
-            // otherwise legacy keys would be misdispatched to
-            // non-existent plugin factories instead of warned about.
-            for legacy_key in LEGACY_TOP_LEVEL_KEYS {
-                if top.remove(*legacy_key).is_some() {
-                    tracing::warn!(
-                        field = *legacy_key,
-                        "config: top-level `{}` is no longer supported; move it under [core] in ~/.config/lixun/config.toml. The legacy value has been ignored.",
-                        legacy_key
-                    );
-                }
-            }
-            for (key, value) in top {
-                if known.contains(key.as_str()) {
-                    continue;
-                }
-                cfg.plugin_sections.insert(key, value);
-            }
-        }
+        cfg.collect_plugin_sections(toml::from_str(content)?);
 
         Ok(cfg)
+    }
+
+    fn apply_core(&mut self, core: CoreToml) -> Result<()> {
+        if let Some(roots) = core.roots {
+            self.roots = roots.iter().map(|s| expand_tilde(s)).collect();
+        }
+        if let Some(extra) = core.exclude {
+            self.exclude.extend(extra);
+        }
+        if let Some(patterns) = core.exclude_regex {
+            for pat in patterns {
+                self.exclude_regex
+                    .push(regex::Regex::new(&pat).map_err(|_| {
+                        anyhow::anyhow!("invalid regular expression in core.exclude_regex")
+                    })?);
+            }
+        }
+        if let Some(max) = core.max_file_size_mb {
+            self.max_file_size_mb = max;
+        }
+        if let Some(timeout) = core.extractor_timeout_secs {
+            self.extractor_timeout_secs = timeout;
+        }
+        if let Some(n) = core.max_results {
+            self.max_results = n;
+        }
+        Ok(())
+    }
+
+    fn apply_keybindings(&mut self, bindings: KeybindingsToml) {
+        if let Some(v) = bindings.close {
+            self.keybindings.close = v;
+        }
+        if let Some(v) = bindings.primary_action {
+            self.keybindings.primary_action = v;
+        }
+        if let Some(v) = bindings.secondary_action {
+            self.keybindings.secondary_action = v;
+        }
+        if let Some(v) = bindings.copy {
+            self.keybindings.copy = v;
+        }
+        if let Some(v) = bindings.quick_look {
+            self.keybindings.quick_look = v;
+        }
+        if let Some(v) = bindings.quick_look_alt {
+            self.keybindings.quick_look_alt = v;
+        }
+        if let Some(v) = bindings.history_up {
+            self.keybindings.history_up = v;
+        }
+        if let Some(v) = bindings.next_result {
+            self.keybindings.next_result = v;
+        }
+        if let Some(v) = bindings.previous_result {
+            self.keybindings.previous_result = v;
+        }
+        if let Some(v) = bindings.next_category {
+            self.keybindings.next_category = v;
+        }
+        if let Some(v) = bindings.previous_category {
+            self.keybindings.previous_category = v;
+        }
+        if let Some(v) = bindings.filter_all {
+            self.keybindings.filter_all = v;
+        }
+        if let Some(v) = bindings.filter_apps {
+            self.keybindings.filter_apps = v;
+        }
+        if let Some(v) = bindings.filter_files {
+            self.keybindings.filter_files = v;
+        }
+        if let Some(v) = bindings.filter_mail {
+            self.keybindings.filter_mail = v;
+        }
+        if let Some(v) = bindings.filter_attachments {
+            self.keybindings.filter_attachments = v;
+        }
+        if let Some(v) = bindings.global_toggle {
+            self.keybindings.global_toggle = v;
+        }
+        if let Some(v) = bindings.reset_gui_position {
+            self.keybindings.reset_gui_position = v;
+        }
+        if let Some(v) = bindings.actions_menu {
+            self.keybindings.actions_menu = v;
+        }
+        if let Some(v) = bindings.info {
+            self.keybindings.info = v;
+        }
+    }
+
+    fn apply_preview(&mut self, preview: PreviewToml) {
+        if let Some(v) = preview.enabled {
+            self.preview.enabled = v;
+        }
+        if let Some(v) = preview.default_format {
+            self.preview.default_format = v;
+        }
+        if let Some(v) = preview.max_file_size_mb {
+            self.preview.max_file_size_mb = v;
+        }
+        if let Some(v) = preview.cache_dir {
+            self.preview.cache_dir = expand_tilde(&v);
+        }
+    }
+
+    fn apply_gui(&mut self, gui: GuiToml) {
+        if let Some(v) = gui.width_percent {
+            self.gui.width_percent = v.clamp(10, 95);
+        }
+        if let Some(v) = gui.height_percent {
+            self.gui.height_percent = v.clamp(10, 95);
+        }
+        if let Some(v) = gui.max_width_px {
+            self.gui.max_width_px = v.max(200);
+        }
+        if let Some(v) = gui.max_height_px {
+            self.gui.max_height_px = v.max(200);
+        }
+        if let Some(v) = gui.preview_width_percent {
+            self.gui.preview_width_percent = v.clamp(10, 95);
+        }
+        if let Some(v) = gui.preview_height_percent {
+            self.gui.preview_height_percent = v.clamp(10, 95);
+        }
+        if let Some(v) = gui.preview_max_width_px {
+            self.gui.preview_max_width_px = v.max(400);
+        }
+        if let Some(v) = gui.preview_max_height_px {
+            self.gui.preview_max_height_px = v.max(400);
+        }
+        if let Some(v) = gui.preview_placement {
+            self.gui.preview_placement = v;
+        }
+        if let Some(v) = gui.blur {
+            self.gui.blur = v.into();
+        }
+        if let Some(v) = gui.opacity {
+            let clamped = v.clamp(0.0, 1.0);
+            if (clamped - v).abs() > f64::EPSILON {
+                tracing::warn!(
+                    "[gui].opacity = {} out of 0.0..=1.0, clamped to {}",
+                    v,
+                    clamped
+                );
+            }
+            self.gui.opacity = clamped;
+        }
+        if let Some(v) = gui.show_recents {
+            self.gui.show_recents = v;
+        }
+        if let Some(theme) = gui.theme {
+            let trimmed = theme.trim();
+            self.gui.theme = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            };
+        }
+        if let Some(v) = gui.matugen {
+            self.gui.matugen.enabled = v;
+        }
+        if let Some(path) = gui.matugen_colors_path {
+            let trimmed = path.trim();
+            if !trimmed.is_empty() {
+                self.gui.matugen.colors_path = expand_tilde(trimmed);
+            }
+        }
+    }
+
+    fn apply_ocr(&mut self, ocr: OcrToml) {
+        if let Some(v) = ocr.enabled {
+            self.ocr.enabled = v;
+        }
+        if let Some(v) = ocr.languages {
+            self.ocr.languages = v;
+        }
+        if let Some(v) = ocr.max_pages_per_pdf {
+            self.ocr.max_pages_per_pdf = Some(v);
+        }
+        if let Some(v) = ocr.min_image_side_px {
+            self.ocr.min_image_side_px = v;
+        }
+        if let Some(v) = ocr.timeout_secs {
+            self.ocr.timeout_secs = v;
+        }
+        if let Some(v) = ocr.worker_interval_secs {
+            self.ocr.worker_interval_secs = v;
+        }
+        if let Some(v) = ocr.jobs_per_tick {
+            self.ocr.jobs_per_tick = v;
+        }
+        if let Some(v) = ocr.adaptive_throttle {
+            self.ocr.adaptive_throttle = v;
+        }
+        if let Some(v) = ocr.max_cpu_pressure_avg10 {
+            self.ocr.max_cpu_pressure_avg10 = v;
+        }
+        if let Some(v) = ocr.nice_level {
+            self.ocr.nice_level = v;
+        }
+        if let Some(v) = ocr.io_class_idle {
+            self.ocr.io_class_idle = v;
+        }
+    }
+
+    fn collect_plugin_sections(&mut self, raw: toml::Value) {
+        let known: HashSet<&'static str> = KNOWN_TOP_LEVEL_KEYS.iter().copied().collect();
+        let known_preview: HashSet<&'static str> = KNOWN_PREVIEW_KEYS.iter().copied().collect();
+        let toml::Value::Table(mut top) = raw else {
+            return;
+        };
+        // Uniform warn-and-continue unknown-key sweep (O2): a
+        // misspelled key inside any built-in section is reported
+        // once and ignored, matching the legacy-top-level-key
+        // pattern below. Previously `[core]` hard-errored via
+        // deny_unknown_fields while `[gui]`/`[ranking]` silently
+        // dropped typos.
+        for (section, known_keys) in KNOWN_SECTION_KEYS {
+            if let Some(toml::Value::Table(table)) = top.get(*section) {
+                for key in table.keys() {
+                    if !known_keys.contains(&key.as_str()) {
+                        tracing::warn!(
+                            "config: unknown key `{key}` in [{section}]; ignored. Typo?"
+                        );
+                    }
+                }
+            }
+        }
+        if let Some(toml::Value::Table(preview_table)) = top.remove("preview") {
+            for (key, value) in preview_table {
+                if known_preview.contains(key.as_str()) {
+                    continue;
+                }
+                self.preview.plugin_sections.insert(key, value);
+            }
+        }
+        // Must precede the `plugin_sections` sweep below;
+        // otherwise legacy keys would be misdispatched to
+        // non-existent plugin factories instead of warned about.
+        for legacy_key in LEGACY_TOP_LEVEL_KEYS {
+            if top.remove(*legacy_key).is_some() {
+                tracing::warn!(
+                    field = *legacy_key,
+                    "config: top-level `{}` is no longer supported; move it under [core] in ~/.config/lixun/config.toml. The legacy value has been ignored.",
+                    legacy_key
+                );
+            }
+        }
+        for (key, value) in top {
+            if known.contains(key.as_str()) {
+                continue;
+            }
+            self.plugin_sections.insert(key, value);
+        }
     }
 
     pub fn ranking_config(&self) -> lixun_core::RankingConfig {

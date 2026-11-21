@@ -68,7 +68,11 @@ pub(crate) fn fit_to_page(max_page_size_pt: (f64, f64), viewport_inner_size_px: 
 }
 
 mod imp {
-    use super::*;
+    use super::{
+        Cell, DocumentSession, ObjectImpl, ObjectSubclass, ObjectSubclassExt, PdfPageWidget,
+        PdfSelection, Rc, RefCell, SearchMatchRef, SearchResults, ToValue, WidgetExt, WidgetImpl,
+        WidgetImplExt, glib,
+    };
     use std::sync::OnceLock;
 
     pub struct PdfCanvas {
@@ -109,7 +113,7 @@ mod imp {
 
     #[glib::object_subclass]
     impl ObjectSubclass for PdfCanvas {
-        const NAME: &'static str = "LixunPdfCanvas";
+        const NAME: &str = "LixunPdfCanvas";
         type Type = super::PdfCanvas;
         type ParentType = gtk::Widget;
         type Interfaces = (gtk::Scrollable,);
