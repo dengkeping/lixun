@@ -1,6 +1,6 @@
 # Maintainer: Denis Kopin <deng@lixun.app>
 pkgname=lixun-semantic
-pkgver=0.7.0
+pkgver=0.7.1
 pkgrel=1
 pkgdesc="Lixun semantic sidecar worker: dense-vector hybrid retrieval via fastembed + LanceDB"
 arch=('x86_64')
@@ -17,17 +17,18 @@ options=(!lto)
 # handshake. Bump in lockstep.
 depends=("lixun=$pkgver" 'gcc-libs' 'xz' 'libheif')
 makedepends=('rust' 'cargo' 'protobuf' 'libheif')
-source=("lixun-$pkgver.tar.gz::https://github.com/dengkeping/lixun/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('058811d020495ac4fcc649c8e2f8a408afec9f4aa6f8da3fffb7f3a8a235e709')
+_commit=72136fcb949f46f92d67225ca1adc886db937554
+source=("lixun-$pkgver.tar.gz::https://github.com/dengkeping/lixun/archive/$_commit.tar.gz")
+sha256sums=('870f60c804e33afe0df516fe48e5d2bae7ef7930f614c59ef6463d964aa6a126')
 
 prepare() {
-  cd "$srcdir/lixun-$pkgver"
+  cd "$srcdir/lixun-$_commit"
   export CARGO_TARGET_DIR="$srcdir/target"
   cargo fetch --locked
 }
 
 build() {
-  cd "$srcdir/lixun-$pkgver"
+  cd "$srcdir/lixun-$_commit"
   export CARGO_TARGET_DIR="$srcdir/target"
   # See lixun/PKGBUILD round-6 notes: force the rustc linker driver to
   # /usr/bin/gcc so cargo:rustc-link-lib=static=jemalloc_pic from the
@@ -40,7 +41,7 @@ build() {
 }
 
 package() {
-  cd "$srcdir/lixun-$pkgver"
+  cd "$srcdir/lixun-$_commit"
   install -Dm755 "$srcdir/target/release/lixun-semantic-worker" \
     "$pkgdir/usr/lib/lixun/lixun-semantic-worker"
 

@@ -1,6 +1,6 @@
 # Maintainer: Denis Kopin <deng@lixun.app>
 pkgname=lixun-ocr
-pkgver=0.5.1
+pkgver=0.7.1
 pkgrel=1
 pkgdesc="Lixun OCR metapackage: pulls in tesseract + English language data"
 arch=('any')
