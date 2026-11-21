@@ -269,11 +269,7 @@ impl LauncherController {
         self.recompute_monitor();
 
         let snapshot = self.cached_session.borrow_mut().take();
-        tracing::info!(
-            "gui: show() snapshot_present={} entry_text_before={:?}",
-            snapshot.is_some(),
-            self.entry.text().to_string()
-        );
+        tracing::debug!(snapshot_present = snapshot.is_some(), "show launcher");
         if let Some(snapshot) = snapshot {
             // If the live UI already matches the snapshot (same query
             // and the model is non-empty), the previous hide() left
@@ -290,11 +286,7 @@ impl LauncherController {
             if model_populated && live_query == snapshot.query {
                 tracing::info!("gui: show() reusing live state, skipping restore_session");
             } else {
-                tracing::info!(
-                    "gui: show() restoring snapshot query={:?} hits={}",
-                    snapshot.query,
-                    snapshot.hits.len()
-                );
+                tracing::debug!(hits = snapshot.hits.len(), "restoring launcher session");
                 self.restore_session(&snapshot);
             }
         }
@@ -614,12 +606,11 @@ impl LauncherController {
             );
             return;
         };
-        *self.preview_slide_saved.borrow_mut() =
-            Some(crate::preview_layout::SavedSlidePosition {
-                left_anchored: self.window.is_anchor(Edge::Left),
-                left: self.window.margin(Edge::Left),
-                top: self.window.margin(Edge::Top),
-            });
+        *self.preview_slide_saved.borrow_mut() = Some(crate::preview_layout::SavedSlidePosition {
+            left_anchored: self.window.is_anchor(Edge::Left),
+            left: self.window.margin(Edge::Left),
+            top: self.window.margin(Edge::Top),
+        });
         self.window.set_anchor(Edge::Left, true);
         self.window.set_margin(Edge::Left, target_left);
         tracing::info!(
@@ -822,7 +813,7 @@ impl LauncherController {
         }
 
         let query = self.entry.text().to_string();
-        tracing::info!("gui: persist_session() query={:?}", query);
+
         if query.is_empty() {
             tracing::info!("gui: persist_session() empty query → CLEARING cached_session");
             self.cached_session.borrow_mut().take();
@@ -980,9 +971,10 @@ fn pick_current_monitor() -> Option<gtk::gdk::Monitor> {
     {
         let (surface, _, _) = pointer.surface_at_position();
         if let Some(surface) = surface
-            && let Some(monitor) = display.monitor_at_surface(&surface) {
-                return Some(monitor);
-            }
+            && let Some(monitor) = display.monitor_at_surface(&surface)
+        {
+            return Some(monitor);
+        }
     }
     display
         .monitors()
@@ -1237,9 +1229,7 @@ fn load_config_document(status_bar: &StatusBar) -> Option<toml_edit::DocumentMut
                 None
             }
         },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Some(toml_edit::DocumentMut::new())
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(toml_edit::DocumentMut::new()),
         Err(e) => {
             status_bar.show_error(&format!("Couldn't read config.toml: {}", e));
             None
@@ -1622,7 +1612,12 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
     let semantic_ui_for_icon = std::rc::Rc::clone(&semantic_ui);
     entry.connect_icon_press(move |entry, pos| {
         if pos == gtk::EntryIconPosition::Primary {
-            popup_settings_menu(entry, &semantic_ui_for_icon, semantic_configured, ocr_enabled);
+            popup_settings_menu(
+                entry,
+                &semantic_ui_for_icon,
+                semantic_configured,
+                ocr_enabled,
+            );
         }
     });
 
@@ -1707,9 +1702,7 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
     // Built before the factory: the row action handlers surface
     // launch failures through the status bar (they used to vanish
     // into the log).
-    let status_bar = std::rc::Rc::new(StatusBar::new(
-        daemon_config.search.web_engine_url.clone(),
-    ));
+    let status_bar = std::rc::Rc::new(StatusBar::new(daemon_config.search.web_engine_url.clone()));
 
     // Shared with the factory rows: click-selection protection (K10)
     // and the popover-open counter that gates the focus-leave hide
@@ -1723,6 +1716,7 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
     let list_view = gtk::ListView::builder()
         .model(&selection)
         .factory(&create_list_factory(crate::factory::RowFactoryCtx {
+            relative_date_sources: crate::ipc::relative_date_sources(),
             entry: entry.clone(),
             status: std::rc::Rc::clone(&status_bar),
             keybindings: std::rc::Rc::clone(&keybindings_rc),
@@ -2022,7 +2016,9 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
                     // replaces the client-filtered view.
                     let new_epoch = epoch.fetch_add(1, Ordering::SeqCst) + 1;
                     limit.set(max_results);
-                    let _ = ipc.request_tx.send((q, max_results, new_epoch, category.get()));
+                    let _ = ipc
+                        .request_tx
+                        .send((q, max_results, new_epoch, category.get()));
                 } else if selection.n_items() == 0 && model.n_items() > 0 {
                     // No query to re-issue (history/recents view):
                     // the client-side filter produced a silent void —
@@ -2624,14 +2620,17 @@ fn install_response_handler(
                                         hits.len(),
                                         epoch
                                     );
-                                    let prior = override_t.get().then(|| {
-                                        let idx = selection_t.selected();
-                                        selection_t.item(idx).and_then(|obj| {
-                                            obj.downcast::<gtk::StringObject>()
-                                                .ok()
-                                                .map(|s| s.string().to_string())
+                                    let prior = override_t
+                                        .get()
+                                        .then(|| {
+                                            let idx = selection_t.selected();
+                                            selection_t.item(idx).and_then(|obj| {
+                                                obj.downcast::<gtk::StringObject>()
+                                                    .ok()
+                                                    .map(|s| s.string().to_string())
+                                            })
                                         })
-                                    }).flatten();
+                                        .flatten();
                                     // No top-hit nomination on Initial —
                                     // hero styling waits for the Final.
                                     let plan = compute_render_plan(&hits, None);
@@ -2709,15 +2708,6 @@ fn install_response_handler(
                             } else {
                                 hits
                             };
-                            for (i, h) in all_hits.iter().enumerate().take(10) {
-                                tracing::debug!(
-                                    "gui: final hit[{}] id={} title={:?} score={:.4}",
-                                    i,
-                                    h.id.0,
-                                    h.title,
-                                    h.score
-                                );
-                            }
                             pending_hits.borrow_mut().clear();
 
                             let preserve_doc_id = user_selected_override.get();
@@ -2747,9 +2737,8 @@ fn install_response_handler(
                                 let q = last_query.borrow().clone();
                                 if !q.is_empty() {
                                     let next = max_results.saturating_mul(4).min(1000);
-                                    plan.hits.push(
-                                        crate::factory::synthetic_more_results_hit(&q, next),
-                                    );
+                                    plan.hits
+                                        .push(crate::factory::synthetic_more_results_hit(&q, next));
                                 }
                             }
                             let plan = plan;
@@ -2806,17 +2795,11 @@ fn install_response_handler(
                                     // filtered out — show the
                                     // category-aware message instead.
                                     if !claimed && category.is_none() {
-                                        let web_hit =
-                                            crate::factory::synthetic_web_search_hit(
-                                                &q,
-                                                &web_engine_url,
-                                            );
-                                        update_results(
-                                            &model,
-                                            &selection,
-                                            &[web_hit],
-                                            None,
+                                        let web_hit = crate::factory::synthetic_web_search_hit(
+                                            &q,
+                                            &web_engine_url,
                                         );
+                                        update_results(&model, &selection, &[web_hit], None);
                                         filter.changed(gtk::FilterChange::Different);
                                         if selection.n_items() > 0 {
                                             selection.set_selected(0);
@@ -2826,8 +2809,7 @@ fn install_response_handler(
                                     } else {
                                         scrolled.set_visible(false);
                                         scrolled.set_vexpand(false);
-                                        selection
-                                            .set_selected(gtk::INVALID_LIST_POSITION);
+                                        selection.set_selected(gtk::INVALID_LIST_POSITION);
                                     }
                                     present_zero_hit_status(
                                         &q,
@@ -2905,9 +2887,7 @@ type IndexStatusSnapshot = (Instant, Option<crate::ipc::DaemonStatusSnapshot>);
 /// authoritative.
 fn semantic_down_note(semantic: &Option<(bool, String, bool)>) -> Option<String> {
     match semantic {
-        Some((true, state, false)) => {
-            Some(format!("Semantic search unavailable ({state})"))
-        }
+        Some((true, state, false)) => Some(format!("Semantic search unavailable ({state})")),
         _ => None,
     }
 }
@@ -3034,7 +3014,6 @@ fn install_entry_handler(
             return;
         }
         let text = e.text().to_string();
-        tracing::debug!("gui: entry changed, text={:?}", text);
 
         if let Some(id) = pending_debounce.borrow_mut().take() {
             id.remove();
@@ -3152,12 +3131,7 @@ fn install_entry_handler(
         let id = glib::timeout_add_local_once(Duration::from_millis(30), move || {
             *last_q.borrow_mut() = q.clone();
             let epoch_snapshot = epoch.load(Ordering::SeqCst);
-            tracing::debug!(
-                "gui: debounce fired, sending search query={:?} limit={} epoch={}",
-                q,
-                max_results,
-                epoch_snapshot
-            );
+
             // Skip "Searching…" spinner for queries claimed by an
             // instant plugin (shell `>`, calculator `=`). These
             // respond in <10ms so the spinner would only flash.
@@ -3191,12 +3165,9 @@ fn install_entry_handler(
             limit_for_debounce.set(max_results);
             // R5: keep the active chip constraint on the wire so the
             // daemon filters pre-limit.
-            let _ = ipc.request_tx.send((
-                q,
-                max_results,
-                epoch_snapshot,
-                category_for_debounce.get(),
-            ));
+            let _ =
+                ipc.request_tx
+                    .send((q, max_results, epoch_snapshot, category_for_debounce.get()));
             *pending_self.borrow_mut() = None;
         });
         *pending_debounce.borrow_mut() = Some(id);

@@ -20,7 +20,7 @@ use tokio::sync::Mutex;
 use crate::session_env;
 
 const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(10);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(1);
 const QUIT_GRACE_PERIOD: Duration = Duration::from_millis(500);
 
@@ -72,8 +72,8 @@ impl GuiControl {
         if state.pid.is_none() {
             let pid = self.spawn(Arc::clone(self)).await?;
             state.pid = Some(pid);
-            drop(state);
             wait_for_ready().await?;
+            drop(state);
             return send_command(cmd, COMMAND_TIMEOUT).await;
         }
 
@@ -204,17 +204,13 @@ impl GuiControl {
 }
 
 async fn wait_for_ready() -> anyhow::Result<()> {
-    let path = gui_socket_path();
     let deadline = tokio::time::Instant::now() + CONNECT_TIMEOUT;
     loop {
-        if let Ok(mut stream) = UnixStream::connect(&path).await
-            && write_frame_async(&mut stream, &GuiCommand::Ping)
-                .await
-                .is_ok()
-            && read_frame_async::<_, GuiResponse>(&mut stream)
-                .await
-                .is_ok()
-        {
+        if matches!(
+            tokio::time::timeout_at(deadline, send_command(GuiCommand::Ping, COMMAND_TIMEOUT))
+                .await,
+            Ok(Ok(GuiResponse::Ok { .. }))
+        ) {
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {

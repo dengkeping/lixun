@@ -90,11 +90,6 @@ impl PreviewPlugin for InfoPreview {
         }
         card.append(&details);
 
-        tracing::info!(
-            "info: rendered card for {} (category={:?})",
-            hit.id.0,
-            hit.category
-        );
         Ok(card.upcast())
     }
 }
@@ -159,11 +154,7 @@ fn category_kind(cat: Category) -> &'static str {
 /// Humanize a byte count: `42 B`, `1.2 KB`, `3.5 MB`, `2.0 GB`.
 /// Decimal units to match what file managers show users.
 fn human_bytes(n: u64) -> String {
-    const UNITS: &[(&str, u64)] = &[
-        ("GB", 1_000_000_000),
-        ("MB", 1_000_000),
-        ("KB", 1_000),
-    ];
+    const UNITS: &[(&str, u64)] = &[("GB", 1_000_000_000), ("MB", 1_000_000), ("KB", 1_000)];
     for (unit, factor) in UNITS {
         if n >= *factor {
             return format!("{:.1} {}", n as f64 / *factor as f64, unit);
@@ -247,10 +238,7 @@ mod tests {
         assert_eq!(InfoPreview.match_score(&app), 1);
         assert!(InfoPreview.match_score(&app) < 50);
 
-        let calc = hit(
-            Category::Calculator,
-            Action::CopyText { text: "4".into() },
-        );
+        let calc = hit(Category::Calculator, Action::CopyText { text: "4".into() });
         assert_eq!(InfoPreview.match_score(&calc), 1);
     }
 

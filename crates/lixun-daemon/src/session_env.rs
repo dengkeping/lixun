@@ -122,7 +122,10 @@ pub async fn discover_gui_env_async() -> HashMap<String, String> {
     match tokio::time::timeout(MANAGER_ENV_TIMEOUT, read_manager_environment()).await {
         Ok(Ok(manager)) => overlay_manager_env(&mut env, &missing, &manager),
         Ok(Err(e)) => {
-            tracing::debug!("session_env: systemd manager Environment unavailable: {}", e);
+            tracing::debug!(
+                "session_env: systemd manager Environment unavailable: {}",
+                e
+            );
         }
         Err(_) => {
             tracing::warn!(
@@ -562,7 +565,11 @@ mod tests {
     #[test]
     fn manager_overlay_fills_desktop_identity() {
         let mut env = HashMap::new();
-        let missing = ["XDG_CURRENT_DESKTOP", "KDE_SESSION_VERSION", "XDG_DATA_DIRS"];
+        let missing = [
+            "XDG_CURRENT_DESKTOP",
+            "KDE_SESSION_VERSION",
+            "XDG_DATA_DIRS",
+        ];
         let manager = manager_env(&[
             ("XDG_CURRENT_DESKTOP", "KDE"),
             ("KDE_SESSION_VERSION", "6"),
@@ -609,7 +616,11 @@ mod tests {
             &missing,
             &manager_env(&[("XDG_CURRENT_DESKTOP", "plasma:KDE")]),
         );
-        assert_eq!(env.get("XDG_CURRENT_DESKTOP"), None, "colon list, no version");
+        assert_eq!(
+            env.get("XDG_CURRENT_DESKTOP"),
+            None,
+            "colon list, no version"
+        );
 
         let mut env = HashMap::new();
         let missing = ["XDG_CURRENT_DESKTOP", "KDE_SESSION_VERSION"];

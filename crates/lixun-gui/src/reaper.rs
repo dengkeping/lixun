@@ -138,7 +138,6 @@ fn reaper_loop(state: Arc<ReaperState>) {
                 // the failure to the GTK side for a desktop
                 // notification.
                 tracing::warn!(
-                    program = %tracked.program,
                     pid = tracked.child.id(),
                     code = ?status.code(),
                     "reaper: launched child exited non-zero — the action likely failed to open"
@@ -154,7 +153,6 @@ fn reaper_loop(state: Arc<ReaperState>) {
                 // ECHILD or similar: child vanished. Drop it —
                 // there's nothing to wait on anyway.
                 tracing::debug!(
-                    program = %tracked.program,
                     pid = tracked.child.id(),
                     error = %e,
                     "reaper: try_wait failed, dropping"
@@ -175,7 +173,7 @@ pub(crate) fn spawn_reaped(cmd: &mut Command) -> std::io::Result<()> {
     // after the child exits there is no way to recover what it was.
     let program = cmd.get_program().to_string_lossy().into_owned();
     let child = cmd.spawn()?;
-    tracing::debug!(program = %program, pid = child.id(), "reaper: spawned child");
+    tracing::debug!(pid = child.id(), "reaper: spawned child");
     let state = reaper();
     {
         let mut guard = state.children.lock().expect("reaper mutex poisoned");

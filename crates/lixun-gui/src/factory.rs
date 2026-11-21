@@ -57,6 +57,7 @@ pub(crate) struct RowFactoryCtx {
     /// (C2 "Hide from Results") can update the visible list without
     /// waiting for the next search round-trip.
     pub(crate) model: gtk::StringList,
+    pub(crate) relative_date_sources: std::collections::HashSet<String>,
 }
 
 use crate::actions::{copy_to_clipboard, execute_action, execute_secondary_action};
@@ -70,17 +71,6 @@ pub(crate) const ICON_SIZE_TOP_HIT: i32 = 48;
 
 pub(crate) fn add_css_class<W: gtk::prelude::WidgetExt>(widget: &W, class: &str) {
     widget.add_css_class(class);
-}
-
-fn category_kind_fallback(cat: &Category) -> &'static str {
-    match cat {
-        Category::App => "Application",
-        Category::File => "File",
-        Category::Mail => "Email",
-        Category::Attachment => "Attachment",
-        Category::Calculator => "Calculator",
-        Category::Shell => "Shell",
-    }
 }
 
 thread_local! {
@@ -210,7 +200,9 @@ pub(crate) fn synthetic_more_results_hit(query: &str, next_limit: u32) -> Hit {
         icon_name: Some("go-down-symbolic".to_string()),
         kind_label: Some("More".to_string()),
         score: 0.0,
-        action: Action::ReplaceQuery { q: query.to_string() },
+        action: Action::ReplaceQuery {
+            q: query.to_string(),
+        },
         extract_fail: false,
         sender: None,
         recipients: None,
@@ -415,8 +407,7 @@ fn openwith_mime_for_hit(hit: &Hit) -> Option<String> {
         return Some(mime.to_string());
     }
     let path = hit_file_path(hit)?;
-    let (guess, _uncertain) =
-        gio::functions::content_type_guess(Some(&path), None::<&[u8]>);
+    let (guess, _uncertain) = gio::functions::content_type_guess(Some(&path), None::<&[u8]>);
     Some(guess.to_string())
 }
 
@@ -518,6 +509,14 @@ pub(crate) fn relative_age(ts: i64, now: i64) -> String {
 }
 
 /// Absolute local timestamp for tooltips / Get Info.
+fn relative_caption_timestamp(
+    hit: &Hit,
+    sources: &std::collections::HashSet<String>,
+) -> Option<i64> {
+    hit.timestamp
+        .filter(|_| sources.contains(&hit.source_instance))
+}
+
 fn absolute_date(ts: i64) -> Option<String> {
     use chrono::TimeZone;
     chrono::Local
@@ -616,9 +615,7 @@ fn parse_score_multipliers(explanation: &str) -> Vec<(String, f32)> {
         let open = i + open_rel;
         // Walk back over the multiplier name (ascii alnum + '_').
         let mut start = open;
-        while start > 0
-            && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_')
-        {
+        while start > 0 && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_') {
             start -= 1;
         }
         let Some(close_rel) = explanation[open..].find(')') else {
@@ -755,6 +752,7 @@ pub(crate) fn create_list_factory(ctx: RowFactoryCtx) -> gtk::SignalListItemFact
     let setup_user_selected = Rc::clone(&ctx.user_selected);
     let setup_popover_open = Rc::clone(&ctx.popover_open);
     let setup_model = ctx.model.clone();
+    let date_sources = Rc::new(ctx.relative_date_sources);
 
     factory.connect_setup(move |_, list_item| {
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
@@ -833,7 +831,7 @@ pub(crate) fn create_list_factory(ctx: RowFactoryCtx) -> gtk::SignalListItemFact
             if let Some(hit) = cached_hit_by_id(&doc_id) {
                 dispatch_click_pair(&hit.id.0, open_entry.text().as_str());
                 if let Err(e) = execute_action(&hit) {
-                    tracing::error!("Action failed: {}", e);
+                    tracing::error!("Failed to launch selected action");
                     // Same visibility rule as the Enter path (keymap):
                     // a silent failure is indistinguishable from
                     // success.
@@ -898,8 +896,7 @@ pub(crate) fn create_list_factory(ctx: RowFactoryCtx) -> gtk::SignalListItemFact
         let openwith_state = Rc::clone(&state);
         let openwith_entry = setup_entry.clone();
         let openwith_status = setup_status.clone();
-        let openwith =
-            gio::SimpleAction::new("openwith", Some(glib::VariantTy::STRING));
+        let openwith = gio::SimpleAction::new("openwith", Some(glib::VariantTy::STRING));
         openwith.connect_activate(move |_, param| {
             let Some(doc_id) = openwith_state.borrow().doc_id.clone() else {
                 tracing::debug!("row.openwith fired on unbound row");
@@ -915,8 +912,10 @@ pub(crate) fn create_list_factory(ctx: RowFactoryCtx) -> gtk::SignalListItemFact
                 dispatch_click_pair(&hit.id.0, openwith_entry.text().as_str());
                 if let Err(e) = crate::actions::launch_with_app_id(&app_id, &path) {
                     tracing::error!("open-with failed: {}", e);
-                    openwith_status
-                        .show_error(&format!("Couldn't open \u{201c}{}\u{201d}: {}", hit.title, e));
+                    openwith_status.show_error(&format!(
+                        "Couldn't open \u{201c}{}\u{201d}: {}",
+                        hit.title, e
+                    ));
                 }
             }
         });
@@ -946,9 +945,7 @@ pub(crate) fn create_list_factory(ctx: RowFactoryCtx) -> gtk::SignalListItemFact
                 }
             }
             CACHED_HITS.with(|c| c.borrow_mut().retain(|h| h.id.0 != doc_id));
-            hide_status.show_toast(
-                "Hidden from results \u{2014} undo with `lixun-cli hidden`",
-            );
+            hide_status.show_toast("Hidden from results \u{2014} undo with `lixun-cli hidden`");
         });
         group.add_action(&hide);
 
@@ -1151,6 +1148,7 @@ pub(crate) fn create_list_factory(ctx: RowFactoryCtx) -> gtk::SignalListItemFact
         // This avoids the need for `unsafe { set_data }` plumbing
         // a shared factory-level connect_bind handler would have
         // required, at the cost of one extra closure per row.
+        let notify_dates = Rc::clone(&date_sources);
         let notify_state = Rc::clone(&state);
         let notify_shell = shell_menu.clone();
         let notify_openwith = openwith_menu.clone();
@@ -1166,6 +1164,7 @@ pub(crate) fn create_list_factory(ctx: RowFactoryCtx) -> gtk::SignalListItemFact
                 &notify_secondary,
                 &notify_entry,
                 &notify_kb,
+                &notify_dates,
             );
         });
 
@@ -1228,6 +1227,7 @@ fn on_item_notify(
     secondary: &gio::SimpleAction,
     entry: &gtk::Entry,
     kb: &Rc<lixun_config::Keybindings>,
+    date_sources: &std::collections::HashSet<String>,
 ) {
     let Some(row) = list_item.child().and_downcast::<gtk::Box>() else {
         return;
@@ -1286,8 +1286,7 @@ fn on_item_notify(
             // the row tooltip. Non-path subtitles (mail authors,
             // "Recent search") keep the plain end-ellipsized text.
             if hit.subtitle.starts_with('/') {
-                let displayed =
-                    display_path_subtitle(&hit.subtitle, dirs::home_dir().as_deref());
+                let displayed = display_path_subtitle(&hit.subtitle, dirs::home_dir().as_deref());
                 subtitle.set_text(&displayed);
                 apply_highlight(&subtitle, &displayed, &query);
                 subtitle.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
@@ -1306,12 +1305,7 @@ fn on_item_notify(
             let kind_text = hit
                 .kind_label
                 .clone()
-                .unwrap_or_else(|| category_kind_fallback(&hit.category).to_string());
-            // R4: mail and attachment rows show WHEN over WHAT — the
-            // relative date replaces the kind label (which moves to
-            // the label's tooltip; the full metadata lives in Get
-            // Info). Generic: keyed on category + timestamp presence.
-            let mail_like = matches!(hit.category, Category::Mail | Category::Attachment);
+                .unwrap_or_else(|| hit.category.display_name().to_string());
             // R9: the hero row carries a "Top Hit" caption in the
             // existing kind-label slot (no box-model change — BUG-6);
             // the displaced kind text moves to the tooltip.
@@ -1321,8 +1315,8 @@ fn on_item_notify(
                 kind.add_css_class("lixun-top-hit-caption");
             } else {
                 kind.remove_css_class("lixun-top-hit-caption");
-                match hit.timestamp {
-                    Some(ts) if mail_like => {
+                match relative_caption_timestamp(hit, date_sources) {
+                    Some(ts) => {
                         let now = chrono::Utc::now().timestamp();
                         kind.set_text(&relative_age(ts, now));
                         kind.set_tooltip_text(Some(&kind_text));
@@ -1337,8 +1331,7 @@ fn on_item_notify(
             // A1: expose the whole row to assistive tech. Selection
             // moves while focus stays on the entry, so the label is
             // the only thing Orca can read per row.
-            let mut accessible_label =
-                format!("{}, {}, {}", hit.title, hit.subtitle, kind_text);
+            let mut accessible_label = format!("{}, {}, {}", hit.title, hit.subtitle, kind_text);
             if is_top_hit_doc(&doc_id) {
                 accessible_label.push_str(", Top Hit");
             }
@@ -1570,10 +1563,7 @@ mod tests {
         // Open + ranking section only — OpenWith is per-hit and must
         // never enter the shared cached model.
         assert_eq!(menu.n_items(), 2);
-        assert_eq!(
-            menu_openwith_label(&def).as_deref(),
-            Some("Open With")
-        );
+        assert_eq!(menu_openwith_label(&def).as_deref(), Some("Open With"));
         assert!(menu_openwith_label(&sample_def_single(RowMenuVerb::Open, "Open")).is_none());
     }
 
@@ -1628,7 +1618,10 @@ mod tests {
                     \u{d7} coord(1.000) \u{d7} stage2(1.350)";
         let summary = ranking_summary(expl).expect("non-neutral multipliers present");
         assert!(summary.starts_with("Ranked up:"), "got: {summary}");
-        assert!(summary.contains("title starts with query"), "got: {summary}");
+        assert!(
+            summary.contains("title starts with query"),
+            "got: {summary}"
+        );
         assert!(summary.contains("opened often"), "got: {summary}");
         // Neutral breakdown → no summary line at all.
         let neutral = "score=1.0 = tantivy(1.0) \u{d7} cat(1.000) \u{d7} exact(1.000) \
@@ -1682,7 +1675,10 @@ mod tests {
             display_path_subtitle("/home/user/docs/deep/report.pdf", Some(home)),
             "~/docs/deep"
         );
-        assert_eq!(display_path_subtitle("/home/user/report.pdf", Some(home)), "~");
+        assert_eq!(
+            display_path_subtitle("/home/user/report.pdf", Some(home)),
+            "~"
+        );
     }
 
     #[test]
@@ -1698,7 +1694,10 @@ mod tests {
     #[test]
     fn display_path_subtitle_root_and_no_home() {
         assert_eq!(display_path_subtitle("/", None), "/");
-        assert_eq!(display_path_subtitle("/home/user/a.txt", None), "/home/user");
+        assert_eq!(
+            display_path_subtitle("/home/user/a.txt", None),
+            "/home/user"
+        );
     }
 
     #[test]
@@ -1708,6 +1707,18 @@ mod tests {
         assert_eq!(human_size(1000), "1.0 KB");
         assert_eq!(human_size(1_234_000), "1.2 MB");
         assert_eq!(human_size(5_000_000_000), "5.0 GB");
+    }
+
+    #[test]
+    fn any_source_can_request_a_relative_caption() {
+        let mut hit = synthetic_more_results_hit("fixture", 30);
+        hit.source_instance = "custom-collection".into();
+        hit.timestamp = Some(12345);
+        assert_eq!(relative_caption_timestamp(&hit, &Default::default()), None);
+        assert_eq!(
+            relative_caption_timestamp(&hit, &[hit.source_instance.clone()].into()),
+            hit.timestamp
+        );
     }
 
     #[test]
@@ -1737,7 +1748,10 @@ mod tests {
         let ranges = highlight_ranges(text, "resume");
         assert_eq!(ranges.len(), 1);
         let (s, e) = ranges[0];
-        assert_eq!(&text.as_bytes()[s as usize..e as usize], "R\u{e9}sum\u{e9}".as_bytes());
+        assert_eq!(
+            &text.as_bytes()[s as usize..e as usize],
+            "R\u{e9}sum\u{e9}".as_bytes()
+        );
     }
 
     #[test]

@@ -5,22 +5,35 @@ on:
     branches: [main, wave-d-semantic]
   pull_request:
 
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+
 jobs:
   default:
     runs-on: ubuntu-latest
+    container: archlinux:base-devel
     steps:
+      - name: Install native build and test dependencies
+        run: pacman -Syu --noconfirm --needed git clang cmake protobuf gtk4 gtk4-layer-shell poppler-glib libheif openssl pkgconf xorg-server-xvfb xorg-xauth tesseract tesseract-data-eng sway wtype wl-clipboard ttf-dejavu python
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --workspace --all-targets
+      - run: cargo build --release --locked -p lixun-semantic-worker
+      - run: cargo test --locked --workspace
+      - run: cargo build --locked --workspace --all-targets
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo fmt --all -- --check
 
   semantic:
     runs-on: ubuntu-latest
+    container: archlinux:base-devel
     steps:
+      - name: Install native build and test dependencies
+        run: pacman -Syu --noconfirm --needed git clang cmake protobuf gtk4 gtk4-layer-shell poppler-glib libheif openssl pkgconf xorg-server-xvfb xorg-xauth tesseract tesseract-data-eng sway wtype wl-clipboard ttf-dejavu python
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -29,3 +42,7 @@ jobs:
         with:
           key: semantic
       - run: bash scripts/qa-wave-d.sh
+      - name: Exercise the launcher on headless Wayland
+        run: |
+          export PATH="$GITHUB_WORKSPACE/target/release:$PATH"
+          runuser -u nobody --preserve-environment -- bash tests/desktop-smoke.sh

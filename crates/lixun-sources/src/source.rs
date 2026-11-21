@@ -118,6 +118,12 @@ pub trait IndexerSource: Send + Sync {
         false
     }
 
+    /// Exclude sensitive result identities from persistent personalization,
+    /// including legacy clicks which do not carry the originating query.
+    fn excludes_from_click_history(&self, _doc_id: &str) -> bool {
+        false
+    }
+
     /// Whether this source exclusively claims the query, suppressing
     /// all other sources and the Tantivy/BM25 index search. When any
     /// plugin returns `true`, the daemon skips fusion entirely and
@@ -147,12 +153,16 @@ pub trait IndexerSource: Send + Sync {
     /// `Hit::source_instance`, so sources MUST return a stable,
     /// data-independent declaration (no per-hit branching). Items
     /// whose visibility depends on per-hit state should use
-    /// [`RowMenuVisibility::RequiresSecondaryAction`] and rely on
+    /// `RowMenuVisibility::RequiresSecondaryAction` and rely on
     /// action enablement at bind time rather than inserting or
     /// omitting items.
     ///
     /// Default returns an empty menu, which tells the GUI to hide
     /// the context menu for rows from this source.
+    fn relative_date_caption(&self) -> bool {
+        false
+    }
+
     fn row_menu(&self) -> RowMenuDef {
         RowMenuDef::empty()
     }
@@ -231,6 +241,13 @@ pub struct PluginInstance {
 /// factory never sees a `None`.
 pub trait PluginFactory: Send + Sync {
     fn section(&self) -> &'static str;
+
+    /// Prefixes reserved for private history, even after this source is disabled.
+    /// The document prefix is required; an optional query prefix covers
+    /// sources whose trigger is independent of instance configuration.
+    fn private_history_prefixes(&self) -> Option<(&'static str, Option<char>)> {
+        None
+    }
 
     fn build(&self, raw: &toml::Value, ctx: &PluginBuildContext) -> Result<Vec<PluginInstance>>;
 

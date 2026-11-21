@@ -5,10 +5,11 @@ use lixun_index::LixunIndex;
 
 #[test]
 fn test_lixun_help() {
-    let output = Command::new("cargo")
-        .args(["run", "-p", "lixun-cli", "--", "--help"])
+    let output = Command::new(env!("CARGO_BIN_EXE_lixun-cli"))
+        .arg("--help")
         .output()
         .expect("failed to run lixun");
+    assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("toggle"));
     assert!(stdout.contains("search"));
@@ -77,6 +78,29 @@ fn spotlight_diacritic_insensitive() {
     );
     let titles = search(&idx, "resume");
     assert!(titles.iter().any(|t| t.contains("résumé")));
+}
+
+#[test]
+fn spotlight_finds_a_unicode_filename_word_with_plugin_aliases_registered() {
+    use lixun_core::{PluginFieldSpec, PluginFieldType};
+    const FIELDS: &[PluginFieldSpec] = &[PluginFieldSpec {
+        schema_name: "collection_label",
+        query_alias: Some("label"),
+        ty: PluginFieldType::Keyword,
+        stored: false,
+        default_search: false,
+        boost: 0.0,
+    }];
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut idx, _) = LixunIndex::create_or_open_with_plugins(
+        tmp.path(),
+        &[("collection", FIELDS)].into(),
+        RankingConfig::default(),
+    )
+    .unwrap();
+    let filename = "Архив черновики за май.docx";
+    upsert_docs(&mut idx, &[make_doc("sample", filename, None)]);
+    assert_eq!(search(&idx, "черновики"), [filename]);
 }
 
 #[test]
@@ -161,11 +185,9 @@ fn dir_rename_removes_subtree_from_index() {
 
     rt.block_on(async {
         let tmp = tempfile::tempdir().unwrap();
-        let idx = LixunIndex::create_or_open(
-            tmp.path().to_str().unwrap(),
-            RankingConfig::default(),
-        )
-        .unwrap();
+        let idx =
+            LixunIndex::create_or_open(tmp.path().to_str().unwrap(), RankingConfig::default())
+                .unwrap();
         let (tx, search, _handle) = spawn_writer_service(idx).unwrap();
 
         let docs = vec![
@@ -180,7 +202,9 @@ fn dir_rename_removes_subtree_from_index() {
                 path: "/tmp/dir".into(),
                 mtime: 0,
                 size: 0,
-                action: Action::OpenFile { path: "/tmp/dir".into() },
+                action: Action::OpenFile {
+                    path: "/tmp/dir".into(),
+                },
                 extract_fail: false,
                 sender: None,
                 recipients: None,
@@ -189,14 +213,29 @@ fn dir_rename_removes_subtree_from_index() {
                 extra: Vec::new(),
                 mime: None,
             },
-            make_doc("dir/note-uniqlex.txt", "uniqlex note", Some("uniqlex body alpha")),
-            make_doc("dir/sub/deep-uniqlex.md", "deep uniqlex", Some("uniqlex body beta")),
-            make_doc("other-uniqlex.txt", "other uniqlex", Some("uniqlex body gamma")),
+            make_doc(
+                "dir/note-uniqlex.txt",
+                "uniqlex note",
+                Some("uniqlex body alpha"),
+            ),
+            make_doc(
+                "dir/sub/deep-uniqlex.md",
+                "deep uniqlex",
+                Some("uniqlex body beta"),
+            ),
+            make_doc(
+                "other-uniqlex.txt",
+                "other uniqlex",
+                Some("uniqlex body gamma"),
+            ),
         ];
         tx.send(Mutation::UpsertMany(docs)).await.unwrap();
         let _ = tx.commit_now().await.unwrap();
 
-        let q = Query { text: "uniqlex".into(), limit: 20 };
+        let q = Query {
+            text: "uniqlex".into(),
+            limit: 20,
+        };
         let before = search.search(&q).await.unwrap();
         let before_titles: Vec<String> = before.iter().map(|h| h.title.clone()).collect();
         assert!(before_titles.iter().any(|t| t == "uniqlex note"));
@@ -249,11 +288,9 @@ fn symlink_delete_removes_stored_canonical_id() {
 
     rt.block_on(async {
         let tmp = tempfile::tempdir().unwrap();
-        let idx = LixunIndex::create_or_open(
-            tmp.path().to_str().unwrap(),
-            RankingConfig::default(),
-        )
-        .unwrap();
+        let idx =
+            LixunIndex::create_or_open(tmp.path().to_str().unwrap(), RankingConfig::default())
+                .unwrap();
         let (tx, search, _handle) = spawn_writer_service(idx).unwrap();
 
         // Observed (raw, symlinked) path differs from the canonical id
@@ -364,8 +401,9 @@ fn file_event_round_trip() {
 
     rt.block_on(async {
         let tmp = tempfile::tempdir().unwrap();
-        let idx = LixunIndex::create_or_open(tmp.path().to_str().unwrap(), RankingConfig::default())
-            .unwrap();
+        let idx =
+            LixunIndex::create_or_open(tmp.path().to_str().unwrap(), RankingConfig::default())
+                .unwrap();
         let (tx, search, _handle) = spawn_writer_service(idx).unwrap();
 
         let id = "fs:/tmp/roundtrip-evtwn.txt";
@@ -402,9 +440,12 @@ fn file_event_round_trip() {
         };
 
         // CREATE → indexed.
-        tx.send(Mutation::Upsert(Box::new(doc("evtwn original", "evtwn body one"))))
-            .await
-            .unwrap();
+        tx.send(Mutation::Upsert(Box::new(doc(
+            "evtwn original",
+            "evtwn body one",
+        ))))
+        .await
+        .unwrap();
         let _ = tx.commit_now().await.unwrap();
         let after_create = titles(search.search(&q).await.unwrap());
         assert!(
@@ -413,9 +454,12 @@ fn file_event_round_trip() {
         );
 
         // MODIFY → same id, updated title (upsert overwrites).
-        tx.send(Mutation::Upsert(Box::new(doc("evtwn modified", "evtwn body two"))))
-            .await
-            .unwrap();
+        tx.send(Mutation::Upsert(Box::new(doc(
+            "evtwn modified",
+            "evtwn body two",
+        ))))
+        .await
+        .unwrap();
         let _ = tx.commit_now().await.unwrap();
         let after_modify = titles(search.search(&q).await.unwrap());
         assert!(
@@ -449,11 +493,19 @@ fn file_event_round_trip() {
             "old-path doc survived the rename as a ghost: {after_rename:?}",
         );
         let ids_after_rename = search.all_doc_ids().await.unwrap();
-        assert!(!ids_after_rename.contains(id), "old id lingered after rename");
-        assert!(ids_after_rename.contains(new_id), "new id missing after rename");
+        assert!(
+            !ids_after_rename.contains(id),
+            "old id lingered after rename"
+        );
+        assert!(
+            ids_after_rename.contains(new_id),
+            "new id missing after rename"
+        );
 
         // DELETE → gone.
-        tx.send(Mutation::DeleteSubtree(new_id.into())).await.unwrap();
+        tx.send(Mutation::DeleteSubtree(new_id.into()))
+            .await
+            .unwrap();
         let _ = tx.commit_now().await.unwrap();
         let after_delete = titles(search.search(&q).await.unwrap());
         assert!(
@@ -467,9 +519,12 @@ fn file_event_round_trip() {
 
 #[test]
 fn config_example_matches_struct_keys() {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/config.example.toml");
-    let content = std::fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("cannot read {path}: {e}"));
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../docs/config.example.toml"
+    );
+    let content =
+        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("cannot read {path}: {e}"));
     lixun_daemon::config::Config::from_toml_str(&content).unwrap_or_else(|e| {
         panic!("docs/config.example.toml no longer deserializes into Config: {e}")
     });

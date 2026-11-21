@@ -26,28 +26,27 @@ pub async fn reindex_full(
     config: &dyn IndexerSources,
     registry: &SourceRegistry,
     state_dir: &Path,
+    indexed_ids: HashSet<String>,
 ) -> Result<ReindexOutcome> {
-    let state_dir_owned = state_dir.to_path_buf();
-    let _ = std::fs::remove_file(state_dir_owned.join("manifest.json"));
-
-    let fs_count = {
+    let mut manifest = Manifest::load(state_dir);
+    for id in indexed_ids {
+        if let Some(path) = id.strip_prefix("fs:") {
+            manifest.update(path.to_owned(), i64::MIN);
+        }
+    }
+    let (fs_count, manifest, deleted, policy) = {
         let (batch_tx, mut batch_rx) = tokio::sync::mpsc::channel::<Vec<Document>>(2);
         let fs_source = config.build_fs_source()?;
-        let empty_ids: HashSet<String> = HashSet::new();
+        let policy = Box::new(fs_source.path_policy());
         let runtime = tokio::runtime::Handle::current();
-        let state_dir_for_walk = state_dir_owned.clone();
-
-        let walk_task = tokio::task::spawn_blocking(move || -> Result<()> {
-            let mut manifest = Manifest::default();
-            let _deleted =
-                fs_source.index_incremental_batched(&mut manifest, &empty_ids, |docs| {
+        let walk_task = tokio::task::spawn_blocking(move || -> Result<_> {
+            let deleted =
+                fs_source.index_incremental_batched(&mut manifest, &HashSet::new(), |docs| {
                     runtime
                         .block_on(batch_tx.send(docs))
-                        .map_err(|_| anyhow::anyhow!("reindex consumer closed"))?;
-                    Ok(())
+                        .map_err(|_| anyhow::anyhow!("reindex consumer closed"))
                 })?;
-            manifest.save(&state_dir_for_walk);
-            Ok(())
+            Ok((manifest, deleted))
         });
 
         let mut fs_count = 0usize;
@@ -59,12 +58,16 @@ pub async fn reindex_full(
             // one batch per COMMIT_MIN_INTERVAL while extractors sit idle.
             mutation_tx.applied().await?;
         }
-        walk_task.await??;
-        fs_count
+        let (manifest, deleted) = walk_task.await??;
+        (fs_count, manifest, deleted, policy)
     };
 
-    let other_count = reindex_non_fs_from_registry(mutation_tx, registry).await?;
+    mutation_tx
+        .send(Mutation::ReconcileFiles(deleted, policy))
+        .await?;
+    let other_count = reindex_non_fs_from_registry(mutation_tx, registry, false).await?;
     mutation_tx.commit_now().await?;
+    manifest.save_checked(state_dir)?;
 
     tracing::info!(
         "Full reindex: {} fs docs, {} other docs, manifest rebuilt",
@@ -87,7 +90,7 @@ pub async fn reindex_paths(
     let caps = config.caps();
     let enqueue = config.ocr_enqueue();
     let body_checker = config.body_checker();
-    let exclude = config.exclude().to_vec();
+    let fs_source = config.build_fs_source()?;
     let max_file_size_mb = config.max_file_size_mb();
     let min_image_side_px = config.min_image_side_px();
     let paths = paths.to_vec();
@@ -96,7 +99,12 @@ pub async fn reindex_paths(
     // them off the async workers.
     let all_docs = tokio::task::spawn_blocking(move || -> Result<Vec<Document>> {
         let mut all_docs: Vec<Document> = Vec::new();
+        let mut source = fs_source;
+        let policy = source.path_policy();
         for path in &paths {
+            if policy.matches(path) {
+                continue;
+            }
             if path.is_file() {
                 let enq_ref = enqueue
                     .as_ref()
@@ -115,14 +123,7 @@ pub async fn reindex_paths(
                     all_docs.push(doc);
                 }
             } else if path.is_dir() {
-                let source = lixun_sources::fs::FsSource::new_with_ocr(
-                    vec![path.clone()],
-                    exclude.clone(),
-                    max_file_size_mb,
-                    Arc::clone(&caps),
-                    enqueue.clone(),
-                )
-                .with_body_checker(body_checker.clone());
+                source.roots = vec![path.clone()];
                 all_docs.extend(source.index_all()?);
             }
         }
@@ -162,6 +163,7 @@ pub async fn run_incremental(
     let fs_count = {
         let (batch_tx, mut batch_rx) = tokio::sync::mpsc::channel::<Vec<Document>>(2);
         let fs_source = config.build_fs_source()?;
+        let policy = Box::new(fs_source.path_policy());
         let indexed_ids_cloned = indexed_ids.clone();
         let manifest_for_walk = std::mem::take(&mut manifest);
         let runtime = tokio::runtime::Handle::current();
@@ -195,7 +197,9 @@ pub async fn run_incremental(
         let had_deletes = !deleted_ids.is_empty();
         if had_deletes {
             let del_count = deleted_ids.len();
-            mutation_tx.send(Mutation::DeleteMany(deleted_ids)).await?;
+            mutation_tx
+                .send(Mutation::ReconcileFiles(deleted_ids, policy))
+                .await?;
             tracing::info!(
                 "Filesystem incremental: +{} docs, -{} deleted",
                 fs_count,
@@ -215,7 +219,7 @@ pub async fn run_incremental(
     };
 
     let other_count = if rebuilt_from_scratch {
-        reindex_non_fs_from_registry(mutation_tx, registry).await?
+        reindex_non_fs_from_registry(mutation_tx, registry, true).await?
     } else {
         tracing::info!(
             "Incremental indexer: skipping non-fs reindex_full (warm start, {} instance(s) will catch up via on_fs_events/on_tick)",
@@ -224,13 +228,14 @@ pub async fn run_incremental(
         0
     };
 
-    manifest.save(state_dir);
+    manifest.save_checked(state_dir)?;
     Ok((fs_count, other_count))
 }
 
 async fn reindex_non_fs_from_registry(
     mutation_tx: &IndexMutationTx,
     registry: &SourceRegistry,
+    after_schema_wipe: bool,
 ) -> Result<usize> {
     let writer_sink: Arc<dyn MutationSink> = Arc::new(WriterSink::new(mutation_tx.clone()));
     let counter = Arc::new(AtomicUsize::new(0));
@@ -243,7 +248,7 @@ async fn reindex_non_fs_from_registry(
         if inst.source.kind() == "fs" {
             continue;
         }
-        if !inst.source.reindex_on_schema_wipe() {
+        if after_schema_wipe && !inst.source.reindex_on_schema_wipe() {
             tracing::info!(
                 "Source instance {} opts out of schema-wipe reindex (explicit `lixun reindex` required)",
                 inst.instance_id
@@ -328,6 +333,10 @@ mod tests {
     }
 
     impl IndexerSource for StubSource {
+        fn reindex_on_schema_wipe(&self) -> bool {
+            false
+        }
+
         fn kind(&self) -> &'static str {
             self.kind
         }
@@ -367,6 +376,40 @@ mod tests {
             sink.emit(SourceMutation::Upsert(Box::new(doc)))?;
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn manual_rebuild_includes_a_source_that_opts_out_after_schema_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let index = lixun_index::LixunIndex::create_or_open(
+            tmp.path().to_str().unwrap(),
+            Default::default(),
+        )
+        .unwrap();
+        let (tx, search, _writer) = crate::index_service::spawn_writer_service(index).unwrap();
+        let mut registry = SourceRegistry::new();
+        registry.instances.push(crate::registry::SourceInstance {
+            instance_id: "archive".into(),
+            state_dir: tmp.path().to_owned(),
+            source: Arc::new(StubSource {
+                kind: "archive",
+                emitted_for: Mutex::new(Vec::new()),
+            }),
+        });
+        assert_eq!(
+            reindex_non_fs_from_registry(&tx, &registry, true)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            reindex_non_fs_from_registry(&tx, &registry, false)
+                .await
+                .unwrap(),
+            1
+        );
+        tx.commit_now().await.unwrap();
+        assert!(search.all_doc_ids().await.unwrap().contains("archive:1"));
     }
 
     #[test]

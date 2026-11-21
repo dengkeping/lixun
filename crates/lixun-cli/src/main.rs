@@ -25,6 +25,7 @@ const BUILTIN_VERBS: &[&str] = &[
     "status",
     "impact",
     "check-exclude",
+    "clean-private-history",
     "dashboard",
     "hidden",
 ];
@@ -38,13 +39,17 @@ async fn open_daemon_stream() -> Result<UnixStream> {
     Ok(stream)
 }
 
+static PEER_VERSION: std::sync::atomic::AtomicU16 =
+    std::sync::atomic::AtomicU16::new(lixun_ipc::PROTOCOL_VERSION_LEGACY);
+
 async fn write_request(stream: &mut UnixStream, req: &Request) -> Result<()> {
-    let payload = lixun_ipc::encode_request_for_version(PROTOCOL_VERSION, req)
+    let version = PEER_VERSION.load(std::sync::atomic::Ordering::Relaxed);
+    let payload = lixun_ipc::encode_request_for_version(version, req)
         .context("encode request for protocol version")?;
     let total_len = (2 + payload.len()) as u32;
     let mut buf = BytesMut::with_capacity(4 + 2 + payload.len());
     buf.put_u32(total_len);
-    buf.put_u16(PROTOCOL_VERSION);
+    buf.put_u16(version);
     buf.put_slice(&payload);
     stream.write_all(&buf).await?;
     Ok(())
@@ -77,7 +82,10 @@ async fn read_response_frame(stream: &mut UnixStream) -> Result<Response> {
 async fn send_request(req: Request) -> Result<Response> {
     let mut stream = open_daemon_stream().await?;
     write_request(&mut stream, &req).await?;
-    read_response_frame(&mut stream).await
+    match read_response_frame(&mut stream).await? {
+        Response::Error(message) => anyhow::bail!("{message}"),
+        response => Ok(response),
+    }
 }
 
 async fn run_search(query: String, limit: u32, explain: bool) -> Result<Response> {
@@ -101,6 +109,7 @@ async fn run_search(query: String, limit: u32, explain: bool) -> Result<Response
                 phase: Phase::Initial,
                 ..
             } => continue,
+            Response::Error(message) => anyhow::bail!("{message}"),
             other => return Ok(other),
         }
     }
@@ -139,6 +148,7 @@ fn leak_string(s: &str) -> &'static str {
 
 fn root_command(plugin_verbs: &[CliVerb]) -> Command {
     let mut root = Command::new("lixun-cli")
+        .version(env!("CARGO_PKG_VERSION"))
         .about("Spotlight-like launcher for Linux")
         .subcommand_required(true)
         .arg_required_else_help(true)
@@ -215,15 +225,24 @@ fn root_command(plugin_verbs: &[CliVerb]) -> Command {
                 .about("Check if a path would be excluded by current config.")
                 .arg(Arg::new("path").required(true).help("Path to check")),
         )
+        .subcommand(
+            Command::new("clean-private-history")
+                .about(
+                    "Count stored entries excluded by active sources, or remove them with --apply",
+                )
+                .arg(
+                    Arg::new("apply")
+                        .long("apply")
+                        .action(clap::ArgAction::SetTrue),
+                ),
+        )
         .subcommand(Command::new("dashboard").about("Launch btop-style TUI dashboard"))
         .subcommand(
             Command::new("hidden")
                 .about("Inspect and undo \"Hide from results\" (ranking blocklist).")
                 .subcommand_required(true)
                 .arg_required_else_help(true)
-                .subcommand(
-                    Command::new("list").about("List every doc id hidden from results."),
-                )
+                .subcommand(Command::new("list").about("List every doc id hidden from results."))
                 .subcommand(
                     Command::new("unhide")
                         .about("Remove a doc id from the blocklist so it appears again.")
@@ -279,35 +298,32 @@ fn handle_check_exclude(path_str: &str) -> Result<()> {
     let config = lixun_daemon::config::Config::load()?;
 
     let path = Path::new(path_str);
-    let path_lossy = path.to_string_lossy();
-
-    for substr in &config.exclude {
-        if path_lossy.contains(substr.as_str()) {
-            println!("EXCLUDED by substring: '{}'", substr);
-            return Ok(());
-        }
+    let mut rules = lixun_sources::exclude::lixun_self_excludes();
+    rules.extend(lixun_daemon::sources_glue::plugin_fs_excludes());
+    rules.extend(config.exclude);
+    match lixun_sources::exclude::PathPolicy::new(&config.roots, &rules, &config.exclude_regex)
+        .reason(path)
+    {
+        Some(reason) => println!("EXCLUDED by {reason}"),
+        None => println!("NOT EXCLUDED"),
     }
-
-    for regex in &config.exclude_regex {
-        if regex.is_match(&path_lossy) {
-            println!("EXCLUDED by regex: '{}'", regex.as_str());
-            return Ok(());
-        }
-    }
-
-    for substr in lixun_sources::exclude::lixun_self_excludes() {
-        if path_lossy.contains(substr.as_str()) {
-            println!("EXCLUDED by lixun self-exclude: '{}'", substr);
-            return Ok(());
-        }
-    }
-
-    println!("NOT EXCLUDED");
     Ok(())
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if PROTOCOL_VERSION != lixun_ipc::PROTOCOL_VERSION_LEGACY
+        && let Ok(Ok(Response::Capabilities { versions, .. })) = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            send_request(Request::Capabilities),
+        )
+        .await
+    {
+        PEER_VERSION.store(
+            lixun_ipc::client_version(&versions),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
     let plugin_verbs: Vec<CliVerb> = match send_request(Request::EnumeratePlugins).await {
         Ok(Response::PluginManifest(manifest)) => manifest.verbs,
         Ok(Response::PluginError(msg)) => {
@@ -386,6 +402,14 @@ async fn main() -> Result<()> {
                 }
                 other => anyhow::bail!("unknown impact subcommand: {}", other),
             }
+        }
+        "clean-private-history" => {
+            let apply = sub_matches.get_flag("apply");
+            let response = send_request(Request::CleanPrivateHistory { apply }).await?;
+            if !apply {
+                println!("Preview only. Use --apply to remove these entries.");
+            }
+            handle_response(response, false);
         }
         "check-exclude" => {
             let path = sub_matches
@@ -478,9 +502,10 @@ async fn dashboard_main() -> Result<()> {
                 let mut lines = BufReader::new(stdout).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
                     if let Some(entry) = dashboard::LogEntry::parse(&line)
-                        && log_tx.send(entry).is_err() {
-                            break;
-                        }
+                        && log_tx.send(entry).is_err()
+                    {
+                        break;
+                    }
                 }
             });
         }
@@ -572,30 +597,30 @@ async fn dashboard_main() -> Result<()> {
                         );
                         if let Ok(mut s) = open_daemon_stream().await
                             && let Ok(_) = write_request(&mut s, &Request::Status).await
-                                && let Ok(Response::Status {
-                                    indexed_docs,
-                                    memory,
-                                    watcher,
-                                    writer,
-                                    ocr,
-                                    ..
-                                }) = read_response_frame(&mut s).await
-                                {
-                                    app.indexed_docs = indexed_docs;
-                                    app.memory = memory;
-                                    app.watcher = watcher;
-                                    app.writer = writer;
-                                    app.ocr_stats = ocr;
-                                    app.connected = true;
-                                    app.restart_status = dashboard::app::RestartStatus::Idle;
-                                    app.update_semantic_status();
-                                    app.push_log_message(
-                                        "Daemon restarted successfully".to_string(),
-                                        dashboard::LogLevel::Info,
-                                    );
-                                    reconnected = true;
-                                    break;
-                                }
+                            && let Ok(Response::Status {
+                                indexed_docs,
+                                memory,
+                                watcher,
+                                writer,
+                                ocr,
+                                ..
+                            }) = read_response_frame(&mut s).await
+                        {
+                            app.indexed_docs = indexed_docs;
+                            app.memory = memory;
+                            app.watcher = watcher;
+                            app.writer = writer;
+                            app.ocr_stats = ocr;
+                            app.connected = true;
+                            app.restart_status = dashboard::app::RestartStatus::Idle;
+                            app.update_semantic_status();
+                            app.push_log_message(
+                                "Daemon restarted successfully".to_string(),
+                                dashboard::LogLevel::Info,
+                            );
+                            reconnected = true;
+                            break;
+                        }
                         tokio::time::sleep(Duration::from_millis(500)).await;
                     }
 
@@ -872,7 +897,10 @@ fn handle_response(resp: Response, ocr_only: bool) {
                 return;
             }
             println!("Indexed documents: {}", indexed_docs);
-            println!("Last reindex: {}", format_opt_datetime(last_reindex.as_ref()));
+            println!(
+                "Last reindex: {}",
+                format_opt_datetime(last_reindex.as_ref())
+            );
             println!("Errors: {}", errors);
             if reindex_in_progress {
                 println!(
@@ -935,6 +963,16 @@ fn handle_response(resp: Response, ocr_only: bool) {
             eprintln!("Error: recents response routed to built-in handler");
         }
         // Handled inline by the `hidden` subcommand; defensive guard.
+        Response::PrivateHistory {
+            queries,
+            clicks,
+            associations,
+        } => {
+            println!(
+                "Queries: {queries}, click records: {clicks}, query associations: {associations}"
+            );
+        }
+        Response::Capabilities { .. } => {}
         Response::HiddenDocs(ids) => {
             for id in ids {
                 println!("{id}");
@@ -1107,7 +1145,10 @@ mod tests {
             enabled: true,
             state: SemanticWorkerState::Ready,
         };
-        assert_eq!(format_semantic_line(Some(&on)).unwrap(), "Semantic: on (ready)");
+        assert_eq!(
+            format_semantic_line(Some(&on)).unwrap(),
+            "Semantic: on (ready)"
+        );
         let missing = SemanticStatus {
             enabled: true,
             state: SemanticWorkerState::NotFound,

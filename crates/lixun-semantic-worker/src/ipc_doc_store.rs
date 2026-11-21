@@ -108,7 +108,7 @@ impl DocStore for IpcDocStore {
                 lixun_semantic_proto::CallbackResp::HydrateDoc
                 doc-comment); the only consumer in start_backfill
                 ignores it, so a default value is sufficient. */
-                Ok(hit.map(|h| (h, ScoreBreakdown::default())))
+                Ok(hit.map(|h| (*h, ScoreBreakdown::default())))
             }
             CallbackResp::Error { code, detail } => {
                 tracing::warn!(?code, %detail, doc_id = %doc_id, "ipc_doc_store: hydrate_doc failed");

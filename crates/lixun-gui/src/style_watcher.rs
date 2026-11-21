@@ -36,6 +36,10 @@ const DEBOUNCE_MS: u64 = 80;
 /// thread. The pump in `window.rs` reads these from an
 /// `async_channel::Receiver` and reloads the matching CSS provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[expect(
+    clippy::enum_variant_names,
+    reason = "public event variants describe completed filesystem changes"
+)]
 pub enum StyleEvent {
     /// `config.toml` was modified. Caller reloads `Config` and applies
     /// the new theme / blur flag.
@@ -183,9 +187,10 @@ fn classify(
         return Some(RawHit::ColorsCss);
     }
     if let Some(theme) = theme_css
-        && paths_equivalent(path, theme) {
-            return Some(RawHit::ThemeCss);
-        }
+        && paths_equivalent(path, theme)
+    {
+        return Some(RawHit::ThemeCss);
+    }
     None
 }
 

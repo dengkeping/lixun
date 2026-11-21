@@ -953,11 +953,16 @@ fn duplicate_accel_warnings(kb: &Keybindings) -> Vec<String> {
 impl Config {
     pub fn load() -> Result<Self> {
         let config_path = config_dir().join("lixun/config.toml");
-        if !config_path.exists() {
-            return Ok(Self::default());
+        match std::fs::symlink_metadata(&config_path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(e) => return Err(e.into()),
+            Ok(_) => {}
         }
-        let content = std::fs::read_to_string(&config_path)?;
-        Self::from_toml_str(&content)
+        Self::read_existing(&config_path)
+    }
+
+    pub fn read_existing(path: &std::path::Path) -> Result<Self> {
+        Self::from_toml_str(&std::fs::read_to_string(path)?)
     }
 
     /// Resolved path of the user config file, plus whether it exists
@@ -969,20 +974,18 @@ impl Config {
         (path, exists)
     }
 
-    /// Load the config, falling back to built-in defaults instead of
-    /// failing when the file is unreadable or does not parse (O2): a
-    /// config typo must degrade search defaults, never kill the
-    /// daemon — and with it the global hotkey. Returns the config
-    /// plus the load error string (if any) so the daemon can carry it
-    /// into `Response::Status` for the CLI/GUI to surface.
+    /// For displaying settings when loading fails. Operational callers must
+    /// propagate the error from `load` before starting plugins or index work.
+    #[deprecated(note = "Use Config::load and handle an invalid indexing configuration")]
     pub fn load_or_default() -> (Self, Option<String>) {
         match Self::load() {
             Ok(cfg) => (cfg, None),
-            Err(e) => {
-                let (path, _) = Self::user_config_path();
-                let msg = format!("config: {} failed to load: {e:#}", path.display());
-                tracing::error!("{msg}; continuing with built-in defaults");
-                (Self::default(), Some(msg))
+            Err(error) => {
+                let config = Self {
+                    roots: Vec::new(),
+                    ..Self::default()
+                };
+                (config, Some(error.to_string()))
             }
         }
     }
@@ -1005,14 +1008,9 @@ impl Config {
             }
             if let Some(patterns) = core.exclude_regex {
                 for pat in patterns {
-                    match regex::Regex::new(&pat) {
-                        Ok(r) => cfg.exclude_regex.push(r),
-                        Err(e) => tracing::error!(
-                            "config: skipping invalid [core].exclude_regex '{}': {}",
-                            pat,
-                            e
-                        ),
-                    }
+                    cfg.exclude_regex.push(regex::Regex::new(&pat).map_err(|_| {
+                        anyhow::anyhow!("invalid regular expression in core.exclude_regex")
+                    })?);
                 }
             }
             if let Some(max) = core.max_file_size_mb {
@@ -1372,7 +1370,7 @@ impl Config {
         Self::persist_impact_level_at(config_dir().join("lixun/config.toml"), level)
     }
 
-    /// Same as [`persist_impact_level`] but writes to an explicit path.
+    /// Same as `persist_impact_level` but writes to an explicit path.
     /// Used by unit tests to avoid mutating process-wide environment
     /// state (`XDG_CONFIG_HOME`) which races between parallel tests.
     pub fn persist_impact_level_at(path: PathBuf, level: SystemImpact) -> Result<PathBuf> {
@@ -1811,10 +1809,7 @@ follow_battery = false
             .and_then(|v| v.as_array())
             .expect("keyword array present");
         assert_eq!(keywords.len(), 1);
-        assert_eq!(
-            keywords[0].get("key").and_then(|v| v.as_str()),
-            Some("gh")
-        );
+        assert_eq!(keywords[0].get("key").and_then(|v| v.as_str()), Some("gh"));
     }
 
     #[test]
@@ -1916,8 +1911,13 @@ follow_battery = false
         // here) and half plugin ([[search.keyword]] entries consumed
         // by the keyword source factory); the whole table is kept in
         // plugin_sections so the factory can read it.
-        let documented_plugin_sections =
-            ["calculator", "shell", "semantic", "search", "command_source"];
+        let documented_plugin_sections = [
+            "calculator",
+            "shell",
+            "semantic",
+            "search",
+            "command_source",
+        ];
         for key in top.keys() {
             assert!(
                 KNOWN_TOP_LEVEL_KEYS.contains(&key.as_str())

@@ -149,8 +149,8 @@ impl FsSource {
         self
     }
 
-    fn is_excluded(&self, path: &Path) -> bool {
-        crate::exclude::path_excluded(path, &self.exclude, &self.exclude_regex)
+    pub fn path_policy(&self) -> crate::exclude::PathPolicy {
+        crate::exclude::PathPolicy::new(&self.roots, &self.exclude, &self.exclude_regex)
     }
 
     /// Extract content from a file, going through the T1 bytes cache so
@@ -269,12 +269,21 @@ impl FsSource {
         let mut changed_metas: Vec<FileMeta> = Vec::new();
         let mut resurrected: u64 = 0;
 
+        let offline = manifest.offline_mounts(&self.roots);
+        let mut unreadable = offline.clone();
+        let policy = self.path_policy();
         for root in &self.roots {
-            for entry in walkdir::WalkDir::new(root)
-                .into_iter()
-                .filter_entry(|e| !self.is_excluded(e.path()))
-                .filter_map(|e| e.ok())
-            {
+            for result in walkdir::WalkDir::new(root).into_iter().filter_entry(|e| {
+                !offline.iter().any(|p| e.path().starts_with(p))
+                    && policy.allows_walk_entry(e.path(), root)
+            }) {
+                let entry = match result {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        unreadable.push(error.path().unwrap_or(root).to_owned());
+                        continue;
+                    }
+                };
                 let ft = entry.file_type();
                 if !ft.is_file() && !ft.is_dir() {
                     continue;
@@ -287,6 +296,7 @@ impl FsSource {
 
                 let path = entry.path();
                 let Ok(metadata) = std::fs::metadata(path) else {
+                    unreadable.push(path.to_owned());
                     continue;
                 };
 
@@ -340,6 +350,14 @@ impl FsSource {
         let deleted_ids: Vec<String> = manifest
             .known_paths()
             .filter(|p| !current_files.contains(*p))
+            .filter(|p| !unreadable.iter().any(|area| Path::new(p).starts_with(area)))
+            .filter(|p| {
+                let path = Path::new(p);
+                // Preserve files created behind the walker during this pass.
+                !self.roots.iter().any(|root| path.starts_with(root))
+                    || policy.matches(path)
+                    || matches!(std::fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+            })
             .map(|p| format!("fs:{p}"))
             .collect();
 
@@ -445,10 +463,11 @@ impl FsSource {
 
         let mut metas: Vec<FileMeta> = Vec::new();
 
+        let policy = self.path_policy();
         for root in &self.roots {
             for entry in walkdir::WalkDir::new(root)
                 .into_iter()
-                .filter_entry(|e| !self.is_excluded(e.path()))
+                .filter_entry(|e| policy.allows_walk_entry(e.path(), root))
                 .filter_map(|e| e.ok())
             {
                 let ft = entry.file_type();

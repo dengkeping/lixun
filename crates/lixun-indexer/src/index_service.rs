@@ -65,6 +65,7 @@ pub enum Mutation {
     Delete(String),
     UpsertMany(Vec<Document>),
     DeleteMany(Vec<String>),
+    ReconcileFiles(Vec<String>, Box<lixun_sources::exclude::PathPolicy>),
     /// Purge every doc whose id equals `prefix` OR starts with
     /// `prefix + "/"`. Sole entry point for directory removals and
     /// rename-aways: a watched dir vanishes, the watcher emits this
@@ -135,8 +136,7 @@ impl IndexMutationTx {
     pub async fn applied(&self) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         self.send(Mutation::Applied(tx)).await?;
-        rx.await
-            .map_err(|_| anyhow::anyhow!("applied ack dropped"))
+        rx.await.map_err(|_| anyhow::anyhow!("applied ack dropped"))
     }
 
     pub async fn commit_now(&self) -> Result<u64> {
@@ -165,7 +165,7 @@ impl IndexMutationTx {
 pub struct SearchHandle {
     index: Arc<LixunIndex>,
     permits: Arc<Semaphore>,
-    /// Bounded lexical result cache keyed by (query text, limit,
+    /// Bounded lexical result cache keyed by (query text, limit, category,
     /// reload epoch). The epoch component means a commit+reload
     /// naturally invalidates every prior entry; stage-2 (frecency /
     /// latch) is applied downstream per request, so click feedback
@@ -175,16 +175,18 @@ pub struct SearchHandle {
 
 type CachedPairs = Vec<(lixun_core::Hit, lixun_core::ScoreBreakdown)>;
 
-struct ResultCache(std::collections::HashMap<(String, u32, u64), CachedPairs>);
+type CacheKey = (String, u32, Option<lixun_core::Category>, u64);
+
+struct ResultCache(std::collections::HashMap<CacheKey, CachedPairs>);
 
 const RESULT_CACHE_MAX: usize = 64;
 
 impl ResultCache {
-    fn get(&self, key: &(String, u32, u64)) -> Option<CachedPairs> {
+    fn get(&self, key: &CacheKey) -> Option<CachedPairs> {
         self.0.get(key).cloned()
     }
 
-    fn put(&mut self, key: (String, u32, u64), pairs: CachedPairs) {
+    fn put(&mut self, key: CacheKey, pairs: CachedPairs) {
         if self.0.len() >= RESULT_CACHE_MAX {
             self.0.clear();
         }
@@ -235,9 +237,18 @@ impl SearchHandle {
         &self,
         query: &lixun_core::Query,
     ) -> Result<Vec<(lixun_core::Hit, lixun_core::ScoreBreakdown)>> {
+        self.search_in_category(query, None).await
+    }
+
+    pub async fn search_in_category(
+        &self,
+        query: &lixun_core::Query,
+        category: Option<lixun_core::Category>,
+    ) -> Result<CachedPairs> {
         let key = (
             query.text.clone(),
             query.limit,
+            category,
             self.index.reload_epoch(),
         );
         if let Ok(cache) = self.result_cache.lock()
@@ -247,12 +258,25 @@ impl SearchHandle {
         }
         let q = query.clone();
         let pairs = self
-            .run_blocking(move |idx| idx.search_with_breakdown(&q))
+            .run_blocking(move |idx| idx.search_in_category(&q, category))
             .await?;
         if let Ok(mut cache) = self.result_cache.lock() {
             cache.put(key, pairs.clone());
         }
         Ok(pairs)
+    }
+
+    pub async fn ids_in_category(
+        &self,
+        ids: std::collections::HashSet<String>,
+        category: lixun_core::Category,
+    ) -> Result<std::collections::HashSet<String>> {
+        self.run_blocking(move |idx| idx.ids_in_category(&ids, category))
+            .await
+    }
+
+    pub fn document_count(&self) -> u64 {
+        self.index.reader().searcher().num_docs()
     }
 
     pub async fn all_doc_ids(&self) -> Result<std::collections::HashSet<String>> {
@@ -446,7 +470,7 @@ async fn writer_loop(
                     }
 
                     Mutation::Upsert(doc) => {
-                        if id_tombstoned(&doc.id.0, &subtree_tombstones) {
+                        if discard_removed_document(&doc, &subtree_tombstones, &mut pending_batch) {
                             tracing::debug!(
                                 "IndexService: upsert {} dropped, subtree deleted in this batch",
                                 doc.id.0
@@ -461,7 +485,7 @@ async fn writer_loop(
 
                     Mutation::UpsertMany(docs) => {
                         for doc in &docs {
-                            if id_tombstoned(&doc.id.0, &subtree_tombstones) {
+                            if discard_removed_document(doc, &subtree_tombstones, &mut pending_batch) {
                                 tracing::debug!(
                                     "IndexService: upsert {} dropped, subtree deleted in this batch",
                                     doc.id.0
@@ -485,15 +509,12 @@ async fn writer_loop(
                     }
 
                     Mutation::DeleteMany(ids) => {
-                        for id in ids {
-                            if let Err(e) = apply_delete(&shared, &mut writer, &id) {
-                                tracing::warn!("IndexService: delete {} failed: {}", id, e);
-                            } else {
-                                pending_batch.deletes.push(id);
-                                dirty = true;
-                            }
-                        }
-                    }
+                    dirty |= apply_deletes(&shared, &mut writer, &mut pending_batch, ids);
+                }
+                Mutation::ReconcileFiles(mut ids, policy) => {
+                    ids.retain(|id| id.strip_prefix("fs:").is_some_and(|p| policy.should_remove(std::path::Path::new(p))));
+                    dirty |= apply_deletes(&shared, &mut writer, &mut pending_batch, ids);
+                }
 
                     Mutation::DeleteSubtree(prefix) => {
                         let matched = collect_subtree_ids(&shared, &pending_batch, &prefix);
@@ -608,7 +629,7 @@ async fn writer_loop(
     while let Ok(mutation) = rx.try_recv() {
         match mutation {
             Mutation::Upsert(doc) => {
-                if !id_tombstoned(&doc.id.0, &subtree_tombstones)
+                if !discard_removed_document(&doc, &subtree_tombstones, &mut pending_batch)
                     && apply_upsert(&shared, &mut writer, doc.as_ref()).is_ok()
                 {
                     pending_batch.upserts.push(upserted_doc_from(doc.as_ref()));
@@ -617,7 +638,7 @@ async fn writer_loop(
             }
             Mutation::UpsertMany(docs) => {
                 for doc in &docs {
-                    if !id_tombstoned(&doc.id.0, &subtree_tombstones)
+                    if !discard_removed_document(doc, &subtree_tombstones, &mut pending_batch)
                         && apply_upsert(&shared, &mut writer, doc).is_ok()
                     {
                         pending_batch.upserts.push(upserted_doc_from(doc));
@@ -632,13 +653,16 @@ async fn writer_loop(
                 dirty = true;
             }
             Mutation::DeleteMany(ids) => {
-                for id in ids {
-                    if apply_delete(&shared, &mut writer, &id).is_ok() {
-                        pending_batch.deletes.push(id);
-                    }
-                    dirty = true;
-                }
+                dirty |= apply_deletes(&shared, &mut writer, &mut pending_batch, ids);
             }
+            Mutation::ReconcileFiles(mut ids, policy) => {
+                ids.retain(|id| {
+                    id.strip_prefix("fs:")
+                        .is_some_and(|p| policy.should_remove(std::path::Path::new(p)))
+                });
+                dirty |= apply_deletes(&shared, &mut writer, &mut pending_batch, ids);
+            }
+
             Mutation::DeleteSubtree(prefix) => {
                 let matched = collect_subtree_ids(&shared, &pending_batch, &prefix);
                 pending_batch
@@ -724,6 +748,22 @@ fn apply_delete(
     Ok(())
 }
 
+fn apply_deletes(
+    shared: &LixunIndex,
+    writer: &mut TantivyIndexWriter<TantivyDoc>,
+    batch: &mut MutationBatch,
+    ids: Vec<String>,
+) -> bool {
+    let before = batch.deletes.len();
+    for id in ids {
+        match apply_delete(shared, writer, &id) {
+            Ok(()) => batch.deletes.push(id),
+            Err(error) => tracing::warn!(%error, "IndexService: delete failed"),
+        }
+    }
+    batch.deletes.len() != before
+}
+
 fn id_in_subtree(id: &str, prefix: &str) -> bool {
     if id == prefix {
         return true;
@@ -739,6 +779,33 @@ fn id_in_subtree(id: &str, prefix: &str) -> bool {
 /// `writer_loop`).
 fn id_tombstoned(id: &str, tombstones: &[String]) -> bool {
     tombstones.iter().any(|p| id_in_subtree(id, p))
+}
+
+// A late extraction can arrive after a subtree was removed. A file
+// recreated before commit is valid only if its current snapshot still matches.
+fn discard_removed_document(
+    doc: &Document,
+    prefixes: &[String],
+    pending: &mut MutationBatch,
+) -> bool {
+    if !id_tombstoned(&doc.id.0, prefixes) {
+        return false;
+    }
+    let Some(path) = doc.id.0.strip_prefix("fs:") else {
+        return true;
+    };
+    let Ok(meta) = std::fs::metadata(path) else {
+        return true;
+    };
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok());
+    if !mtime.is_some_and(|t| t.as_secs() as i64 == doc.mtime) || meta.len() != doc.size {
+        return true;
+    }
+    pending.deletes.retain(|id| id != &doc.id.0);
+    false
 }
 
 fn collect_subtree_ids(
@@ -1183,6 +1250,27 @@ mod tests {
         .unwrap();
         let (tx, search, handle) = spawn_writer_service(idx).unwrap();
         (tmp, tx, search, handle)
+    }
+
+    #[tokio::test]
+    async fn recreated_file_survives_a_delete_in_the_same_batch() {
+        let (tmp, tx, search, _handle) = fresh_writer_service();
+        let file = tmp.path().join("new.txt");
+        std::fs::write(&file, b"current").unwrap();
+        let id = fs_doc_id(&file);
+        let mut doc = make_fs_doc(&id);
+        let meta = file.metadata().unwrap();
+        doc.size = meta.len();
+        doc.mtime = meta
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        tx.send(Mutation::DeleteSubtree(id.clone())).await.unwrap();
+        tx.send(Mutation::Upsert(Box::new(doc))).await.unwrap();
+        tx.commit_now().await.unwrap();
+        assert!(search.all_doc_ids().await.unwrap().contains(&id));
     }
 
     #[tokio::test]

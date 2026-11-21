@@ -3,7 +3,7 @@
 //! Shows the contents of `zip`, `tar` (plain / gzip / zstd / bzip2)
 //! and `7z` containers as a flat, read-only entry list. Nothing is
 //! ever extracted to disk: enumeration is header-only (see
-//! [`listing`]). Encrypted, malformed and oversized archives degrade
+//! `listing`). Encrypted, malformed and oversized archives degrade
 //! to an inline message rather than panicking or blocking.
 //!
 //! The widget owns its own scrolling ([`SizingPreference::OwnsScroll`]):

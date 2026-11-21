@@ -183,10 +183,7 @@ fn send_search(stream: &mut UnixStream, q: &str, limit: u32, epoch: u64) {
 
 fn drain_until_final_or_cancelled(stream: &mut UnixStream, target_epoch: u64) -> Duration {
     let start = Instant::now();
-    loop {
-        let Some(resp) = read_response(stream) else {
-            break;
-        };
+    while let Some(resp) = read_response(stream) {
         if let Some(c) = resp.get("SearchChunk") {
             let phase_final = c.get("phase").map(|p| p == "Final").unwrap_or(false);
             let ep = c.get("epoch").and_then(|v| v.as_u64()).unwrap_or(0);

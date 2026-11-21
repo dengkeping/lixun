@@ -9,7 +9,8 @@ lixun-core = { path = "../lixun-core" }
 lixun-mutation = { path = "../lixun-mutation" }
 serde.workspace = true
 serde_json.workspace = true
-postcard = { version = "1", features = ["use-std"] }
+rmp-serde = "1.3"
+postcard = { version = "1", default-features = false, features = ["use-std"] }
 tokio.workspace = true
 tokio-util = { workspace = true, features = ["codec"] }
 bytes.workspace = true
@@ -19,10 +20,5 @@ libc = "0.2"
 
 [features]
 default = ["legacy-json-ipc"]
-# legacy-json-ipc (default: ON for this release)
-#   Gates the v4 serde_json IPC codec. When A2 migrates to a binary
-#   framing, this flag becomes default-OFF and the serde_json path
-#   is compiled out.
-#   Rollback: cargo build -p lixun-ipc --no-default-features --features legacy-json-ipc
-#   Evidence: .workspace-local/evidence/task-a2-ipc-framing.log
+# Select the outgoing format. Readers support all three versions.
 legacy-json-ipc = []

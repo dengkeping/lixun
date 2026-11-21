@@ -71,11 +71,20 @@ impl HybridSearchHandle {
         query: &lixun_core::Query,
         cancel: CancellationToken,
     ) -> Result<mpsc::Receiver<FusionChunk>> {
+        self.search_streaming_in_category(query, None, cancel).await
+    }
+
+    pub async fn search_streaming_in_category(
+        &self,
+        query: &lixun_core::Query,
+        category: Option<lixun_core::Category>,
+        cancel: CancellationToken,
+    ) -> Result<mpsc::Receiver<FusionChunk>> {
         let (tx, rx) = mpsc::channel(2);
 
         if self.ann.is_none() {
             // Lexical-only mode: single Final chunk.
-            let pairs = self.inner.search_with_breakdown(query).await?;
+            let pairs = self.inner.search_in_category(query, category).await?;
             let _ = tx
                 .send(FusionChunk {
                     phase: Phase::Final,
@@ -90,7 +99,10 @@ impl HybridSearchHandle {
         let query = query.clone();
         let handle = self.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle.fused_search_streaming(&query, tx, cancel).await {
+            if let Err(e) = handle
+                .fused_search_streaming(&query, category, tx, cancel)
+                .await
+            {
                 tracing::warn!(target: "lixun_fusion", error = %e, "fused_search_streaming failed");
             }
         });
@@ -129,6 +141,10 @@ impl HybridSearchHandle {
         Ok(final_pairs)
     }
 
+    pub fn document_count(&self) -> u64 {
+        self.inner.document_count()
+    }
+
     pub async fn all_doc_ids(&self) -> Result<std::collections::HashSet<String>> {
         self.inner.all_doc_ids().await
     }
@@ -161,6 +177,7 @@ impl HybridSearchHandle {
     async fn fused_search_streaming(
         &self,
         query: &lixun_core::Query,
+        category: Option<lixun_core::Category>,
         tx: mpsc::Sender<FusionChunk>,
         cancel: CancellationToken,
     ) -> Result<()> {
@@ -177,7 +194,7 @@ impl HybridSearchHandle {
             .expect("fused_search_streaming called without ANN");
 
         // Phase 1: BM25-only, send Initial chunk immediately.
-        let lex_pairs = self.inner.search_with_breakdown(query).await?;
+        let lex_pairs = self.inner.search_in_category(query, category).await?;
         let _ = tx
             .send(FusionChunk {
                 phase: Phase::Initial,
@@ -201,20 +218,33 @@ impl HybridSearchHandle {
             res = async { tokio::join!(text_fut, image_fut, classify_fut) } => res,
         };
 
-        let text_hits = match text_res {
+        let mut text_hits = match text_res {
             Ok(hits) => hits,
             Err(e) => {
                 tracing::debug!(target: "lixun_fusion", error = %e, "text ANN errored, falling back to BM25-only");
                 Vec::new()
             }
         };
-        let image_hits = match image_res {
+        let mut image_hits = match image_res {
             Ok(hits) => hits,
             Err(e) => {
                 tracing::debug!(target: "lixun_fusion", error = %e, "image ANN errored, falling back to BM25-only");
                 Vec::new()
             }
         };
+
+        if let Some(category) = category
+            && !(text_hits.is_empty() && image_hits.is_empty())
+        {
+            let ids = text_hits
+                .iter()
+                .chain(&image_hits)
+                .map(|hit| hit.doc_id.clone())
+                .collect();
+            let allowed = self.inner.ids_in_category(ids, category).await?;
+            text_hits.retain(|hit| allowed.contains(&hit.doc_id));
+            image_hits.retain(|hit| allowed.contains(&hit.doc_id));
+        }
 
         tracing::debug!(
             target: "lixun_fusion",
@@ -279,7 +309,14 @@ impl HybridSearchHandle {
         };
         let weights = match modality {
             lixun_mutation::Modality::Image => (1.0, 0.8, 1.8),
-            lixun_mutation::Modality::Both => (1.0, 1.0, 1.3),
+            // A rank-one neighbour exists even for a channel with no clear
+            // match. For ambiguous intent use the separation of the leading
+            // neighbours within each channel, not raw cross-model distances.
+            lixun_mutation::Modality::Both => (
+                1.0,
+                1.0 + lead_separation(&text_hits),
+                1.0 + 1.3 * lead_separation(&image_hits),
+            ),
             lixun_mutation::Modality::Text => (1.0, 1.0, 1.0),
         };
         tracing::debug!(
@@ -311,16 +348,26 @@ impl HybridSearchHandle {
             .collect();
         let lexical_ids: std::collections::HashSet<String> =
             bm25_ranked.iter().map(|(id, _)| id.clone()).collect();
-        let fused = crate::rrf::precision_first(fused, &precision_ids, &lexical_ids);
+        let mut fused = crate::rrf::precision_first(fused, &precision_ids, &lexical_ids);
 
-        // The RRF order is authoritative for the Final chunk, but downstream
+        // Preserve category priority before the fused page is truncated.
+        // Only full lexical matches carry priority: a semantic neighbour
+        // alone does not establish that the query names a searchable item.
+        let priorities: HashMap<&str, i8> = lex_pairs
+            .iter()
+            .filter(|(_, bd)| !bd.lexical_fallback)
+            .map(|(hit, bd)| (hit.id.0.as_str(), bd.rank_tier(hit.category)))
+            .collect();
+        prioritize_fused(&mut fused, &priorities);
+
+        // The tiered fusion order defines the Final chunk, but downstream
         // stage-2 (frecency/latch) multiplies `hit.score` and re-sorts, and
         // plugin hits compete on the same scale. Raw RRF scores have a very
         // flat dynamic range (~1/(k+rank)), which would let stage-2 dominate.
         // Instead, map fused rank positions onto the BM25 final-score ladder:
-        // the hit RRF ranks #i gets the #i-th highest lexical score. Ordering
-        // follows RRF exactly while the score distribution stage-2 sees is
-        // identical to lexical-only mode.
+        // the hit at position #i gets the #i-th highest lexical score. Ordering
+        // follows category priority then RRF; stage-2 sees the same score
+        // distribution as lexical-only mode.
         // Fallback-tier scores are excluded: a partial match's inflated
         // BM25 value must not become a rank slot's score, or the
         // daemon's post-stage-2 re-sort would promote whatever lands on
@@ -382,13 +429,7 @@ impl HybridSearchHandle {
                 (false, false, true) => "IMAGE_ANN",
                 (false, false, false) => "HYDRATE",
             };
-            tracing::debug!(
-                target: "lixun_fusion",
-                "fusion: hit doc_id={} source={} rrf_score={:.4}",
-                doc_id,
-                source,
-                rrf_score
-            );
+            tracing::debug!(target: "lixun_fusion", source, rrf_score, "fusion result");
             let (mut hit, mut bd) = if let Some(pair) = bm25_by_id.get(&doc_id) {
                 pair.clone()
             } else if let Some(pair) = hydrated_by_id.get(&doc_id) {
@@ -410,6 +451,9 @@ impl HybridSearchHandle {
                 bd.latch_mult = 1.0;
                 bd.stage2_clamped = 1.0;
             }
+            // A lexical refill candidate can independently qualify through ANN.
+            // Only the filler appended below remains in the partial-match tier.
+            bd.lexical_fallback = false;
             let assigned = score_for_rank(pos, rrf_score);
             hit.score = assigned;
             bd.final_score = assigned;
@@ -451,6 +495,30 @@ impl HybridSearchHandle {
     }
 }
 
+/// Stable tier ordering leaves fusion relevance untouched within each tier.
+fn prioritize_fused(fused: &mut [(String, f32)], priorities: &std::collections::HashMap<&str, i8>) {
+    fused.sort_by_key(|(id, _)| {
+        std::cmp::Reverse(priorities.get(id.as_str()).copied().unwrap_or(0))
+    });
+}
+
+fn lead_separation(hits: &[lixun_mutation::AnnHit]) -> f32 {
+    match hits {
+        // A singleton has no observed runner-up. A weak prior preserves
+        // image retrieval in small collections while letting well-separated
+        // text neighbours win ambiguous queries.
+        [only] if only.distance.is_finite() => 0.18,
+        [first, second, ..]
+            if first.distance.is_finite()
+                && second.distance.is_finite()
+                && second.distance > 0.0 =>
+        {
+            ((second.distance - first.distance) / second.distance).clamp(0.0, 1.0)
+        }
+        _ => 0.0,
+    }
+}
+
 /// Filename-shaped query heuristic for the navigational modality pin:
 /// a single token joined by separator characters (`-`, `_`, `.`, `/`)
 /// reads as an identifier the user is naming, not a scene they are
@@ -463,7 +531,46 @@ fn looks_navigational(query: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::looks_navigational;
+    use super::{looks_navigational, prioritize_fused};
+
+    #[test]
+    fn priority_match_survives_semantic_page_cutoff() {
+        let lexical = vec![("app:viewer".into(), 1.0)];
+        let semantic = vec![("fs:photo".into(), 0.1), ("mail:note".into(), 0.2)];
+        let mut fused = crate::rrf::rrf_fuse_3way_weighted(
+            &lexical,
+            &semantic,
+            &semantic,
+            60.0,
+            (1.0, 1.0, 1.8),
+        );
+        assert_ne!(
+            fused[0].0, "app:viewer",
+            "semantic votes reproduce the page-cutoff failure"
+        );
+        let original_scores: std::collections::HashMap<_, _> = fused.iter().cloned().collect();
+        prioritize_fused(&mut fused, &[("app:viewer", 1)].into());
+        assert_eq!(
+            fused[0].0, "app:viewer",
+            "priority must apply before taking the page"
+        );
+        assert_eq!(fused[1].0, "fs:photo");
+        assert_eq!(fused[2].0, "mail:note");
+        for (id, score) in fused {
+            assert_eq!(
+                score, original_scores[&id],
+                "tiering must not alter relevance scores"
+            );
+        }
+    }
+
+    #[test]
+    fn fusion_order_is_unchanged_without_priority_matches() {
+        let mut fused = vec![("mail:note".into(), 0.5), ("fs:photo".into(), 0.3)];
+        let expected = fused.clone();
+        prioritize_fused(&mut fused, &Default::default());
+        assert_eq!(fused, expected);
+    }
 
     #[test]
     fn navigational_detects_separator_joined_tokens() {

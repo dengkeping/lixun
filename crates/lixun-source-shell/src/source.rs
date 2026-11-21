@@ -97,7 +97,7 @@ impl ShellSource {
         let title = if whitelisted {
             format!("Run: {cmd}")
         } else {
-            tracing::warn!(cmd = %cmd, program = %argv[0], "shell plugin: non-whitelisted program");
+            tracing::warn!("shell plugin: unlisted program");
             format!("Run: {cmd} \u{26A0}")
         };
         vec![Hit {
@@ -184,6 +184,10 @@ impl IndexerSource for ShellSource {
         } else {
             self.argv_hit(body, ctx)
         }
+    }
+
+    fn excludes_from_click_history(&self, doc_id: &str) -> bool {
+        doc_id.starts_with("shell:")
     }
 
     fn excludes_from_query_log(&self, query: &str) -> bool {

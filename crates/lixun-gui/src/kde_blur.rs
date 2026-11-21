@@ -127,7 +127,8 @@ const BACKDROP_BLUR_CLASS: &str = "lixun-backdrop-blur";
 /// blur region on its own `ext_background_effect_surface_v1`, following
 /// the CSS border box and radius. The blur strength is up to the
 /// compositor; the value only has to be non-zero.
-const BACKDROP_BLUR_CSS: &str = ".lixun-window.lixun-backdrop-blur { backdrop-filter: blur(12px); }";
+const BACKDROP_BLUR_CSS: &str =
+    ".lixun-window.lixun-backdrop-blur { backdrop-filter: blur(12px); }";
 
 /// Border-radius (in CSS pixels) of `.lixun-window` in style.css. Must
 /// match so the blur region honours the rounded silhouette and the

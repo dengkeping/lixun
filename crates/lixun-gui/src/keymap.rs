@@ -94,9 +94,7 @@ fn visible_categories(filter_model: &gtk::FilterListModel) -> Vec<Category> {
                 .and_then(|o| o.downcast::<gtk::StringObject>().ok())
                 .and_then(|s| {
                     let id = s.string().to_string();
-                    with_cached_hits(|hits| {
-                        hits.iter().find(|h| h.id.0 == id).map(|h| h.category)
-                    })
+                    with_cached_hits(|hits| hits.iter().find(|h| h.id.0 == id).map(|h| h.category))
                 })
                 .unwrap_or(Category::File)
         })
@@ -165,10 +163,13 @@ fn activate_primary_action(
     }
     dispatch_click_pair(&hit.id.0, query_at_activation);
     if let Err(e) = execute_action(hit) {
-        tracing::error!("Action failed: {}", e);
+        tracing::error!("Failed to launch selected action");
         // Keep the launcher up and say what went wrong — a silent
         // failure is indistinguishable from success.
-        status_bar.show_error(&format!("Couldn't open \u{201c}{}\u{201d}: {}", hit.title, e));
+        status_bar.show_error(&format!(
+            "Couldn't open \u{201c}{}\u{201d}: {}",
+            hit.title, e
+        ));
         return false;
     }
     true
@@ -328,14 +329,6 @@ pub(crate) fn install_keyboard_handler(
         #[strong]
         shortcuts_overlay,
         move |_, key, _keycode, state| {
-            let entry_focus = entry_has_focus(&entry, &window);
-            let printable = is_printable_key(key, state);
-            tracing::info!(
-                "gui: window key_controller fired key={:?} entry_focus={} printable={}",
-                key.name(),
-                entry_focus,
-                printable
-            );
             // A focused button (category chip ToggleButton — a Button
             // subclass — or the status bar's "Search the web") must stay
             // activatable from the keyboard: without this, the capture-
@@ -420,8 +413,7 @@ pub(crate) fn install_keyboard_handler(
             // the Top Hit cost Down, Up, Space; the Ctrl chord carries
             // no text so it can fire from typing position. Dispatched
             // before the printable-key short-circuit on purpose.
-            if accel_matches(&keybindings.quick_look_alt, key, state)
-                && filter_model.n_items() > 0
+            if accel_matches(&keybindings.quick_look_alt, key, state) && filter_model.n_items() > 0
             {
                 controller.set_preview_mode_active(true);
                 let monitor = current_monitor_connector(&window);
@@ -721,12 +713,8 @@ pub(crate) fn install_keyboard_handler(
                         // Primary leg shared with Alt+digit (K12):
                         // "Show more", ReplaceQuery, CopyText and the
                         // generic launch all live in the helper.
-                        should_hide = activate_primary_action(
-                            hit,
-                            &entry,
-                            &status_bar,
-                            &query_at_click,
-                        );
+                        should_hide =
+                            activate_primary_action(hit, &entry, &status_bar, &query_at_click);
                         return;
                     }
                     // Secondary ReplaceQuery chains the hit's value back
@@ -776,7 +764,7 @@ pub(crate) fn install_keyboard_handler(
                     }
                     dispatch_click_pair(&hit.id.0, &query_at_click);
                     if let Err(e) = execute_secondary_action(hit) {
-                        tracing::error!("Action failed: {}", e);
+                        tracing::error!("Failed to launch selected action");
                         // Keep the launcher up and say what went wrong.
                         // Hiding on a failed launch makes the failure
                         // indistinguishable from success — the user sees
@@ -917,7 +905,6 @@ pub(crate) fn install_keyboard_handler(
         #[strong]
         controller,
         move |_, key, _keycode, state| {
-            tracing::info!("gui: ENTRY key_controller fired key={:?}", key.name());
             if accel_matches(&keybindings.history_up, key, state) && entry.text().is_empty() {
                 // K9: the history list is already up — Up must not
                 // re-fire the IPC fetch and yank the cursor to row 0.
@@ -1064,7 +1051,11 @@ mod tests {
         // Bare "Down" must no longer match Ctrl+Down — that chord
         // belongs to `next_category`.
         assert!(accel_matches("Down", Key::Down, ModifierType::empty()));
-        assert!(!accel_matches("Down", Key::Down, ModifierType::CONTROL_MASK));
+        assert!(!accel_matches(
+            "Down",
+            Key::Down,
+            ModifierType::CONTROL_MASK
+        ));
         assert!(accel_matches(
             "<Ctrl>Down",
             Key::Down,
@@ -1076,18 +1067,30 @@ mod tests {
             Key::Return,
             ModifierType::SHIFT_MASK
         ));
-        assert!(!accel_matches("<Shift>Return", Key::Return, ModifierType::empty()));
+        assert!(!accel_matches(
+            "<Shift>Return",
+            Key::Return,
+            ModifierType::empty()
+        ));
         // Bare "space" quick_look must not fire on Ctrl+space so it
         // cannot shadow quick_look_alt.
         assert!(accel_matches("space", Key::space, ModifierType::empty()));
-        assert!(!accel_matches("space", Key::space, ModifierType::CONTROL_MASK));
+        assert!(!accel_matches(
+            "space",
+            Key::space,
+            ModifierType::CONTROL_MASK
+        ));
         assert!(accel_matches(
             "<Ctrl>space",
             Key::space,
             ModifierType::CONTROL_MASK
         ));
         // CapsLock must not break plain bindings.
-        assert!(accel_matches("Return", Key::Return, ModifierType::LOCK_MASK));
+        assert!(accel_matches(
+            "Return",
+            Key::Return,
+            ModifierType::LOCK_MASK
+        ));
         // Unparseable accels never match.
         assert!(!accel_matches("<Bogus>x", Key::x, ModifierType::empty()));
     }

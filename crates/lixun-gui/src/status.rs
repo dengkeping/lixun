@@ -319,7 +319,11 @@ pub(crate) fn web_search_url_for(template: &str, query: &str) -> String {
     } else {
         // Defensive: lixun-config validates the placeholder, but a
         // caller-supplied template may bypass it.
-        format!("{}{}", lixun_config::DEFAULT_WEB_ENGINE_URL.replace("{query}", ""), encoded)
+        format!(
+            "{}{}",
+            lixun_config::DEFAULT_WEB_ENGINE_URL.replace("{query}", ""),
+            encoded
+        )
     }
 }
 

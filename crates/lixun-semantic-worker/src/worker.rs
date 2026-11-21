@@ -288,9 +288,7 @@ impl WorkerThread {
         plain map or session, so recovering the inner guard is sound
         and keeps the batch from being silently dropped. */
         let mut j = self.journal.lock().unwrap_or_else(|poisoned| {
-            tracing::warn!(
-                "semantic embed worker: journal mutex poisoned; recovering inner guard"
-            );
+            tracing::warn!("semantic embed worker: journal mutex poisoned; recovering inner guard");
             poisoned.into_inner()
         });
         for id in &ids {
@@ -407,11 +405,7 @@ impl WorkerThread {
 
         let original_paths: Vec<std::path::PathBuf> = batch
             .iter()
-            .filter_map(|d| {
-                d.doc_id
-                    .strip_prefix("fs:")
-                    .map(std::path::PathBuf::from)
-            })
+            .filter_map(|d| d.doc_id.strip_prefix("fs:").map(std::path::PathBuf::from))
             .collect();
 
         if original_paths.is_empty() {

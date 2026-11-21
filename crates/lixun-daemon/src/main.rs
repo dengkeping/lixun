@@ -9,10 +9,12 @@ use arc_swap::ArcSwap;
 use bytes::{BufMut, BytesMut};
 use chrono::Utc;
 use futures::StreamExt;
+#[cfg(test)]
+use lixun_ipc::PROTOCOL_VERSION_BINARY;
 use lixun_ipc::gui::{GuiCommand, GuiResponse};
 use lixun_ipc::{
-    DaemonInfo, ImpactProfileWire, PROTOCOL_VERSION_BINARY, PROTOCOL_VERSION_LEGACY, Request,
-    Response, SemanticStatus, socket_path,
+    DaemonInfo, ImpactProfileWire, PROTOCOL_VERSION_LEGACY, Request, Response, SemanticStatus,
+    socket_path,
 };
 use lixun_sources::QueryContext;
 use std::os::unix::io::AsRawFd;
@@ -59,7 +61,6 @@ type SearchSurface = HybridSearchHandle;
 
 #[derive(Debug, Clone, Default)]
 struct IndexStats {
-    indexed_docs: u64,
     last_reindex: Option<chrono::DateTime<Utc>>,
     reindex_in_progress: bool,
     reindex_started: Option<chrono::DateTime<Utc>>,
@@ -135,19 +136,27 @@ fn format_breakdown(b: &lixun_core::ScoreBreakdown, _h: &lixun_core::Hit) -> Str
     )
 }
 
-/// Total-order comparator for the final hit sort: descending by
-/// score, with a deterministic tiebreaker on `doc_id.0` ascending.
-/// Without the tiebreaker, near-ties (or NaN scores) produce
-/// non-deterministic order, which propagates into Top Hit selection
-/// because `select_top_hit` reads `hits[0]` and `hits[1]` directly.
-fn compare_hits_for_ranking(a: &lixun_core::Hit, b: &lixun_core::Hit) -> std::cmp::Ordering {
-    b.score
-        .partial_cmp(&a.score)
-        .unwrap_or(std::cmp::Ordering::Equal)
-        .then_with(|| a.id.0.cmp(&b.id.0))
+fn plugin_hit_with_breakdown(
+    hit: lixun_core::Hit,
+) -> (lixun_core::Hit, lixun_core::ScoreBreakdown) {
+    let breakdown = lixun_core::ScoreBreakdown {
+        tantivy: hit.score,
+        category_mult: 1.0,
+        exact_title_mult: 1.0,
+        prefix_mult: 1.0,
+        acronym_mult: 1.0,
+        recency_mult: 1.0,
+        coord_mult: 1.0,
+        frecency_mult: 1.0,
+        latch_mult: 1.0,
+        stage2_clamped: 1.0,
+        lexical_fallback: false,
+        final_score: hit.score,
+    };
+    (hit, breakdown)
 }
 
-/// Compare two [`ImpactProfile`]s and split changed knob names into
+/// Compare two `ImpactProfile`s and split changed knob names into
 /// the hot subset (re-applied immediately) and the cold subset
 /// (require daemon restart). The split mirrors plan §5.6: every
 /// `daemon_nice` and every `ocr_*` knob is hot; everything else is
@@ -312,10 +321,13 @@ fn main() -> Result<()> {
 
     let _lock = try_single_instance()?;
 
-    // A config typo must not kill the daemon (and with it the global
-    // hotkey): fall back to built-in defaults and carry the parse
-    // error into Response::Status for the CLI/GUI to surface (O2).
-    let (config, config_error) = config::Config::load_or_default();
+    let config = match config::Config::load() {
+        Ok(config) => config,
+        Err(error) => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(wait_for_valid_config(error))?,
+    };
     let initial_profile = config.resolved_profile();
     let profile_swap: Arc<ArcSwap<lixun_core::ImpactProfile>> =
         Arc::new(ArcSwap::from_pointee(initial_profile.clone()));
@@ -337,7 +349,74 @@ fn main() -> Result<()> {
         .enable_all()
         .build()?;
 
-    rt.block_on(async_main(config, config_error, profile, profile_swap))
+    rt.block_on(async_main(config, None, profile, profile_swap))
+}
+
+fn bind_control_socket() -> Result<tokio::net::UnixListener> {
+    let socket_path = socket_path();
+    // Unconditional remove (ignoring NotFound) avoids the TOCTOU window an
+    // exists()-then-remove pair would open before binding.
+    match std::fs::remove_file(&socket_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+
+    tracing::info!("Listening on {:?}", socket_path);
+
+    let listener = tokio::net::UnixListener::bind(&socket_path)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = std::fs::metadata(&socket_path)?;
+        let mut perms = metadata.permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(&socket_path, perms)?;
+    }
+
+    Ok(listener)
+}
+
+/// Keep the control socket available without opening the index, starting
+/// plugins, or consuming pending OCR work until the policy can be read.
+async fn wait_for_valid_config(mut error: anyhow::Error) -> Result<config::Config> {
+    let listener = bind_control_socket()?;
+    let mut retry = tokio::time::interval(std::time::Duration::from_secs(1));
+    let (path, _) = config::Config::user_config_path();
+    tracing::error!("indexing paused: unreadable or invalid configuration");
+    loop {
+        tokio::select! {
+            _ = retry.tick() => {
+                // Removing the broken file while editing must not broaden the roots.
+                match config::Config::read_existing(&path) {
+                    Ok(config) => return Ok(config),
+                    Err(cause) => error = cause,
+                }
+            }
+            client = listener.accept() => {
+                let (stream, _) = client?;
+                let cause = if let Some(e) = error.downcast_ref::<std::io::Error>() {
+                    format!("configuration file could not be read ({})", e.kind())
+                } else if let Some(e) = error.downcast_ref::<toml::de::Error>() {
+                    format!("invalid TOML at byte {}", e.span().map_or(0, |s| s.start))
+                } else {
+                    "invalid configuration value or exclusion expression".into()
+                };
+                tokio::spawn(async move {
+                    let (mut reader, writer) = tokio::io::split(stream);
+                    let result = tokio::time::timeout(std::time::Duration::from_secs(2),
+                        async { read_request(&mut reader, &mut Vec::new()).await }).await;
+                    if let Ok(Ok(Some((version, _)))) = result {
+                        let (tx, rx) = mpsc::channel(1);
+                        let _ = tx.send(Response::Error(format!("Indexing paused: {cause}"))).await;
+                        drop(tx);
+                        let _ = writer_task(writer, rx, version).await;
+                    }
+                });
+            }
+        }
+    }
 }
 
 async fn async_main(
@@ -474,7 +553,8 @@ async fn async_main(
     let ocr_worker_stats = Arc::new(lixun_indexer::ocr_tick::OcrWorkerStats::default());
     let state_dir = config.state_dir.clone();
     let watcher_roots = config.roots.clone();
-    let watcher_exclude = config.exclude.clone();
+    let watcher_exclude =
+        lixun_indexer::sources_api::IndexerSources::build_fs_source(sources.as_ref())?.exclude;
     let watcher_exclude_regex = config.exclude_regex.clone();
     let watcher_max_size = config.max_file_size_mb;
 
@@ -615,6 +695,7 @@ async fn async_main(
         }
     });
 
+    let watcher_search = search.clone();
     let watcher_mutation = mutation_tx.clone();
     let watcher_caps = Arc::clone(&extract_caps_arc);
     let watcher_enqueue = ocr_enqueue_arc.clone();
@@ -634,6 +715,7 @@ async fn async_main(
             watcher_min_image_side_px,
             watcher_alias_noter,
             watcher_mutation,
+            watcher_search,
         )
         .await
         {
@@ -707,26 +789,7 @@ async fn async_main(
     }
 
     let socket_path = socket_path();
-    // Unconditional remove (ignoring NotFound) avoids the TOCTOU window an
-    // exists()-then-remove pair would open before binding.
-    match std::fs::remove_file(&socket_path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e.into()),
-    }
-
-    tracing::info!("Listening on {:?}", socket_path);
-
-    let listener = tokio::net::UnixListener::bind(&socket_path)?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let metadata = std::fs::metadata(&socket_path)?;
-        let mut perms = metadata.permissions();
-        perms.set_mode(0o600);
-        std::fs::set_permissions(&socket_path, perms)?;
-    }
+    let listener = bind_control_socket()?;
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
 
@@ -872,13 +935,13 @@ async fn run_incremental_indexer(
     let total = fs_count + other_count;
     if total > 0 {
         let mut stats_lock = stats.write().await;
-        stats_lock.indexed_docs += total as u64;
         stats_lock.last_reindex = Some(Utc::now());
     }
     Ok(())
 }
 
 async fn do_reindex(
+    search: &SearchSurface,
     mutation_tx: &IndexMutationTx,
     stats: &Arc<RwLock<IndexStats>>,
     sources: &SourcesGlue,
@@ -887,16 +950,21 @@ async fn do_reindex(
     paths: Vec<std::path::PathBuf>,
 ) -> Result<usize, anyhow::Error> {
     let count = if paths.is_empty() {
-        indexer::reindex_full(mutation_tx, sources, registry, state_dir)
-            .await?
-            .total_docs
+        indexer::reindex_full(
+            mutation_tx,
+            sources,
+            registry,
+            state_dir,
+            search.all_doc_ids().await?,
+        )
+        .await?
+        .total_docs
     } else {
         indexer::reindex_paths(mutation_tx, sources, &paths).await?
     };
 
     {
         let mut stats_lock = stats.write().await;
-        stats_lock.indexed_docs += count as u64;
         stats_lock.last_reindex = Some(Utc::now());
     }
 
@@ -1011,8 +1079,9 @@ const PLUGIN_BUDGET: std::time::Duration = std::time::Duration::from_millis(50);
 
 #[allow(clippy::too_many_arguments)]
 async fn process_search_chunk(
-    mut hits: Vec<lixun_core::Hit>,
-    mut breakdowns: Vec<lixun_core::ScoreBreakdown>,
+    category: Option<lixun_core::Category>,
+    limit: u32,
+    mut pairs: Vec<(lixun_core::Hit, lixun_core::ScoreBreakdown)>,
     phase: lixun_fusion::Phase,
     explain: bool,
     cancel: &CancellationToken,
@@ -1031,31 +1100,9 @@ async fn process_search_chunk(
 )> {
     let now = chrono::Utc::now().timestamp();
 
-    // Ranking blocklist (C2): drop user-hidden docs BEFORE any
-    // ranking multiplier or top-hit selection runs. Snapshot the set
-    // once so the plugin fan-out below can reuse it without holding
-    // the lock. Kept in lockstep with `breakdowns`, which is
-    // index-aligned with `hits` in explain mode.
-    let hidden: std::collections::HashSet<String> = {
-        let list = blocklist.read().await;
-        list.list().into_iter().collect()
-    };
-    if !hidden.is_empty() {
-        if explain && breakdowns.len() == hits.len() {
-            let mut kept_breakdowns = Vec::with_capacity(breakdowns.len());
-            let mut kept_hits = Vec::with_capacity(hits.len());
-            for (hit, breakdown) in hits.drain(..).zip(breakdowns.drain(..)) {
-                if !hidden.contains(&hit.id.0) {
-                    kept_hits.push(hit);
-                    kept_breakdowns.push(breakdown);
-                }
-            }
-            hits = kept_hits;
-            breakdowns = kept_breakdowns;
-        } else {
-            hits.retain(|h| !hidden.contains(&h.id.0));
-        }
-    }
+    let hidden: std::collections::HashSet<String> =
+        blocklist.read().await.list().into_iter().collect();
+    pairs.retain(|(hit, _)| !hidden.contains(&hit.id.0));
 
     let claiming_entry = if phase == lixun_fusion::Phase::Final {
         registry.instances.iter().find(|e| e.source.claims_query(q))
@@ -1064,8 +1111,7 @@ async fn process_search_chunk(
     };
 
     if let Some(claimer) = claiming_entry {
-        hits.clear();
-        breakdowns.clear();
+        pairs.clear();
 
         let plugin = claimer.source.clone();
         let q_str = q.to_string();
@@ -1073,7 +1119,7 @@ async fn process_search_chunk(
         let state_dir = claimer.state_dir.clone();
         let cancel_probe = cancel.clone();
 
-        let plugin_hits = tokio::task::spawn_blocking(move || {
+        let mut plugin_hits = tokio::task::spawn_blocking(move || {
             // Superseded before the blocking pool even scheduled us:
             // skip the plugin call instead of burning a worker.
             if cancel_probe.is_cancelled() {
@@ -1090,25 +1136,8 @@ async fn process_search_chunk(
         .await
         .unwrap_or_default();
 
-        if explain {
-            for h in &plugin_hits {
-                breakdowns.push(lixun_core::ScoreBreakdown {
-                    tantivy: h.score,
-                    category_mult: 1.0,
-                    exact_title_mult: 1.0,
-                    prefix_mult: 1.0,
-                    acronym_mult: 1.0,
-                    recency_mult: 1.0,
-                    coord_mult: 1.0,
-                    frecency_mult: 1.0,
-                    latch_mult: 1.0,
-                    stage2_clamped: 1.0,
-                    lexical_fallback: false,
-                    final_score: h.score,
-                });
-            }
-        }
-        hits.extend(plugin_hits);
+        plugin_hits.retain(|hit| !hidden.contains(&hit.id.0));
+        pairs.extend(plugin_hits.into_iter().map(plugin_hit_with_breakdown));
     } else {
         {
             let frecency_store = frecency.read().await;
@@ -1117,19 +1146,18 @@ async fn process_search_chunk(
             let w = config.ranking_latch_weight;
             let cap = config.ranking_latch_cap;
             let total_cap = config.ranking_total_multiplier_cap;
-            for (i, hit) in hits.iter_mut().enumerate() {
+            for (hit, b) in &mut pairs {
                 let frec = frecency_store.mult(&hit.id.0, now, alpha);
                 let lat = latch_store.mult(q, &hit.id.0, now, w, cap);
                 let stage2 = frec * lat;
                 let clamped = clamp_stage2_mult(stage2, total_cap);
                 hit.score *= clamped;
-                if explain
-                    && let Some(b) = breakdowns.get_mut(i) {
-                        b.frecency_mult = frec;
-                        b.latch_mult = lat;
-                        b.stage2_clamped = clamped;
-                        b.final_score = hit.score;
-                    }
+                if explain {
+                    b.frecency_mult = frec;
+                    b.latch_mult = lat;
+                    b.stage2_clamped = clamped;
+                    b.final_score = hit.score;
+                }
             }
         }
 
@@ -1140,9 +1168,9 @@ async fn process_search_chunk(
             // mapped onto the local result distribution (score of the
             // current best hit). Claiming plugins (calculator, shell)
             // are unaffected — they replace the result set wholesale.
-            let max_lexical_score = hits
+            let max_lexical_score = pairs
                 .iter()
-                .map(|h| h.score)
+                .map(|(h, _)| h.score)
                 .fold(0.0_f32, f32::max)
                 .max(1.0);
             let mut plugin_tasks = Vec::new();
@@ -1186,55 +1214,37 @@ async fn process_search_chunk(
                 for h in &mut plugin_hits {
                     h.score = h.score.clamp(0.0, 1.0) * max_lexical_score;
                 }
-                if explain {
-                    for h in &plugin_hits {
-                        breakdowns.push(lixun_core::ScoreBreakdown {
-                            tantivy: h.score,
-                            category_mult: 1.0,
-                            exact_title_mult: 1.0,
-                            prefix_mult: 1.0,
-                            acronym_mult: 1.0,
-                            recency_mult: 1.0,
-                            coord_mult: 1.0,
-                            frecency_mult: 1.0,
-                            latch_mult: 1.0,
-                            stage2_clamped: 1.0,
-                            lexical_fallback: false,
-                            final_score: h.score,
-                        });
-                    }
-                }
-                hits.extend(plugin_hits);
+                pairs.extend(plugin_hits.into_iter().map(plugin_hit_with_breakdown));
             }
         }
     }
 
-    for hit in hits.iter_mut() {
-        if hit.source_instance.is_empty() {
-            continue;
-        }
-        if let Some(menu) = registry.row_menu_for(&hit.source_instance) {
-            hit.row_menu = menu;
-        }
+    let claimed = claiming_entry.is_some();
+    if let Some(category) = category
+        && !claimed
+    {
+        // Lexical and semantic candidates are already scoped. Plugins may add
+        // other categories during fan-out.
+        pairs.retain(|(hit, _)| hit.category == category);
+    }
+    pairs.sort_by(lixun_core::compare_ranked_hits);
+    if category.is_some() && !claimed {
+        pairs.truncate(limit as usize);
     }
 
-    let explanations: Vec<String> = if explain {
-        let mut idx: Vec<usize> = (0..hits.len()).collect();
-        idx.sort_by(|&a, &b| compare_hits_for_ranking(&hits[a], &hits[b]));
-        let hits_sorted: Vec<_> = idx.iter().map(|&i| hits[i].clone()).collect();
-        let brk_sorted: Vec<_> = idx.iter().map(|&i| breakdowns[i].clone()).collect();
-        hits = hits_sorted;
-        breakdowns = brk_sorted;
-        breakdowns
-            .iter()
-            .zip(hits.iter())
-            .map(|(b, h)| format_breakdown(b, h))
-            .collect()
-    } else {
-        hits.sort_by(compare_hits_for_ranking);
-        Vec::new()
-    };
-
+    let mut hits = Vec::with_capacity(pairs.len());
+    let mut explanations = Vec::new();
+    for (mut hit, breakdown) in pairs {
+        if !hit.source_instance.is_empty()
+            && let Some(menu) = registry.row_menu_for(&hit.source_instance)
+        {
+            hit.row_menu = menu;
+        }
+        if explain {
+            explanations.push(format_breakdown(&breakdown, &hit));
+        }
+        hits.push(hit);
+    }
     let top_hit_id = if phase == lixun_fusion::Phase::Final {
         let frecency_store = frecency.read().await;
         let latch_store = query_latch.read().await;
@@ -1249,8 +1259,6 @@ async fn process_search_chunk(
             config.ranking_strong_latch_threshold,
         );
         tracing::debug!(
-            query = %q,
-            top_hit = ?decision.id,
             confidence = decision.confidence,
             margin = decision.margin,
             prefix_match = decision.prefix_match,
@@ -1265,7 +1273,6 @@ async fn process_search_chunk(
     };
 
     let calculation: Option<lixun_core::Calculation> = None;
-    let claimed = claiming_entry.is_some();
     Ok((hits, calculation, top_hit_id, explanations, claimed))
 }
 
@@ -1306,14 +1313,9 @@ async fn handle_search(
         .saturating_mul(4)
         .clamp(1, ABSOLUTE_RESULT_CEILING);
     let limit = limit.clamp(1, ceiling);
-    // Category filter (R5): a chip constraint drops rows AFTER
-    // retrieval, so fetch deeper to keep the page fillable — a mail
-    // hit ranked below the unfiltered page must still be reachable
-    // when the Mail chip is active.
+    // Leave room on a filtered page for hidden hits and stage-2 reranking.
     let fetch_limit = if category.is_some() {
-        limit
-            .saturating_mul(4)
-            .min(ABSOLUTE_RESULT_CEILING)
+        limit.saturating_mul(4).min(ABSOLUTE_RESULT_CEILING)
     } else {
         limit
     };
@@ -1322,29 +1324,20 @@ async fn handle_search(
         limit: fetch_limit,
     };
 
-    let mut rx = fusion.search_streaming(&query_obj, cancel.clone()).await?;
+    let mut rx = fusion
+        .search_streaming_in_category(&query_obj, category, cancel.clone())
+        .await?;
 
     while let Some(chunk) = rx.recv().await {
         if cancel.is_cancelled() {
             return Ok(());
         }
 
-        let (hits, breakdowns) = if explain {
-            let mut hits_v = Vec::with_capacity(chunk.hits.len());
-            let mut brk_v = Vec::with_capacity(chunk.hits.len());
-            for (h, b) in chunk.hits {
-                hits_v.push(h);
-                brk_v.push(b);
-            }
-            (hits_v, brk_v)
-        } else {
-            (chunk.hits.into_iter().map(|(h, _)| h).collect(), Vec::new())
-        };
-
-        let (mut processed_hits, calculation, top_hit_id, explanations, claimed) =
+        let (processed_hits, calculation, top_hit_id, explanations, claimed) =
             process_search_chunk(
-                hits,
-                breakdowns,
+                category,
+                limit,
+                chunk.hits,
                 chunk.phase,
                 explain,
                 &cancel,
@@ -1360,41 +1353,6 @@ async fn handle_search(
         if cancel.is_cancelled() {
             return Ok(());
         }
-
-        // R5: apply the category constraint AFTER ranking but BEFORE
-        // the page truncation, so the returned page is filled with
-        // matching hits rather than sliced out of the unfiltered
-        // page. Claimed queries bypass the filter — their plugin
-        // replaced the result set wholesale. Explanations (index-
-        // aligned with hits) are filtered in lockstep.
-        let mut explanations = explanations;
-        if let Some(cat) = category
-            && !claimed
-        {
-            if explanations.len() == processed_hits.len() {
-                let mut kept_hits = Vec::with_capacity(processed_hits.len());
-                let mut kept_expl = Vec::with_capacity(explanations.len());
-                for (hit, expl) in processed_hits.drain(..).zip(explanations.drain(..)) {
-                    if hit.category == cat {
-                        kept_hits.push(hit);
-                        kept_expl.push(expl);
-                    }
-                }
-                processed_hits = kept_hits;
-                explanations = kept_expl;
-            } else {
-                processed_hits.retain(|h| h.category == cat);
-            }
-            // Only the category path over-fetched; trim back to the
-            // requested page size. The unfiltered path keeps its
-            // historical shape (fusion page + plugin fan-out hits,
-            // untruncated).
-            if processed_hits.len() > limit as usize {
-                processed_hits.truncate(limit as usize);
-                explanations.truncate(limit as usize);
-            }
-        }
-        let processed_hits = processed_hits;
 
         let phase = match chunk.phase {
             lixun_fusion::Phase::Initial => lixun_ipc::Phase::Initial,
@@ -1418,9 +1376,10 @@ async fn handle_search(
 
     let mut slot = active_search_slot.lock().await;
     if let Some(s) = slot.as_ref()
-        && s.generation == generation {
-            *slot = None;
-        }
+        && s.generation == generation
+    {
+        *slot = None;
+    }
 
     Ok(())
 }
@@ -1432,6 +1391,10 @@ async fn writer_task(
 ) -> anyhow::Result<()> {
     while let Some(resp) = rx.recv().await {
         let payload = lixun_ipc::encode_response_for_version(negotiated_version, &resp)?;
+        anyhow::ensure!(
+            payload.len() <= lixun_ipc::MAX_FRAME_LEN - 2,
+            "response exceeds maximum frame size"
+        );
         let total_len = (2 + payload.len()) as u32;
         let mut out = BytesMut::with_capacity(4 + total_len as usize);
         out.put_u32(total_len);
@@ -1467,13 +1430,8 @@ async fn read_request(
     let mut ver_buf = [0u8; 2];
     stream_read.read_exact(&mut ver_buf).await?;
     let version = u16::from_be_bytes(ver_buf);
-    if !(PROTOCOL_VERSION_LEGACY..=PROTOCOL_VERSION_BINARY).contains(&version) {
-        anyhow::bail!(
-            "unsupported protocol version: got {}, supported {}..={}",
-            version,
-            PROTOCOL_VERSION_LEGACY,
-            PROTOCOL_VERSION_BINARY
-        );
+    if !(PROTOCOL_VERSION_LEGACY..=lixun_ipc::PROTOCOL_VERSION_NAMED).contains(&version) {
+        return Err(lixun_ipc::DecodeError::UnsupportedVersion(version).into());
     }
     frame_buf.clear();
     frame_buf.resize(frame_len - 2, 0);
@@ -1510,6 +1468,22 @@ async fn handle_client(
     {
         Ok(Some(pair)) => pair,
         Ok(None) => return Ok(()),
+        Err(e)
+            if matches!(
+                e.downcast_ref::<lixun_ipc::DecodeError>(),
+                Some(lixun_ipc::DecodeError::UnsupportedVersion(_))
+            ) =>
+        {
+            // v4 is the common discovery format for peers without a negotiated codec.
+            let (tx, rx) = mpsc::channel(1);
+            tx.send(Response::Error(format!(
+                "{e}; supported versions are {PROTOCOL_VERSION_LEGACY} through {}",
+                lixun_ipc::PROTOCOL_VERSION_NAMED
+            )))
+            .await?;
+            drop(tx);
+            return writer_task(stream_write, rx, PROTOCOL_VERSION_LEGACY).await;
+        }
         Err(e) => return Err(e),
     };
 
@@ -1518,6 +1492,7 @@ async fn handle_client(
 
     let mut writer_handle = tokio::spawn(writer_task(stream_write, write_rx, negotiated_version));
 
+    let mut writer_finished = false;
     let mut search_tasks = tokio::task::JoinSet::<anyhow::Result<()>>::new();
 
     let fusion = Arc::new(search);
@@ -1531,6 +1506,7 @@ async fn handle_client(
             tokio::select! {
             biased;
             res = &mut writer_handle => {
+                writer_finished = true;
                 match res {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => tracing::debug!("writer task error: {}", e),
@@ -1662,6 +1638,7 @@ async fn handle_client(
                         .unwrap_or_else(|| "unknown".into());
                     Response::Error(format!("Reindex already in progress (started {})", started))
                 } else {
+                    let search_for_task = Arc::clone(&fusion);
                     let stats_for_task = Arc::clone(&stats);
                     let mutation_tx_for_task = mutation_tx.clone();
                     let sources_for_task = Arc::clone(&sources);
@@ -1669,6 +1646,7 @@ async fn handle_client(
                     let state_dir_for_task = config.state_dir.clone();
                     tokio::spawn(async move {
                         let result = do_reindex(
+                            &search_for_task,
                             &mutation_tx_for_task,
                             &stats_for_task,
                             &sources_for_task,
@@ -1692,7 +1670,7 @@ async fn handle_client(
                     let s = stats.read().await;
                     let (semantic, hotkey, daemon) = runtime_info.status_extras();
                     Response::Status {
-                        indexed_docs: s.indexed_docs,
+                        indexed_docs: fusion.document_count(),
                         last_reindex: s.last_reindex,
                         errors: 0,
                         watcher: Some(collect_watcher_stats()),
@@ -1718,7 +1696,7 @@ async fn handle_client(
                 let s = stats.read().await;
                 let (semantic, hotkey, daemon) = runtime_info.status_extras();
                 let resp = Response::Status {
-                    indexed_docs: s.indexed_docs,
+                    indexed_docs: fusion.document_count(),
                     last_reindex: s.last_reindex,
                     errors: 0,
                     watcher: Some(collect_watcher_stats()),
@@ -1739,8 +1717,66 @@ async fn handle_client(
                     break;
                 }
             }
-            Request::RecordClick { doc_id } => {
+            Request::CleanPrivateHistory { apply } => {
+                let exclude_query = |q: &str| registry.private_query(q);
+                let exclude_doc = |id: &str| registry.private_doc(id);
+                let mut frec = frecency.write().await;
+                let mut latch = query_latch.write().await;
+                let mut log = query_log.write().await;
+                let result = (|| -> Result<Response> {
+                    let mut next = frec.clone();
+                    let clicks = next.remove_excluded(exclude_doc);
+                    if apply && clicks > 0 {
+                        next.save(&config.state_dir)?;
+                        *frec = next;
+                    }
+                    let mut next = latch.clone();
+                    let associations = next.remove_excluded(exclude_query, exclude_doc);
+                    if apply && associations > 0 {
+                        next.save(&config.state_dir)?;
+                        *latch = next;
+                    }
+                    let mut next = log.clone();
+                    let queries = next.remove_excluded(exclude_query);
+                    if apply && queries > 0 {
+                        next.save(&config.state_dir)?;
+                        *log = next;
+                    }
+                    Ok(Response::PrivateHistory {
+                        queries,
+                        clicks,
+                        associations,
+                    })
+                })();
+                drop(log);
+                drop(latch);
+                drop(frec);
+                if write_tx
+                    .send(result.unwrap_or_else(|e| {
+                        Response::Error(format!("history cleanup failed: {e}"))
+                    }))
+                    .await
+                    .is_err()
                 {
+                    break;
+                }
+            }
+            Request::RecordSelection { doc_id, query } => {
+                let excluded = registry.private_doc(&doc_id) || registry.private_query(&query);
+                if !excluded {
+                    let now = Utc::now().timestamp();
+                    frecency.write().await.record_click(&doc_id, now);
+                    if !query.trim().is_empty() {
+                        query_latch.write().await.record(&query, &doc_id, now);
+                        query_log.write().await.record_query(&query);
+                    }
+                }
+                if write_tx.send(Response::Ok).await.is_err() {
+                    break;
+                }
+            }
+            Request::RecordClick { doc_id } => {
+                if !registry.private_doc(&doc_id) {
                     let mut frec = frecency.write().await;
                     frec.record_click(&doc_id, chrono::Utc::now().timestamp());
                 }
@@ -1749,10 +1785,7 @@ async fn handle_client(
                 }
             }
             Request::RecordQuery { q } => {
-                let excluded = registry
-                    .instances
-                    .iter()
-                    .any(|inst| inst.source.excludes_from_query_log(&q));
+                let excluded = registry.private_query(&q);
                 if !excluded {
                     let mut log = query_log.write().await;
                     log.record_query(&q);
@@ -1763,15 +1796,9 @@ async fn handle_client(
             }
             Request::RecordQueryClick { doc_id, query } => {
                 let now = chrono::Utc::now().timestamp();
-                {
-                    let mut latch = query_latch.write().await;
-                    latch.record(&query, &doc_id, now);
-                }
-                let excluded = registry
-                    .instances
-                    .iter()
-                    .any(|inst| inst.source.excludes_from_query_log(&query));
+                let excluded = registry.private_doc(&doc_id) || registry.private_query(&query);
                 if !excluded {
+                    query_latch.write().await.record(&query, &doc_id, now);
                     let mut log = query_log.write().await;
                     log.record_query(&query);
                 }
@@ -1850,6 +1877,25 @@ async fn handle_client(
                     break;
                 }
             }
+            Request::Capabilities => {
+                let ids = registry
+                    .instances
+                    .iter()
+                    .filter(|entry| entry.source.relative_date_caption())
+                    .map(|entry| entry.instance_id.clone())
+                    .collect();
+                if write_tx
+                    .send(Response::Capabilities {
+                        versions: lixun_ipc::SUPPORTED_VERSIONS.to_vec(),
+                        relative_date_sources: ids,
+                        record_selection: true,
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
             Request::ClaimedPrefixes => {
                 let prefixes: Vec<String> = registry
                     .instances
@@ -1910,43 +1956,46 @@ async fn handle_client(
                 // Persist immediately: hides are rare, explicit user
                 // actions and must survive a crash (unlike the
                 // shutdown-saved frecency/latch stores).
-                {
+                let result = {
                     let mut list = blocklist.write().await;
-                    if list.set_hidden(&doc_id, hidden)
-                        && let Err(e) = list.save(&config.state_dir)
-                    {
-                        tracing::error!("blocklist: save failed: {e:#}");
+                    let mut updated = list.clone();
+                    if updated.set_hidden(&doc_id, hidden) {
+                        updated.save(&config.state_dir).map(|()| *list = updated)
+                    } else {
+                        Ok(())
                     }
-                }
-                tracing::info!(doc_id = %doc_id, hidden, "ranking blocklist updated");
-                if write_tx.send(Response::Ok).await.is_err() {
+                };
+                let response = result.map_or_else(
+                    |e| Response::Error(format!("could not save visibility: {e}")),
+                    |()| Response::Ok,
+                );
+                if write_tx.send(response).await.is_err() {
                     break;
                 }
             }
             Request::ResetDocRanking { doc_id } => {
-                let removed_frecency = {
-                    let mut frec = frecency.write().await;
-                    let removed = frec.remove_doc(&doc_id);
-                    if removed && let Err(e) = frec.save(&config.state_dir) {
-                        tracing::error!("frecency: save after reset failed: {e:#}");
+                let mut frec = frecency.write().await;
+                let mut latch = query_latch.write().await;
+                let result = (|| -> Result<()> {
+                    let mut next_frec = frec.clone();
+                    if next_frec.remove_doc(&doc_id) {
+                        next_frec.save(&config.state_dir)?;
+                        *frec = next_frec;
                     }
-                    removed
-                };
-                let removed_latch = {
-                    let mut latch = query_latch.write().await;
-                    let removed = latch.remove_doc(&doc_id);
-                    if removed && let Err(e) = latch.save(&config.state_dir) {
-                        tracing::error!("query_latch: save after reset failed: {e:#}");
+                    let mut next_latch = latch.clone();
+                    if next_latch.remove_doc(&doc_id) {
+                        next_latch.save(&config.state_dir)?;
+                        *latch = next_latch;
                     }
-                    removed
-                };
-                tracing::info!(
-                    doc_id = %doc_id,
-                    removed_frecency,
-                    removed_latch,
-                    "ranking state reset"
+                    Ok(())
+                })();
+                drop(latch);
+                drop(frec);
+                let response = result.map_or_else(
+                    |e| Response::Error(format!("could not reset ranking: {e}")),
+                    |()| Response::Ok,
                 );
-                if write_tx.send(Response::Ok).await.is_err() {
+                if write_tx.send(response).await.is_err() {
                     break;
                 }
             }
@@ -2059,7 +2108,9 @@ async fn handle_client(
     drop(write_tx);
     search_tasks.abort_all();
     while search_tasks.join_next().await.is_some() {}
-    let _ = writer_handle.await;
+    if !writer_finished {
+        let _ = writer_handle.await;
+    }
 
     Ok(())
 }
@@ -2248,8 +2299,8 @@ impl lixun_indexer::ocr_tick::IdleGate for StatsIdleGate {
 }
 
 /// Bridge between the daemon's live [`ArcSwap<ImpactProfile>`] and
-/// the indexer's per-tick [`OcrCfgRefresh`] hook. Every OCR tick
-/// re-derives the hot subset of [`OcrWorkerCfg`] from the current
+/// the indexer's per-tick `OcrCfgRefresh` hook. Every OCR tick
+/// re-derives the hot subset of `OcrWorkerCfg` from the current
 /// profile so `lixun impact set` propagates without a restart.
 struct ArcSwapOcrRefresh {
     profile_swap: Arc<ArcSwap<lixun_core::ImpactProfile>>,
@@ -2458,38 +2509,67 @@ mod tests {
 
     #[test]
     fn sort_tiebreaker_deterministic() {
-        let mut a = [
+        let a = [
             mk_hit("app:c", 5.0),
             mk_hit("app:a", 5.0),
             mk_hit("app:b", 5.0),
         ];
-        let mut b = [
+        let b = [
             mk_hit("app:b", 5.0),
             mk_hit("app:c", 5.0),
             mk_hit("app:a", 5.0),
         ];
-        a.sort_by(compare_hits_for_ranking);
-        b.sort_by(compare_hits_for_ranking);
+        let mut a = a.map(plugin_hit_with_breakdown);
+        a.sort_by(lixun_core::compare_ranked_hits);
+        let mut b = b.map(plugin_hit_with_breakdown);
+        b.sort_by(lixun_core::compare_ranked_hits);
         assert_eq!(
-            a.iter().map(|h| h.id.0.as_str()).collect::<Vec<_>>(),
+            a.iter().map(|(h, _)| h.id.0.as_str()).collect::<Vec<_>>(),
             ["app:a", "app:b", "app:c"]
         );
         assert_eq!(
-            b.iter().map(|h| h.id.0.as_str()).collect::<Vec<_>>(),
+            b.iter().map(|(h, _)| h.id.0.as_str()).collect::<Vec<_>>(),
             ["app:a", "app:b", "app:c"]
         );
     }
 
     #[test]
+    fn matching_apps_stay_first_after_stage2_scoring() {
+        let mut file = mk_hit("fs:recent", 600.0);
+        file.category = Category::File;
+        let mut mail = mk_hit("mail:popular", 500.0);
+        mail.category = Category::Mail;
+        let hits = [
+            file,
+            mk_hit("app:second", 2.0),
+            mail,
+            mk_hit("app:first", 3.0),
+        ];
+        let mut hits = hits.map(plugin_hit_with_breakdown);
+        hits[1].1.lexical_fallback = true;
+        hits[3].1.prefix_mult = 1.4;
+        hits.sort_by(lixun_core::compare_ranked_hits);
+        assert_eq!(
+            hits.iter()
+                .map(|(h, _)| h.id.0.as_str())
+                .collect::<Vec<_>>(),
+            ["app:first", "fs:recent", "mail:popular", "app:second"]
+        );
+    }
+
+    #[test]
     fn sort_score_descending_takes_precedence() {
-        let mut hits = [
+        let hits = [
             mk_hit("app:a", 1.0),
             mk_hit("app:b", 10.0),
             mk_hit("app:c", 5.0),
         ];
-        hits.sort_by(compare_hits_for_ranking);
+        let mut hits = hits.map(plugin_hit_with_breakdown);
+        hits.sort_by(lixun_core::compare_ranked_hits);
         assert_eq!(
-            hits.iter().map(|h| h.id.0.as_str()).collect::<Vec<_>>(),
+            hits.iter()
+                .map(|(h, _)| h.id.0.as_str())
+                .collect::<Vec<_>>(),
             ["app:b", "app:c", "app:a"]
         );
     }

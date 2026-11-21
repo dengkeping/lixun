@@ -175,10 +175,7 @@ mod tests {
         );
         match &hit.action {
             Action::OpenUri { uri } => {
-                assert_eq!(
-                    uri,
-                    "https://github.com/search?q=rust+lifetimes+%26+bounds"
-                );
+                assert_eq!(uri, "https://github.com/search?q=rust+lifetimes+%26+bounds");
             }
             other => panic!("expected OpenUri, got {other:?}"),
         }

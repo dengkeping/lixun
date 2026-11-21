@@ -238,7 +238,7 @@ impl OcrQueue {
     /// under permanent-failure conditions while preserving a grace
     /// window during which operators can still inspect `last_error`
     /// via `sqlite3`. The worker treats a row with `attempts >=
-    /// max_attempts` as invisible (see [`peek_next`]), so reaping
+    /// max_attempts` as invisible (see [`Self::peek_next`]), so reaping
     /// does not race with in-flight OCR.
     pub fn reap_zombies(&self, max_attempts: u32, older_than_secs: i64) -> Result<u64> {
         self.with_conn(|conn| {

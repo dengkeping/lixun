@@ -24,7 +24,7 @@ pub struct LatchEntry {
     pub last_ts: i64,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct QueryLatchStore {
     // key = normalize_for_latch_key(query_raw)
     by_query: BTreeMap<String, HashMap<String, LatchEntry>>,
@@ -122,6 +122,25 @@ impl QueryLatchStore {
     /// keys (C2 "Reset ranking"). Query keys left empty afterwards
     /// are removed entirely. Returns `true` when anything was
     /// deleted.
+    pub fn remove_excluded(
+        &mut self,
+        excludes_query: impl Fn(&str) -> bool,
+        excludes_doc: impl Fn(&str) -> bool,
+    ) -> usize {
+        let mut removed = 0;
+        self.by_query.retain(|query, docs| {
+            let before = docs.len();
+            if excludes_query(query) {
+                docs.clear();
+            } else {
+                docs.retain(|id, _| !excludes_doc(id));
+            }
+            removed += before - docs.len();
+            !docs.is_empty()
+        });
+        removed
+    }
+
     pub fn remove_doc(&mut self, doc_id: &str) -> bool {
         let mut removed = false;
         self.by_query.retain(|_, per_query| {

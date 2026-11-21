@@ -158,6 +158,10 @@ impl lixun_sources::source::IndexerSource for ThunderbirdAttachmentsSource {
         "tb_attachments"
     }
 
+    fn relative_date_caption(&self) -> bool {
+        true
+    }
+
     fn row_menu(&self) -> RowMenuDef {
         RowMenuDef {
             items: vec![
@@ -301,7 +305,8 @@ mod tests {
             );
             std::fs::write(inbox_dir.join("Inbox"), mbox).unwrap();
 
-            let source = ThunderbirdAttachmentsSource::new(profile.to_path_buf(), 100 * 1024 * 1024);
+            let source =
+                ThunderbirdAttachmentsSource::new(profile.to_path_buf(), 100 * 1024 * 1024);
             let docs = source.index_all().unwrap();
 
             assert!(docs.iter().any(|doc| {
@@ -341,7 +346,8 @@ mod tests {
             );
             std::fs::write(inbox_dir.join("Inbox"), mbox).unwrap();
 
-            let source = ThunderbirdAttachmentsSource::new(profile.to_path_buf(), 100 * 1024 * 1024);
+            let source =
+                ThunderbirdAttachmentsSource::new(profile.to_path_buf(), 100 * 1024 * 1024);
             let docs = source.index_all().unwrap();
             let attachment = docs
                 .iter()
@@ -371,7 +377,8 @@ mod tests {
             );
             std::fs::write(inbox_dir.join("Inbox"), mbox).unwrap();
 
-            let source = ThunderbirdAttachmentsSource::new(profile.to_path_buf(), 100 * 1024 * 1024);
+            let source =
+                ThunderbirdAttachmentsSource::new(profile.to_path_buf(), 100 * 1024 * 1024);
             let docs = source.index_all().unwrap();
             let attachment = docs
                 .iter()

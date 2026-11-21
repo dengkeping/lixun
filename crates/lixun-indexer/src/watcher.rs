@@ -11,10 +11,9 @@
 //! New directories discovered at runtime are scanned (to hydrate git-clone-
 //! style bursts) and watched.
 
-use crate::index_service::{IndexMutationTx, Mutation, fs_doc_id, index_file};
+use crate::index_service::{IndexMutationTx, Mutation, SearchHandle, fs_doc_id, index_file};
 use anyhow::Result;
 use lixun_extract::ExtractorCapabilities;
-use lixun_sources::exclude::path_excluded;
 use lixun_sources::{HasBody, OcrEnqueue, SymlinkAliasNoter};
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
@@ -25,16 +24,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use walkdir::WalkDir;
 
-struct ExcludeSet {
-    subs: Vec<String>,
-    regexes: Vec<regex::Regex>,
-}
-
-impl ExcludeSet {
-    fn matches(&self, path: &Path) -> bool {
-        path_excluded(path, &self.subs, &self.regexes)
-    }
-}
+use lixun_sources::exclude::PathPolicy as ExcludeSet;
 
 const COALESCE_FLUSH_INTERVAL: Duration = Duration::from_secs(3);
 const RESOLVER_WORKERS: usize = 2;
@@ -61,7 +51,7 @@ enum RefreshJob {
     /// a single `Delete`: prefix==id matches that one doc, no other id
     /// starts with `path + "/"` for a real file, so no false deletes.
     /// For a directory it purges the dir doc plus every descendant.
-    DeleteSubtree(String),
+    DeleteSubtree(PathBuf),
 }
 
 static OVERFLOW_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -91,15 +81,13 @@ pub async fn start(
     min_image_side_px: u32,
     alias_noter: Option<Arc<dyn SymlinkAliasNoter>>,
     mutation_tx: IndexMutationTx,
+    search: SearchHandle,
 ) -> Result<()> {
     let (raw_tx, raw_rx) = mpsc::channel::<RawEvent>(RAW_EVENT_QUEUE_CAP);
     let (ctrl_tx, ctrl_rx) = std::sync::mpsc::sync_channel::<Control>(CONTROL_QUEUE_CAP);
     let (refresh_tx, refresh_rx) = async_channel::bounded::<RefreshJob>(REFRESH_QUEUE_CAP);
 
-    let exclude_arc: Arc<ExcludeSet> = Arc::new(ExcludeSet {
-        subs: exclude,
-        regexes: exclude_regex,
-    });
+    let exclude_arc: Arc<ExcludeSet> = Arc::new(ExcludeSet::new(&roots, &exclude, &exclude_regex));
 
     let nt_roots = roots.clone();
     let nt_exclude = Arc::clone(&exclude_arc);
@@ -116,6 +104,7 @@ pub async fn start(
         refresh_tx.clone(),
         coalesce_exclude,
         roots.clone(),
+        search,
     ));
 
     for worker_id in 0..RESOLVER_WORKERS {
@@ -123,7 +112,6 @@ pub async fn start(
         let mutation_tx = mutation_tx.clone();
         let ctrl_tx = ctrl_tx.clone();
         let exclude = Arc::clone(&exclude_arc);
-        let refresh_tx = refresh_tx.clone();
         let env = ResolverEnv {
             exclude,
             max_file_size_mb,
@@ -133,14 +121,7 @@ pub async fn start(
             min_image_side_px,
             alias_noter: alias_noter.clone(),
         };
-        tokio::spawn(resolver_task(
-            worker_id,
-            rx,
-            mutation_tx,
-            ctrl_tx,
-            refresh_tx,
-            env,
-        ));
+        tokio::spawn(resolver_task(worker_id, rx, mutation_tx, ctrl_tx, env));
     }
 
     Ok(())
@@ -298,6 +279,7 @@ async fn coalescer_task(
     refresh_tx: async_channel::Sender<RefreshJob>,
     exclude: Arc<ExcludeSet>,
     roots: Vec<PathBuf>,
+    search: SearchHandle,
 ) {
     let mut pending: HashMap<PathBuf, Intent> = HashMap::new();
     let mut flush_tick = tokio::time::interval(COALESCE_FLUSH_INTERVAL);
@@ -305,8 +287,6 @@ async fn coalescer_task(
 
     loop {
         tokio::select! {
-            biased;
-
             maybe_ev = raw_rx.recv() => {
                 let Some(ev) = maybe_ev else { break };
                 match ev {
@@ -339,6 +319,21 @@ async fn coalescer_task(
                         OVERFLOW_COUNT.load(Ordering::Relaxed),
                         roots.len()
                     );
+                    // Missing paths produce no create/modify events during a rescan.
+                    // Check only available roots, and re-stat each path at consumption.
+                    match search.all_doc_ids().await {
+                        Ok(ids) => {
+                            for id in ids {
+                                let Some(path) = id.strip_prefix("fs:").map(Path::new) else { continue };
+                                if roots.iter().any(|root| path.starts_with(root) && root.is_dir())
+                                    && matches!(std::fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+                                    && refresh_tx.send(RefreshJob::Refresh(path.to_owned())).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                        Err(_) => OVERFLOW_FLAG.store(true, Ordering::Relaxed),
+                    }
                     for root in &roots {
                         if refresh_tx.send(RefreshJob::Refresh(root.clone())).await.is_err() {
                             return;
@@ -355,7 +350,7 @@ async fn coalescer_task(
                 for (path, intent) in surviving {
                     let job = match intent {
                         Intent::Refresh => RefreshJob::Refresh(path),
-                        Intent::Delete => RefreshJob::DeleteSubtree(fs_doc_id(&path)),
+                        Intent::Delete => RefreshJob::DeleteSubtree(path),
                     };
                     if refresh_tx.send(job).await.is_err() {
                         return;
@@ -367,9 +362,7 @@ async fn coalescer_task(
     }
 }
 
-fn drop_descendant_deletes(
-    pending: HashMap<PathBuf, Intent>,
-) -> Vec<(PathBuf, Intent)> {
+fn drop_descendant_deletes(pending: HashMap<PathBuf, Intent>) -> Vec<(PathBuf, Intent)> {
     let mut delete_paths: Vec<PathBuf> = pending
         .iter()
         .filter(|(_, i)| matches!(i, Intent::Delete))
@@ -413,118 +406,159 @@ async fn resolver_task(
     rx: async_channel::Receiver<RefreshJob>,
     mutation_tx: IndexMutationTx,
     ctrl_tx: std::sync::mpsc::SyncSender<Control>,
-    refresh_tx: async_channel::Sender<RefreshJob>,
     env: ResolverEnv,
 ) {
-    while let Ok(job) = rx.recv().await {
-        match job {
-            RefreshJob::DeleteSubtree(prefix) => {
-                if let Err(e) = mutation_tx
-                    .send(Mutation::DeleteSubtree(prefix.clone()))
-                    .await
+    // Each resolver consumes a private bounded directory stream. The walker
+    // never enqueues into the queue that its own resolver must drain.
+    let mut directory_stream: Option<mpsc::Receiver<PathBuf>> = None;
+    loop {
+        let job = if let Some(stream) = &mut directory_stream {
+            match stream.recv().await {
+                Some(file) => RefreshJob::Refresh(file),
+                None => {
+                    directory_stream = None;
+                    continue;
+                }
+            }
+        } else {
+            let Ok(job) = rx.recv().await else {
+                return;
+            };
+            job
+        };
+        let path = match job {
+            RefreshJob::Refresh(path) => path,
+            RefreshJob::DeleteSubtree(path) => {
+                // Events may wait behind a directory walk. Resolve the current
+                // path and retain the index while its configured root is offline.
+                if !env.exclude.root_available_for(&path) {
+                    continue;
+                }
+                if path.is_dir() {
+                    OVERFLOW_FLAG.store(true, Ordering::Relaxed);
+                }
+                path
+            }
+        };
+        let exclude = Arc::clone(&env.exclude);
+        let path_blocking = path.clone();
+        let caps_b = Arc::clone(&env.caps);
+        let enq_b = env.ocr_enqueue.clone();
+        let body_b = env.body_checker.clone();
+        let alias_b = env.alias_noter.clone();
+        let max_size = env.max_file_size_mb;
+        let min_side = env.min_image_side_px;
+        let result = tokio::task::spawn_blocking(move || {
+            resolve_refresh(
+                &path_blocking,
+                &exclude,
+                max_size,
+                &caps_b,
+                enq_b.as_ref().map(|a| a.as_ref() as &dyn OcrEnqueue),
+                body_b.as_ref().map(|a| a.as_ref() as &dyn HasBody),
+                min_side,
+                alias_b
+                    .as_ref()
+                    .map(|a| a.as_ref() as &dyn SymlinkAliasNoter),
+            )
+        })
+        .await;
+        let resolved = match result {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::debug!("resolver[{}]: blocking task panicked: {}", worker_id, e);
+                continue;
+            }
+        };
+        match resolved {
+            Resolved::File(doc) => {
+                if let Err(e) = mutation_tx.send(Mutation::Upsert(doc)).await {
+                    tracing::debug!("resolver[{}]: send upsert failed: {}", worker_id, e);
+                }
+            }
+            Resolved::Directory(doc) => {
+                if let Some(doc) = doc
+                    && mutation_tx.send(Mutation::Upsert(doc)).await.is_err()
                 {
+                    return;
+                }
+                // A file can become a directory while an older enumeration is
+                // draining. The active walker already covers its subtree.
+                if directory_stream.is_some() {
+                    continue;
+                }
+                let (tx, stream) = mpsc::channel(32);
+                directory_stream = Some(stream);
+                let rules = Arc::clone(&env.exclude);
+                let controls = ctrl_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    for entry in WalkDir::new(&path)
+                        .follow_links(false)
+                        .into_iter()
+                        .filter_entry(|entry| rules.allows_walk_entry(entry.path(), &path))
+                        .flatten()
+                    {
+                        if entry.file_type().is_dir() {
+                            if controls
+                                .send(Control::AddWatch(entry.path().to_owned()))
+                                .is_err()
+                            {
+                                break;
+                            }
+                        } else if !entry.file_type().is_file() {
+                            continue;
+                        }
+                        if entry.depth() > 0 && tx.blocking_send(entry.into_path()).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+            Resolved::Gone => {
+                if !env.exclude.root_available_for(&path) {
+                    continue;
+                }
+                // Key convention: the alias map is keyed on
+                // the raw observed path string, the same
+                // value `fs_doc_id` falls back to when
+                // `canonicalize` fails on a vanished path.
+                // If a prior index_file recorded an alias,
+                // recover the canonical id and forget the
+                // entry; otherwise fall back to the raw id.
+                let observed = path.to_string_lossy().to_string();
+                let id = match env.alias_noter.as_ref() {
+                    Some(noter) => match noter.resolve(&observed) {
+                        Some(canonical) => {
+                            noter.forget(&canonical);
+                            if canonical
+                                .strip_prefix("fs:")
+                                .is_some_and(|p| Path::new(p).exists())
+                            {
+                                continue;
+                            }
+                            canonical
+                        }
+                        None => fs_doc_id(&path),
+                    },
+                    None => fs_doc_id(&path),
+                };
+                if let Err(e) = mutation_tx.send(Mutation::DeleteSubtree(id.clone())).await {
                     tracing::debug!(
-                        "resolver[{}]: send delete_subtree {} failed: {}",
+                        "resolver[{}]: send gone-delete-subtree {} failed: {}",
                         worker_id,
-                        prefix,
+                        id,
                         e
                     );
                 }
             }
-            RefreshJob::Refresh(path) => {
-                let exclude = Arc::clone(&env.exclude);
-                let path_blocking = path.clone();
-                let caps_b = Arc::clone(&env.caps);
-                let enq_b = env.ocr_enqueue.clone();
-                let body_b = env.body_checker.clone();
-                let alias_b = env.alias_noter.clone();
-                let max_size = env.max_file_size_mb;
-                let min_side = env.min_image_side_px;
-                let result = tokio::task::spawn_blocking(move || {
-                    resolve_refresh(
-                        &path_blocking,
-                        &exclude,
-                        max_size,
-                        &caps_b,
-                        enq_b.as_ref().map(|a| a.as_ref() as &dyn OcrEnqueue),
-                        body_b.as_ref().map(|a| a.as_ref() as &dyn HasBody),
-                        min_side,
-                        alias_b
-                            .as_ref()
-                            .map(|a| a.as_ref() as &dyn SymlinkAliasNoter),
-                    )
-                })
-                .await;
-                let resolved = match result {
-                    Ok(r) => r,
-                    Err(e) => {
-                        tracing::debug!("resolver[{}]: blocking task panicked: {}", worker_id, e);
-                        continue;
-                    }
-                };
-                match resolved {
-                    Resolved::File(doc) => {
-                        if let Err(e) = mutation_tx.send(Mutation::Upsert(doc)).await {
-                            tracing::debug!("resolver[{}]: send upsert failed: {}", worker_id, e);
-                        }
-                    }
-                    Resolved::Directory {
-                        subtree_files,
-                        subdirs,
-                    } => {
-                        for dir in subdirs {
-                            let _ = ctrl_tx.try_send(Control::AddWatch(dir));
-                        }
-                        for f in subtree_files {
-                            if refresh_tx.send(RefreshJob::Refresh(f)).await.is_err() {
-                                break;
-                            }
-                        }
-                    }
-                    Resolved::Gone => {
-                        // Key convention: the alias map is keyed on
-                        // the raw observed path string, the same
-                        // value `fs_doc_id` falls back to when
-                        // `canonicalize` fails on a vanished path.
-                        // If a prior index_file recorded an alias,
-                        // recover the canonical id and forget the
-                        // entry; otherwise fall back to the raw id.
-                        let observed = path.to_string_lossy().to_string();
-                        let id = match env.alias_noter.as_ref() {
-                            Some(noter) => match noter.resolve(&observed) {
-                                Some(canonical) => {
-                                    noter.forget(&canonical);
-                                    canonical
-                                }
-                                None => fs_doc_id(&path),
-                            },
-                            None => fs_doc_id(&path),
-                        };
-                        if let Err(e) = mutation_tx
-                            .send(Mutation::DeleteSubtree(id.clone()))
-                            .await
-                        {
-                            tracing::debug!(
-                                "resolver[{}]: send gone-delete-subtree {} failed: {}",
-                                worker_id,
-                                id,
-                                e
-                            );
-                        }
-                    }
-                    Resolved::Skip => {}
-                }
-            }
+            Resolved::Skip => {}
         }
     }
 }
 
 enum Resolved {
     File(Box<lixun_core::Document>),
-    Directory {
-        subtree_files: Vec<PathBuf>,
-        subdirs: Vec<PathBuf>,
-    },
+    Directory(Option<Box<lixun_core::Document>>),
     Gone,
     Skip,
 }
@@ -540,8 +574,10 @@ fn resolve_refresh(
     min_image_side_px: u32,
     alias_noter: Option<&dyn SymlinkAliasNoter>,
 ) -> Resolved {
-    let Ok(meta) = std::fs::metadata(path) else {
-        return Resolved::Gone;
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Resolved::Gone,
+        Err(_) => return Resolved::Skip,
     };
     if exclude.matches(path) {
         return Resolved::Skip;
@@ -575,24 +611,14 @@ fn resolve_refresh(
             Err(_) => Resolved::Skip,
         }
     } else if meta.is_dir() {
-        let mut subtree_files = Vec::new();
-        let mut subdirs = Vec::new();
-        for entry in WalkDir::new(path)
-            .follow_links(false)
-            .into_iter()
-            .filter_entry(|e| !exclude.matches(e.path()))
-            .flatten()
-        {
-            if entry.file_type().is_dir() {
-                subdirs.push(entry.path().to_path_buf());
-            } else if entry.file_type().is_file() {
-                subtree_files.push(entry.path().to_path_buf());
-            }
-        }
-        Resolved::Directory {
-            subtree_files,
-            subdirs,
-        }
+        let doc = if exclude.is_root(path) {
+            None
+        } else {
+            index_file(path, max_file_size_mb, caps, None, None, min_image_side_px)
+                .ok()
+                .map(Box::new)
+        };
+        Resolved::Directory(doc)
     } else {
         Resolved::Skip
     }
@@ -643,11 +669,11 @@ mod tests {
         assert!(matches!(intent, Intent::Delete));
         let job = match intent {
             Intent::Refresh => RefreshJob::Refresh(path.clone()),
-            Intent::Delete => RefreshJob::DeleteSubtree(fs_doc_id(path)),
+            Intent::Delete => RefreshJob::DeleteSubtree(path.clone()),
         };
         assert!(matches!(job, RefreshJob::DeleteSubtree(_)));
         if let RefreshJob::DeleteSubtree(prefix) = job {
-            assert_eq!(prefix, fs_doc_id(&dir));
+            assert_eq!(prefix, dir);
         }
     }
 

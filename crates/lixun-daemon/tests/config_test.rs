@@ -77,17 +77,12 @@ fn exclude_regex_compiled_from_toml() {
 }
 
 #[test]
-fn invalid_regex_patterns_dropped_not_fatal() {
+fn invalid_exclusion_prevents_loading_partial_policy() {
     let toml = r#"
         [core]
         exclude_regex = ['\.~lock\..*#$', '[unterminated', '\.tmp$']
     "#;
-    let cfg = Config::from_toml_str(toml).unwrap();
-    assert_eq!(
-        cfg.exclude_regex.len(),
-        2,
-        "bad pattern dropped; good ones kept"
-    );
+    assert!(Config::from_toml_str(toml).is_err());
 }
 
 #[test]

@@ -215,10 +215,8 @@ fn strip_mbox_envelope(msg_slice: &[u8]) -> Option<(usize, &[u8])> {
     if msg_slice.starts_with(b"From ") {
         let start = if let Some(pos) = msg_slice.windows(2).position(|window| window == b"\r\n") {
             pos + 2
-        } else if let Some(pos) = msg_slice.iter().position(|b| *b == b'\n') {
-            pos + 1
         } else {
-            return None;
+            msg_slice.iter().position(|b| *b == b'\n')? + 1
         };
         return Some((start, &msg_slice[start..]));
     }

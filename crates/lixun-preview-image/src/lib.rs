@@ -17,7 +17,7 @@
 //! via crossfade, mirroring the office plugin's spinner→content
 //! pattern. Files above `preview.max_file_size_mb` are refused up
 //! front with a "too large" placeholder, and oversized decodes are
-//! downscaled to [`MAX_DECODE_DIM`] so a 60-megapixel JPEG never
+//! downscaled to `MAX_DECODE_DIM` so a 60-megapixel JPEG never
 //! becomes a full-resolution GPU texture.
 
 use std::cell::Cell;

@@ -9,7 +9,7 @@ use std::path::Path;
 const DEFAULT_MAX: usize = 100;
 const FILE_NAME: &str = "queries.json";
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryLog {
     entries: VecDeque<String>,
     max: usize,
@@ -41,8 +41,16 @@ impl QueryLog {
     pub fn save(&self, state_dir: &Path) -> Result<()> {
         std::fs::create_dir_all(state_dir)?;
         let path = state_dir.join(FILE_NAME);
-        std::fs::write(&path, serde_json::to_string_pretty(self)?)?;
+        let temporary = state_dir.join("queries.json.tmp");
+        std::fs::write(&temporary, serde_json::to_string_pretty(self)?)?;
+        std::fs::rename(temporary, path)?;
         Ok(())
+    }
+
+    pub fn remove_excluded(&mut self, excludes: impl Fn(&str) -> bool) -> usize {
+        let before = self.entries.len();
+        self.entries.retain(|query| !excludes(query));
+        before - self.entries.len()
     }
 
     pub fn record_query(&mut self, q: &str) {

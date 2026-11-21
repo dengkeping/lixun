@@ -75,7 +75,7 @@ pub fn looks_like_math(input: &str) -> bool {
 
 /// Detect and evaluate a calculator query. Two passes, in order:
 ///
-/// 1. The static conversion grammars in [`crate::convert`] (unit, base,
+/// 1. The static conversion grammars in `crate::convert` (unit, base,
 ///    and percent-of conversions). These run first because their inputs
 ///    contain identifiers ("km", "of", "0xff") that `looks_like_math`
 ///    rejects, and their exact grammars keep prose from matching.

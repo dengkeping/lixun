@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::Path;
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Blocklist {
     // BTreeSet so `list()` is stable-sorted for the CLI without an
     // extra sort pass.
@@ -33,12 +33,20 @@ impl Blocklist {
             Ok(content) => match serde_json::from_str::<Blocklist>(&content) {
                 Ok(list) => list,
                 Err(e) => {
-                    tracing::warn!("blocklist: failed to parse {:?}: {}; starting empty", path, e);
+                    tracing::warn!(
+                        "blocklist: failed to parse {:?}: {}; starting empty",
+                        path,
+                        e
+                    );
                     Self::default()
                 }
             },
             Err(e) => {
-                tracing::warn!("blocklist: failed to read {:?}: {}; starting empty", path, e);
+                tracing::warn!(
+                    "blocklist: failed to read {:?}: {}; starting empty",
+                    path,
+                    e
+                );
                 Self::default()
             }
         }
@@ -93,7 +101,10 @@ mod tests {
         assert!(b.contains("fs:/tmp/a"));
         assert!(!b.contains("fs:/tmp/b"));
         assert!(b.set_hidden("fs:/tmp/a", false));
-        assert!(!b.set_hidden("fs:/tmp/a", false), "second remove is a no-op");
+        assert!(
+            !b.set_hidden("fs:/tmp/a", false),
+            "second remove is a no-op"
+        );
         assert!(!b.contains("fs:/tmp/a"));
     }
 
@@ -105,7 +116,11 @@ mod tests {
         b.set_hidden("app:m", true);
         assert_eq!(
             b.list(),
-            vec!["app:m".to_string(), "fs:/a".to_string(), "fs:/z".to_string()]
+            vec![
+                "app:m".to_string(),
+                "fs:/a".to_string(),
+                "fs:/z".to_string()
+            ]
         );
     }
 

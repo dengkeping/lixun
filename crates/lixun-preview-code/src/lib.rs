@@ -32,11 +32,11 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::sync::LazyLock;
 
+use gtk::prelude::IsA;
 use gtk::prelude::*;
 use lixun_core::{Action, Hit};
 use lixun_preview::{PreviewPlugin, PreviewPluginCfg, PreviewPluginEntry, SizingPreference};
 use syntect::easy::HighlightLines;
-use gtk::prelude::IsA;
 use syntect::highlighting::{Style, Theme, ThemeSet};
 use syntect::parsing::{SyntaxReference, SyntaxSet};
 use syntect::util::LinesWithEndings;

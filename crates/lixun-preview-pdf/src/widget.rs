@@ -594,9 +594,10 @@ fn wire_selection_gestures(canvas: &PdfCanvas, region_mode_default: Rc<Cell<bool
                 );
                 if region_mode
                     && let Some(anchor) = *anchor_cell.borrow()
-                        && active.page != anchor.page {
-                            return;
-                        }
+                    && active.page != anchor.page
+                {
+                    return;
+                }
                 canvas.update_selection_active(active);
             }
         });
@@ -628,9 +629,10 @@ fn wire_clipboard_key(view: &PdfView, canvas: &PdfCanvas, session: &Rc<DocumentS
                 PdfSelectionMode::Region => {
                     let zoom = canvas.zoom();
                     if let Some(tex) = render_region_image(&session, &sel, zoom)
-                        && let Some(display) = gdk::Display::default() {
-                            display.clipboard().set_texture(&tex);
-                        }
+                        && let Some(display) = gdk::Display::default()
+                    {
+                        display.clipboard().set_texture(&tex);
+                    }
                     return glib::Propagation::Stop;
                 }
                 PdfSelectionMode::Text { .. } => {

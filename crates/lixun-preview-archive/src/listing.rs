@@ -161,7 +161,7 @@ fn list_zip(path: &Path, cap: usize) -> Result<ArchiveListing, ArchiveError> {
         // their entry names, sizes, and directory flags.
         let entry = archive.by_index_raw(i).map_err(map_zip_err)?;
         entries.push(Entry {
-            name: sanitize_entry_name(entry.name()),
+            name: sanitize_entry_name(&entry.name().map_err(map_zip_err)?),
             size: entry.size(),
             is_dir: entry.is_dir(),
         });

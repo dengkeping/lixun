@@ -44,6 +44,10 @@ fn expand_tilde(s: &str) -> PathBuf {
 }
 
 impl PluginFactory for CommandFactory {
+    fn private_history_prefixes(&self) -> Option<(&'static str, Option<char>)> {
+        Some(("command:", None))
+    }
+
     fn section(&self) -> &'static str {
         "command_source"
     }
@@ -64,8 +68,7 @@ impl PluginFactory for CommandFactory {
         };
 
         let mut instances = Vec::new();
-        let mut seen_prefixes: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        let mut seen_prefixes: std::collections::HashSet<String> = std::collections::HashSet::new();
         for (i, entry) in entries.into_iter().enumerate() {
             let parsed: CommandEntry = entry.try_into().map_err(|e| {
                 anyhow::anyhow!("[[command_source]] entry {}: invalid shape: {e}", i + 1)
@@ -76,11 +79,13 @@ impl PluginFactory for CommandFactory {
                 .map(str::trim)
                 .filter(|n| !n.is_empty())
             else {
-                tracing::warn!("[[command_source]] entry {}: missing `name`; skipped", i + 1);
+                tracing::warn!(
+                    "[[command_source]] entry {}: missing `name`; skipped",
+                    i + 1
+                );
                 continue;
             };
-            let Some(prefix) = parsed.prefix.as_deref().filter(|p| !p.trim().is_empty())
-            else {
+            let Some(prefix) = parsed.prefix.as_deref().filter(|p| !p.trim().is_empty()) else {
                 tracing::warn!("[[command_source]] {name:?}: missing `prefix`; skipped");
                 continue;
             };
@@ -124,10 +129,7 @@ mod tests {
         PluginBuildContext {
             max_file_size_mb: 50,
             state_dir_root: PathBuf::from("/tmp"),
-            impact: Arc::new(ImpactProfile::from_level(
-                lixun_core::SystemImpact::High,
-                4,
-            )),
+            impact: Arc::new(ImpactProfile::from_level(lixun_core::SystemImpact::High, 4)),
         }
     }
 

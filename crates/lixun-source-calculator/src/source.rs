@@ -111,6 +111,10 @@ impl IndexerSource for CalculatorSource {
         vec![result_hit(calc, ctx)]
     }
 
+    fn excludes_from_click_history(&self, doc_id: &str) -> bool {
+        doc_id.starts_with("calculator:")
+    }
+
     fn excludes_from_query_log(&self, query: &str) -> bool {
         query.trim_start().starts_with('=')
     }

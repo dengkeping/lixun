@@ -223,6 +223,10 @@ impl IndexerSource for MaildirSource {
         MAILDIR_FIELDS
     }
 
+    fn relative_date_caption(&self) -> bool {
+        true
+    }
+
     fn row_menu(&self) -> RowMenuDef {
         RowMenuDef {
             items: vec![

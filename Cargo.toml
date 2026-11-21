@@ -40,7 +40,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.7.0"
+version = "0.7.1"
 edition = "2024"
 rust-version = "1.92"
 description = "Spotlight-like launcher for Linux"
@@ -66,7 +66,7 @@ walkdir = "2.5"
 
 # Extractors
 chardetng = "0.1"
-zip = "2.2"
+zip = "9.8"
 rtf-grimoire = "0.2"
 
 # CLI
@@ -110,7 +110,7 @@ zstd = "0.13"
 uuid = { version = "1", features = ["v4"] }
 dirs = "5"
 image = "0.25"
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.43", features = ["bundled"] }
 
 # Wave D: dense-vector hybrid retrieval. Pinned because the ONNX
 # Runtime ABI between fastembed/ort/lancedb is fragile across patch

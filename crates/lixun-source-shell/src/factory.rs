@@ -14,6 +14,10 @@ lixun_sources::inventory::submit! {
 pub struct ShellFactory;
 
 impl PluginFactory for ShellFactory {
+    fn private_history_prefixes(&self) -> Option<(&'static str, Option<char>)> {
+        Some(("shell:", Some('>')))
+    }
+
     fn section(&self) -> &'static str {
         "shell"
     }

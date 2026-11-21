@@ -157,6 +157,10 @@ impl EmbedderSupervisor {
     /// Convenience constructor that captures the cache and ONNX
     /// thread settings into the loader closures. Mirrors the
     /// eager-load sequence in `main.rs`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "accepts the three already initialized model handles and their reload settings"
+    )]
     pub fn from_config(
         cache_dir: std::path::PathBuf,
         text_model: String,

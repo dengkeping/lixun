@@ -39,6 +39,37 @@ fn worker_bin() -> PathBuf {
     candidate
 }
 
+/// Run each live test in its own process because the connection registry and
+/// runtime locations are process-wide. The worker wrapper records only its own PID.
+fn isolated_worker_test(name: &str) -> bool {
+    if std::env::var_os("LIXUN_TEST_WORKER_PID_FILE").is_some() {
+        return false;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let launcher = dir.path().join("worker");
+    std::fs::write(
+        &launcher,
+        r#"#!/bin/sh
+printf '%s\n' "$$" > "$LIXUN_TEST_WORKER_PID_FILE"
+exec "$LIXUN_TEST_WORKER_BINARY" "$@"
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", name, "--nocapture"])
+        .env("XDG_RUNTIME_DIR", dir.path())
+        .env("LIXUN_TEST_WORKER_PID_FILE", dir.path().join("pid"))
+        .env("LIXUN_TEST_WORKER_BINARY", worker_bin())
+        .env("LIXUN_SEMANTIC_WORKER", launcher)
+        .env("LIXUN_SEMANTIC_DATA_DIR", dir.path().join("data"))
+        .status()
+        .unwrap();
+    assert!(status.success(), "isolated worker test failed");
+    true
+}
+
 fn ann_handle() -> Arc<dyn AnnHandle> {
     let factory = SemanticIpcFactory;
     let ctx = PluginBuildContext {
@@ -98,13 +129,10 @@ fn probe_returns_none_for_unreachable_env_path() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn supervisor_handshakes_and_serves_empty_search() {
-    let bin = worker_bin();
-    let tmp = tempfile::tempdir().expect("tempdir");
-    unsafe {
-        std::env::set_var("LIXUN_SEMANTIC_DATA_DIR", tmp.path());
-        std::env::set_var("LIXUN_SEMANTIC_WORKER", &bin);
+    if isolated_worker_test("supervisor_handshakes_and_serves_empty_search") {
+        return;
     }
-
+    let bin = PathBuf::from(std::env::var_os("LIXUN_SEMANTIC_WORKER").unwrap());
     let supervisor = tokio::spawn(semantic_supervisor::supervise(bin.clone()));
 
     wait_until_connected(Duration::from_secs(120)).await;
@@ -121,36 +149,44 @@ async fn supervisor_handshakes_and_serves_empty_search() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn supervisor_restarts_after_worker_kill() {
-    let bin = worker_bin();
-    let tmp = tempfile::tempdir().expect("tempdir");
-    unsafe {
-        std::env::set_var("LIXUN_SEMANTIC_DATA_DIR", tmp.path());
-        std::env::set_var("LIXUN_SEMANTIC_WORKER", &bin);
+    if isolated_worker_test("supervisor_restarts_after_worker_kill") {
+        return;
     }
-
+    let bin = PathBuf::from(std::env::var_os("LIXUN_SEMANTIC_WORKER").unwrap());
     let supervisor = tokio::spawn(semantic_supervisor::supervise(bin.clone()));
     wait_until_connected(Duration::from_secs(120)).await;
 
-    /* SIGKILL every running worker. The supervisor's restart loop
-    binds a fresh socket, spawns a replacement, and re-handshakes
-    after the backoff. We assert that a search round-trip
-    eventually completes again — proving the restart took.
-    `pkill -f` matches the full command line because the binary
-    name exceeds 15 chars (Linux's /proc/pid/comm is truncated). */
-    let kill_status = tokio::process::Command::new("pkill")
-        .args(["-9", "-f", "lixun-semantic-worker"])
-        .status()
-        .await
-        .expect("pkill spawn");
-    /* pkill returns 1 if no processes matched. The test only
-    proceeds when at least one worker was killed; otherwise the
-    "recovers after kill" assertion would be vacuous. */
-    assert!(
-        kill_status.success(),
-        "pkill found no worker to kill (exit={kill_status:?}) — \
-         supervisor never spawned its child?"
+    let pid_file = std::env::var_os("LIXUN_TEST_WORKER_PID_FILE").unwrap();
+    let pid: i32 = std::fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(pid > 1);
+    // Pin the process before checking ownership so PID reuse cannot redirect
+    // the signal. The supervisor spawns the worker directly in this process.
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    assert!(fd >= 0, "worker already exited");
+    let worker = unsafe { OwnedFd::from_raw_fd(fd as i32) };
+    let proc_status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+    let parent = proc_status
+        .lines()
+        .find_map(|line| line.strip_prefix("PPid:"))
+        .unwrap();
+    assert_eq!(parent.trim().parse::<u32>().unwrap(), std::process::id());
+    assert_eq!(
+        unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                worker.as_raw_fd(),
+                libc::SIGKILL,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        },
+        0
     );
-
     /* Give the supervisor a moment to notice the dead child before
     we begin probing. */
     sleep(Duration::from_millis(500)).await;
@@ -163,10 +199,11 @@ async fn supervisor_restarts_after_worker_kill() {
             panic!("worker did not recover within 120s after kill; last err: {last_err:?}");
         }
         match timeout(Duration::from_secs(5), ann.search_text("hello", 5)).await {
-            Ok(Ok(_)) => {
+            Ok(Ok(_)) if std::fs::read_to_string(&pid_file).unwrap().trim() != pid.to_string() => {
                 supervisor.abort();
                 return;
             }
+            Ok(Ok(_)) => {}
             Ok(Err(e)) => last_err = Some(format!("{e}")),
             Err(_) => last_err = Some("timeout".into()),
         }

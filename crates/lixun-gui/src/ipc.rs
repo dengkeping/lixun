@@ -114,12 +114,7 @@ pub(crate) fn start_ipc_thread(
                 );
                 continue;
             }
-            tracing::debug!(
-                "ipc: sending search request query={:?} limit={} epoch={}",
-                query,
-                limit,
-                epoch_at_send
-            );
+            tracing::debug!(limit, epoch_at_send, "sending search");
 
             // `explain: true` (R9): the Get Info popover surfaces the
             // top ranking multipliers, so the daemon's breakdown
@@ -346,10 +341,16 @@ fn read_loop(
             }) => {
                 // Server-side preemption ack for a superseded search;
                 // nothing to deliver.
-                tracing::debug!("ipc: search cancelled server-side (epoch {})", cancelled_epoch);
+                tracing::debug!(
+                    "ipc: search cancelled server-side (epoch {})",
+                    cancelled_epoch
+                );
             }
             Ok(other) => {
-                tracing::debug!("ipc: ignoring unexpected response variant: {:?}", other);
+                tracing::debug!(
+                    "ipc: ignoring unexpected response variant: {:?}",
+                    std::mem::discriminant(&other)
+                );
             }
             Err(e) => {
                 tracing::error!("Failed to deserialize response: {}", e);
@@ -362,7 +363,12 @@ fn read_loop(
 
 /// Length-prefix + version frame for a request, ready to write.
 fn encode_frame(req: &Request) -> Option<Vec<u8>> {
-    let (version, payload) = match lixun_ipc::encode_request(req) {
+    let version = if matches!(req, Request::Capabilities) {
+        lixun_ipc::PROTOCOL_VERSION_LEGACY
+    } else {
+        PEER_VERSION.load(Ordering::Relaxed)
+    };
+    let payload = match lixun_ipc::encode_request_for_version(version, req) {
         Ok(p) => p,
         Err(e) => {
             tracing::error!("Failed to serialize request: {}", e);
@@ -520,6 +526,13 @@ pub(crate) fn dispatch_click_pair(doc_id: &str, query: &str) {
     if crate::factory::is_synthetic_doc_id(doc_id) {
         return;
     }
+    if SUPPORTS_SELECTION.load(Ordering::Relaxed) {
+        send_request_fire_and_forget(&Request::RecordSelection {
+            doc_id: doc_id.into(),
+            query: query.into(),
+        });
+        return;
+    }
     for req in build_click_pair(doc_id, query) {
         send_request_fire_and_forget(&req);
     }
@@ -571,6 +584,26 @@ fn send_request_fire_and_forget(req: &Request) {
     }
 }
 
+static PEER_VERSION: std::sync::atomic::AtomicU16 =
+    std::sync::atomic::AtomicU16::new(lixun_ipc::PROTOCOL_VERSION_LEGACY);
+
+static SUPPORTS_SELECTION: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn relative_date_sources() -> std::collections::HashSet<String> {
+    let (versions, ids, selection) = match one_shot_request(&Request::Capabilities) {
+        Some(Response::Capabilities {
+            versions,
+            relative_date_sources,
+            record_selection,
+        }) => (versions, relative_date_sources, record_selection),
+        _ => Default::default(),
+    };
+    PEER_VERSION.store(lixun_ipc::client_version(&versions), Ordering::Relaxed);
+    SUPPORTS_SELECTION.store(selection, Ordering::Relaxed);
+    ids.into_iter().collect()
+}
+
 pub(crate) fn fetch_claimed_prefixes() -> Vec<String> {
     match one_shot_request(&Request::ClaimedPrefixes) {
         Some(Response::ClaimedPrefixes(p)) => p,
@@ -593,11 +626,6 @@ pub(crate) fn current_monitor_connector(window: &gtk::ApplicationWindow) -> Opti
 }
 
 pub(crate) fn send_preview_request(hit: &Hit, monitor: Option<String>) {
-    tracing::info!(
-        "gui: send_preview_request hit_id={} monitor={:?}",
-        hit.id.0,
-        monitor
-    );
     send_request_fire_and_forget(&Request::Preview {
         hit: Box::new(hit.clone()),
         monitor,

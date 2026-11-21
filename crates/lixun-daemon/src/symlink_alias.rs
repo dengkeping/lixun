@@ -87,7 +87,6 @@ impl SymlinkAliases {
     }
 }
 
-
 /// Read-lock the alias map, recovering from poisoning. The map is a
 /// plain String->String table, so the state a panicking writer left
 /// behind is still internally consistent; losing one note() is

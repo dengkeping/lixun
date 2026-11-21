@@ -348,7 +348,11 @@ mod tests {
 
     #[test]
     fn on_query_surfaces_nonzero_exit() {
-        let s = src(vec!["sh".into(), "-c".into(), "echo bad >&2; exit 2".into()]);
+        let s = src(vec![
+            "sh".into(),
+            "-c".into(),
+            "echo bad >&2; exit 2".into(),
+        ]);
         let hits = s.on_query("t x", &ctx());
         assert_eq!(hits.len(), 1);
         assert!(hits[0].subtitle.contains("code 2"));

@@ -211,12 +211,6 @@ fn build_from_hit_fields(hit: &Hit) -> gtk::Widget {
     scroll.set_min_content_width(720);
     scroll.set_min_content_height(320);
 
-    tracing::info!(
-        "email: rendered from Hit fields (gloda path) hit_id={} body_len={}",
-        hit.id.0,
-        hit.body.as_deref().map(|s| s.len()).unwrap_or(0)
-    );
-
     scroll.upcast()
 }
 

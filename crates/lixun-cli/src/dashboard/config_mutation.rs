@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 /// Read semantic.enabled from config.toml.
 ///
-/// Returns None if config doesn't exist or [semantic] section is missing.
+/// Returns None if config doesn't exist or `[semantic]` section is missing.
 pub fn read_semantic_enabled() -> Result<Option<bool>> {
     let path = dirs::config_dir()
         .ok_or_else(|| anyhow::anyhow!("No config dir"))?
@@ -32,7 +32,7 @@ pub fn read_semantic_enabled() -> Result<Option<bool>> {
 
 /// Read ocr.enabled from config.toml.
 ///
-/// Returns None if config doesn't exist or [ocr] section is missing.
+/// Returns None if config doesn't exist or `[ocr]` section is missing.
 #[allow(dead_code)]
 pub fn read_ocr_enabled() -> Result<Option<bool>> {
     let path = dirs::config_dir()

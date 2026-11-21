@@ -1,15 +1,7 @@
 //! Integration test for per-keystroke cancellation through the collector.
 //!
-//! This test is `#[ignore]` by default because:
-//!  * The daemon's search path is implemented inside `bin/lixund` (`src/main.rs`)
-//!    and is not exposed through the `lixun_daemon` library, so we cannot spawn
-//!    an in-process daemon without duplicating ~1200 lines of wiring.
-//!  * Tantivy holds a single-writer lock on the index directory, so spinning a
-//!    second daemon on a temporary directory would still fight the system
-//!    daemon for any shared paths.
-//!
-//! Run manually against a live daemon with:
-//!     cargo test -p lixun-daemon --test cancellation -- --ignored
+//! Run through the release QA script, which creates an isolated daemon,
+//! configuration, runtime directory and synthetic corpus for these tests.
 //!
 //! The test verifies the supersede contract: when a `Search` with epoch=2
 //! arrives while epoch=1 is still in-flight, the daemon emits
@@ -123,5 +115,72 @@ fn test_supersede_emits_cancelled() {
         "Cancelled{{epoch:1}} (at index {}) must arrive before SearchChunk{{epoch:2, Final}} (at index {})",
         ci,
         fi
+    );
+}
+
+#[test]
+#[ignore = "requires the isolated release QA corpus"]
+fn versioned_searches_return_file_application_and_plugin_hits() {
+    use lixun_core::Category;
+    use lixun_ipc::{Phase, Request, Response};
+    for version in [4u16, 5, 6] {
+        for (query, category) in [
+            ("reference-0.txt", Category::File),
+            ("Wirefixture", Category::App),
+            ("=2+3", Category::Calculator),
+        ] {
+            let mut socket = UnixStream::connect(lixun_ipc::socket_path()).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let payload = lixun_ipc::encode_request_for_version(
+                version,
+                &Request::Search {
+                    q: query.into(),
+                    limit: 5,
+                    explain: false,
+                    epoch: 1,
+                    category: None,
+                },
+            )
+            .unwrap();
+            socket
+                .write_all(&((2 + payload.len()) as u32).to_be_bytes())
+                .unwrap();
+            socket.write_all(&version.to_be_bytes()).unwrap();
+            socket.write_all(&payload).unwrap();
+            loop {
+                let mut header = [0; 6];
+                socket.read_exact(&mut header).unwrap();
+                assert_eq!(u16::from_be_bytes(header[4..].try_into().unwrap()), version);
+                let len = u32::from_be_bytes(header[..4].try_into().unwrap()) as usize;
+                assert!((2..=lixun_ipc::MAX_FRAME_LEN).contains(&len));
+                let mut bytes = vec![0; len - 2];
+                socket.read_exact(&mut bytes).unwrap();
+                match lixun_ipc::decode_response(version, &bytes).unwrap() {
+                    Response::SearchChunk {
+                        phase: Phase::Final,
+                        hits,
+                        ..
+                    } => {
+                        assert!(
+                            hits.iter().any(|hit| hit.category == category),
+                            "v{version} {query}"
+                        );
+                        break;
+                    }
+                    Response::SearchChunk { .. } => {}
+                    other => panic!("unexpected response: {other:?}"),
+                }
+            }
+        }
+    }
+    let mut socket = UnixStream::connect(lixun_ipc::socket_path()).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    socket.write_all(&[0, 0, 0, 2, 0, 99]).unwrap();
+    assert!(
+        matches!(read_response(&mut socket), Some(Response::Error(detail)) if detail.contains("unsupported"))
     );
 }

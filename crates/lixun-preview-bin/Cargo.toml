@@ -6,6 +6,7 @@ license.workspace = true
 
 [[bin]]
 name = "lixun-preview"
+doc = false
 path = "src/main.rs"
 
 [features]

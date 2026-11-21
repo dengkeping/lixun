@@ -12,16 +12,18 @@
 //! `factory::MENU_CACHE` live on that worker and stay consistent).
 
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::mpsc::{Sender, channel};
-use std::sync::Mutex;
 
 type Job = Box<dyn FnOnce() + Send>;
 type JobResult = std::thread::Result<()>;
 
-static GTK_THREAD: OnceLock<Option<Mutex<Sender<(Job, Sender<JobResult>)>>>> = OnceLock::new();
+type JobQueue = Mutex<Sender<(Job, Sender<JobResult>)>>;
 
-fn gtk_thread() -> Option<&'static Mutex<Sender<(Job, Sender<JobResult>)>>> {
+static GTK_THREAD: OnceLock<Option<JobQueue>> = OnceLock::new();
+
+fn gtk_thread() -> Option<&'static JobQueue> {
     GTK_THREAD
         .get_or_init(|| {
             let (tx, rx) = channel::<(Job, Sender<JobResult>)>();

@@ -21,6 +21,17 @@ pub enum Category {
 }
 
 impl Category {
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            Self::App => "Application",
+            Self::File => "File",
+            Self::Mail => "Email",
+            Self::Attachment => "Attachment",
+            Self::Calculator => "Calculator",
+            Self::Shell => "Shell",
+        }
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Category::App => "app",
@@ -235,6 +246,9 @@ fn deserialize_exec_string_or_vec<'de, D>(d: D) -> Result<Vec<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
+    if !d.is_human_readable() {
+        return Vec::<String>::deserialize(d);
+    }
     #[derive(serde::Deserialize)]
     #[serde(untagged)]
     enum OneOrMany {
@@ -376,7 +390,7 @@ pub struct Hit {
     /// non-primary affordances. `Box` keeps `Hit` size stable since
     /// `Action` is a sizable enum. `None` means no secondary action;
     /// the host hides the corresponding menu entry.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub secondary_action: Option<Box<Action>>,
     /// Identifies which source produced this hit. The host uses it
     /// as the cache key for the translated row menu (see
@@ -390,7 +404,7 @@ pub struct Hit {
     /// Row context-menu supplied by the source. Attached by the
     /// daemon (never by the plugin itself) from the source's
     /// `row_menu()` declaration. Empty when the source opts out.
-    #[serde(default, skip_serializing_if = "RowMenuDef::is_empty")]
+    #[serde(default)]
     pub row_menu: RowMenuDef,
     /// MIME type inferred from file extension or content. Used by semantic
     /// worker backfill to classify documents into text/image/skip channels.
@@ -441,6 +455,32 @@ pub struct ScoreBreakdown {
     /// matches and carry no standing in hybrid rank fusion (they are
     /// page filler, not relevance evidence).
     pub lexical_fallback: bool,
+}
+
+impl ScoreBreakdown {
+    /// Keep lexical refill below full matches. Only a lexical match on an
+    /// application's visible name can promote it above the ordinary score order.
+    pub fn rank_tier(&self, category: Category) -> i8 {
+        if self.lexical_fallback {
+            -1
+        } else if category == Category::App && self.exact_title_mult > 1.0 {
+            2
+        } else if category == Category::App && self.prefix_mult > 1.0 {
+            1
+        } else {
+            0
+        }
+    }
+}
+
+pub fn compare_ranked_hits(
+    a: &(Hit, ScoreBreakdown),
+    b: &(Hit, ScoreBreakdown),
+) -> std::cmp::Ordering {
+    b.1.rank_tier(b.0.category)
+        .cmp(&a.1.rank_tier(a.0.category))
+        .then_with(|| b.0.score.total_cmp(&a.0.score))
+        .then_with(|| a.0.id.0.cmp(&b.0.id.0))
 }
 
 /// Inline calculator result (for Spotlight-style "2+2 = 4" display).

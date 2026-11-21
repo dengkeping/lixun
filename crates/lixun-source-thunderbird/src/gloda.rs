@@ -350,6 +350,10 @@ impl lixun_sources::source::IndexerSource for GlodaSource {
         Some(Duration::from_secs(30))
     }
 
+    fn relative_date_caption(&self) -> bool {
+        true
+    }
+
     fn row_menu(&self) -> RowMenuDef {
         RowMenuDef {
             items: vec![
@@ -604,9 +608,15 @@ mod tests {
     fn test_gloda_date_conversion_microseconds_to_seconds() {
         assert_eq!(gloda_date_to_unix_secs(None), 0);
         assert_eq!(gloda_date_to_unix_secs(Some(0)), 0);
-        assert_eq!(gloda_date_to_unix_secs(Some(1_735_689_600_000_000)), 1_735_689_600);
+        assert_eq!(
+            gloda_date_to_unix_secs(Some(1_735_689_600_000_000)),
+            1_735_689_600
+        );
         // Sub-second remainder truncates toward the floor.
-        assert_eq!(gloda_date_to_unix_secs(Some(1_735_689_600_999_999)), 1_735_689_600);
+        assert_eq!(
+            gloda_date_to_unix_secs(Some(1_735_689_600_999_999)),
+            1_735_689_600
+        );
         // Nonsense negative PRTime collapses to the unknown sentinel.
         assert_eq!(gloda_date_to_unix_secs(Some(-5_000_000)), 0);
     }

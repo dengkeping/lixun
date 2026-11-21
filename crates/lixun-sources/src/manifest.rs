@@ -1,11 +1,13 @@
 use lixun_core::paths::canonical_fs_path_str;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct Manifest {
     files: HashMap<String, i64>,
+    #[serde(default)]
+    mounts: BTreeSet<PathBuf>,
 }
 
 impl Manifest {
@@ -42,14 +44,44 @@ impl Manifest {
                 migrated.len(),
             );
         }
-        Self { files: migrated }
+        Self {
+            files: migrated,
+            mounts: raw.mounts,
+        }
     }
 
     pub fn save(&self, state_dir: &Path) {
-        let path = state_dir.join("manifest.json");
-        if let Ok(content) = serde_json::to_string(self) {
-            let _ = std::fs::write(&path, content);
+        if let Err(error) = self.save_checked(state_dir) {
+            tracing::error!(%error, "cannot save filesystem manifest");
         }
+    }
+
+    pub fn save_checked(&self, state_dir: &Path) -> anyhow::Result<()> {
+        let mut file = tempfile::NamedTempFile::new_in(state_dir)?;
+        serde_json::to_writer(file.as_file_mut(), self)?;
+        file.as_file().sync_all()?;
+        file.persist(state_dir.join("manifest.json"))?;
+        Ok(())
+    }
+
+    /// A detached volume can leave a readable, empty mountpoint. Preserve
+    /// its committed documents until the mount reappears, including on restart.
+    pub fn offline_mounts(&mut self, roots: &[PathBuf]) -> Vec<PathBuf> {
+        let roots: Vec<_> = roots
+            .iter()
+            .filter_map(|p| p.canonicalize().or_else(|_| std::path::absolute(p)).ok())
+            .collect();
+        self.mounts.retain(|p| {
+            roots
+                .iter()
+                .any(|root| root.starts_with(p) || p.starts_with(root))
+        });
+        let Ok(observed) = mounted_areas(&roots) else {
+            return self.mounts.iter().cloned().collect();
+        };
+        let missing = self.mounts.difference(&observed).cloned().collect();
+        self.mounts.extend(observed);
+        missing
     }
 
     pub fn is_unchanged(&self, path: &str, mtime: i64) -> bool {
@@ -75,6 +107,47 @@ impl Manifest {
     pub fn is_empty(&self) -> bool {
         self.files.is_empty()
     }
+}
+
+/// Mount information is read once per scan. Linux escapes delimiters in
+/// this table even for paths that contain literal backslashes.
+pub(crate) fn mounted_areas(roots: &[PathBuf]) -> std::io::Result<BTreeSet<PathBuf>> {
+    use std::os::unix::ffi::OsStringExt;
+    let table = std::fs::read("/proc/self/mountinfo")?;
+    let mut mounts = BTreeSet::new();
+    for path in table
+        .split(|&b| b == b'\n')
+        .filter_map(|line| line.split(|&b| b == b' ').nth(4))
+    {
+        let mut decoded = Vec::with_capacity(path.len());
+        let mut pos = 0;
+        while pos < path.len() {
+            if path[pos] == b'\\'
+                && let Some(code) = path.get(pos + 1..pos + 4)
+                && let Some(byte) = match code {
+                    b"040" => Some(b' '),
+                    b"011" => Some(b'\t'),
+                    b"012" => Some(b'\n'),
+                    b"134" => Some(b'\\'),
+                    _ => None,
+                }
+            {
+                decoded.push(byte);
+                pos += 4;
+            } else {
+                decoded.push(path[pos]);
+                pos += 1;
+            }
+        }
+        let mount = PathBuf::from(std::ffi::OsString::from_vec(decoded));
+        if roots
+            .iter()
+            .any(|root| root.starts_with(&mount) || mount.starts_with(root))
+        {
+            mounts.insert(mount);
+        }
+    }
+    Ok(mounts)
 }
 
 #[cfg(test)]

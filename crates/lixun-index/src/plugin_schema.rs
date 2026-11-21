@@ -186,36 +186,24 @@ pub fn write_fingerprint(index_dir: &Path, fingerprint: &str) -> Result<()> {
 }
 
 pub fn rewrite_query_aliases(text: &str, aliases: &HashMap<&'static str, &'static str>) -> String {
-    if aliases.is_empty() {
+    if aliases.is_empty() || !text.contains(':') {
         return text.to_string();
     }
     let mut out = String::with_capacity(text.len());
-    let bytes = text.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let c = bytes[i];
-        let is_id_start = c.is_ascii_alphabetic() || c == b'_';
-        let at_boundary = i == 0 || !bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_';
-        if is_id_start && at_boundary {
-            let start = i;
-            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
-                i += 1;
-            }
-            if i < bytes.len() && bytes[i] == b':' {
-                let ident = &text[start..i];
-                if let Some(real) = aliases.get(ident) {
-                    out.push_str(real);
-                    out.push(':');
-                    i += 1;
-                    continue;
-                }
-            }
-            out.push_str(&text[start..i]);
-        } else {
-            out.push(c as char);
-            i += 1;
+    let mut copied = 0;
+    for (colon, _) in text.match_indices(':') {
+        let prefix = &text[..colon];
+        let alias = prefix
+            .rsplit(|ch: char| !ch.is_alphanumeric() && ch != '_')
+            .next()
+            .unwrap_or_default();
+        if let Some(field) = aliases.get(alias) {
+            out.push_str(&text[copied..colon - alias.len()]);
+            out.push_str(field);
+            copied = colon;
         }
     }
+    out.push_str(&text[copied..]);
     out
 }
 
@@ -332,6 +320,21 @@ mod tests {
         let sa: &'static [PluginFieldSpec] = &[FOLDER, FLAGS];
         a.insert("maildir", sa);
         assert_eq!(compute_fingerprint(5, &a), compute_fingerprint(5, &a));
+    }
+
+    #[test]
+    fn registered_aliases_preserve_unicode_query_text() {
+        let aliases = HashMap::from([("label", "collection_label")]);
+        for (query, expected) in [
+            ("черновики", "черновики"),
+            (
+                "資料 label:Архив résumé",
+                "資料 collection_label:Архив résumé",
+            ),
+            ("prefixlabel:x меткаlabel:y", "prefixlabel:x меткаlabel:y"),
+        ] {
+            assert_eq!(rewrite_query_aliases(query, &aliases), expected);
+        }
     }
 
     #[test]

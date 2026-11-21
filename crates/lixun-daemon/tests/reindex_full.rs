@@ -65,14 +65,20 @@ async fn reindex_full_rebuilds_manifest_and_drops_phantom_entries() {
         lixun_core::RankingConfig::default(),
     )
     .unwrap();
-    let (mutation_tx, _search, _writer_handle) = spawn_writer_service(index).unwrap();
+    let (mutation_tx, search, _writer_handle) = spawn_writer_service(index).unwrap();
 
     let config = test_config(root.clone(), state_dir.clone());
     let sources = lixun_daemon::sources_glue::SourcesGlue::new(std::sync::Arc::new(config));
     let registry = lixun_indexer::SourceRegistry::new();
-    let outcome = indexer::reindex_full(&mutation_tx, &sources, &registry, &state_dir)
-        .await
-        .unwrap();
+    let outcome = indexer::reindex_full(
+        &mutation_tx,
+        &sources,
+        &registry,
+        &state_dir,
+        search.all_doc_ids().await.unwrap(),
+    )
+    .await
+    .unwrap();
 
     assert!(outcome.fs_docs >= 1, "real file must be indexed");
 
@@ -89,4 +95,65 @@ async fn reindex_full_rebuilds_manifest_and_drops_phantom_entries() {
             .any(|p| p == real_file.to_string_lossy().as_ref()),
         "real file must be present"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rebuild_reconciles_committed_files_and_keeps_an_offline_root() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let state = tmp.path().join("state");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::create_dir(&state).unwrap();
+    let keep = root.join("keep.txt");
+    let removed = root.join("removed.txt");
+    std::fs::write(&keep, b"keep").unwrap();
+    std::fs::write(&removed, b"drop").unwrap();
+    let index = lixun_index::LixunIndex::create_or_open(
+        state.join("index").to_str().unwrap(),
+        Default::default(),
+    )
+    .unwrap();
+    let (tx, search, _writer) = spawn_writer_service(index).unwrap();
+    let sources = lixun_daemon::sources_glue::SourcesGlue::new(std::sync::Arc::new(test_config(
+        root.clone(),
+        state.clone(),
+    )));
+    let registry = lixun_indexer::SourceRegistry::new();
+    let rebuild = || async {
+        indexer::reindex_full(
+            &tx,
+            &sources,
+            &registry,
+            &state,
+            search.all_doc_ids().await.unwrap(),
+        )
+        .await
+        .unwrap();
+    };
+    rebuild().await;
+    assert_eq!(search.all_doc_ids().await.unwrap().len(), 2);
+    std::fs::remove_file(&removed).unwrap();
+    Manifest::default().save_checked(&state).unwrap();
+    rebuild().await;
+    let keep_id = format!("fs:{}", keep.display());
+    assert_eq!(
+        search.all_doc_ids().await.unwrap(),
+        [keep_id.clone()].into()
+    );
+    // A previously mounted subtree may still be a readable empty directory.
+    let manifest_file = state.join("manifest.json");
+    let original = std::fs::read(&manifest_file).unwrap();
+    let mut saved: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    saved["mounts"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!(root));
+    std::fs::write(&manifest_file, serde_json::to_vec(&saved).unwrap()).unwrap();
+    std::fs::remove_file(&keep).unwrap();
+    rebuild().await;
+    assert!(search.all_doc_ids().await.unwrap().contains(&keep_id));
+    std::fs::write(&manifest_file, original).unwrap();
+    std::fs::rename(&root, tmp.path().join("offline")).unwrap();
+    rebuild().await;
+    assert_eq!(search.all_doc_ids().await.unwrap(), [keep_id].into());
 }

@@ -249,7 +249,11 @@ pub(crate) fn icon_ready_rx() -> async_channel::Receiver<IconKey> {
         .clone()
 }
 
-fn lookup_cached_texture(path: &std::path::Path, size: i32, kind: LoadKind) -> Option<gdk::Paintable> {
+fn lookup_cached_texture(
+    path: &std::path::Path,
+    size: i32,
+    kind: LoadKind,
+) -> Option<gdk::Paintable> {
     let key: IconKey = (path.to_string_lossy().into_owned(), size, 1);
     {
         let map = texture_cache().map.read().unwrap();

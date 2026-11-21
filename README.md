@@ -1,6 +1,6 @@
 # Lixun 利寻
 
-[![version](https://img.shields.io/badge/version-0.7.0-blue)](https://github.com/dengkeping/lixun/releases)
+[![version](https://img.shields.io/badge/version-0.7.1-blue)](https://github.com/dengkeping/lixun/releases)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-green)](#license)
 [![platform](https://img.shields.io/badge/platform-Linux-lightgrey)]()
 [![rust](https://img.shields.io/badge/rust-2024-orange)](https://www.rust-lang.org/)
@@ -83,16 +83,14 @@ native switcher bound.
 
 ## Install
 
-### Arch Linux (binary package)
+### Arch Linux
+
+Build and install the core package with the Arch packaging tools:
 
 ```sh
 git clone https://github.com/dengkeping/lixun.git
-cd lixun
-cargo build --workspace --release
-cp target/release/{lixun-cli,lixund,lixun-gui,lixun-preview} /tmp/lixun-arch-tarball/
-tar -C /tmp/lixun-arch-tarball -czf packaging/arch/lixun-0.7.0-x86_64.tar.gz .
-cd packaging/arch && makepkg -f
-sudo pacman -U lixun-bin-0.7.0-1-x86_64.pkg.tar.zst
+cd lixun/packaging/arch/lixun
+makepkg -si
 systemctl --user enable --now lixund.service
 ```
 
@@ -688,8 +686,8 @@ by how often people actually ask for it:
 
 Explicitly **not** planned for v1.x: SaaS integrations (GitHub, Jira,
 Slack, Notion, Linear, Google Drive, cloud LLMs); password manager
-integrations beyond `pass` titles-only; smart home and cloud admin; an
-"AI assistant" plugin. If a plugin's value disappears offline, it is
+integrations beyond `pass` titles-only; smart home and cloud admin; a
+conversational model plugin. If a plugin's value disappears offline, it is
 not v1.
 
 ### Plugin trust model (Phase 3)
@@ -731,6 +729,11 @@ user-visible search downtime. Expect transient CPU and I/O for the
 duration of the reindex (minutes on typical home corpora).
 
 Recent version bumps:
+
+- **v0.7.1** fixes Unicode search and applies category filters before filling
+  the results page. Apps get priority for name matches. The daemon also
+  enforces indexing exclusions during updates and protects private query
+  history.
 
 - **v0.7.0** (UX hardening pass). Keyboard-flow fixes: the top-hit preview
   chord, safe Enter on empty results, and session text selection. Honest

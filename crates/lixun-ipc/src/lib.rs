@@ -1,7 +1,7 @@
 //! Lixun IPC — unix-socket protocol and codec.
 //!
 //! Transport: unix-socket at `$XDG_RUNTIME_DIR/lixun.sock`, fallback `/tmp/lixun-$UID.sock`.
-//! Framing: `u32` big-endian length prefix + JSON payload.
+//! Framing: big-endian length (u32), version (u16), then the versioned payload.
 //! Socket permissions: `0600`.
 
 use bytes::{Buf, BufMut, BytesMut};
@@ -20,6 +20,23 @@ pub mod preview;
 pub const PROTOCOL_VERSION_LEGACY: u16 = 4;
 /// Postcard binary wire format introduced in v5.
 pub const PROTOCOL_VERSION_BINARY: u16 = 5;
+/// Named MessagePack fields allow extensible payloads and plugin-defined values.
+pub const PROTOCOL_VERSION_NAMED: u16 = 6;
+pub const SUPPORTED_VERSIONS: &[u16] = &[
+    PROTOCOL_VERSION_LEGACY,
+    PROTOCOL_VERSION_BINARY,
+    PROTOCOL_VERSION_NAMED,
+];
+
+/// Probes always use the common v4 frame. A peer predating discovery may
+/// close that connection, so the first real request still uses v4.
+pub fn client_version(versions: &[u16]) -> u16 {
+    if versions.contains(&PROTOCOL_VERSION) {
+        PROTOCOL_VERSION
+    } else {
+        PROTOCOL_VERSION_LEGACY
+    }
+}
 
 /// Upper bound on a length-prefixed frame payload, in bytes. Readers
 /// reject any `u32` length prefix above this before allocating, so a
@@ -27,15 +44,12 @@ pub const PROTOCOL_VERSION_BINARY: u16 = 5;
 /// is far above any legitimate request or response.
 pub const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
 
-/// The protocol version this build emits on the wire. Decode paths
-/// still accept both [`PROTOCOL_VERSION_LEGACY`] and
-/// [`PROTOCOL_VERSION_BINARY`] regardless of which codec is compiled
-/// in, so a rolling upgrade between daemon and launcher does not
-/// require a coordinated restart.
+/// The default build sends v4 JSON; binary builds send v6 MessagePack.
+/// All builds accept requests in v4, v5 and v6 and reply in the request format.
 #[cfg(feature = "legacy-json-ipc")]
 pub const PROTOCOL_VERSION: u16 = PROTOCOL_VERSION_LEGACY;
 #[cfg(not(feature = "legacy-json-ipc"))]
-pub const PROTOCOL_VERSION: u16 = PROTOCOL_VERSION_BINARY;
+pub const PROTOCOL_VERSION: u16 = PROTOCOL_VERSION_NAMED;
 
 /// Error returned by [`encode_request`] / [`encode_response`] and their
 /// version-aware [`encode_request_for_version`] /
@@ -43,6 +57,7 @@ pub const PROTOCOL_VERSION: u16 = PROTOCOL_VERSION_BINARY;
 /// mirrors [`DecodeError::UnsupportedVersion`].
 #[derive(Debug)]
 pub enum EncodeError {
+    Named(rmp_serde::encode::Error),
     Json(serde_json::Error),
     Postcard(postcard::Error),
     UnsupportedVersion(u16),
@@ -51,6 +66,7 @@ pub enum EncodeError {
 impl std::fmt::Display for EncodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            EncodeError::Named(e) => write!(f, "MessagePack error: {e}"),
             EncodeError::Json(e) => write!(f, "json encode error: {}", e),
             EncodeError::Postcard(e) => write!(f, "postcard encode error: {}", e),
             EncodeError::UnsupportedVersion(v) => {
@@ -63,6 +79,7 @@ impl std::fmt::Display for EncodeError {
 impl std::error::Error for EncodeError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            EncodeError::Named(e) => Some(e),
             EncodeError::Json(e) => Some(e),
             EncodeError::Postcard(e) => Some(e),
             EncodeError::UnsupportedVersion(_) => None,
@@ -85,6 +102,7 @@ impl From<postcard::Error> for EncodeError {
 /// Error returned by [`decode_request`] / [`decode_response`].
 #[derive(Debug)]
 pub enum DecodeError {
+    Named(rmp_serde::decode::Error),
     Json(serde_json::Error),
     Postcard(postcard::Error),
     UnsupportedVersion(u16),
@@ -93,6 +111,7 @@ pub enum DecodeError {
 impl std::fmt::Display for DecodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            DecodeError::Named(e) => write!(f, "MessagePack error: {e}"),
             DecodeError::Json(e) => write!(f, "json decode error: {}", e),
             DecodeError::Postcard(e) => write!(f, "postcard decode error: {}", e),
             DecodeError::UnsupportedVersion(v) => {
@@ -105,6 +124,7 @@ impl std::fmt::Display for DecodeError {
 impl std::error::Error for DecodeError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            DecodeError::Named(e) => Some(e),
             DecodeError::Json(e) => Some(e),
             DecodeError::Postcard(e) => Some(e),
             DecodeError::UnsupportedVersion(_) => None,
@@ -128,31 +148,19 @@ impl From<postcard::Error> for DecodeError {
 /// the wire-protocol version that callers must write into the framing
 /// header alongside the payload.
 pub fn encode_request(req: &Request) -> Result<(u16, Vec<u8>), EncodeError> {
-    #[cfg(feature = "legacy-json-ipc")]
-    {
-        let bytes = serde_json::to_vec(req)?;
-        Ok((PROTOCOL_VERSION_LEGACY, bytes))
-    }
-    #[cfg(not(feature = "legacy-json-ipc"))]
-    {
-        let bytes = postcard::to_allocvec(req)?;
-        Ok((PROTOCOL_VERSION_BINARY, bytes))
-    }
+    Ok((
+        PROTOCOL_VERSION,
+        encode_request_for_version(PROTOCOL_VERSION, req)?,
+    ))
 }
 
 /// Encode a response using the codec selected at compile time. See
 /// [`encode_request`].
 pub fn encode_response(resp: &Response) -> Result<(u16, Vec<u8>), EncodeError> {
-    #[cfg(feature = "legacy-json-ipc")]
-    {
-        let bytes = serde_json::to_vec(resp)?;
-        Ok((PROTOCOL_VERSION_LEGACY, bytes))
-    }
-    #[cfg(not(feature = "legacy-json-ipc"))]
-    {
-        let bytes = postcard::to_allocvec(resp)?;
-        Ok((PROTOCOL_VERSION_BINARY, bytes))
-    }
+    Ok((
+        PROTOCOL_VERSION,
+        encode_response_for_version(PROTOCOL_VERSION, resp)?,
+    ))
 }
 
 /// Encode a request for the version negotiated with the peer, ignoring
@@ -162,6 +170,7 @@ pub fn encode_response(resp: &Response) -> Result<(u16, Vec<u8>), EncodeError> {
 pub fn encode_request_for_version(version: u16, req: &Request) -> Result<Vec<u8>, EncodeError> {
     match version {
         PROTOCOL_VERSION_LEGACY => Ok(serde_json::to_vec(req)?),
+        PROTOCOL_VERSION_NAMED => rmp_serde::to_vec_named(req).map_err(EncodeError::Named),
         PROTOCOL_VERSION_BINARY => Ok(postcard::to_allocvec(req)?),
         other => Err(EncodeError::UnsupportedVersion(other)),
     }
@@ -172,6 +181,7 @@ pub fn encode_request_for_version(version: u16, req: &Request) -> Result<Vec<u8>
 pub fn encode_response_for_version(version: u16, resp: &Response) -> Result<Vec<u8>, EncodeError> {
     match version {
         PROTOCOL_VERSION_LEGACY => Ok(serde_json::to_vec(resp)?),
+        PROTOCOL_VERSION_NAMED => rmp_serde::to_vec_named(resp).map_err(EncodeError::Named),
         PROTOCOL_VERSION_BINARY => Ok(postcard::to_allocvec(resp)?),
         other => Err(EncodeError::UnsupportedVersion(other)),
     }
@@ -183,6 +193,7 @@ pub fn encode_response_for_version(version: u16, resp: &Response) -> Result<Vec<
 pub fn decode_request(version: u16, bytes: &[u8]) -> Result<Request, DecodeError> {
     match version {
         PROTOCOL_VERSION_LEGACY => Ok(serde_json::from_slice(bytes)?),
+        PROTOCOL_VERSION_NAMED => rmp_serde::from_slice(bytes).map_err(DecodeError::Named),
         PROTOCOL_VERSION_BINARY => Ok(postcard::from_bytes(bytes)?),
         other => Err(DecodeError::UnsupportedVersion(other)),
     }
@@ -192,6 +203,7 @@ pub fn decode_request(version: u16, bytes: &[u8]) -> Result<Request, DecodeError
 pub fn decode_response(version: u16, bytes: &[u8]) -> Result<Response, DecodeError> {
     match version {
         PROTOCOL_VERSION_LEGACY => Ok(serde_json::from_slice(bytes)?),
+        PROTOCOL_VERSION_NAMED => rmp_serde::from_slice(bytes).map_err(DecodeError::Named),
         PROTOCOL_VERSION_BINARY => Ok(postcard::from_bytes(bytes)?),
         other => Err(DecodeError::UnsupportedVersion(other)),
     }
@@ -404,7 +416,7 @@ pub enum Request {
     /// Hand the launcher's xdg-foreign-v2 export handle to the daemon
     /// so the preview process can transient-parent its xdg-toplevel
     /// onto the launcher's surface. The daemon forwards this to
-    /// [`PreviewCommand::SetParent`] over the per-process preview
+    /// `PreviewCommand::SetParent` over the per-process preview
     /// socket, buffering until the preview reports `Ready` if the
     /// preview is still in `Starting`. Sent by the launcher right
     /// after its own surface realises and exports successfully; on
@@ -416,7 +428,7 @@ pub enum Request {
     },
     /// Tell the daemon to drop any currently-imported launcher parent
     /// on the warm preview process. Forwarded as
-    /// [`PreviewCommand::ClearParent`]. Sent by the launcher on hide
+    /// `PreviewCommand::ClearParent`. Sent by the launcher on hide
     /// so a subsequent re-export (with a new handle string) starts
     /// from a clean slate.
     PreviewClearParent,
@@ -495,7 +507,9 @@ pub enum Request {
     /// via index hydration. The GUI renders these as the "Recent"
     /// section of the empty launcher (O4). Appended at the end of
     /// the enum so existing variants keep their wire identity.
-    Recents { limit: u32 },
+    Recents {
+        limit: u32,
+    },
     /// Page the currently-shown preview without moving keyboard
     /// focus into the preview window (P11). Sent by the launcher
     /// while `preview_mode_active` on PgUp/PgDn (and Shift+Space
@@ -504,23 +518,40 @@ pub enum Request {
     /// CURRENT preview epoch (scrolling does not change content, so
     /// no epoch bump). Appended at the end of the enum so existing
     /// variants keep their wire identity.
-    PreviewScroll { down: bool, pages: u32 },
+    PreviewScroll {
+        down: bool,
+        pages: u32,
+    },
     /// Ranking control (C2): add (`hidden: true`) or remove
     /// (`hidden: false`) a doc id on the daemon's persistent
     /// blocklist. Blocklisted ids are dropped from every search
     /// result and from Recents. Reply is `Response::Ok`. Appended
     /// for wire stability.
-    SetDocHidden { doc_id: String, hidden: bool },
+    SetDocHidden {
+        doc_id: String,
+        hidden: bool,
+    },
     /// Ranking control (C2): delete the learned frecency and
     /// query-latch state for one doc id, returning it to neutral
     /// ranking. Reply is `Response::Ok`. Appended for wire
     /// stability.
-    ResetDocRanking { doc_id: String },
+    ResetDocRanking {
+        doc_id: String,
+    },
     /// List the doc ids currently on the blocklist (C2). Reply is
     /// `Response::HiddenDocs`. Backs `lixun-cli hidden list` so
     /// hides are inspectable and undoable. Appended for wire
     /// stability.
     ListHiddenDocs,
+    /// Read-only discovery on a separate v4 connection, before choosing a codec.
+    Capabilities,
+    RecordSelection {
+        doc_id: String,
+        query: String,
+    },
+    CleanPrivateHistory {
+        apply: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -626,11 +657,23 @@ pub enum Response {
     /// GUI renders them through the normal result path. Appended at
     /// the end of the enum so existing variants keep their wire
     /// identity.
-    Recents { hits: Vec<Hit> },
+    Recents {
+        hits: Vec<Hit>,
+    },
     /// Reply to [`Request::ListHiddenDocs`]: every doc id on the
     /// ranking blocklist, sorted. Appended at the end of the enum so
     /// existing variants keep their wire identity.
     HiddenDocs(Vec<String>),
+    Capabilities {
+        versions: Vec<u16>,
+        relative_date_sources: Vec<String>,
+        record_selection: bool,
+    },
+    PrivateHistory {
+        queries: usize,
+        clicks: usize,
+        associations: usize,
+    },
 }
 
 /// Serde-friendly mirror of [`lixun_core::ImpactProfile`]. Lives in
@@ -686,7 +729,7 @@ impl From<&ImpactProfile> for ImpactProfileWire {
     }
 }
 
-/// Framing codec: u32 BE length + u16 version + JSON payload.
+/// Framing codec for a length, version and version-specific payload.
 pub struct FrameCodec {
     state: DecodeState,
 }
@@ -694,7 +737,7 @@ pub struct FrameCodec {
 enum DecodeState {
     Header,
     Version(usize),
-    Payload(usize),
+    Payload(usize, u16),
 }
 
 impl Default for FrameCodec {
@@ -709,12 +752,18 @@ impl Encoder<Request> for FrameCodec {
     type Error = std::io::Error;
 
     fn encode(&mut self, item: Request, dst: &mut BytesMut) -> Result<(), Self::Error> {
-        let json = serde_json::to_vec(&item)
+        let (version, payload) = encode_request(&item)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        let total_len = 2 + json.len();
+        let total_len = 2 + payload.len();
+        if total_len > MAX_FRAME_LEN {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "request too large",
+            ));
+        }
         dst.put_u32(total_len as u32);
-        dst.put_u16(PROTOCOL_VERSION);
-        dst.put_slice(&json);
+        dst.put_u16(version);
+        dst.put_slice(&payload);
         Ok(())
     }
 }
@@ -750,23 +799,23 @@ impl Decoder for FrameCodec {
                         return Ok(None);
                     }
                     let version = src.get_u16();
-                    if !(MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&version) {
+                    if !(MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION_NAMED).contains(&version) {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
                             format!(
                                 "version {} outside supported {}..={}",
-                                version, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION
+                                version, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION_NAMED
                             ),
                         ));
                     }
-                    self.state = DecodeState::Payload(len - 2);
+                    self.state = DecodeState::Payload(len - 2, version);
                 }
-                DecodeState::Payload(len) => {
+                DecodeState::Payload(len, version) => {
                     if src.len() < len {
                         return Ok(None);
                     }
                     let data = src.split_to(len);
-                    let req: Request = serde_json::from_slice(&data)
+                    let req = decode_request(version, &data)
                         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
                     self.state = DecodeState::Header;
                     return Ok(Some(req));
@@ -807,6 +856,42 @@ pub(crate) fn get_uid_fallback() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn versioned_result_frames_preserve_real_hits_and_plugin_values() {
+        let mut app = fake_hit();
+        app.action = lixun_core::Action::Launch {
+            exec: vec!["app".into(), "a b".into()],
+            terminal: false,
+            desktop_id: None,
+            desktop_file: None,
+            working_dir: None,
+        };
+        let response = Response::Recents {
+            hits: vec![fake_hit(), app],
+        };
+        for version in [
+            PROTOCOL_VERSION_LEGACY,
+            PROTOCOL_VERSION_BINARY,
+            PROTOCOL_VERSION_NAMED,
+        ] {
+            let bytes = encode_response_for_version(version, &response).unwrap();
+            let back = decode_response(version, &bytes).unwrap();
+            assert_eq!(
+                serde_json::to_value(back).unwrap(),
+                serde_json::to_value(&response).unwrap()
+            );
+        }
+        let data = serde_json::json!({"records": [1, null, true]});
+        let bytes = encode_response_for_version(
+            PROTOCOL_VERSION_NAMED,
+            &Response::PluginResult(data.clone()),
+        )
+        .unwrap();
+        assert!(
+            matches!(decode_response(PROTOCOL_VERSION_NAMED, &bytes).unwrap(), Response::PluginResult(value) if value == data)
+        );
+    }
 
     #[test]
     fn test_encode_decode_toggle() {
@@ -1338,8 +1423,7 @@ mod tests {
     #[test]
     fn encode_response_for_version_rejects_unknown() {
         let resp = Response::Visibility { visible: true };
-        let err = encode_response_for_version(99, &resp)
-            .expect_err("unknown version must error");
+        let err = encode_response_for_version(99, &resp).expect_err("unknown version must error");
         match err {
             EncodeError::UnsupportedVersion(v) => assert_eq!(v, 99),
             other => panic!("expected UnsupportedVersion(99), got {:?}", other),

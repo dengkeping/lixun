@@ -11,7 +11,7 @@
 //!
 //! * `portal` — the freedesktop `org.freedesktop.portal.GlobalShortcuts`
 //!   interface. Required for non-KDE desktops and sandboxed contexts.
-//!   See [`portal`] for the full rationale and login-race handling.
+//!   See `portal` for the full rationale and login-race handling.
 //!
 //! Backend selection probes the session bus for `org.kde.kglobalaccel`.
 //! The systemd user manager does not always have `KDE_FULL_SESSION` /

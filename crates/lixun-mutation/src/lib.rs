@@ -96,6 +96,8 @@ pub enum Modality {
 /// Lives in this leaf crate so `lixun-fusion` (the RRF consumer)
 /// and `lixun-source-semantic-stub` (the producer) can share the type
 /// without either depending on the other (DB-3, AGENTS.md §1).
+// The macro marks the already must-use boxed future.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait AnnHandle: Send + Sync {
     async fn search_text(&self, query: &str, k: usize) -> anyhow::Result<Vec<AnnHit>>;
@@ -162,6 +164,8 @@ pub struct CliArg {
 /// pulling in a hard dependency on `lixun-indexer`. The daemon installs
 /// an implementation backed by `SearchHandle` after the writer service
 /// boots; plugins that don't need it never observe the install.
+// The macro marks the already must-use boxed future.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait DocStore: Send + Sync {
     async fn all_doc_ids(&self) -> anyhow::Result<std::collections::HashSet<String>>;

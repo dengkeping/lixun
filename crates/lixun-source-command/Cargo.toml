@@ -9,6 +9,7 @@ name = "lixun_source_command"
 path = "src/lib.rs"
 
 [dependencies]
+libc = "0.2"
 lixun-core = { path = "../lixun-core" }
 lixun-sources = { path = "../lixun-sources" }
 anyhow.workspace = true

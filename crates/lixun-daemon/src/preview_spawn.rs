@@ -113,6 +113,10 @@ const CONNECT_POLL_INTERVAL: Duration = Duration::from_millis(15);
 /// `shutdown()` can SIGTERM the child without waiting for the
 /// state to progress.
 #[derive(Default)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one lifecycle per daemon, including its single buffered request"
+)]
 enum PreviewLifecycle {
     #[default]
     Dead,
@@ -148,7 +152,6 @@ enum PreviewLifecycle {
         last_used: tokio::time::Instant,
     },
 }
-
 
 impl PreviewLifecycle {
     fn pid(&self) -> Option<u32> {
@@ -419,7 +422,13 @@ impl PreviewSpawner {
                 tracing::debug!("preview_spawn: set_launcher_geometry sending to Ready preview");
                 if send_or_drop(
                     cmd_tx,
-                    PreviewCommand::LauncherGeometry { monitor, x, y, w, h },
+                    PreviewCommand::LauncherGeometry {
+                        monitor,
+                        x,
+                        y,
+                        w,
+                        h,
+                    },
                 ) {
                     tracing::warn!(
                         "preview_spawn: writer channel closed during set_launcher_geometry"
@@ -696,7 +705,13 @@ impl PreviewSpawner {
                             );
                             if send_or_drop(
                                 &cmd_tx,
-                                PreviewCommand::LauncherGeometry { monitor, x, y, w, h },
+                                PreviewCommand::LauncherGeometry {
+                                    monitor,
+                                    x,
+                                    y,
+                                    w,
+                                    h,
+                                },
                             ) {
                                 tracing::warn!(
                                     "preview_spawn: pid={} writer gone before buffered LauncherGeometry",
@@ -811,14 +826,9 @@ impl PreviewSpawner {
                             epoch,
                             delta
                         );
-                        if let Err(e) = gui_control
-                            .dispatch(GuiCommand::PreviewNav { delta })
-                            .await
+                        if let Err(e) = gui_control.dispatch(GuiCommand::PreviewNav { delta }).await
                         {
-                            tracing::warn!(
-                                "preview_spawn: dispatch PreviewNav failed: {}",
-                                e
-                            );
+                            tracing::warn!("preview_spawn: dispatch PreviewNav failed: {}", e);
                         }
                     }
                     PreviewEvent::SetLauncherVisible { visible } => {
@@ -838,7 +848,7 @@ impl PreviewSpawner {
                         } else {
                             GuiCommand::SoftHide
                         };
-                        tracing::debug!("preview_spawn: pid={} dispatching {:?} to GUI", pid, cmd);
+                        tracing::debug!(pid, "dispatching preview event");
                         if let Err(e) = gui_control.dispatch(cmd).await {
                             tracing::warn!(
                                 "preview_spawn: pid={} SetLauncherVisible({}) dispatch failed: {}",

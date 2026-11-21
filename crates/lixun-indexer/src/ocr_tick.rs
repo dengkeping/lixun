@@ -259,9 +259,7 @@ where
                         // write-back if the *indexed* doc has moved on
                         // (a newer upsert committed or staged while
                         // this job was in flight).
-                        if let Err(e) = sink
-                            .upsert_body(&doc_id, &text, Some(expected_mtime))
-                            .await
+                        if let Err(e) = sink.upsert_body(&doc_id, &text, Some(expected_mtime)).await
                         {
                             tracing::warn!("ocr: upsert_body failed for {doc_id}: {e:#}");
                             return TickOutcome::Failed {
@@ -356,7 +354,7 @@ pub struct OcrCfgUpdate {
 /// calls [`tick_once`] with the real [`lixun_extract::ocr::run_ocr_job`].
 /// Every successful drain is reflected in [`OcrWorkerStats`] and an
 /// aggregate progress line is emitted every
-/// [`PROGRESS_LOG_EVERY_N_DRAINED`] drains.
+/// `PROGRESS_LOG_EVERY_N_DRAINED` drains.
 ///
 /// When `refresh` is `Some`, the worker re-reads the hot
 /// [`OcrCfgUpdate`] fields at the top of every iteration so a

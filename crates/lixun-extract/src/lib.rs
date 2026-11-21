@@ -414,7 +414,7 @@ fn validate_zip_archive<R: std::io::Read + std::io::Seek>(
     let mut total = 0_u64;
     for i in 0..archive.len() {
         let file = archive.by_index(i)?;
-        let name = file.name().to_string();
+        let name = file.name()?.into_owned();
         let size = file.size();
         if size > ZIP_ENTRY_MAX_BYTES {
             anyhow::bail!(
@@ -436,7 +436,7 @@ fn validate_zip_archive<R: std::io::Read + std::io::Seek>(
 }
 
 fn read_zip_file_to_string(
-    file: &mut zip::read::ZipFile<'_>,
+    file: &mut zip::read::ZipFile<'_, impl std::io::Read>,
     caps: &ExtractorCapabilities,
     label: &str,
 ) -> Result<String> {
@@ -602,7 +602,7 @@ impl Extractor for OoxmlExtractor {
         if text.is_empty() {
             for i in 0..archive.len() {
                 if let Ok(mut file) = archive.by_index(i) {
-                    let name = file.name().to_string();
+                    let name = file.name()?.into_owned();
                     if name.starts_with("xl/worksheets/") && name.ends_with(".xml") {
                         let content = read_zip_file_to_string(&mut file, &self.caps, "OOXML")?;
                         push_capped_str(
@@ -620,7 +620,7 @@ impl Extractor for OoxmlExtractor {
         if text.is_empty() {
             for i in 0..archive.len() {
                 if let Ok(mut file) = archive.by_index(i) {
-                    let name = file.name().to_string();
+                    let name = file.name()?.into_owned();
                     if name.starts_with("ppt/slides/") && name.ends_with(".xml") {
                         let content = read_zip_file_to_string(&mut file, &self.caps, "OOXML")?;
                         push_capped_str(

@@ -5,43 +5,51 @@ on:
     branches: [main, wave-d-semantic]
   pull_request:
 
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+
 jobs:
   matrix:
     runs-on: ubuntu-latest
+    container: archlinux:base-devel
     strategy:
       matrix:
         include:
           # legacy-json-ipc (lixun-ipc)
           - crate: lixun-ipc
             flag: legacy-json-ipc
-            state: on
+            state: "on"
           - crate: lixun-ipc
             flag: legacy-json-ipc
-            state: off
+            state: "off"
           # image-decode (lixun-semantic-worker)
           - crate: lixun-semantic-worker
             flag: image-decode
-            state: on
+            state: "on"
           - crate: lixun-semantic-worker
             flag: image-decode
-            state: off
+            state: "off"
           # jemalloc (lixun-semantic-worker)
           - crate: lixun-semantic-worker
             flag: jemalloc
-            state: on
+            state: "on"
           # quantized-embedders (lixun-semantic-worker)
           - crate: lixun-semantic-worker
             flag: quantized-embedders
-            state: on
+            state: "on"
           # idle-eviction (lixun-semantic-worker)
           - crate: lixun-semantic-worker
             flag: idle-eviction
-            state: on
+            state: "on"
           # minimum build: no default features across workspace
           - crate: workspace
             flag: none
-            state: off
+            state: "off"
     steps:
+      - name: Install native build and test dependencies
+        run: pacman -Syu --noconfirm --needed git clang cmake protobuf gtk4 gtk4-layer-shell poppler-glib libheif openssl pkgconf xorg-server-xvfb xorg-xauth tesseract tesseract-data-eng sway wtype wl-clipboard ttf-dejavu python
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -63,3 +71,11 @@ jobs:
       - name: Build crate with flag OFF
         if: matrix.crate != 'workspace' && matrix.state == 'off'
         run: cargo build --manifest-path crates/${{ matrix.crate }}/Cargo.toml --no-default-features
+      - name: Run negotiated IPC fixtures
+        if: matrix.crate == 'lixun-ipc'
+        run: |
+          if [ "${{ matrix.state }}" = on ]; then
+            cargo test --locked -p lixun-ipc --features legacy-json-ipc
+          else
+            cargo test --locked -p lixun-ipc --no-default-features
+          fi

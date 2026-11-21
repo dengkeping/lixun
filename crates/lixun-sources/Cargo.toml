@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+tempfile = "3"
 lixun-core = { path = "../lixun-core" }
 lixun-extract = { path = "../lixun-extract" }
 lixun-mutation = { path = "../lixun-mutation" }
@@ -24,5 +25,4 @@ mime_guess = "2"
 shell-words = "1"
 
 [dev-dependencies]
-tempfile.workspace = true
 image = { workspace = true }

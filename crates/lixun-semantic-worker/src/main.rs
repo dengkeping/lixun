@@ -389,9 +389,8 @@ async fn main() -> Result<()> {
     // SIGTERM with a grace window before escalating to SIGKILL —
     // a bare SIGKILL mid-commit is how zero-byte manifests (and a
     // permanent open-crash loop) happened in the field.
-    let mut sigterm =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .context("installing SIGTERM handler")?;
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("installing SIGTERM handler")?;
 
     loop {
         let frame = tokio::select! {
@@ -449,29 +448,31 @@ async fn main() -> Result<()> {
                 let tx = reply_tx.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
-                    let reply =
-                        match tokio::time::timeout(SEARCH_TIMEOUT, ann.search_text(&query, k as usize))
-                            .await
-                        {
-                            Ok(Ok(hits)) => Msg::SearchResult { req_id, hits },
-                            Ok(Err(e)) => Msg::Error {
+                    let reply = match tokio::time::timeout(
+                        SEARCH_TIMEOUT,
+                        ann.search_text(&query, k as usize),
+                    )
+                    .await
+                    {
+                        Ok(Ok(hits)) => Msg::SearchResult { req_id, hits },
+                        Ok(Err(e)) => Msg::Error {
+                            req_id,
+                            code: ErrorCode::Internal,
+                            detail: format!("{e:#}"),
+                        },
+                        Err(_) => {
+                            tracing::error!(
+                                req_id,
+                                "search_text timed out after {}s",
+                                SEARCH_TIMEOUT.as_secs()
+                            );
+                            Msg::Error {
                                 req_id,
                                 code: ErrorCode::Internal,
-                                detail: format!("{e:#}"),
-                            },
-                            Err(_) => {
-                                tracing::error!(
-                                    req_id,
-                                    "search_text timed out after {}s",
-                                    SEARCH_TIMEOUT.as_secs()
-                                );
-                                Msg::Error {
-                                    req_id,
-                                    code: ErrorCode::Internal,
-                                    detail: "search_text timed out".into(),
-                                }
+                                detail: "search_text timed out".into(),
                             }
-                        };
+                        }
+                    };
                     let _ = tx.send(reply).await;
                 });
             }
@@ -523,28 +524,31 @@ async fn main() -> Result<()> {
                 let tx = reply_tx.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
-                    let reply =
-                        match tokio::time::timeout(SEARCH_TIMEOUT, ann.classify_query(&query)).await
-                        {
-                            Ok(Ok(modality)) => Msg::ClassifyResult { req_id, modality },
-                            Ok(Err(e)) => Msg::Error {
+                    let reply = match tokio::time::timeout(
+                        SEARCH_TIMEOUT,
+                        ann.classify_query(&query),
+                    )
+                    .await
+                    {
+                        Ok(Ok(modality)) => Msg::ClassifyResult { req_id, modality },
+                        Ok(Err(e)) => Msg::Error {
+                            req_id,
+                            code: ErrorCode::Internal,
+                            detail: format!("{e:#}"),
+                        },
+                        Err(_) => {
+                            tracing::error!(
+                                req_id,
+                                "classify_query timed out after {}s",
+                                SEARCH_TIMEOUT.as_secs()
+                            );
+                            Msg::Error {
                                 req_id,
                                 code: ErrorCode::Internal,
-                                detail: format!("{e:#}"),
-                            },
-                            Err(_) => {
-                                tracing::error!(
-                                    req_id,
-                                    "classify_query timed out after {}s",
-                                    SEARCH_TIMEOUT.as_secs()
-                                );
-                                Msg::Error {
-                                    req_id,
-                                    code: ErrorCode::Internal,
-                                    detail: "classify_query timed out".into(),
-                                }
+                                detail: "classify_query timed out".into(),
                             }
-                        };
+                        }
+                    };
                     let _ = tx.send(reply).await;
                 });
             }

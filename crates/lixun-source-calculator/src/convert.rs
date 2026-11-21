@@ -10,7 +10,7 @@
 //! extends the conservative philosophy of `looks_like_math`: false
 //! positives are worse than false negatives.
 
-use crate::detect::{format_result, MAX_INPUT_LEN};
+use crate::detect::{MAX_INPUT_LEN, format_result};
 use lixun_core::Calculation;
 
 /// Significant digits for converted quantities ("3.106856 mi").
@@ -75,7 +75,12 @@ static UNITS: &[UnitDef] = &[
     // Length (base: metre).
     linear(&["mm"], "mm", Dimension::Length, 1e-3),
     linear(&["cm"], "cm", Dimension::Length, 1e-2),
-    linear(&["m", "meter", "meters", "metre", "metres"], "m", Dimension::Length, 1.0),
+    linear(
+        &["m", "meter", "meters", "metre", "metres"],
+        "m",
+        Dimension::Length,
+        1.0,
+    ),
     linear(&["km"], "km", Dimension::Length, 1e3),
     linear(&["in", "inch", "inches"], "in", Dimension::Length, 0.0254),
     linear(&["ft", "feet", "foot"], "ft", Dimension::Length, 0.3048),
@@ -86,9 +91,24 @@ static UNITS: &[UnitDef] = &[
     linear(&["g", "gram", "grams"], "g", Dimension::Mass, 1e-3),
     linear(&["kg"], "kg", Dimension::Mass, 1.0),
     linear(&["t", "tonne", "tonnes"], "t", Dimension::Mass, 1e3),
-    linear(&["oz", "ounce", "ounces"], "oz", Dimension::Mass, 0.028349523125),
-    linear(&["lb", "lbs", "pound", "pounds"], "lb", Dimension::Mass, 0.45359237),
-    linear(&["st", "stone", "stones"], "st", Dimension::Mass, 6.35029318),
+    linear(
+        &["oz", "ounce", "ounces"],
+        "oz",
+        Dimension::Mass,
+        0.028349523125,
+    ),
+    linear(
+        &["lb", "lbs", "pound", "pounds"],
+        "lb",
+        Dimension::Mass,
+        0.45359237,
+    ),
+    linear(
+        &["st", "stone", "stones"],
+        "st",
+        Dimension::Mass,
+        6.35029318,
+    ),
     // Temperature (base: kelvin; affine, not just a factor).
     UnitDef {
         names: &["c", "°c", "celsius"],
@@ -118,10 +138,30 @@ static UNITS: &[UnitDef] = &[
     linear(&["kb", "kilobyte", "kilobytes"], "kB", Dimension::Data, 1e3),
     linear(&["mb", "megabyte", "megabytes"], "MB", Dimension::Data, 1e6),
     linear(&["gb", "gigabyte", "gigabytes"], "GB", Dimension::Data, 1e9),
-    linear(&["tb", "terabyte", "terabytes"], "TB", Dimension::Data, 1e12),
-    linear(&["kib", "kibibyte", "kibibytes"], "KiB", Dimension::Data, 1024.0),
-    linear(&["mib", "mebibyte", "mebibytes"], "MiB", Dimension::Data, 1024.0 * 1024.0),
-    linear(&["gib", "gibibyte", "gibibytes"], "GiB", Dimension::Data, 1024.0 * 1024.0 * 1024.0),
+    linear(
+        &["tb", "terabyte", "terabytes"],
+        "TB",
+        Dimension::Data,
+        1e12,
+    ),
+    linear(
+        &["kib", "kibibyte", "kibibytes"],
+        "KiB",
+        Dimension::Data,
+        1024.0,
+    ),
+    linear(
+        &["mib", "mebibyte", "mebibytes"],
+        "MiB",
+        Dimension::Data,
+        1024.0 * 1024.0,
+    ),
+    linear(
+        &["gib", "gibibyte", "gibibytes"],
+        "GiB",
+        Dimension::Data,
+        1024.0 * 1024.0 * 1024.0,
+    ),
     linear(
         &["tib", "tebibyte", "tebibytes"],
         "TiB",
@@ -129,10 +169,30 @@ static UNITS: &[UnitDef] = &[
         1024.0 * 1024.0 * 1024.0 * 1024.0,
     ),
     // Time (base: second).
-    linear(&["ms", "millisecond", "milliseconds"], "ms", Dimension::Time, 1e-3),
-    linear(&["s", "sec", "secs", "second", "seconds"], "s", Dimension::Time, 1.0),
-    linear(&["min", "mins", "minute", "minutes"], "min", Dimension::Time, 60.0),
-    linear(&["h", "hr", "hrs", "hour", "hours"], "h", Dimension::Time, 3600.0),
+    linear(
+        &["ms", "millisecond", "milliseconds"],
+        "ms",
+        Dimension::Time,
+        1e-3,
+    ),
+    linear(
+        &["s", "sec", "secs", "second", "seconds"],
+        "s",
+        Dimension::Time,
+        1.0,
+    ),
+    linear(
+        &["min", "mins", "minute", "minutes"],
+        "min",
+        Dimension::Time,
+        60.0,
+    ),
+    linear(
+        &["h", "hr", "hrs", "hour", "hours"],
+        "h",
+        Dimension::Time,
+        3600.0,
+    ),
     linear(&["d", "day", "days"], "d", Dimension::Time, 86400.0),
     linear(&["week", "weeks", "wk"], "wk", Dimension::Time, 604800.0),
 ];
@@ -325,7 +385,10 @@ fn percent_of(expr: &str) -> Option<Calculation> {
     let rest = rest.trim_start();
     // Keyword "of" (case-insensitive) followed by whitespace and the
     // amount, nothing after.
-    if !rest.get(..2).is_some_and(|kw| kw.eq_ignore_ascii_case("of")) {
+    if !rest
+        .get(..2)
+        .is_some_and(|kw| kw.eq_ignore_ascii_case("of"))
+    {
         return None;
     }
     let after_of = &rest[2..];
@@ -459,7 +522,10 @@ mod tests {
 
     #[test]
     fn temperature_word_spellings() {
-        assert_eq!(result_of("0 celsius in fahrenheit").as_deref(), Some("32 °F"));
+        assert_eq!(
+            result_of("0 celsius in fahrenheit").as_deref(),
+            Some("32 °F")
+        );
     }
 
     // -- data sizes ----------------------------------------------------

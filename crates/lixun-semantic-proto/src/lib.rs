@@ -141,7 +141,7 @@ pub enum CallbackResp {
     /// backfill) does not read it, so keeping it off the wire avoids
     /// adding `serde` derives to `lixun_core::ScoreBreakdown`.
     HydrateDoc {
-        hit: Option<Hit>,
+        hit: Option<Box<Hit>>,
     },
     GetBody {
         body: Option<String>,
@@ -471,7 +471,7 @@ mod tests {
             ids: vec!["x".into()],
         });
         round_trip(CallbackResp::HydrateDoc {
-            hit: Some(sample_hit()),
+            hit: Some(Box::new(sample_hit())),
         });
         round_trip(CallbackResp::HydrateDoc { hit: None });
         round_trip(CallbackResp::GetBody {

@@ -13,6 +13,7 @@ pub struct SourceInstance {
 
 pub struct SourceRegistry {
     pub instances: Vec<SourceInstance>,
+    private_history_prefixes: Vec<(&'static str, Option<char>)>,
     pub plugin_fields_by_kind: BTreeMap<&'static str, &'static [PluginFieldSpec]>,
 }
 
@@ -20,8 +21,34 @@ impl SourceRegistry {
     pub fn new() -> Self {
         Self {
             instances: Vec::new(),
+            private_history_prefixes: lixun_sources::inventory::iter::<
+                lixun_sources::PluginFactoryEntry,
+            >
+                .into_iter()
+                .filter_map(|entry| (entry.new)().private_history_prefixes())
+                .collect(),
             plugin_fields_by_kind: BTreeMap::new(),
         }
+    }
+
+    pub fn private_query(&self, query: &str) -> bool {
+        self.private_history_prefixes
+            .iter()
+            .any(|(_, prefix)| prefix.is_some_and(|p| query.trim_start().starts_with(p)))
+            || self
+                .instances
+                .iter()
+                .any(|entry| entry.source.excludes_from_query_log(query))
+    }
+
+    pub fn private_doc(&self, doc_id: &str) -> bool {
+        self.private_history_prefixes
+            .iter()
+            .any(|(prefix, _)| doc_id.starts_with(prefix))
+            || self
+                .instances
+                .iter()
+                .any(|entry| entry.source.excludes_from_click_history(doc_id))
     }
 
     /// Look up the row-menu declaration for a given `instance_id`.

@@ -449,6 +449,7 @@ mod tests {
     #[test]
     #[ignore]
     fn page_widget_measure_scales_with_zoom() {
+        gtk::init().expect("GTK display required for the widget test");
         let Some(session) = fixture_session() else {
             eprintln!("fixture missing — skipping");
             return;

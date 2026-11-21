@@ -172,7 +172,10 @@ mod tests {
 
     #[test]
     fn column_width_accounts_for_preview_and_its_edge_margin() {
-        assert_eq!(left_column_width(1920, 960), 1920 - 960 - PREVIEW_EDGE_MARGIN);
+        assert_eq!(
+            left_column_width(1920, 960),
+            1920 - 960 - PREVIEW_EDGE_MARGIN
+        );
     }
 
     #[test]
@@ -180,7 +183,10 @@ mod tests {
         // Exactly launcher + two gaps: fits.
         assert!(launcher_fits_column(720 + 2 * LAUNCHER_COLUMN_GAP, 720));
         // One pixel short: does not fit.
-        assert!(!launcher_fits_column(720 + 2 * LAUNCHER_COLUMN_GAP - 1, 720));
+        assert!(!launcher_fits_column(
+            720 + 2 * LAUNCHER_COLUMN_GAP - 1,
+            720
+        ));
     }
 
     #[test]
@@ -220,9 +226,18 @@ mod tests {
 
     #[test]
     fn overlay_slide_rejects_degenerate_inputs() {
-        assert_eq!(slide_left_margin(SlideMode::OverlayColumn, 0, 720, 960), None);
-        assert_eq!(slide_left_margin(SlideMode::OverlayColumn, 1920, 0, 960), None);
-        assert_eq!(slide_left_margin(SlideMode::OverlayColumn, 1920, 720, 0), None);
+        assert_eq!(
+            slide_left_margin(SlideMode::OverlayColumn, 0, 720, 960),
+            None
+        );
+        assert_eq!(
+            slide_left_margin(SlideMode::OverlayColumn, 1920, 0, 960),
+            None
+        );
+        assert_eq!(
+            slide_left_margin(SlideMode::OverlayColumn, 1920, 720, 0),
+            None
+        );
     }
 
     #[test]
@@ -271,7 +286,13 @@ mod tests {
 
     #[test]
     fn window_slide_rejects_degenerate_monitor_or_launcher() {
-        assert_eq!(slide_left_margin(SlideMode::WindowManaged, 0, 720, 960), None);
-        assert_eq!(slide_left_margin(SlideMode::WindowManaged, 1920, 0, 960), None);
+        assert_eq!(
+            slide_left_margin(SlideMode::WindowManaged, 0, 720, 960),
+            None
+        );
+        assert_eq!(
+            slide_left_margin(SlideMode::WindowManaged, 1920, 0, 960),
+            None
+        );
     }
 }

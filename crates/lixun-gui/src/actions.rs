@@ -212,7 +212,6 @@ fn dispatch_action(action: &Action) -> Result<()> {
             Ok(())
         }
         Action::OpenUri { uri } => {
-            tracing::debug!(uri = %uri, "execute_action: dispatching via xdg-open");
             let mut builder = xdg_open_command(uri);
             spawn_reaped(&mut builder)?;
             Ok(())
@@ -293,7 +292,7 @@ pub(crate) fn copy_to_clipboard(hit: &Hit) -> String {
     if let Some(display) = gtk::gdk::Display::default() {
         display.clipboard().set_text(&text);
     }
-    tracing::info!("Copied to clipboard: {}", text);
+
     text
 }
 

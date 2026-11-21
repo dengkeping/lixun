@@ -33,7 +33,7 @@ pub fn is_ocr_candidate(ext: &str) -> bool {
     OCR_CANDIDATES.contains(&ext)
 }
 
-/// Cache engine tag for an OCR run. Part of the [`cache::CacheKey`]
+/// Cache engine tag for an OCR run. Part of the `cache::CacheKey`
 /// input so a tesseract major/minor upgrade or a langs change
 /// invalidates cached OCR results (DB-4).
 ///

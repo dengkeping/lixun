@@ -3,7 +3,7 @@
 //! Spawns `lixun-semantic-worker`, owns the AF_UNIX listener,
 //! handshakes, then runs duplex IPC: incoming `Msg` frames route to
 //! the appropriate pending request via the
-//! [`SemanticConnection`](lixun_source_semantic_stub::SemanticConnection)
+//! [`SemanticConnection`]
 //! installed in the stub plugin; outgoing `Cmd` frames flow from
 //! the stub through the same connection back to the worker.
 //!
@@ -402,7 +402,9 @@ async fn handle_msg(msg: Msg, conn: &Arc<SemanticConnection>, writer: &mpsc::Sen
                         dropped at the wire (see proto crate's
                         type doc-comment). The worker's
                         start_backfill ignores it. */
-                        Ok(Some((hit, _bd))) => CallbackResp::HydrateDoc { hit: Some(hit) },
+                        Ok(Some((hit, _bd))) => CallbackResp::HydrateDoc {
+                            hit: Some(Box::new(hit)),
+                        },
                         Ok(None) => CallbackResp::HydrateDoc { hit: None },
                         Err(e) => CallbackResp::Error {
                             code: ErrorCode::Callback,
@@ -447,7 +449,10 @@ async fn kill_child(child: &mut Child) {
     // every subsequent start. Escalate only if the grace window
     // expires (wedged worker).
     if let Some(id) = child.id() {
-        tracing::debug!(pid = id, "semantic supervisor: stopping worker child (SIGTERM)");
+        tracing::debug!(
+            pid = id,
+            "semantic supervisor: stopping worker child (SIGTERM)"
+        );
         // SAFETY: plain kill(2) on a pid we own; no memory involved.
         unsafe {
             libc::kill(id as libc::pid_t, libc::SIGTERM);
@@ -555,7 +560,7 @@ mod should_spawn_tests {
     fn extra_fields_ignored_when_disabled() {
         assert!(!should_spawn(Some(&val(r#"
             enabled = false
-            text_model = "bge-small-en-v1.5"
+            text_model = "example-text-model"
             "#))));
     }
 
@@ -563,7 +568,7 @@ mod should_spawn_tests {
     fn extra_fields_ignored_when_enabled() {
         assert!(should_spawn(Some(&val(r#"
             enabled = true
-            text_model = "bge-small-en-v1.5"
+            text_model = "example-text-model"
             batch_size = 32
             "#))));
     }

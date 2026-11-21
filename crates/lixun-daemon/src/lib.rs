@@ -5,12 +5,12 @@
 /// depending on the daemon crate.
 pub use lixun_config as config;
 pub mod gui_control;
-pub mod sources_glue;
 pub mod hotkeys;
 pub mod portal_identity;
 pub mod preview_spawn;
 pub mod semantic_supervisor;
 pub mod session_env;
+pub mod sources_glue;
 pub mod symlink_alias;
 
 pub use lixun_indexer::index_service;

@@ -500,7 +500,6 @@ fn spawn_socket_workers(
             loop {
                 match read_frame_sync::<_, PreviewCommand>(&mut r) {
                     Ok(cmd) => {
-                        tracing::debug!("preview: read_frame_sync received command: {:?}", cmd);
                         if inbound_tx.send_blocking(InboundMsg::Cmd(cmd)).is_err() {
                             break;
                         }
@@ -822,9 +821,7 @@ fn show_or_update(
             .as_ref()
             .map(|w| w.grab_focus())
             .unwrap_or(false);
-        if !focused
-            && let Some(scroll) = state.content_scroll.borrow().as_ref()
-        {
+        if !focused && let Some(scroll) = state.content_scroll.borrow().as_ref() {
             scroll.grab_focus();
         }
         try_apply_pending_parent(state, window);
@@ -834,17 +831,17 @@ fn show_or_update(
             let outbound_clone = outbound_tx.clone();
             let gui_cfg_clone = Rc::clone(gui_cfg);
             glib::timeout_add_local_once(std::time::Duration::from_millis(100), move || {
-                update_launcher_visibility(&state_clone, &window_clone, &outbound_clone, &gui_cfg_clone);
+                update_launcher_visibility(
+                    &state_clone,
+                    &window_clone,
+                    &outbound_clone,
+                    &gui_cfg_clone,
+                );
             });
         }
     }
 
-    tracing::info!(
-        "preview: showed plugin={} hit_id={} epoch={}",
-        plugin_id,
-        hit.id.0,
-        state.current_epoch.get()
-    );
+    tracing::debug!(plugin = plugin_id, "preview shown");
     Ok(())
 }
 
@@ -1045,9 +1042,10 @@ fn try_apply_pending_parent(state: &Rc<PreviewState>, window: &gtk::ApplicationW
         }
     }
     if let Some(imp) = importer.as_mut()
-        && let Err(e) = imp.import(&handle, &wl_surface) {
-            tracing::warn!("preview: xdg-foreign import failed: {}", e);
-        }
+        && let Err(e) = imp.import(&handle, &wl_surface)
+    {
+        tracing::warn!("preview: xdg-foreign import failed: {}", e);
+    }
 }
 
 /// Pure predicate for [`update_launcher_visibility`] (layer-shell
@@ -1213,7 +1211,11 @@ fn update_launcher_visibility(
     };
     tracing::debug!(
         "visibility: mode={} monitor_w={} launcher_w={} preview_w={} fits={} hidden_by_us={}",
-        if state.layer_shell_active.get() { "overlay" } else { "window" },
+        if state.layer_shell_active.get() {
+            "overlay"
+        } else {
+            "window"
+        },
         mon_w,
         lw,
         pw,
@@ -1481,11 +1483,7 @@ fn run_plugin_launch(
 ) {
     match plugin.launch(hit) {
         Ok(()) => {
-            tracing::info!(
-                "preview: plugin `{}` launched hit_id={}",
-                plugin.id(),
-                hit.id.0
-            );
+            tracing::debug!(plugin = plugin.id(), "preview launched");
             let epoch = state.current_epoch.get();
             let _ = outbound_tx.send_blocking(PreviewEvent::Launched { epoch });
             if let Some(window) = state.window.borrow().as_ref() {
@@ -1494,12 +1492,7 @@ fn run_plugin_launch(
             schedule_idle(state, app);
         }
         Err(e) => {
-            tracing::error!(
-                "preview: plugin `{}` launch failed for hit_id={}: {}",
-                plugin.id(),
-                hit.id.0,
-                e
-            );
+            tracing::warn!(plugin = plugin.id(), "preview launch failed");
             // A silent failure looks like a dead Enter key (P10):
             // surface the cause in the header. `{:#}` renders the
             // whole anyhow context chain down to the root cause.
@@ -1926,8 +1919,9 @@ fn cancel_idle(state: &Rc<PreviewState>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        SizingPreference, clamp_scroll_value, content_accessible_label, launcher_clears_centered_preview,
-        launcher_fits_beside, should_apply_sizing, truncate_chars,
+        SizingPreference, clamp_scroll_value, content_accessible_label,
+        launcher_clears_centered_preview, launcher_fits_beside, should_apply_sizing,
+        truncate_chars,
     };
 
     #[test]

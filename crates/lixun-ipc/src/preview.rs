@@ -154,7 +154,7 @@ pub enum PreviewCommand {
     /// on-screen geometry (monitor + monitor-local rect). The
     /// preview uses this to decide whether its own window rect on
     /// the same monitor overlaps the launcher, and if so to emit
-    /// [`PreviewEvent::LauncherHideRequest`] so the daemon tells
+    /// `PreviewEvent::LauncherHideRequest` so the daemon tells
     /// the launcher to unmap for the duration of the preview
     /// session.
     ///
@@ -265,7 +265,7 @@ pub enum PreviewEvent {
 
 /// Length-prefixed JSON codec parameterised by what each side
 /// decodes (`I`) and what it encodes (`O`). Shape mirrors
-/// [`lixun_semantic_proto::FrameCodec`] — both channels decided
+/// `lixun_semantic_proto::FrameCodec` — both channels decided
 /// on identical wire framing, so the codec implementation is
 /// identical too. Kept independent of the semantic codec so
 /// version bumps on either channel cannot accidentally break the

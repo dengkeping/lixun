@@ -10,6 +10,10 @@ lixun_sources::inventory::submit! {
 pub struct CalculatorFactory;
 
 impl PluginFactory for CalculatorFactory {
+    fn private_history_prefixes(&self) -> Option<(&'static str, Option<char>)> {
+        Some(("calculator:", Some('=')))
+    }
+
     fn section(&self) -> &'static str {
         "calculator"
     }

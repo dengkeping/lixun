@@ -49,18 +49,24 @@ impl PluginFactory for KeywordFactory {
             let parsed: KeywordEntry = entry.clone().try_into().map_err(|e| {
                 anyhow::anyhow!("[[search.keyword]] entry {}: invalid shape: {e}", i + 1)
             })?;
-            let Some(key) = parsed.key.as_deref().map(str::trim).filter(|k| !k.is_empty())
+            let Some(key) = parsed
+                .key
+                .as_deref()
+                .map(str::trim)
+                .filter(|k| !k.is_empty())
             else {
                 tracing::warn!("[[search.keyword]] entry {}: missing `key`; skipped", i + 1);
                 continue;
             };
             if key.contains(char::is_whitespace) {
-                tracing::warn!(
-                    "[[search.keyword]] key {key:?} contains whitespace; skipped"
-                );
+                tracing::warn!("[[search.keyword]] key {key:?} contains whitespace; skipped");
                 continue;
             }
-            let Some(url) = parsed.url.as_deref().map(str::trim).filter(|u| !u.is_empty())
+            let Some(url) = parsed
+                .url
+                .as_deref()
+                .map(str::trim)
+                .filter(|u| !u.is_empty())
             else {
                 tracing::warn!("[[search.keyword]] key {key:?}: missing `url`; skipped");
                 continue;
@@ -113,10 +119,7 @@ mod tests {
         PluginBuildContext {
             max_file_size_mb: 50,
             state_dir_root: std::path::PathBuf::from("/tmp"),
-            impact: Arc::new(ImpactProfile::from_level(
-                lixun_core::SystemImpact::High,
-                4,
-            )),
+            impact: Arc::new(ImpactProfile::from_level(lixun_core::SystemImpact::High, 4)),
         }
     }
 

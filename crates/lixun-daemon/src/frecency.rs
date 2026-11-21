@@ -28,12 +28,12 @@ pub struct VisitEntry {
     pub kind: VisitKind,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct FrecencyRecord {
     visits: VecDeque<VisitEntry>,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FrecencyStore {
     records: HashMap<String, FrecencyRecord>,
 }
@@ -102,6 +102,12 @@ impl FrecencyStore {
         std::fs::write(&tmp_path, content)?;
         std::fs::rename(&tmp_path, &final_path)?;
         Ok(())
+    }
+
+    pub fn remove_excluded(&mut self, excludes: impl Fn(&str) -> bool) -> usize {
+        let before = self.records.len();
+        self.records.retain(|id, _| !excludes(id));
+        before - self.records.len()
     }
 
     pub fn record_click(&mut self, doc_id: &str, now: i64) {

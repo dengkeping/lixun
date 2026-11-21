@@ -309,7 +309,7 @@ impl LixunIndex {
         Ok(())
     }
 
-    /// Monotonic counter of successful [`reload`] calls; cache key
+    /// Monotonic counter of successful [`Self::reload`] calls; cache key
     /// component for result caches layered above this index.
     pub fn reload_epoch(&self) -> u64 {
         self.reload_epoch.load(std::sync::atomic::Ordering::SeqCst)
@@ -422,6 +422,14 @@ impl LixunIndex {
     /// by the daemon after this call; daemon fills them in before
     /// formatting the human-readable explanation string.
     pub fn search_with_breakdown(&self, query: &Query) -> Result<Vec<(Hit, ScoreBreakdown)>> {
+        self.search_in_category(query, None)
+    }
+
+    pub fn search_in_category(
+        &self,
+        query: &Query,
+        category: Option<Category>,
+    ) -> Result<Vec<(Hit, ScoreBreakdown)>> {
         let reader = &self.reader;
         let searcher = reader.searcher();
         let s = &self.schema;
@@ -429,8 +437,33 @@ impl LixunIndex {
         let now_secs = Utc::now().timestamp();
         let limit = query.limit as usize;
 
-        let query_obj =
-            build_search_query(&query.text, &self.index, s, &self.plugins, &self.ranking, true);
+        let query_obj = build_search_query(
+            &query.text,
+            &self.index,
+            s,
+            &self.plugins,
+            &self.ranking,
+            true,
+        );
+        let restrict_category = |candidate: Box<dyn tantivy::query::Query>,
+                                 category: Option<Category>|
+         -> Box<dyn tantivy::query::Query> {
+            let Some(category) = category else {
+                return candidate;
+            };
+            let filter = TermQuery::new(
+                Term::from_field_text(s.category, category.as_str()),
+                IndexRecordOption::Basic,
+            );
+            Box::new(BooleanQuery::new(vec![
+                (Occur::Must, candidate),
+                (
+                    Occur::Must,
+                    Box::new(tantivy::query::ConstScoreQuery::new(Box::new(filter), 0.0)),
+                ),
+            ]))
+        };
+        let query_obj = restrict_category(query_obj, category);
         let top_docs = searcher.search(&query_obj, &TopDocs::with_limit(limit).order_by_score())?;
 
         // Fast-path: exact title equality (bypasses BM25 IDF collapse).
@@ -454,7 +487,10 @@ impl LixunIndex {
             let term = Term::from_field_text(s.title_exact, &q_norm);
             let tq = TermQuery::new(term, IndexRecordOption::Basic);
             searcher
-                .search(&tq, &TopDocs::with_limit(limit).order_by_score())?
+                .search(
+                    &restrict_category(Box::new(tq), category),
+                    &TopDocs::with_limit(limit).order_by_score(),
+                )?
                 .into_iter()
                 .map(|(_, addr)| (max_top_score, addr))
                 .collect()
@@ -467,6 +503,54 @@ impl LixunIndex {
         for (score, addr) in exact_addrs {
             if seen_addrs.insert(addr) {
                 merged.push((score, addr));
+            }
+        }
+
+        // Keep application candidates reachable even on a crowded mixed page.
+        if category.is_none() {
+            let probe = restrict_category(query_obj.box_clone(), Some(Category::App));
+            for (score, addr) in
+                searcher.search(&probe, &TopDocs::with_limit(limit).order_by_score())?
+            {
+                if seen_addrs.insert(addr) {
+                    merged.push((score, addr));
+                }
+            }
+        }
+
+        // Preserve literal title completions before the global raw-score cutoff.
+        // A large category can otherwise fill TopDocs with equally scored names
+        // and exclude other categories before their ranking multipliers apply.
+        // Probe each category independently, with a bounded quota and the same
+        // synthetic base score as the exact-title fast path above.
+        if q_norm.chars().count() >= MIN_QUERY_PREFIX_LEN && !query_uses_operators(&query.text) {
+            let categories = [
+                Category::App,
+                Category::File,
+                Category::Mail,
+                Category::Attachment,
+            ];
+            for &candidate_category in category
+                .as_ref()
+                .map(std::slice::from_ref)
+                .unwrap_or(&categories)
+            {
+                let prefix = tantivy::query::FuzzyTermQuery::new_prefix(
+                    Term::from_field_text(s.title_exact, &q_norm),
+                    0,
+                    true,
+                );
+                let probe = tantivy::query::ConstScoreQuery::new(
+                    restrict_category(Box::new(prefix), Some(candidate_category)),
+                    max_top_score,
+                );
+                for (score, addr) in
+                    searcher.search(&probe, &TopDocs::with_limit(limit).order_by_score())?
+                {
+                    if seen_addrs.insert(addr) {
+                        merged.push((score, addr));
+                    }
+                }
             }
         }
 
@@ -489,8 +573,8 @@ impl LixunIndex {
                 &self.ranking,
                 false,
             );
-            let extra =
-                searcher.search(&or_query, &TopDocs::with_limit(limit).order_by_score())?;
+            let or_query = restrict_category(or_query, category);
+            let extra = searcher.search(&or_query, &TopDocs::with_limit(limit).order_by_score())?;
             for (score, addr) in extra {
                 if seen_addrs.insert(addr) {
                     fallback_addrs.insert(addr);
@@ -584,11 +668,10 @@ impl LixunIndex {
             // whole-index DocSetCollector probe, which materialized every
             // matching doc address per query.
             let coord_mult = if (2..=3).contains(&q_tokens.len()) {
-                let title_tokens: HashSet<String> =
-                    tokenize_with_spotlight(&self.index, &title)
-                        .unwrap_or_default()
-                        .into_iter()
-                        .collect();
+                let title_tokens: HashSet<String> = tokenize_with_spotlight(&self.index, &title)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect();
                 if q_tokens.iter().all(|t| title_tokens.contains(t)) {
                     1.0 + self.ranking.coordination_boost
                         / (q_tokens.len() as f32).powf(self.ranking.coordination_delta)
@@ -659,19 +742,7 @@ impl LixunIndex {
             results.push((hit, breakdown));
         }
 
-        // Full matches strictly outrank fallback partial matches; BM25
-        // score orders within each tier. A partial match with inflated
-        // term-frequency (a doc stuffed with one query word) must never
-        // beat a doc that matched the whole query.
-        results.sort_by(|a, b| {
-            (a.1.lexical_fallback as u8)
-                .cmp(&(b.1.lexical_fallback as u8))
-                .then(
-                    b.0.score
-                        .partial_cmp(&a.0.score)
-                        .unwrap_or(std::cmp::Ordering::Equal),
-                )
-        });
+        results.sort_by(lixun_core::compare_ranked_hits);
         results.truncate(query.limit as usize);
 
         Ok(results)
@@ -714,6 +785,50 @@ impl LixunIndex {
             }
         }
         Ok(out)
+    }
+
+    /// Check a bounded set of semantic candidates using only postings. The
+    /// stored document (including its body) is needed only for displayed hits.
+    pub fn ids_in_category(
+        &self,
+        ids: &HashSet<String>,
+        category: Category,
+    ) -> Result<HashSet<String>> {
+        let searcher = self.reader.searcher();
+        let category_term = Term::from_field_text(self.schema.category, category.as_str());
+        let terms: Vec<_> = ids
+            .iter()
+            .map(|id| (id, Term::from_field_text(self.schema.id, id)))
+            .collect();
+        let mut matches = HashSet::new();
+        for segment in searcher.segment_readers() {
+            let categories = segment.inverted_index(self.schema.category)?;
+            let Some(mut category_docs) =
+                categories.read_postings(&category_term, IndexRecordOption::Basic)?
+            else {
+                continue;
+            };
+            let by_id = segment.inverted_index(self.schema.id)?;
+            let mut candidates = Vec::new();
+            for (id, term) in &terms {
+                if let Some(mut postings) = by_id.read_postings(term, IndexRecordOption::Basic)? {
+                    let mut doc = postings.doc();
+                    while doc != tantivy::TERMINATED {
+                        if !segment.is_deleted(doc) {
+                            candidates.push((doc, *id));
+                        }
+                        doc = postings.advance();
+                    }
+                }
+            }
+            candidates.sort_unstable_by_key(|(doc, _)| *doc);
+            for (doc, id) in candidates {
+                if category_docs.doc() <= doc && category_docs.seek(doc) == doc {
+                    matches.insert(id.clone());
+                }
+            }
+        }
+        Ok(matches)
     }
 
     /// Reconstruct a `Hit` + `ScoreBreakdown` for a single doc identified
@@ -793,10 +908,7 @@ impl LixunIndex {
             .unwrap_or("")
             .to_string();
         let mime = stored_optional_text(&doc, s.mime);
-        let mtime = doc
-            .get_first(s.mtime)
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
+        let mtime = doc.get_first(s.mtime).and_then(|v| v.as_i64()).unwrap_or(0);
         let size = doc.get_first(s.size).and_then(|v| v.as_u64());
 
         let hit = Hit {
@@ -836,7 +948,7 @@ impl LixunIndex {
         Ok(Some((hit, breakdown)))
     }
 
-    /// Batch variant of [`hydrate_doc_by_id`]: one call, one searcher,
+    /// Batch variant of [`Self::hydrate_doc_by_id`]: one call, one searcher,
     /// preserving input order; ids with no live doc are skipped. Used by
     /// the fusion layer to hydrate every ANN-only doc in a single
     /// blocking hop instead of one round trip per doc.
@@ -1130,8 +1242,10 @@ fn build_search_query(
     if conjunctive {
         parser.set_conjunction_by_default();
     }
-    parser.set_field_boost(s.title, 5.0);
-    parser.set_field_boost(s.title_terms, 4.0);
+    let title_fields = [(s.title, 5.0), (s.title_terms, 4.0)];
+    for (field, boost) in title_fields {
+        parser.set_field_boost(field, boost);
+    }
     parser.set_field_boost(s.title_initials, 3.0);
     parser.set_field_boost(s.sender, 3.0);
     parser.set_field_boost(s.recipients, 2.5);
@@ -1169,7 +1283,11 @@ fn build_search_query(
     let operators = query_uses_operators(text);
 
     let mut clauses: Vec<(Occur, Box<dyn tantivy::query::Query>)> = vec![(
-        if operators { Occur::Must } else { Occur::Should },
+        if operators {
+            Occur::Must
+        } else {
+            Occur::Should
+        },
         parsed_query,
     )];
 
@@ -1185,30 +1303,39 @@ fn build_search_query(
             .is_some_and(|t| t.chars().count() >= MIN_QUERY_PREFIX_LEN)
     {
         let (last, head) = tokens.split_last().expect("tokens is non-empty");
-        let title_fields = [s.title, s.title_terms];
         let mut incr: Vec<(Occur, Box<dyn tantivy::query::Query>)> = Vec::new();
         for tok in head {
             let per_field: Vec<(Occur, Box<dyn tantivy::query::Query>)> = title_fields
                 .iter()
-                .map(|f| {
+                .map(|(f, _)| {
                     let tq = TermQuery::new(
                         Term::from_field_text(*f, tok),
                         IndexRecordOption::WithFreqs,
                     );
-                    (Occur::Should, Box::new(tq) as Box<dyn tantivy::query::Query>)
+                    (
+                        Occur::Should,
+                        Box::new(tq) as Box<dyn tantivy::query::Query>,
+                    )
                 })
                 .collect();
             incr.push((Occur::Must, Box::new(BooleanQuery::new(per_field))));
         }
         let per_field_prefix: Vec<(Occur, Box<dyn tantivy::query::Query>)> = title_fields
             .iter()
-            .map(|f| {
+            .map(|(f, boost)| {
                 let fq = tantivy::query::FuzzyTermQuery::new_prefix(
                     Term::from_field_text(*f, last),
                     0,
                     true,
                 );
-                (Occur::Should, Box::new(fq) as Box<dyn tantivy::query::Query>)
+                // Keep literal completions on the same field-weight scale as
+                // parser matches. Otherwise a shorter fuzzy word can collect
+                // both title boosts and outrank the name being completed.
+                (
+                    Occur::Should,
+                    Box::new(BoostQuery::new(Box::new(fq), *boost))
+                        as Box<dyn tantivy::query::Query>,
+                )
             })
             .collect();
         incr.push((Occur::Must, Box::new(BooleanQuery::new(per_field_prefix))));
@@ -1715,6 +1842,212 @@ mod tests {
             "title_prefixes + title boosts must outrank body-only match"
         );
         assert!(results[0].score > results[1].score);
+    }
+
+    #[test]
+    fn matching_app_survives_crowded_exact_file_matches() {
+        let mut docs: Vec<_> = (0..100)
+            .map(|n| {
+                sample_document(
+                    &format!("fs:/tmp/guide-{n}"),
+                    "starviewer",
+                    "starviewer notes",
+                )
+            })
+            .collect();
+        let mut app = sample_document(
+            "app:open-starviewer.desktop",
+            "Starviewer Open",
+            "Image viewer",
+        );
+        app.category = Category::App;
+        docs.push(app);
+        let (_tmp, index) = create_index_with_docs(&docs);
+        for limit in [1, 10] {
+            let hits = index
+                .search(&Query {
+                    text: "starviewer".into(),
+                    limit,
+                })
+                .unwrap();
+            assert_eq!(
+                hits[0].id.0, "app:open-starviewer.desktop",
+                "a matching application must survive file saturation and rank first at limit {limit}"
+            );
+        }
+        let excluded = search(&index, "starviewer -open");
+        assert!(
+            excluded.iter().all(|hit| hit.category != Category::App),
+            "priority candidate retrieval must respect exclusion operators"
+        );
+        assert!(!excluded.is_empty());
+    }
+
+    #[test]
+    fn matching_apps_lead_while_files_keep_score_order() {
+        let mut app = sample_document(
+            "app:open-starviewer.desktop",
+            "Starviewer Open",
+            "Image viewer",
+        );
+        app.category = Category::App;
+        let exact_file = sample_document("fs:/tmp/exact", "starviewer", "");
+        let body_file = sample_document("fs:/tmp/notes", "Notes", "starviewer");
+        let mut unrelated =
+            sample_document("app:unrelated.desktop", "MusicPlayer", "Listen to music");
+        unrelated.category = Category::App;
+        let (_tmp, index) = create_index_with_docs(&[body_file, exact_file, app, unrelated]);
+        let hits = search(&index, "starviewer");
+        assert_eq!(hits[0].category, Category::App);
+        assert_eq!(hits[1].id.0, "fs:/tmp/exact");
+        assert_eq!(hits[2].id.0, "fs:/tmp/notes");
+        assert_eq!(hits.len(), 3, "unmatched items must not be injected");
+    }
+
+    #[test]
+    fn exact_file_beats_a_path_only_or_partial_application_match() {
+        let mut path_match = sample_document("app:quartz.desktop", "Lantern", "");
+        path_match.category = Category::App;
+        let exact_file = sample_document("fs:/tmp/note", "quartz", "");
+        let mut partial = sample_document("app:viewer.desktop", "Atlas", "");
+        partial.category = Category::App;
+        let full_file = sample_document("fs:/tmp/guide", "atlas handbook", "");
+        let (_dir, index) = create_index_with_docs(&[path_match, exact_file, partial, full_file]);
+        for (query, expected, fallback) in [
+            ("quartz", "fs:/tmp/note", false),
+            ("atlas handbook", "fs:/tmp/guide", true),
+        ] {
+            let pairs = index
+                .search_with_breakdown(&Query {
+                    text: query.into(),
+                    limit: 5,
+                })
+                .unwrap();
+            assert_eq!(pairs[0].0.id.0, expected);
+            assert!(
+                pairs
+                    .iter()
+                    .any(|(h, bd)| h.category == Category::App && bd.lexical_fallback == fallback)
+            );
+        }
+    }
+
+    #[test]
+    fn category_scopes_every_candidate_probe_before_the_limit() {
+        let mut docs: Vec<_> = (0..16)
+            .map(|n| {
+                let mut app = sample_document(&format!("app:viewer-{n}"), "Starviewer", "");
+                app.category = Category::App;
+                app
+            })
+            .collect();
+        docs.push(sample_document("fs:/tmp/only", "Starviewer", ""));
+        let (_dir, index) = create_index_with_docs(&docs);
+        for (text, fallback) in [
+            ("Starviewer", false),
+            ("starv", false),
+            ("starviewer telescope", true),
+        ] {
+            let q = Query {
+                text: text.into(),
+                limit: 1,
+            };
+            let pairs = index.search_in_category(&q, Some(Category::File)).unwrap();
+            assert_eq!(pairs.len(), 1);
+            assert_eq!(pairs[0].0.id.0, "fs:/tmp/only");
+            assert_eq!(pairs[0].1.lexical_fallback, fallback);
+            assert!(
+                index
+                    .search_in_category(&q, Some(Category::Mail))
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        let q = Query {
+            text: "category:app starviewer".into(),
+            limit: 1,
+        };
+        assert!(
+            index
+                .search_in_category(&q, Some(Category::File))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn semantic_candidate_membership_follows_live_category_after_replacement() {
+        let mut doc = sample_document("item:one", "First", "");
+        let other = sample_document("item:two", "Second", "");
+        let (_dir, index) = create_index_with_docs(&[doc.clone(), other]);
+        let ids = ["item:one", "item:two", "item:missing"]
+            .map(str::to_owned)
+            .into();
+        doc.category = Category::Mail;
+        let mut writer = index.writer(20_000_000).unwrap();
+        index.upsert(&doc, &mut writer).unwrap();
+        index.commit(&mut writer).unwrap();
+        index.reload().unwrap();
+        assert_eq!(
+            index.ids_in_category(&ids, Category::Mail).unwrap(),
+            ["item:one".to_owned()].into()
+        );
+        assert_eq!(
+            index.ids_in_category(&ids, Category::File).unwrap(),
+            ["item:two".to_owned()].into()
+        );
+    }
+
+    #[test]
+    fn literal_title_prefix_outranks_shorter_fuzzy_title() {
+        let mut app = sample_document("app:starviewer.desktop", "Starviewer", "Image viewer");
+        app.category = Category::App;
+        let mut noise = sample_document("fs:/tmp/guide.txt", "Guide to Star", "Astronomy notes");
+        noise.mtime = Utc::now().timestamp();
+        let (_tmp, index) = create_index_with_docs(&[app, noise]);
+
+        for limit in [1, 10] {
+            let hits = index
+                .search(&Query {
+                    text: "starv".into(),
+                    limit,
+                })
+                .unwrap();
+            assert_eq!(
+                hits[0].id.0, "app:starviewer.desktop",
+                "a literal name completion must beat a shorter edit-distance match at limit {limit}"
+            );
+        }
+    }
+
+    #[test]
+    fn title_prefix_candidates_survive_crowded_category() {
+        let mut docs: Vec<_> = (0..100)
+            .map(|n| {
+                sample_document(
+                    &format!("fs:/tmp/note-{n}"),
+                    &format!("Starviewer Notes {n}"),
+                    "",
+                )
+            })
+            .collect();
+        let mut app = sample_document("app:starviewer.desktop", "Starviewer", "Image viewer");
+        app.category = Category::App;
+        docs.push(app);
+        let (_tmp, index) = create_index_with_docs(&docs);
+
+        for limit in [1, 10] {
+            let hits = index
+                .search(&Query {
+                    text: "starv".into(),
+                    limit,
+                })
+                .unwrap();
+            assert_eq!(
+                hits[0].id.0, "app:starviewer.desktop",
+                "category preference must apply before a crowded candidate pool drops the name match at limit {limit}"
+            );
+        }
     }
 
     #[test]

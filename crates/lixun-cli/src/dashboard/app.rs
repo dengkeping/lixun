@@ -97,8 +97,7 @@ pub enum WidgetMode {
 }
 
 /// Which widget currently has focus for keyboard navigation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FocusedWidget {
     SocketPanel,
     LogViewer,
@@ -192,7 +191,6 @@ impl FocusedWidget {
         }
     }
 }
-
 
 impl App {
     /// Create a new App instance with default values.
@@ -386,11 +384,9 @@ impl App {
             KeyCode::Backspace => {
                 self.pop_query_char();
             }
-            KeyCode::Enter => {
-                if !self.query_input.is_empty() {
-                    self.search_pending = true;
-                    self.input_mode = InputMode::Navigation;
-                }
+            KeyCode::Enter if !self.query_input.is_empty() => {
+                self.search_pending = true;
+                self.input_mode = InputMode::Navigation;
             }
             _ => {}
         }

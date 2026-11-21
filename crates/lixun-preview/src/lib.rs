@@ -285,7 +285,6 @@ pub fn default_launch(hit: &lixun_core::Hit) -> anyhow::Result<()> {
             Ok(())
         }
         Action::OpenUri { uri } => {
-            tracing::debug!(uri = %uri, "default_launch: dispatching via xdg-open");
             // xdg-utils' xdg-open rejects any argv that begins with '-' (it
             // treats the conventional GNU end-of-options separator as an
             // unrecognised option and bails). Pass the URI directly. Producers
