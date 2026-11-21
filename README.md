@@ -1,10 +1,10 @@
 # Lixun 利寻
 
-[![version](https://img.shields.io/badge/version-0.7.2-blue)](https://github.com/dengkeping/lixun/releases)
+[![version](https://img.shields.io/github/v/release/dengkeping/lixun)](https://github.com/dengkeping/lixun/releases/latest)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-green)](#license)
-[![platform](https://img.shields.io/badge/platform-Linux-lightgrey)]()
+![platform](https://img.shields.io/badge/platform-Linux-lightgrey)
 [![rust](https://img.shields.io/badge/rust-2024-orange)](https://www.rust-lang.org/)
-[![status](https://img.shields.io/badge/status-active%20development-yellow)]()
+![status](https://img.shields.io/badge/status-active%20development-yellow)
 [![SonarQube Quality Gate](https://sonarcloud.io/api/project_badges/measure?project=dengkeping_lixun&metric=alert_status)](https://sonarcloud.io/project/overview?id=dengkeping_lixun)
 
 > **Status — active development.** Lixun is under heavy development. Expect
@@ -15,15 +15,11 @@
 > `lixun-cli status` and the relevant section of `~/.config/lixun/config.toml`
 > when reporting bugs.
 
-A **queryable personal workspace browser for Linux**. Press `Super + Space`,
-start typing, get instant results across applications, files, email, and
-**photos by content**. Inspect before you open: hit Space on any result to
-preview text, images, PDFs, code, email, office documents, or audio/video
-without launching an external app. Backed by a local
-[Tantivy](https://github.com/quickwit-oss/tantivy) full-text index, dense
-vector search via CLIP, and a long-lived daemon that keeps everything fresh
-via filesystem watchers. Lexical (BM25) and semantic (text + image) results
-fuse with Reciprocal Rank Fusion.
+Lixun is a local search launcher for Linux Wayland desktops. Press **Super+Space**
+to find an application, file, folder or email. Search by filename or by words
+inside a document. Press **Space** to preview a result and **Enter** to open it.
+The optional semantic worker can also find documents by meaning and photos by
+what they depict.
 
 ---
 
@@ -31,20 +27,15 @@ fuse with Reciprocal Rank Fusion.
 
 - **Preview pane** — inspect before you open. Hit Space on any result to see
   text, images, PDFs, code, email, office documents, or audio/video content in
-  a warm overlay. No external app launch, no wait. The preview process stays
-  alive across queries so the second Space is instant.
-- **Semantic search** — hybrid lexical + dense-vector retrieval via
-  Reciprocal Rank Fusion. Three parallel backends: BM25 (always on), text
-  semantic (bge-small-en-v1.5), and **image semantic** (CLIP cross-modal
-  text→image search). Query "photos of dogs" and get actual photos ranked by
-  content, not just filename matches. Runs as a sidecar process: install the
-  `lixun-semantic-worker` binary on `$PATH` (or set
-  `LIXUN_SEMANTIC_WORKER` to its path) and add `[semantic] enabled = true`
-  to the config to activate it at runtime (default is off). See
-  [docs/search-fusion.md](docs/search-fusion.md) for architecture details.
+  an overlay. Lixun keeps the preview process available between queries.
+- **Semantic search** — combines full-text results with document and image
+  embeddings. Photo queries can use English, Russian or Chinese descriptions.
+  Install the optional worker and enable it in the configuration. See
+  [Semantic search](#semantic-search) for setup and measured results.
 - **Apps** — all `.desktop` entries, launched with `GDK_BACKEND` respected.
-- **Files** — everything under your home (minus sensible excludes) with
-  full-text body extraction from PDF/DOCX/XLSX/PPTX/RTF/DOC/XLS/PPT/plain text.
+- **Files** — search names and contents under the configured roots. The default
+  root is your home directory, subject to exclusions. Supported formats include
+  plain text, PDF, DOCX, XLSX, PPTX, ODT, RTF and legacy Office files.
 - **Email (Thunderbird)** — reads the running profile's
   `global-messages-db.sqlite` directly; subjects, bodies, senders,
   recipients all searchable. Optional attachment indexing from mbox files.
@@ -71,7 +62,7 @@ fuse with Reciprocal Rank Fusion.
 - **System impact preset** — four resource levels (unlimited/high/medium/low)
   controlling thread pools, heap sizes, and scheduling hints.
 
-Everything local. No telemetry, no cloud, no vendor.
+Indexing, queries and model inference run locally. The semantic worker downloads models on first use. Activating a web-search shortcut sends the query to the configured search engine.
 
 Deliberately out of scope for now: **window switching** (listing and
 focusing open windows, as KRunner does). It needs per-compositor
@@ -86,57 +77,66 @@ native switcher bound.
 
 ### Release packages (x86_64)
 
-The Linux packages workflow builds for Arch Linux/CachyOS, Debian 13 and
-Ubuntu 26.04 LTS. A manual run produces downloadable Actions artifacts.
-Pushing a tag matching the workspace version (for example, `v0.7.2` for
-version `0.7.2`) publishes the tested packages and `SHA256SUMS` to
-[GitHub Releases](https://github.com/dengkeping/lixun/releases).
+Download the core package for your distribution from the
+[latest release](https://github.com/dengkeping/lixun/releases/latest).
+The release workflow builds and tests three packages per distribution.
 
-Download the core package for your distribution. From its download directory,
-install it with `sudo pacman -U ./lixun-<version>-1-x86_64.pkg.tar.zst`
-on Arch/CachyOS or `sudo apt install ./lixun_<version>_<arch>.deb` on
-Debian/Ubuntu, substituting the downloaded filename. Install the matching
-`lixun-semantic` and `lixun-ocr` packages to add semantic search and OCR.
-Start the daemon with `systemctl --user enable --now lixund.service`.
+| Package | Purpose |
+| --- | --- |
+| `lixun` | Daemon, launcher, CLI and preview |
+| `lixun-semantic` | Optional worker for document and image search |
+| `lixun-ocr` | Optional dependencies for recognizing text in scans and images |
 
-### Build on Arch Linux
-
-Build and install the core package with the Arch packaging tools:
+From the download directory, run the command for your distribution. The globs
+below select the core package. Add optional package filenames to the same
+command if needed.
 
 ```sh
-git clone https://github.com/dengkeping/lixun.git
-cd lixun/packaging/arch/lixun
-makepkg -si
-systemctl --user enable --now lixund.service
+# Arch Linux or CachyOS
+sudo pacman -U ./lixun-[0-9]*-x86_64.pkg.tar.zst
+
+# Debian 13
+sudo apt install ./lixun_*+deb13_amd64.deb
+
+# Ubuntu 26.04
+sudo apt install ./lixun_*+ubuntu26.04_amd64.deb
 ```
 
-### From source (any Linux)
+Start the daemon in your desktop session and check its status.
 
 ```sh
-# Daemon, GUI, CLI, preview (lexical search only)
-cargo build --workspace --release
-
-# Semantic search worker (separate sidecar binary; ONNX Runtime, ~400 MB model cache)
-# Default build includes HEIC/JXL/RAW image decoding (~10 MB binary overhead).
-# Use --no-default-features for a minimal worker if you never index those formats.
-cargo build --release -p lixun-semantic-worker
-
-install -Dm755 target/release/lixund        /usr/local/bin/lixund
-install -Dm755 target/release/lixun-cli     /usr/local/bin/lixun-cli
-install -Dm755 target/release/lixun-gui     /usr/local/bin/lixun-gui
-install -Dm755 target/release/lixun-preview /usr/local/bin/lixun-preview
-# Optional: install the semantic worker if you built it above
-install -Dm755 target/release/lixun-semantic-worker /usr/local/bin/lixun-semantic-worker
-install -Dm644 packaging/systemd/lixund.service \
-  ~/.config/systemd/user/lixund.service
 systemctl --user enable --now lixund.service
+lixun-cli status
+lixun-cli toggle
+```
+
+### From source
+
+From a checkout with Rust and the native build dependencies installed, build
+the four core binaries. The [release build script](packaging/release/build.sh)
+lists the native packages used on each supported distribution.
+
+```sh
+cargo build --locked --release -p lixun-daemon -p lixun-cli -p lixun-gui -p lixun-preview-bin
+# Optional semantic worker
+cargo build --locked --release -p lixun-semantic-worker
+```
+
+To run this build directly in a Wayland session, put the binaries on the
+daemon's search path and start it in the foreground. Use this method when
+there is no other Lixun daemon running for your user.
+
+```sh
+export PATH="$PWD/target/release:$PATH"
+lixund
 ```
 
 **Runtime dependencies:** `gtk4`, `gtk4-layer-shell`, `poppler` (PDF),
 `zstd`, `sqlite`.
 
-**Optional (extraction):** `libreoffice-fresh` (docx/xlsx/pptx),
-`catdoc` or `antiword` (legacy .doc).
+**Text extraction:** DOCX, XLSX, PPTX and ODT are read directly. For PDF
+text install `pdftotext` (Poppler). Legacy DOC, XLS and PPT extraction
+uses `antiword`, `catdoc` and LibreOffice respectively.
 
 **Optional (OCR for images and scan PDFs):** `tesseract` plus the
 language packs you need — `tesseract-data-eng`, `tesseract-data-rus`,
@@ -160,9 +160,8 @@ blank paintables.
 program. Without it, lixun falls back to `$TERMINAL` then `xterm`;
 if none of those resolve, the shell hit's spawn silently fails.
 
-**Optional (semantic search):** ONNX Runtime (pulled via `fastembed`),
-~400 MB model cache (`bge-small-en-v1.5` default), ~1.5–1.7 GB
-Lance/Arrow staging during backfill. See [Semantic search](#semantic-search).
+**Optional (semantic search):** the worker uses ONNX Runtime and caches
+its models locally. See [Semantic search](#semantic-search).
 
 ---
 
@@ -170,12 +169,12 @@ Lance/Arrow staging during backfill. See [Semantic search](#semantic-search).
 
 ### Bind the global hotkey
 
-Lixun uses the **XDG GlobalShortcuts portal** (works on KDE Plasma 6+,
-Hyprland, and other compositors that ship the portal). GNOME is currently
-out of scope: the launcher window needs `wlr-layer-shell`, which
-GNOME / Mutter does not implement (see the roadmap's compositor matrix).
-On first run lixun registers a request for `Super+space`; accept it in the
-portal dialog, or configure your compositor directly:
+On KDE Plasma the daemon uses KGlobalAccel when available. On other desktops
+it tries the XDG GlobalShortcuts portal. Check the **Hotkey** line in
+`lixun-cli status` to see the active backend. The launcher requires a Wayland
+compositor with layer-shell support. GNOME/Mutter lacks this protocol.
+
+The default toggle can be set in the user configuration.
 
 ```toml
 # ~/.config/lixun/config.toml
@@ -197,36 +196,37 @@ bindsym $mod+space exec lixun-cli toggle
 
 ```sh
 lixun-cli toggle        # show/hide the GUI
-lixun-cli search <q>    # search without GUI (prints to stdout)
-lixun-cli reindex       # fire-and-forget full reindex (returns in ms)
+lixun-cli search "meeting notes"    # search without GUI (prints to stdout)
+lixun-cli reindex       # start a full reindex in the background
 lixun-cli status        # daemon health, index stats, reindex progress
 lixun-cli impact get    # show current system-impact level
-lixun-cli impact set medium [--persist]  # change level (hot+cold knobs)
-lixun-cli impact explain                 # preview changes without applying
+lixun-cli impact set medium --persist  # change level (hot+cold knobs)
+lixun-cli impact explain                # show the current resource profile
+lixun-cli dashboard                     # inspect the daemon interactively
+lixun-cli check-exclude ~/Documents     # explain the indexing policy for a path
 ```
 
 ### Working with search results
 
-- A body-text match shows the surrounding passage under the title. Press **Space** on a matching PDF to open its preview on the first occurrence with the quote highlighted. Enter opens the usual file handler.
+- When the filename contains the whole query, the row shows its parent folder, even if the same words appear in a spreadsheet formula or document body. A content match can show the surrounding passage.
+- File type labels use readable names, including for Office files already in the index.
+- Press **Space** on a matching PDF to open its preview on the first occurrence with the quote highlighted. Enter opens the usual file handler.
 - Open the launcher menu and choose **Saved searches…** to name the current query and category. Choosing a saved name searches the current index again.
 - Run `lixun-cli preview-root /path/to/folder` before adding an indexing root. The command checks installed extractors, size limits, OCR eligibility and exclusion rules. Excluded directories appear once with the matching rule. OCR candidates depend on successful recognition when indexed.
 - When an ordinary query returns zero results, the launcher can offer the same keystrokes in the other Russian/English layout. Select the suggestion and press **Enter** to search again.
 
-### Preview pane
-
-Press **Space** on any focused result to open the preview overlay.
-Press **Space** or **Escape** to close it. The preview renders in a
-separate layer-shell window so the main window stays visible underneath.
+See [Preview pane](#preview-pane) for supported formats.
 
 ---
 
 ## Configuration
 
-Copy the example config and edit:
+From a source checkout, copy the example to start a new configuration. Release
+packages also install the example under `/usr/share/doc/lixun/`.
 
 ```sh
 mkdir -p ~/.config/lixun
-cp docs/config.example.toml ~/.config/lixun/config.toml
+cp -n docs/config.example.toml ~/.config/lixun/config.toml
 ```
 
 A short taste of the schema — indexer knobs live under `[core]`:
@@ -243,7 +243,7 @@ exclude_regex = ['\.sqlite-wal$', '/target/(debug|release)/']
 global_toggle = "Super+space"
 
 [semantic]
-enabled = false                # Opt-in dense-vector sidecar (~400 MB models)
+enabled = false                # Opt-in dense-vector sidecar
 ```
 
 Every supported section — `[ranking]`, `[keybindings]`, `[preview]`,
@@ -260,8 +260,7 @@ reference for the config schema.
 
 Press **Space** on a focused result to open the preview overlay. Closes on
 **Escape**, **Space**, or focus-loss. The preview process (`lixun-preview`)
-is spawned on-demand via Unix socket from the daemon; it selects one of
-seven format plugins based on MIME type and file extension:
+is spawned on-demand via Unix socket from the daemon; it selects a bundled preview plugin based on MIME type and file extension:
 
 - **text** — plain text files with syntax-aware line numbers
 - **image** — PNG, JPEG, WebP, GIF (static and animated), TIFF, BMP, SVG
@@ -270,6 +269,9 @@ seven format plugins based on MIME type and file extension:
 - **email** — RFC 822 messages and Thunderbird mbox entries
 - **office** — OOXML and legacy Office documents (DOCX, XLSX, PPTX, DOC, XLS, PPT)
 - **av** — audio/video files via GStreamer (MP3, MP4, WebM, etc.)
+- **archive** — archive contents
+- **folder** — directory contents
+- **info** — file metadata as a fallback
 
 **GStreamer** is required for the av plugin and for animated image rendering.
 Without it, those formats show a "cannot preview" placeholder; all other
@@ -279,45 +281,39 @@ plugins work normally.
 
 ## Semantic search
 
-Semantic search adds dense-vector retrieval to the lexical BM25 index. Three
-backends run **in parallel** for every query — BM25, text semantic
-(bge-small-en-v1.5), and image semantic (CLIP cross-modal text→image). Their
-results merge via Reciprocal Rank Fusion (RRF, k=60). There is **no query
-classifier** — fan-out-and-merge is more robust than trying to guess upfront
-whether a query is "text" or "image".
+Install `lixun-semantic` and enable the worker in
+`~/.config/lixun/config.toml`. These are the default models.
 
-**Cross-modal image search.** Query "photos of dogs" or "screenshot of
-terminal" and get actual photos ranked by their visual content via CLIP,
-not just filename matches. Indexed images live in `~/.local/share/lixun/semantic/vectors/image_vectors.lance/`.
+```toml
+[semantic]
+enabled = true
+text_model = "bge-small-en-v1.5"
+image_model = "clip-vit-b-32-multilingual"
+```
 
-**Requirements:**
-- Install the `lixun-semantic-worker` sidecar binary (the daemon
-  discovers it via `LIXUN_SEMANTIC_WORKER`, then `$PATH`, then
-  `/usr/lib/lixun/lixun-semantic-worker`)
-- Add `[semantic] enabled = true` to config
-- GLIBC >= 2.27 (ONNX Runtime requirement)
+Restart the daemon after enabling the worker. Check its status, then backfill
+existing documents if needed.
 
-**Configuration:**
-- Text embeddings: `fastembed` with `bge-small-en-v1.5` (384-dim)
-- Image embeddings: `fastembed` with `clip-vit-b-32` vision (512-dim)
-- Cross-modal text encoder: `clip-vit-b-32` text (512-dim, same space)
-- Model cache: `~/.cache/lixun/fastembed/` (~400 MB total)
-- Vector store: `~/.local/share/lixun/semantic/vectors/` (LanceDB tables)
+```sh
+systemctl --user restart lixund.service
+lixun-cli status
+lixun-cli semantic backfill
+```
 
-**Memory footprint:**
-- ONNX heap: ~400 MB (worker process, not daemon)
-- Lance/Arrow staging during backfill: ~1.5–1.7 GB
-- Backfill command: `lixun-cli semantic backfill` (resume-safe)
+Hybrid search can show a lexical page immediately and refine it using
+reciprocal rank fusion. Explicit photo queries give more weight to visual
+matches. Quoted phrases and field constraints retain their lexical meaning.
 
-**Latency** (p50/p95 on a 4-core laptop, NVMe SSD):
-- BM25 only: 10-20ms
-- BM25 + text semantic: 30-50ms
-- BM25 + text + image (full 3-way RRF): 40-60ms
+The default document model produces 384-dimensional vectors. The multilingual
+image-query encoder searches the same 512-dimensional image vectors as the
+earlier English CLIP encoder. Switching between these two query encoders
+preserves existing image vectors. For multilingual document retrieval,
+`text_model = "bge-m3"` uses more memory and requires a separate backfill.
 
-See [`docs/architecture.md`](docs/architecture.md) for the full block diagram,
-[`docs/search-fusion.md`](docs/search-fusion.md) for the fusion algorithm, and
-[`docs/wave-d-semantic.md`](docs/wave-d-semantic.md) for worker configuration
-and operations.
+On the project's held-out photo benchmark, the default returned four relevant
+photos in the first five results in each of English, Russian and Chinese.
+The same benchmark records false positives and peak worker memory.
+[Search quality report](docs/search-quality.md) · [Search architecture](docs/search-fusion.md)
 
 ---
 
@@ -333,7 +329,7 @@ Default is `high` (matches v0.4.0 behaviour).
 lixun-cli impact get                    # Show current level
 lixun-cli impact set medium             # Apply level (hot knobs immediate)
 lixun-cli impact set low --persist      # Persist to config.toml
-lixun-cli impact explain                # Preview changes
+lixun-cli impact explain                # Show the current resource profile
 ```
 
 **Hot reload** (takes effect within 2 seconds):
@@ -461,7 +457,7 @@ compositor to blur whatever is behind it on supported compositors:
   layerrule = ignorealpha 0.5, lixun-gui
   ```
 
-- **sway, niri, GNOME** — no blur protocol available; the window
+- **sway, niri** — no blur protocol available; the window
   uses a denser, 94% opaque tint when blur is unavailable.
 
 Set `[gui] opacity` to adjust the tint while blur is active.
@@ -521,7 +517,8 @@ Preview path (spawned on first Space, kept warm between queries):
                                                  • text   • image
                                                  • pdf    • code
                                                  • email  • office
-                                                 • av
+                                                 • av     • archive
+                                                 • folder • info
 ```
 
 - **Daemon (`lixund`)** — owns the Tantivy writer, runs tick scheduler,
@@ -530,7 +527,7 @@ Preview path (spawned on first Space, kept warm between queries):
   demand by the daemon. Fully stateless; re-spawnable.
 - **CLI (`lixun-cli`)** — thin IPC client. Distributions may also install
   it as `lixun` for convenience.
-- **Preview (`lixun-preview`)** — short-lived companion process spawned
+- **Preview (`lixun-preview`)** — reusable companion process spawned
   by the daemon when the user presses Space on a focused result row.
   Renders the hit in a second layer-shell overlay using a format plugin.
   Closes on Escape, Space, or focus-loss; main window remains alive underneath.
@@ -541,14 +538,14 @@ Preview path (spawned on first Space, kept warm between queries):
 
 ### Plugin lifecycle
 
-A source plugin is loaded **if and only if** its config section is present:
+Source factories use their configuration and defaults to decide which instances to create:
 
 - `[thunderbird]` → `lixun-source-thunderbird` registered
 - `[[maildir]]` → `lixun-source-maildir` registered (one instance per block)
-- `[calculator]` → `lixun-source-calculator` registered (singleton)
-- `[shell]` → `lixun-source-shell` registered (singleton)
+- Calculator and shell are enabled by default. Set `enabled = false` under
+  `[calculator]` or `[shell]` to disable the corresponding source.
 - `[semantic]` + reachable `lixun-semantic-worker` sidecar → `lixun-source-semantic-stub` registered
-- Nothing → plugin stays dormant, zero runtime cost
+- `[[search.keyword]]` defines web shortcuts and `[[command_source]]` registers local commands.
 
 No code in `lixund` names any plugin. The daemon iterates
 `inventory::iter::<PluginFactoryEntry>` and hands each factory its
@@ -571,10 +568,11 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 ### Layout
 
-**Core (12 crates):**
+**Core crates:**
 
 | Crate | Role |
 |---|---|
+| `lixun-config` | Configuration types and defaults |
 | `lixun-core` | Shared types (`Document`, `Query`, `Hit`, …) |
 | `lixun-ipc` | Unix-socket codec + request/response schema |
 | `lixun-index` | Tantivy schema + writer wrapper |
@@ -588,17 +586,19 @@ cargo clippy --workspace --all-targets -- -D warnings
 | `lixun-fusion` | Reciprocal Rank Fusion + semantic search integration |
 | `lixun-plugin-bundle` | Linker anchor for source plugins |
 
-**Source plugins (5 crates):**
+**Source plugins:**
 
 | Crate | Role |
 |---|---|
 | `lixun-source-maildir` | Maildir plugin |
+| `lixun-source-command` | External command sources |
+| `lixun-source-keyword` | Keyword web searches |
 | `lixun-source-thunderbird` | Gloda + mbox attachments |
 | `lixun-source-calculator` | Calculator plugin (`=` prefix) |
 | `lixun-source-shell` | Shell-command plugin (`>` prefix) |
 | `lixun-source-semantic-stub` | Semantic search IPC client (talks to `lixun-semantic-worker` sidecar) |
 
-**Preview pane (10 crates):**
+**Preview crates:**
 
 | Crate | Role |
 |---|---|
@@ -612,6 +612,11 @@ cargo clippy --workspace --all-targets -- -D warnings
 | `lixun-preview-email` | Email/mbox preview |
 | `lixun-preview-office` | Office document preview (OOXML + legacy) |
 | `lixun-preview-av` | Audio/video preview via GStreamer |
+| `lixun-preview-archive` | Archive listing |
+| `lixun-preview-folder` | Directory listing |
+| `lixun-preview-info` | File information |
+
+The semantic subsystem also includes `lixun-semantic-worker`, `lixun-semantic-proto` and the shared `lixun-image-decode` crate.
 
 ### Writing a new source plugin
 
@@ -632,15 +637,15 @@ Zero changes to `lixund`. Config-driven, auto-registered.
   attributed to the cgroup, not daemon heap. Check `/proc/$(pgrep lixund)/status`
   for the real number.
 
-- **With semantic search enabled:** Add ~400 MB ONNX heap + 1.5–1.7 GB
-  Lance/Arrow staging during backfill. After backfill completes, staging
-  drops; steady-state is roughly ONNX heap + vector index working set.
+- **Semantic worker memory:** on the mixed-corpus benchmark the default worker
+  peaked at 1,301 MiB. With BGE-M3 it peaked at 2,623 MiB on the same corpus.
+  See the [benchmark conditions](docs/search-quality.md#resources-and-model-choice).
 
 - **System impact preset:** Reduces CPU threads, heap sizes, and applies
   nice/ionice/SCHED_IDLE scheduling hints. Best-effort only — does not cap
   RAM. For hard limits, use systemd slice settings (see `docs/system-impact.md`).
 
-- **Fire-and-forget reindex:** `lixun-cli reindex` returns in ~6 ms; daemon
+- **Background reindex:** `lixun-cli reindex` starts the job and returns. The daemon
   does the work in the background. Watch progress via `lixun-cli status`.
 
 - **gloda batch size:** tune `[thunderbird].gloda_batch_size` to trade off
@@ -672,9 +677,9 @@ does not support `wlr-layer-shell` and is out of scope until it does.
 Ranked roughly by how much each one stresses the indexing substrate and
 by how often people actually ask for it:
 
-1. **Files / folders** — richer than the current "recents via XDG";
-   Markdown / Jupyter / SQLite / archive / font preview; user-configurable
-   indexed roots.
+1. **Files / folders** — extend previews for Markdown, Jupyter notebooks,
+   SQLite databases and fonts. Folder and archive listings already ship.
+
 2. **Clipboard history** — `wl-clipboard` watcher, ring buffer, opt-in
    capture, searchable.
 3. **Browser history / bookmarks / tabs** — Firefox `places.sqlite`,
@@ -735,7 +740,12 @@ After the source walk and writer commit, the daemon checks that every filesystem
 
 The [search quality report](docs/search-quality.md) records the semantic model changes, measurements, and vector backfill requirements.
 
-Recent version bumps:
+**v0.7.8** shows the parent folder for filename matches and readable file types
+for Office documents and attachments. Existing vendor-type labels are resolved
+when records are read. These display changes do not require a full reindex.
+[Release packages](https://github.com/dengkeping/lixun/releases/tag/v0.7.8)
+
+Earlier milestones:
 
 - **v0.7.2** moves filesystem operations off the async runtime threads during
   daemon startup, preview and semantic worker socket cleanup, vector store
