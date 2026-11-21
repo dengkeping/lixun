@@ -249,7 +249,7 @@ where
             // file. If mtime/size changed, the bytes we just OCR'd
             // are stale — drop the result and let the watcher's next
             // reindex re-enqueue with fresh metadata.
-            match std::fs::metadata(&path) {
+            match tokio::fs::metadata(&path).await {
                 Ok(md) => {
                     let cur_mtime = filetime_secs(&md);
                     let cur_size = md.len();

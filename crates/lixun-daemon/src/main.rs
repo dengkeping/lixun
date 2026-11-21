@@ -446,7 +446,8 @@ async fn async_main(
     // `QueryLog`, the index dir, and the per-source state subdir all
     // expect this path to exist already. On a fresh install or in an
     // isolated sandbox, `$XDG_STATE_HOME/lixun` may be absent.
-    std::fs::create_dir_all(&config.state_dir)
+    tokio::fs::create_dir_all(&config.state_dir)
+        .await
         .with_context(|| format!("creating state_dir {}", config.state_dir.display()))?;
 
     // Open the deferred-OCR queue eagerly (before the indexer or the

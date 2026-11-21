@@ -230,7 +230,7 @@ async fn main() -> Result<()> {
                 vectors_dir.display(),
                 quarantine.display()
             );
-            if let Err(mv) = std::fs::rename(&vectors_dir, &quarantine) {
+            if let Err(mv) = tokio::fs::rename(&vectors_dir, &quarantine).await {
                 tracing::error!(
                     "FATAL: could not quarantine corrupt store: {mv}; original error: {e:#}"
                 );

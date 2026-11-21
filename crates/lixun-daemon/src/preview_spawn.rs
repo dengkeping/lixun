@@ -466,7 +466,7 @@ impl PreviewSpawner {
         if let Some(path) = socket_path {
             // Best-effort unlink. Preview also unlinks on its
             // own exit path; duplicate cleanup is harmless.
-            let _ = std::fs::remove_file(&path);
+            let _ = tokio::fs::remove_file(&path).await;
         }
     }
 
@@ -491,7 +491,7 @@ impl PreviewSpawner {
         // preview bind. `preview_socket_path` is chosen per-tag
         // so collisions are improbable, but a leftover from a
         // prior crashed run is still possible if tag reuses.
-        let _ = std::fs::remove_file(&socket_path);
+        let _ = tokio::fs::remove_file(&socket_path).await;
 
         let mut cmd = Command::new("lixun-preview");
         cmd.arg("--socket-path").arg(&socket_path);
@@ -932,7 +932,7 @@ async fn reset_to_dead(
     }
     // Unlink the per-process socket. Preview's own exit path
     // also does this; duplicate cleanup is harmless.
-    let _ = std::fs::remove_file(socket_path);
+    let _ = tokio::fs::remove_file(socket_path).await;
     if let Err(e) = gui_control.dispatch(GuiCommand::Show).await {
         tracing::warn!(
             "preview_spawn: dispatch Show after pid={} exit failed: {}",

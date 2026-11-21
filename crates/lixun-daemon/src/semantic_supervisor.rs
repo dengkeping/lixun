@@ -117,7 +117,7 @@ fn is_executable(p: &Path) -> bool {
 /// connection from then on.
 pub async fn supervise(worker_path: PathBuf) {
     let socket_dir = runtime_socket_dir();
-    if let Err(e) = std::fs::create_dir_all(&socket_dir) {
+    if let Err(e) = tokio::fs::create_dir_all(&socket_dir).await {
         tracing::error!(
             dir = %socket_dir.display(),
             "semantic supervisor: cannot create socket dir, giving up: {e:#}"
@@ -134,7 +134,7 @@ pub async fn supervise(worker_path: PathBuf) {
             std::process::id(),
             random_suffix()
         ));
-        let _ = std::fs::remove_file(&socket_path);
+        let _ = tokio::fs::remove_file(&socket_path).await;
 
         match run_one_session(&worker_path, &socket_path, conn.clone()).await {
             Ok(installed_conn) => {
@@ -166,7 +166,7 @@ pub async fn supervise(worker_path: PathBuf) {
             ));
         }
 
-        let _ = std::fs::remove_file(&socket_path);
+        let _ = tokio::fs::remove_file(&socket_path).await;
         set_worker_state(SemanticWorkerState::Backoff);
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(MAX_BACKOFF);

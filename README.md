@@ -1,6 +1,6 @@
 # Lixun 利寻
 
-[![version](https://img.shields.io/badge/version-0.7.1-blue)](https://github.com/dengkeping/lixun/releases)
+[![version](https://img.shields.io/badge/version-0.7.2-blue)](https://github.com/dengkeping/lixun/releases)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-green)](#license)
 [![platform](https://img.shields.io/badge/platform-Linux-lightgrey)]()
 [![rust](https://img.shields.io/badge/rust-2024-orange)](https://www.rust-lang.org/)
@@ -744,6 +744,10 @@ user-visible search downtime. Expect transient CPU and I/O for the
 duration of the reindex (minutes on typical home corpora).
 
 Recent version bumps:
+
+- **v0.7.2** moves filesystem operations off the async runtime threads during
+  daemon startup, preview and semantic worker socket cleanup, vector store
+  recovery, and OCR result validation.
 
 - **v0.7.1** fixes Unicode search and applies category filters before filling
   the results page. Apps get priority for name matches. The daemon also
