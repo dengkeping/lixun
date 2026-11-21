@@ -1218,8 +1218,11 @@ mod tests {
 
     #[test]
     fn test_socket_path_format() {
-        let path = socket_path();
-        assert!(path.to_string_lossy().contains("lixun.sock"));
+        let expected = match std::env::var("XDG_RUNTIME_DIR") {
+            Ok(dir) => PathBuf::from(dir).join("lixun.sock"),
+            Err(_) => PathBuf::from(format!("/tmp/lixun-{}.sock", get_uid_fallback())),
+        };
+        assert_eq!(socket_path(), expected);
     }
 
     fn fake_hit() -> Hit {

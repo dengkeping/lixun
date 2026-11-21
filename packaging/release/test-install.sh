@@ -11,9 +11,9 @@ else
     apt-get install -y --no-install-recommends ./lixun_*.deb
 fi
 
-test -r /usr/lib/systemd/user/lixund.service
-test -r /usr/share/applications/app.lixun.daemon.desktop
-test -r /usr/share/lixun/matugen/lixun-colors.css.tmpl
+[[ -r /usr/lib/systemd/user/lixund.service ]]
+[[ -r /usr/share/applications/app.lixun.daemon.desktop ]]
+[[ -r /usr/share/lixun/matugen/lixun-colors.css.tmpl ]]
 for binary in lixund lixun-cli lixun-gui lixun-preview; do
     ldd -r "/usr/bin/$binary" > /tmp/link-check
     if grep -E 'not found|undefined symbol' /tmp/link-check; then exit 1; fi

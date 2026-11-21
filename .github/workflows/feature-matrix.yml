@@ -51,26 +51,28 @@ jobs:
       - name: Install native build and test dependencies
         run: pacman -Syu --noconfirm --needed git clang cmake protobuf gtk4 gtk4-layer-shell poppler-glib libheif openssl pkgconf xorg-server-xvfb xorg-xauth tesseract tesseract-data-eng sway wtype wl-clipboard ttf-dejavu python
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: feature-matrix-${{ matrix.crate }}-${{ matrix.flag }}-${{ matrix.state }}
 
       - name: Build workspace (default features)
         if: matrix.crate == 'workspace' && matrix.flag == 'none'
-        run: cargo build --workspace
+        run: cargo build --locked --workspace
 
       - name: Build workspace (--no-default-features)
         if: matrix.crate == 'workspace' && matrix.flag == 'none'
-        run: cargo build --workspace --no-default-features
+        run: cargo build --locked --workspace --no-default-features
 
       - name: Build crate with flag ON
         if: matrix.crate != 'workspace' && matrix.state == 'on'
-        run: cargo build --manifest-path crates/${{ matrix.crate }}/Cargo.toml --no-default-features --features ${{ matrix.flag }}
+        run: cargo build --locked --manifest-path crates/${{ matrix.crate }}/Cargo.toml --no-default-features --features ${{ matrix.flag }}
 
       - name: Build crate with flag OFF
         if: matrix.crate != 'workspace' && matrix.state == 'off'
-        run: cargo build --manifest-path crates/${{ matrix.crate }}/Cargo.toml --no-default-features
+        run: cargo build --locked --manifest-path crates/${{ matrix.crate }}/Cargo.toml --no-default-features
       - name: Run negotiated IPC fixtures
         if: matrix.crate == 'lixun-ipc'
         run: |

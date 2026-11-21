@@ -37,7 +37,7 @@ section1_matches=$(git grep -nE 'fastembed|lancedb|bge-|clip-vit' -- \
     crates/lixun-mutation \
     crates/lixun-fusion ':!*/tests/*' 2>/dev/null || true)
 unauthorised=$(echo "$section1_matches" | grep -vE '^crates/lixun-fusion/Cargo.toml:|:[0-9]+:[[:space:]]*//'  || true)
-if [ -n "$unauthorised" ]; then
+if [[ -n "$unauthorised" ]]; then
     echo 'AGENTS §1 violation:' >&2
     echo "$unauthorised" >&2
     exit 1

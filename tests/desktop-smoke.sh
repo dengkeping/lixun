@@ -49,14 +49,14 @@ cleanup() {
     wait "$compositor" 2>/dev/null || true
 }
 trap cleanup EXIT
-trap 'test ! -f "$profile/daemon.log" || tail -40 "$profile/daemon.log" >&2' ERR
+trap '[[ ! -f "$profile/daemon.log" ]] || tail -40 "$profile/daemon.log" >&2' ERR
 for ((i=0; i<100; i++)); do
     for display in "$XDG_RUNTIME_DIR"/wayland-*; do
         if [[ -S "$display" ]]; then export WAYLAND_DISPLAY="${display##*/}"; break 2; fi
     done
     sleep .1
 done
-test -n "${WAYLAND_DISPLAY:-}"
+[[ -n "${WAYLAND_DISPLAY:-}" ]]
 dbus-update-activation-environment XDG_CURRENT_DESKTOP XDG_CONFIG_HOME XDG_RUNTIME_DIR WAYLAND_DISPLAY GDK_BACKEND
 RUST_LOG=lixun=debug lixund > "$profile/daemon.log" 2>&1 &
 daemon=$!
@@ -70,10 +70,10 @@ lixun-cli show &
 second_show=$!
 wait "$first_show"
 wait "$second_show"
-test "$(grep -c 'gui_control: spawned lixun-gui pid=' "$profile/daemon.log")" -eq 1
+[[ "$(grep -c 'gui_control: spawned lixun-gui pid=' "$profile/daemon.log")" -eq 1 ]]
 # One virtual keyboard maintains its seat for the whole interaction.
 wtype -s 600 -d 35 display-fixture -s 1000 -M ctrl -k c -m ctrl -s 700 -M ctrl -k space -m ctrl -s 1000 -k Page_Down -s 300 -k Escape
-test "$(timeout 3 wl-paste -n)" = "$profile/docs/display-fixture.pdf"
+[[ "$(timeout 3 wl-paste -n)" == "$profile/docs/display-fixture.pdf" ]]
 for ((i=0; i<100; i++)); do
     if grep -q 'preview shown' "$profile/daemon.log"; then break; fi
     sleep .1

@@ -11,9 +11,9 @@ XDOTOOL_CMD="${XDOTOOL_CMD:-xdotool}"
 # Session / tool detection
 
 detect_session_type() {
-    if [ -n "${WAYLAND_DISPLAY:-}" ]; then
+    if [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
         printf 'wayland\n'
-    elif [ -n "${DISPLAY:-}" ]; then
+    elif [[ -n "${DISPLAY:-}" ]]; then
         printf 'x11\n'
     else
         printf 'none\n'
@@ -26,14 +26,14 @@ get_input_tool() {
 
     case "$session" in
         wayland)
-            if [ -x "$WTYPE_CMD" ] || command -v "$WTYPE_CMD" >/dev/null 2>&1; then
+            if [[ -x "$WTYPE_CMD" ]] || command -v "$WTYPE_CMD" >/dev/null 2>&1; then
                 printf 'wtype\n'
             else
                 printf 'wtype (not installed)\n' >&2
             fi
             ;;
         x11)
-            if [ -x "$XDOTOOL_CMD" ] || command -v "$XDOTOOL_CMD" >/dev/null 2>&1; then
+            if [[ -x "$XDOTOOL_CMD" ]] || command -v "$XDOTOOL_CMD" >/dev/null 2>&1; then
                 printf 'xdotool\n'
             else
                 printf 'xdotool (not installed)\n' >&2
@@ -55,7 +55,7 @@ find_binary() {
         "./target/debug/${BINARY_NAME}"
     )
     for c in "${candidates[@]}"; do
-        if [ -x "$c" ]; then
+        if [[ -x "$c" ]]; then
             realpath "$c"
             return 0
         fi
@@ -74,7 +74,7 @@ find_binary() {
 get_running_pid() {
     local pids
     pids=$(pgrep -fx "$BINARY_NAME" 2>/dev/null || true)
-    if [ -z "$pids" ]; then
+    if [[ -z "$pids" ]]; then
         pids=$(pidof "$BINARY_NAME" 2>/dev/null || true)
     fi
     printf '%s\n' "$pids"
@@ -84,7 +84,7 @@ wait_for_exit() {
     local pid=$1
     local max_wait=${2:-10}
     local waited=0
-    while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt "$max_wait" ]; do
+    while kill -0 "$pid" 2>/dev/null && [[ "$waited" -lt "$max_wait" ]]; do
         sleep 1
         waited=$((waited + 1))
     done
@@ -93,7 +93,7 @@ wait_for_exit() {
 terminate_existing() {
     local pid
     pid=$(get_running_pid)
-    if [ -n "$pid" ]; then
+    if [[ -n "$pid" ]]; then
         printf 'Terminating existing %s instance (PID %s)...\n' "$BINARY_NAME" "$pid"
         kill -TERM "$pid" 2>/dev/null || true
         wait_for_exit "$pid" 5
@@ -112,7 +112,7 @@ sample_proc_status() {
     local t_ms=$3
     local status_file="/proc/${pid}/status"
 
-    if [ ! -f "$status_file" ]; then
+    if [[ ! -f "$status_file" ]]; then
         printf 'error: %s does not exist.\n' "$status_file" >&2
         return 1
     fi
@@ -155,7 +155,7 @@ trigger_keystrokes() {
     local text="abcdefghijklmnopqrst"
     local succeeded=0
 
-    if [ -x "$WTYPE_CMD" ] || command -v "$WTYPE_CMD" >/dev/null 2>&1; then
+    if [[ -x "$WTYPE_CMD" ]] || command -v "$WTYPE_CMD" >/dev/null 2>&1; then
         if "$WTYPE_CMD" "$text" >/dev/null 2>&1; then
             succeeded=1
         else
@@ -163,7 +163,7 @@ trigger_keystrokes() {
         fi
     fi
 
-    if [ "$succeeded" -eq 0 ] && { [ -x "$XDOTOOL_CMD" ] || command -v "$XDOTOOL_CMD" >/dev/null 2>&1; }; then
+    if [[ "$succeeded" -eq 0 ]] && { [[ -x "$XDOTOOL_CMD" ]] || command -v "$XDOTOOL_CMD" >/dev/null 2>&1; }; then
         for ((i = 0; i < ${#text}; i++)); do
             "$XDOTOOL_CMD" type "${text:$i:1}" >/dev/null 2>&1 || true
             sleep 0.05
@@ -171,7 +171,7 @@ trigger_keystrokes() {
         succeeded=1
     fi
 
-    if [ "$succeeded" -eq 0 ]; then
+    if [[ "$succeeded" -eq 0 ]]; then
         printf 'warning: No working keystroke injector found (tried wtype, xdotool).\n' >&2
         printf '         Active-phase RSS may not differ from idle-phase RSS.\n' >&2
     fi
@@ -222,7 +222,7 @@ run_baseline() {
     for i in $(seq 0 11); do
         t_ms=$(( ($(date +%s%N) - start_time) / 1000000 ))
         sample_proc_status "$gui_pid" "idle" "$t_ms" >> "$samples_jsonl"
-        if [ "$i" -lt 11 ]; then
+        if [[ "$i" -lt 11 ]]; then
             sleep 5
         fi
     done
@@ -235,7 +235,7 @@ run_baseline() {
     for i in $(seq 0 11); do
         t_ms=$(( ($(date +%s%N) - start_time) / 1000000 ))
         sample_proc_status "$gui_pid" "active" "$t_ms" >> "$samples_jsonl"
-        if [ "$i" -lt 11 ]; then
+        if [[ "$i" -lt 11 ]]; then
             sleep 5
         fi
     done
@@ -267,7 +267,7 @@ run_baseline() {
     sample_count=$(jq '.samples | length' "$out_file")
     printf 'Wrote %d samples to %s\n' "$sample_count" "$out_file"
 
-    if [ "$sample_count" -ne 25 ]; then
+    if [[ "$sample_count" -ne 25 ]]; then
         printf 'warning: Expected 25 samples, got %d.\n' "$sample_count" >&2
     fi
 
@@ -280,11 +280,11 @@ compare_baselines() {
     local old_file=$1
     local new_file=$2
 
-    if [ ! -f "$old_file" ]; then
+    if [[ ! -f "$old_file" ]]; then
         printf 'error: Old baseline not found: %s\n' "$old_file" >&2
         exit 1
     fi
-    if [ ! -f "$new_file" ]; then
+    if [[ ! -f "$new_file" ]]; then
         printf 'error: New baseline not found: %s\n' "$new_file" >&2
         exit 1
     fi
@@ -303,7 +303,7 @@ compare_baselines() {
             if length > 0 then add / length else 0 end
         ' "$new_file")
 
-        if [ "$old_mean" = "null" ] || [ "$new_mean" = "null" ]; then
+        if [[ "$old_mean" == "null" ]] || [[ "$new_mean" == "null" ]]; then
             printf 'Skipping %s (missing data).\n' "$state" >&2
             continue
         fi
@@ -322,7 +322,7 @@ compare_baselines() {
         fi
     done
 
-    if [ "$regressed" -eq 1 ]; then
+    if [[ "$regressed" -eq 1 ]]; then
         exit 1
     else
         printf 'All states within ±5%% threshold.\n'
@@ -351,7 +351,7 @@ main() {
     local out_file
     out_file=$(run_baseline | tail -1)
 
-    if [ -n "$compare_target" ]; then
+    if [[ -n "$compare_target" ]]; then
         printf '\n--- Comparing with %s ---\n' "$compare_target"
         compare_baselines "$compare_target" "$out_file"
     fi

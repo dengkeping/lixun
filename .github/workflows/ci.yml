@@ -18,10 +18,11 @@ jobs:
       - name: Install native build and test dependencies
         run: pacman -Syu --noconfirm --needed git clang cmake protobuf gtk4 gtk4-layer-shell poppler-glib libheif openssl pkgconf xorg-server-xvfb xorg-xauth tesseract tesseract-data-eng sway wtype wl-clipboard ttf-dejavu python
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
+          toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo build --release --locked -p lixun-semantic-worker
       - run: cargo test --locked --workspace
       - run: cargo build --locked --workspace --all-targets
@@ -35,12 +36,15 @@ jobs:
       - name: Install native build and test dependencies
         run: pacman -Syu --noconfirm --needed git clang cmake protobuf gtk4 gtk4-layer-shell poppler-glib libheif openssl pkgconf xorg-server-xvfb xorg-xauth tesseract tesseract-data-eng sway wtype wl-clipboard ttf-dejavu python
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
+          toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: semantic
+      - name: Trust the mounted checkout for release checks
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - run: bash scripts/qa-wave-d.sh
       - name: Exercise the launcher on headless Wayland
         run: |
