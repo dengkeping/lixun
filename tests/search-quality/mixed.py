@@ -119,6 +119,8 @@ def evaluate(args, root):
         ),
         QUALITY_WORKER=str((args.bin / "lixun-semantic-worker").resolve()),
         QUALITY_TRACE=str(root / "trace"),
+        # The model and rank checks read structured fields from both processes' logs.
+        NO_COLOR="1",
         LIXUN_LOG="info",
         RUST_LOG="lixun=info,semantic_worker=info,lixun_fusion::ranks=trace",
     )
