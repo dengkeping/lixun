@@ -92,6 +92,13 @@ pub enum Modality {
     Both,
 }
 
+/// An explicitly scoped result page from a provider. The search service resolves
+/// document IDs in provider order, and can display an action when the page is empty.
+pub struct RankedPage {
+    pub ids: Vec<String>,
+    pub empty_suggestion: Option<lixun_core::Hit>,
+}
+
 /// Async query interface implemented by ANN-providing plugins.
 /// Lives in this leaf crate so `lixun-fusion` (the RRF consumer)
 /// and `lixun-source-semantic-stub` (the producer) can share the type
@@ -100,6 +107,15 @@ pub enum Modality {
 #[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait AnnHandle: Send + Sync {
+    async fn ranked_page(
+        &self,
+        _query: &str,
+        _category: Option<lixun_core::Category>,
+        _k: usize,
+    ) -> anyhow::Result<Option<RankedPage>> {
+        Ok(None)
+    }
+
     async fn search_text(&self, query: &str, k: usize) -> anyhow::Result<Vec<AnnHit>>;
     async fn search_image(&self, query: &str, k: usize) -> anyhow::Result<Vec<AnnHit>>;
 

@@ -7,6 +7,7 @@ use anyhow::Result;
 use gtk::prelude::*;
 
 mod actions;
+mod collections;
 mod color_scheme;
 mod factory;
 mod gui_server;

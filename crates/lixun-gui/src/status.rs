@@ -101,6 +101,12 @@ impl StatusBar {
         self.announce(text);
     }
 
+    pub(crate) fn add_filter_toggle(&self, apply: impl Fn(bool) + 'static) {
+        let button = gtk::ToggleButton::with_label("New only");
+        button.connect_toggled(move |b| apply(b.is_active()));
+        self.content.append(&button);
+    }
+
     pub(crate) fn show_loading(&self) {
         self.show_spinner("Searching\u{2026}");
     }

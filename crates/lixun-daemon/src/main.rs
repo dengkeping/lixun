@@ -1584,10 +1584,24 @@ impl ClientServices {
                 let log = self.query_log.read().await;
                 Response::Queries(log.recent(limit as usize))
             }
-            request @ (Request::Preview { .. } | Request::PreviewFragment { .. }) => {
+            request @ (Request::Preview { .. }
+            | Request::PreviewFragment { .. }
+            | Request::PreviewLocation { .. }) => {
                 let (hit, monitor, fragment) = match request {
                     Request::Preview { hit, monitor } => (hit, monitor, None),
                     Request::PreviewFragment {
+                        hit,
+                        monitor,
+                        fragment,
+                    } => (
+                        hit,
+                        monitor,
+                        Some(lixun_core::fragment::TextFragment {
+                            quote: fragment.quote,
+                            locator: None,
+                        }),
+                    ),
+                    Request::PreviewLocation {
                         hit,
                         monitor,
                         fragment,

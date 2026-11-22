@@ -1266,6 +1266,7 @@ fn popup_settings_menu(
     let menu = gtk::PopoverMenu::from_model(None::<&gtk::gio::MenuModel>);
     let menu_model = gtk::gio::Menu::new();
 
+    menu_model.append(Some("Quote collections…"), Some("app.collections"));
     menu_model.append(Some("Saved searches…"), Some("app.saved-searches"));
     menu_model.append(Some("Relaunch Daemon"), Some("app.relaunch"));
 
@@ -1564,13 +1565,15 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
     window.set_child(Some(&vbox));
 
     let chips_rc = std::rc::Rc::new(chips);
-    crate::saved_searches::install(
+    crate::collections::install(app, &window);
+    let visits = crate::saved_searches::install(
         app,
         &entry,
         chips_rc.clone(),
         current_category.clone(),
         &daemon_config.state_dir,
         row_popover_open.clone(),
+        session_epoch.clone(),
     );
     let pending_debounce: std::rc::Rc<std::cell::RefCell<Option<glib::SourceId>>> =
         std::rc::Rc::new(std::cell::RefCell::new(None));
@@ -1760,6 +1763,7 @@ pub(crate) fn build_window(app: &gtk::Application) -> Result<()> {
     );
 
     install_response_handler(
+        visits,
         ipc_event_rx,
         Arc::clone(&session_epoch),
         model.clone(),
@@ -2127,6 +2131,7 @@ pub(crate) fn report_launcher_geometry(window: &gtk::ApplicationWindow) {
 }
 
 struct SearchResultsView {
+    visits: std::rc::Rc<crate::saved_searches::Visits>,
     session_epoch: Arc<AtomicU64>,
     model: gtk::StringList,
     filter: gtk::CustomFilter,
@@ -2154,6 +2159,7 @@ struct SearchResultsView {
 
 #[allow(clippy::too_many_arguments)]
 fn install_response_handler(
+    visits: std::rc::Rc<crate::saved_searches::Visits>,
     event_rx: async_channel::Receiver<crate::ipc::IpcMessage>,
     session_epoch: Arc<AtomicU64>,
     model: gtk::StringList,
@@ -2175,6 +2181,7 @@ fn install_response_handler(
     max_results: u32,
 ) {
     let view = std::rc::Rc::new(SearchResultsView {
+        visits,
         session_epoch,
         model,
         filter,
@@ -2305,7 +2312,7 @@ impl SearchResultsView {
             return;
         }
         let hits = self.pending_hits.borrow();
-        if hits.is_empty() {
+        if self.visits.pending(epoch) || hits.is_empty() {
             return;
         }
         let prior = self.selected_doc_id();
@@ -2356,39 +2363,18 @@ impl SearchResultsView {
                 std::collections::HashMap::new()
             };
         crate::factory::cache_explanations(explanation_map);
-        let all_hits = if hits.is_empty() {
-            let pending = self.pending_hits.borrow().clone();
-            if !pending.is_empty() {
-                tracing::debug!(
-                    "gui: Final empty, falling back to {} buffered Initial hits",
-                    pending.len()
-                );
-            }
-            pending
-        } else {
-            hits
-        };
+        let mut all_hits = hits;
+        let visit = self.visits.finish(epoch, &mut all_hits);
+        if visit.is_none() && all_hits.is_empty() {
+            all_hits = self.pending_hits.take();
+        }
+        let only_new = visit.as_ref().is_some_and(|v| v.only_new);
         self.pending_hits.borrow_mut().clear();
 
         let prior_selected = self.selected_doc_id();
         let mut plan = compute_render_plan(&all_hits, top_hit.as_ref());
-        // R7: a page that came back full is very
-        // likely truncated — offer a terminal
-        // "Show more results" row. One ×4 step;
-        // once expanded, the row is not offered
-        // again.
-        let requested = self.last_requested_limit.get();
-        if !claimed
-            && !plan.hits.is_empty()
-            && plan.hits.len() as u32 >= requested
-            && requested < self.max_results.saturating_mul(4).min(1000)
-        {
-            let q = self.last_query.borrow().clone();
-            if !q.is_empty() {
-                let next = self.max_results.saturating_mul(4).min(1000);
-                plan.hits
-                    .push(crate::factory::synthetic_more_results_hit(&q, next));
-            }
+        if !claimed && !only_new {
+            self.append_expansion(&mut plan);
         }
         let top_hit_doc_id = plan
             .top_hit_index
@@ -2401,7 +2387,12 @@ impl SearchResultsView {
         self.filter.changed(gtk::FilterChange::Different);
 
         if plan.hits.is_empty() {
-            self.show_empty(epoch, claimed);
+            if let Some(summary) = visit {
+                self.scrolled.set_visible(false);
+                self.status.show_hints(&summary.message);
+            } else {
+                self.show_empty(epoch, claimed);
+            }
             return;
         }
         self.select_doc(
@@ -2412,7 +2403,55 @@ impl SearchResultsView {
         self.chips_container.set_visible(true);
         self.scrolled.set_visible(true);
         self.scrolled.set_vexpand(false);
-        self.status.show_hints(&self.results_hint_line);
+        if let Some(visit) = visit {
+            self.present_visit(epoch, visit, plan.hits);
+        } else {
+            self.status.show_hints(&self.results_hint_line);
+        }
+    }
+
+    fn append_expansion(&self, plan: &mut RenderPlan) {
+        // R7: a page that came back full is very
+        // likely truncated — offer a terminal
+        // "Show more results" row. One ×4 step;
+        // once expanded, the row is not offered
+        // again.
+        let requested = self.last_requested_limit.get();
+        if !plan.hits.is_empty()
+            && plan.hits.len() as u32 >= requested
+            && requested < self.max_results.saturating_mul(4).min(1000)
+        {
+            let q = self.last_query.borrow().clone();
+            if !q.is_empty() {
+                let next = self.max_results.saturating_mul(4).min(1000);
+                plan.hits
+                    .push(crate::factory::synthetic_more_results_hit(&q, next));
+            }
+        }
+    }
+
+    fn present_visit(&self, epoch: u64, visit: crate::saved_searches::VisitSummary, all: Vec<Hit>) {
+        self.status.show_hints(&visit.message);
+        if visit.only_new || visit.fresh.is_empty() {
+            return;
+        }
+        let new: Vec<_> = all
+            .iter()
+            .filter(|h| visit.fresh.contains(&h.id.0))
+            .cloned()
+            .collect();
+        let model = self.model.clone();
+        let selection = self.selection.clone();
+        let filter = self.filter.clone();
+        let session = self.session_epoch.clone();
+        self.status.add_filter_toggle(move |only| {
+            if session.load(Ordering::SeqCst) != epoch {
+                return;
+            }
+            update_results(&model, &selection, if only { &new } else { &all }, None);
+            filter.changed(gtk::FilterChange::Different);
+            selection.set_selected(0);
+        });
     }
 
     fn show_empty(&self, epoch: u64, claimed: bool) {

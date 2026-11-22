@@ -555,8 +555,20 @@ pub enum Request {
     PreviewFragment {
         hit: Box<Hit>,
         monitor: Option<String>,
+        fragment: Quote,
+    },
+    /// A source-defined locator. Appended to preserve positional command tags.
+    PreviewLocation {
+        hit: Box<Hit>,
+        monitor: Option<String>,
         fragment: lixun_core::fragment::TextFragment,
     },
+}
+
+/// Legacy quote-only address. Its positional representation is frozen for v5.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Quote {
+    pub quote: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -861,6 +873,37 @@ pub(crate) fn get_uid_fallback() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preview_fragment_and_location_round_trip_in_each_wire_format() {
+        let requests = [
+            Request::PreviewFragment {
+                hit: Box::new(fake_hit()),
+                monitor: None,
+                fragment: Quote {
+                    quote: "excerpt".into(),
+                },
+            },
+            Request::PreviewLocation {
+                hit: Box::new(fake_hit()),
+                monitor: None,
+                fragment: lixun_core::fragment::TextFragment {
+                    quote: "excerpt".into(),
+                    locator: Some("page=2".into()),
+                },
+            },
+        ];
+        for request in requests {
+            for &version in SUPPORTED_VERSIONS {
+                let bytes = encode_request_for_version(version, &request).unwrap();
+                let decoded = decode_request(version, &bytes).unwrap();
+                assert_eq!(
+                    serde_json::to_value(decoded).unwrap(),
+                    serde_json::to_value(&request).unwrap()
+                );
+            }
+        }
+    }
 
     #[test]
     fn versioned_result_frames_preserve_real_hits_and_plugin_values() {

@@ -17,11 +17,13 @@ const VERB_BACKFILL: &str = "backfill";
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(5);
 const BACKFILL_TIMEOUT: Duration = Duration::from_secs(60 * 30);
 
-pub(crate) struct SemanticIpcSource;
+pub(crate) struct SemanticIpcSource {
+    calibrated: bool,
+}
 
 impl SemanticIpcSource {
-    pub fn new() -> Self {
-        Self
+    pub fn new(calibrated: bool) -> Self {
+        Self { calibrated }
     }
 }
 
@@ -47,7 +49,9 @@ impl IndexerSource for SemanticIpcSource {
     }
 
     fn ann_handle(&self) -> Option<Arc<dyn AnnHandle>> {
-        Some(Arc::new(SemanticIpcAnnHandle))
+        Some(Arc::new(SemanticIpcAnnHandle {
+            calibrated: self.calibrated,
+        }))
     }
 
     fn cli_manifest(&self) -> Option<CliManifest> {
@@ -201,12 +205,32 @@ impl MutationBroadcaster for SemanticIpcBroadcaster {
     }
 }
 
-struct SemanticIpcAnnHandle;
+pub(super) struct SemanticIpcAnnHandle {
+    calibrated: bool,
+}
+
+fn available_hits(result: Result<Vec<AnnHit>>) -> Vec<AnnHit> {
+    result.unwrap_or_else(|e| {
+        tracing::warn!("semantic search unavailable: {e}");
+        Vec::new()
+    })
+}
 
 impl SemanticIpcAnnHandle {
+    pub(super) async fn image_neighbours(&self, query: &str, k: usize) -> Result<Vec<AnnHit>> {
+        let q = query.to_string();
+        let k_u32 = k.min(u32::MAX as usize) as u32;
+        self.issue(|req_id| Cmd::SearchImage {
+            req_id,
+            query: q,
+            k: k_u32,
+        })
+        .await
+    }
+
     async fn issue(&self, build: impl FnOnce(u64) -> Cmd) -> Result<Vec<AnnHit>> {
         let Some(conn) = current_connection() else {
-            return Ok(Vec::new());
+            anyhow::bail!("semantic worker is disconnected");
         };
         Self::issue_on(&conn, build).await
     }
@@ -227,25 +251,21 @@ impl SemanticIpcAnnHandle {
                     detail: "writer channel closed".into(),
                 }),
             );
-            tracing::warn!("semantic stub: search dropped, writer closed");
-            return Ok(Vec::new());
+            anyhow::bail!("semantic worker connection closed");
         }
         match timeout(SEARCH_TIMEOUT, rx).await {
             Ok(Ok(Ok(hits))) => Ok(hits),
-            Ok(Ok(Err(e))) => {
-                tracing::warn!("semantic stub: worker error on search: {e}");
-                Ok(Vec::new())
-            }
-            Ok(Err(_)) => {
-                tracing::warn!("semantic stub: response channel dropped");
-                Ok(Vec::new())
-            }
+            Ok(Ok(Err(e))) => Err(anyhow::anyhow!("semantic search failed: {e}")),
+            Ok(Err(_)) => Err(anyhow::anyhow!("semantic response channel closed")),
             Err(_) => {
-                tracing::warn!(
-                    timeout_ms = SEARCH_TIMEOUT.as_millis(),
-                    "semantic stub: search timeout"
+                conn.complete_search(
+                    req_id,
+                    Err(crate::transport::SemanticIpcError {
+                        code: lixun_semantic_proto::ErrorCode::Internal,
+                        detail: "search timed out".into(),
+                    }),
                 );
-                Ok(Vec::new())
+                Err(anyhow::anyhow!("semantic search timed out"))
             }
         }
     }
@@ -253,29 +273,42 @@ impl SemanticIpcAnnHandle {
 
 #[async_trait]
 impl AnnHandle for SemanticIpcAnnHandle {
+    async fn ranked_page(
+        &self,
+        query: &str,
+        category: Option<lixun_core::Category>,
+        k: usize,
+    ) -> Result<Option<lixun_mutation::RankedPage>> {
+        if !self.calibrated || category.is_some_and(|c| c != lixun_core::Category::File) {
+            return Ok(None);
+        }
+        let Some(photo) = crate::photos::PhotoQuery::parse(query) else {
+            return Ok(None);
+        };
+        photo.search(self, k).await
+    }
+
     async fn search_text(&self, query: &str, k: usize) -> Result<Vec<AnnHit>> {
         let q = query.to_string();
         let k_u32 = k.min(u32::MAX as usize) as u32;
-        self.issue(|req_id| Cmd::SearchText {
-            req_id,
-            query: q,
-            k: k_u32,
-        })
-        .await
+        Ok(available_hits(
+            self.issue(|req_id| Cmd::SearchText {
+                req_id,
+                query: q,
+                k: k_u32,
+            })
+            .await,
+        ))
     }
 
     async fn search_image(&self, query: &str, k: usize) -> Result<Vec<AnnHit>> {
-        let q = query.to_string();
-        let k_u32 = k.min(u32::MAX as usize) as u32;
-        self.issue(|req_id| Cmd::SearchImage {
-            req_id,
-            query: q,
-            k: k_u32,
-        })
-        .await
+        Ok(available_hits(self.image_neighbours(query, k).await))
     }
 
     async fn classify_query(&self, query: &str) -> Result<Modality> {
+        if let Some(intent) = crate::photos::explicit_media_intent(query) {
+            return Ok(intent);
+        }
         let Some(conn) = current_connection() else {
             return Ok(Modality::Text);
         };

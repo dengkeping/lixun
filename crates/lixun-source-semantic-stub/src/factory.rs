@@ -52,7 +52,11 @@ impl PluginFactory for SemanticIpcFactory {
 
         Ok(vec![PluginInstance {
             instance_id: "semantic".into(),
-            source: Arc::new(SemanticIpcSource::new()),
+            source: Arc::new(SemanticIpcSource::new(
+                raw.get("image_model")
+                    .and_then(toml::Value::as_str)
+                    .is_none_or(|m| m == "clip-vit-b-32-multilingual"),
+            )),
         }])
     }
 }

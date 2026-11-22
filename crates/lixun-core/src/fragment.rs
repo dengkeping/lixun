@@ -5,6 +5,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TextFragment {
     pub quote: String,
+    /// Opaque, source-defined position used when reopening a captured excerpt.
+    #[serde(default)]
+    pub locator: Option<String>,
 }
 
 pub struct PassageMatcher {
@@ -83,6 +86,7 @@ impl PassageMatcher {
             &body[start..end],
             TextFragment {
                 quote: matched.as_str().into(),
+                locator: None,
             },
         ))
     }

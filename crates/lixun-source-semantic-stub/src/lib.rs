@@ -29,3 +29,5 @@ pub use transport::{
     BackfillStats, SemanticConnection, SemanticIpcError, current_doc_store, install_connection,
     install_doc_store, is_connected,
 };
+
+mod photos;

@@ -1,6 +1,14 @@
 # Mixed-corpus search quality
 
-On the held-out topic, the default configuration returned a dog photo first and four dog photos in the first five results for each of the English, Russian and Chinese queries. The baseline returned one, one and zero respectively. The dog-care article ranked first in all three languages on both builds.
+In the earlier model comparison, the default configuration returned a dog photo first and four dog photos in the first five results for each of the English, Russian and Chinese queries. The baseline returned one, one and zero respectively. The dog-care article ranked first in all three languages on both builds.
+
+## Explicit photo queries
+
+With the default multilingual encoder, a request such as `photos of dogs` selects images using their squared L2 distances. The calibrated candidate limit is 1.51. A best distance of at most 1.48 accepts the filtered page directly. For a borderline page, the worker also searches for the subject alone (for example, `cats`). The search returns the first image if both rankings agree on it after screening. An image among the nearest neighbours of the reference caption “a screenshot of text” must favour the requested subject by more than 0.04. The decision uses the visual channel before personal ranking. The earlier English-only image encoder continues to use fusion.
+
+When the indexed image candidates are weak, the launcher offers **No confident photo matches**. Activating it searches the same image vectors with the confidence filter disabled. An unavailable worker falls back to the ordinary search path.
+
+On the fixture below, all five leading results were relevant for each of the six cat and dog queries in English, Russian and Chinese. Both screenshots dropped out of the first five. With sixty text distractors, all 33 requests for absent subjects offered the relaxed search, including ten additional English subjects tested after choosing the thresholds. A separate regression corpus retains a single labelled cat photograph alongside five dog photographs and the text screenshots. The gate requires the English cat query to return exactly that photograph. The related-images action returned real images. Five of ten breed-specific English queries ranked the correct breed first. These fixtures establish behaviour on pet photos and text screenshots. They do not measure recall across a general photo library.
 
 ## Corpus and diagnosis
 
@@ -21,7 +29,7 @@ Each cell lists **relevant photos in the first five / nDCG@10**. The relevance f
 | Revised fusion, multilingual CLIP | 4 / 0.907 | 4 / 0.907 | 4 / 0.907 | 3/3 |
 | Multilingual CLIP, BGE-M3 documents | 4 / 0.907 | 4 / 0.907 | 4 / 0.907 | 3/3 |
 
-In the selected run the English first page contained ten meeting notes. The visual channel placed a dog first, a screenshot of the word “dogs” second and four more dogs at positions 3–6. The final page preserved that order. All five dogs appeared in the final top ten for every translation. The same four-of-five threshold passed with six distractors. The screenshot remains a false positive. A request for elephant photos also returned neighbours even though the corpus contained no elephants.
+In the selected run the English first page contained ten meeting notes. The visual channel placed a dog first, a screenshot of the word “dogs” second and four more dogs at positions 3–6. The final page preserved that order. All five dogs appeared in the final top ten for every translation. The same four-of-five threshold passed with six distractors. In that earlier build the screenshot remained a false positive. A request for elephant photos also returned neighbours even though the corpus contained no elephants.
 
 The table below uses the selected default on the larger corpus. Times are end-to-end socket latencies in milliseconds. Each query ran five times. Reported p95 uses the nearest rank, so for one query with five samples it is the maximum. Empty relevance sets have no defined nDCG or recall.
 
@@ -77,6 +85,6 @@ python tests/search-quality/mixed.py --bin target/release --allow-download \
   --split all --skew 60 --output /tmp/lixun-quality.json --gate
 ```
 
-Use `--skew 6` for the balanced corpus, `--image-model clip-vit-b-32` for the original query encoder, and `--text-model bge-m3` for multilingual documents. Ordinary CI tests exercise ordering without model downloads. The full-model workflow runs on retrieval-model and fusion pull requests and gates package publication. It checks first rank, photo precision, article rank, filenames and both constrained pages. Ambiguous requests, absent visual concepts and cross-language text with the English encoder are reported diagnostics. BGE-M3's cross-language check is enforced when that model is requested.
+Use `--skew 6` for the balanced corpus, `--image-model clip-vit-b-32` for the original query encoder, and `--text-model bge-m3` for multilingual documents. Ordinary CI tests exercise ordering without model downloads. The full-model workflow runs on retrieval-model and fusion pull requests and gates package publication. It checks first rank, photo precision, article rank, filenames and both constrained pages. The default configuration gates requests for absent visual concepts and the related-images action. Ambiguous requests, breed identification and cross-language text with the English encoder are reported diagnostics. BGE-M3's cross-language check is enforced when that model is requested.
 
 The [recorded measurements](../tests/search-quality/measurements.json.gz) contain development and held-out labels, per-channel rankings, the classifier decision, both socket pages and latency samples. The current build also records the channel ranks of each fused hit before downstream scoring as triples of lexical, text and image rank (zero means absent). The baseline binary predates that trace. For example, `gzip -dc tests/search-quality/measurements.json.gz | jq '.["final-selected"].rows[0]'` shows the entire English dog query.

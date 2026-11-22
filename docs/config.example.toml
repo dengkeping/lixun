@@ -5,6 +5,8 @@
 
 # Core host settings: indexer behaviour, path policy, result caps.
 [core]
+# Indexing roots default to your home directory.
+# roots = ["~/Documents", "~/Pictures"]
 
 # Maximum number of search hits returned by the daemon, shared by the GUI and
 # the CLI dashboard. Clamped to 1..=1000. The CLI `search` subcommand's
@@ -23,209 +25,88 @@ extractor_timeout_secs = 15
 # target, .venv, __pycache__, .thunderbird, .swp, .swo, .swx, etc).
 exclude = [
     # KDE/GNOME runtime state that changes every few seconds
-    ".local/share/baloo",
-    ".local/share/akonadi",
-    ".local/share/kactivitymanagerd",
-    ".local/share/klipper",
-    ".local/share/RecentDocuments",
-    ".local/share/Nextcloud",
-
+    ".local/share/baloo", ".local/share/akonadi", ".local/share/kactivitymanagerd",
+    ".local/share/klipper", ".local/share/RecentDocuments", ".local/share/Nextcloud",
     # Browser profiles - multi-GB caches, cookies, service workers
-    ".mozilla",
-    ".zen",
-    ".config/google-chrome",
-    ".config/chromium",
-    ".config/BraveSoftware",
+    ".mozilla", ".zen", ".config/google-chrome", ".config/chromium", ".config/BraveSoftware",
     ".config/vivaldi",
-
     # Electron app config (each ships its own Chromium cache)
-    ".config/Code",
-    ".config/VSCodium",
-    ".config/Slack",
-    ".config/discord",
-    ".config/Bitwarden",
-    ".config/obsidian",
-
+    ".config/Code", ".config/VSCodium", ".config/Slack", ".config/discord",
+    ".config/Bitwarden", ".config/obsidian",
     # Secret stores - do not index principally
-    ".password-store",
-    ".gnupg",
-    ".ssh",
-
+    ".password-store", ".gnupg", ".ssh",
     # Nextcloud sync journals
     "Nextcloud/.sync_",
-
     # Git internals - pack objects are not useful for full-text search
-    ".git/objects",
-    ".git/lfs",
-
+    ".git/objects", ".git/lfs",
     # Build artifacts outside the default "target"
-    "dist",
-    "build",
-    ".next",
-    ".nuxt",
-    ".svelte-kit",
-    ".turbo",
-    ".parcel-cache",
-    ".gradle",
-    ".mvn",
-    "CMakeFiles",
-
+    "dist", "build", ".next", ".nuxt", ".svelte-kit", ".turbo", ".parcel-cache", ".gradle",
+    ".mvn", "CMakeFiles",
     # Language package caches
-    ".cargo/registry",
-    ".rustup",
-    ".bun",
-    ".npm",
-    ".yarn",
-    ".pnpm",
-    ".deno",
-    ".pub-cache",
-    ".m2/repository",
-    ".nvm",
-    ".rbenv",
-    ".pyenv",
-    ".poetry",
-    "go/pkg/mod",
-
+    ".cargo/registry", ".rustup", ".bun", ".npm", ".yarn", ".pnpm", ".deno", ".pub-cache",
+    ".m2/repository", ".nvm", ".rbenv", ".pyenv", ".poetry", "go/pkg/mod",
     # Container / VM runtime
-    ".docker",
-    ".podman",
-    ".local/share/containers",
-    ".vagrant.d",
-
+    ".docker", ".podman", ".local/share/containers", ".vagrant.d",
     # Flatpak / Snap
-    ".local/share/flatpak",
-    "snap/",
-
+    ".local/share/flatpak", "snap/",
     # IDE state
     ".idea",
     ".vscode",
     ".cursor",
     ".fleet",
-
     # Systemd / journal
     ".local/share/systemd",
-
     # Crash dumps
-    ".xsession-errors",
-    "core.",
-
+    ".xsession-errors", "core.",
     # Steam / gaming
-    ".local/share/Steam",
-    ".steampath",
-
+    ".local/share/Steam", ".steampath",
     # Wine / Proton
-    ".wine",
-    ".PlayOnLinux",
-
+    ".wine", ".PlayOnLinux",
     # Keyrings
-    ".local/share/kwalletd",
-    ".local/share/keyrings",
-
+    ".local/share/kwalletd", ".local/share/keyrings",
     # Thumbnails
     ".thumbnails",
 ]
 
 # Regex-based excludes. Each pattern is matched against the full path string.
-# Invalid patterns are logged at error level and dropped; the daemon keeps
-# running with the valid ones.
+# An invalid pattern rejects the configuration. Correct the expression before indexing.
 exclude_regex = [
     # LibreOffice / Office lock files
-    '\.~lock\..*#$',
-    '~\$.*\.docx?$',
-    '~\$.*\.xlsx?$',
-    '~\$.*\.pptx?$',
-
+    '\.~lock\..*#$', '~\$.*\.docx?$', '~\$.*\.xlsx?$', '~\$.*\.pptx?$',
     # Compiled / intermediate artifacts
-    '\.pyc$',
-    '\.pyo$',
-    '\.class$',
-    '\.o$',
-    '\.obj$',
-    '\.d$',
-    '\.rlib$',
-    '\.rmeta$',
-    '\.a$',
-    '\.so(\.\d+)*$',
-    '\.dylib$',
-    '\.dll$',
-    '\.pdb$',
-
+    '\.pyc$', '\.pyo$', '\.class$', '\.o$', '\.obj$', '\.d$', '\.rlib$', '\.rmeta$', '\.a$',
+    '\.so(\.\d+)*$', '\.dylib$', '\.dll$', '\.pdb$',
     # Minified / bundled output
-    '\.min\.js$',
-    '\.min\.css$',
-    '\.bundle\.js$',
-    '\.chunk\.js$',
-    '\.map$',
-    '\.tsbuildinfo$',
-
+    '\.min\.js$', '\.min\.css$', '\.bundle\.js$', '\.chunk\.js$', '\.map$', '\.tsbuildinfo$',
     # Rotated logs
-    '\.log\.\d+(\.gz|\.bz2|\.xz)?$',
-    '\.log\.gz$',
-
+    '\.log\.\d+(\.gz|\.bz2|\.xz)?$', '\.log\.gz$',
     # Backups / editor autosaves
-    '\.bak$',
-    '\.backup$',
-    '\.old$',
-    '\.orig$',
-    '~$',
-    '#.*#$',
-
+    '\.bak$', '\.backup$', '\.old$', '\.orig$', '~$', '#.*#$',
     # Partial downloads / temp
-    '\.crdownload$',
-    '\.part$',
-    '\.partial$',
-    '\.tmp$',
-    '\.temp$',
-    '\.!qB$',
-
+    '\.crdownload$', '\.part$', '\.partial$', '\.tmp$', '\.temp$', '\.!qB$',
     # OS-level junk
-    '/\.DS_Store$',
-    '/Thumbs\.db$',
-    '/desktop\.ini$',
-
+    '/\.DS_Store$', '/Thumbs\.db$', '/desktop\.ini$',
     # SQLite journals (churn every second)
-    '\.sqlite-wal$',
-    '\.sqlite-shm$',
-    '\.db-wal$',
-    '\.db-shm$',
-    '\.db-journal$',
-
+    '\.sqlite-wal$', '\.sqlite-shm$', '\.db-wal$', '\.db-shm$', '\.db-journal$',
     # Lock files (the filesystem primitive, not code)
-    '/flock$',
-    '/\.lock$',
-
+    '/flock$', '/\.lock$',
     # Cargo target anywhere (stricter than the default "target" substring)
     '/target/(debug|release|tmp|doc|package)/',
-
     # Python tool state
-    '\.egg-info/',
-    '\.tox/',
-    '\.pytest_cache/',
-    '\.mypy_cache/',
-    '\.ruff_cache/',
-
+    '\.egg-info/', '\.tox/', '\.pytest_cache/', '\.mypy_cache/', '\.ruff_cache/',
     # Jupyter checkpoints
     '/\.ipynb_checkpoints/',
-
     # Git pack-files
     '/\.git/objects/pack/',
-
     # Container image layers
-    '/overlay2/',
-    '/diff/',
-
+    '/overlay2/', '/diff/',
     # File-sync version histories
-    '/\.stversions/',
-    '/\.sync/',
-
+    '/\.stversions/', '/\.sync/',
     # Large binary media (body is not extracted; names rarely searched)
-    '\.(mp4|mkv|avi|mov|webm|flv|wmv)$',
-    '\.(mp3|flac|ogg|m4a|opus|wav)$',
+    '\.(mp4|mkv|avi|mov|webm|flv|wmv)$', '\.(mp3|flac|ogg|m4a|opus|wav)$',
     '\.(iso|img|vmdk|qcow2|vdi)$',
-
     # Archives
     '\.(zip|tar\.gz|tar\.bz2|tar\.xz|tgz|tbz2|txz|7z|rar)$',
-
     # Fonts
     '\.(ttf|otf|woff|woff2|eot)$',
 ]

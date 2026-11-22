@@ -605,6 +605,45 @@ pub(crate) fn current_monitor_connector(window: &gtk::ApplicationWindow) -> Opti
     monitor.connector().map(|s| String::from(s.as_str()))
 }
 
+pub(crate) fn open_cited_fragment(
+    path: &std::path::Path,
+    title: &str,
+    mime: Option<String>,
+    quote: &str,
+    locator: &str,
+) {
+    let hit = Hit {
+        id: DocId(lixun_core::paths::canonical_fs_doc_id(path)),
+        category: Category::File,
+        title: title.into(),
+        subtitle: path.display().to_string(),
+        icon_name: None,
+        kind_label: None,
+        score: 1.0,
+        action: lixun_core::Action::OpenFile {
+            path: path.to_owned(),
+        },
+        extract_fail: false,
+        sender: None,
+        recipients: None,
+        body: None,
+        secondary_action: None,
+        source_instance: String::new(),
+        row_menu: lixun_core::RowMenuDef::empty(),
+        mime,
+        timestamp: None,
+        size: None,
+    };
+    send_request_fire_and_forget(&Request::PreviewLocation {
+        hit: Box::new(hit),
+        monitor: None,
+        fragment: lixun_core::fragment::TextFragment {
+            quote: quote.to_owned(),
+            locator: Some(locator.to_owned()),
+        },
+    });
+}
+
 pub(crate) fn send_preview_request(hit: &Hit, monitor: Option<String>, query: &str) {
     let fragment = hit.body.as_deref().and_then(|body| {
         lixun_core::fragment::PassageMatcher::new(query)?
@@ -616,7 +655,9 @@ pub(crate) fn send_preview_request(hit: &Hit, monitor: Option<String>, query: &s
         Some(fragment) => Request::PreviewFragment {
             hit,
             monitor,
-            fragment,
+            fragment: lixun_ipc::Quote {
+                quote: fragment.quote,
+            },
         },
         None => Request::Preview { hit, monitor },
     };

@@ -120,7 +120,7 @@ impl PreviewPlugin for EmailPreview {
         separator.set_margin_bottom(8);
         vbox.append(&separator);
 
-        vbox.append(&build_body(&message));
+        vbox.append(&build_body(&pick_body_text(&message), hit));
 
         if let Some(list) = build_attachment_list(&message) {
             let heading = gtk::Label::new(Some("Attachments"));
@@ -187,20 +187,13 @@ fn build_from_hit_fields(hit: &Hit) -> gtk::Widget {
         vbox.append(&separator);
     }
 
-    let body_text = hit
-        .body
-        .clone()
-        .unwrap_or_else(|| "(body not available — gloda index stores a snippet only; open the message in your mail client for the full body)".into());
-    let buffer = gtk::TextBuffer::new(None);
-    buffer.set_text(&body_text);
-    let view = gtk::TextView::with_buffer(&buffer);
-    view.set_editable(false);
-    view.set_cursor_visible(false);
-    view.set_wrap_mode(gtk::WrapMode::WordChar);
-    view.set_left_margin(4);
-    view.set_right_margin(4);
-    view.add_css_class("lixun-preview-email-body");
-    vbox.append(&view);
+    if let Some(text) = hit.body.as_deref() {
+        vbox.append(&build_body(text, hit));
+    } else {
+        vbox.append(&gtk::Label::new(Some(
+            "Body unavailable. Open the original message to read it.",
+        )));
+    }
 
     let scroll = gtk::ScrolledWindow::new();
     scroll.set_child(Some(&vbox));
@@ -254,11 +247,11 @@ fn build_header_grid(msg: &mail_parser::Message<'_>) -> gtk::Grid {
     grid
 }
 
-fn build_body(msg: &mail_parser::Message<'_>) -> gtk::Widget {
-    let text = pick_body_text(msg);
+fn build_body(text: &str, hit: &Hit) -> gtk::Widget {
+    use lixun_preview::citations::{Citation, Revision, capture_button};
 
     let buffer = gtk::TextBuffer::new(None);
-    buffer.set_text(&text);
+    buffer.set_text(text);
 
     let view = gtk::TextView::with_buffer(&buffer);
     view.set_editable(false);
@@ -268,7 +261,61 @@ fn build_body(msg: &mail_parser::Message<'_>) -> gtk::Widget {
     view.set_left_margin(4);
     view.set_right_margin(4);
     view.add_css_class("lixun-preview-email-body");
-    view.upcast()
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    content.append(&view);
+    let (uri, file) = match &hit.action {
+        Action::OpenFile { path } | Action::ShowInFileManager { path } => {
+            let Ok(revision) = Revision::read(path) else {
+                return content.upcast();
+            };
+            (
+                gtk::gio::File::for_path(path).uri().to_string(),
+                Some((path.clone(), revision)),
+            )
+        }
+        Action::OpenUri { uri } => (uri.clone(), None),
+        _ => return content.upcast(),
+    };
+    let selection = remembered_selection(&view);
+    let title = hit.title.clone();
+    content.append(&capture_button(move || {
+        let (from, to) = selection
+            .get()
+            .ok_or_else(|| anyhow::anyhow!("Select a passage first"))?;
+        Ok(Citation {
+            title: title.clone(),
+            quote: buffer
+                .text(
+                    &buffer.iter_at_offset(from),
+                    &buffer.iter_at_offset(to),
+                    false,
+                )
+                .to_string(),
+            uri: uri.clone(),
+            file: file.clone(),
+            locator: None,
+            mime: None,
+        })
+    }));
+    content.upcast()
+}
+
+/// The collection-name entry can acquire the primary selection on focus.
+fn remembered_selection(view: &gtk::TextView) -> std::rc::Rc<std::cell::Cell<Option<(i32, i32)>>> {
+    use std::{cell::Cell, rc::Rc};
+    let selected = Rc::new(Cell::new(None));
+    let snapshot = selected.clone();
+    view.buffer().connect_mark_set(move |buffer, _, _| {
+        if let Some((from, to)) = buffer.selection_bounds() {
+            snapshot.set(Some((from.offset(), to.offset())));
+        }
+    });
+    let click = gtk::GestureClick::new();
+    click.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let snapshot = selected.clone();
+    click.connect_pressed(move |_, _, _, _| snapshot.set(None));
+    view.add_controller(click);
+    selected
 }
 
 fn pick_body_text(msg: &mail_parser::Message<'_>) -> String {

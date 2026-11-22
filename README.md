@@ -211,7 +211,8 @@ lixun-cli check-exclude ~/Documents     # explain the indexing policy for a path
 - When the filename contains the whole query, the row shows its parent folder, even if the same words appear in a spreadsheet formula or document body. A content match can show the surrounding passage.
 - File type labels use readable names, including for Office files already in the index.
 - Press **Space** on a matching PDF to open its preview on the first occurrence with the quote highlighted. Enter opens the usual file handler.
-- Open the launcher menu and choose **Saved searches…** to name the current query and category. Choosing a saved name searches the current index again.
+- Open the launcher menu and choose **Saved searches…** to save the current query and category. Opening a saved name shows how many results on the returned page you have never seen in that search. Choose **New only** to view those additions. Existing saved searches start tracking on their next visit.
+- In a PDF or email preview, select a passage and choose **Save quote…**. In PDFs you can also save the current page. Use the same collection name across previews. Open **Quote collections…** in the launcher menu to revisit a source or copy the collection as Markdown. PDF links carry the page number. Collections flag changed or missing local files. Messages opened by URI link back to the mail client.
 - Run `lixun-cli preview-root /path/to/folder` before adding an indexing root. The command checks installed extractors, size limits, OCR eligibility and exclusion rules. Excluded directories appear once with the matching rule. OCR candidates depend on successful recognition when indexed.
 - When an ordinary query returns zero results, the launcher can offer the same keystrokes in the other Russian/English layout. Select the suggestion and press **Enter** to search again.
 
@@ -301,8 +302,9 @@ lixun-cli semantic backfill
 ```
 
 Hybrid search can show a lexical page immediately and refine it using
-reciprocal rank fusion. Explicit photo queries give more weight to visual
-matches. Quoted phrases and field constraints retain their lexical meaning.
+reciprocal rank fusion. With the default multilingual image model, explicit photo
+queries compare visual matches with a screenshot reference. When candidates
+are too weak, activate **No confident photo matches** to see related images. Quoted phrases and field constraints retain their lexical meaning.
 
 The default document model produces 384-dimensional vectors. The multilingual
 image-query encoder searches the same 512-dimensional image vectors as the
@@ -310,9 +312,9 @@ earlier English CLIP encoder. Switching between these two query encoders
 preserves existing image vectors. For multilingual document retrieval,
 `text_model = "bge-m3"` uses more memory and requires a separate backfill.
 
-On the project's held-out photo benchmark, the default returned four relevant
-photos in the first five results in each of English, Russian and Chinese.
-The same benchmark records false positives and peak worker memory.
+On the mixed pet-photo benchmark, the first five results
+were relevant for the cat and dog queries in English, Russian and Chinese.
+The benchmark also tests requests for absent subjects and individual breeds.
 [Search quality report](docs/search-quality.md) · [Search architecture](docs/search-fusion.md)
 
 ---
@@ -739,6 +741,11 @@ A change to `INDEX_VERSION` or the plugin schema fingerprint starts a replacemen
 After the source walk and writer commit, the daemon checks that every filesystem manifest entry is present. If an indexed volume is unavailable, reconnect it and restart the daemon to resume. The daemon then opens a reader, checks the segment checksums and atomically publishes the `CURRENT` pointer. A restart before publication can resume the matching `PENDING` generation. Legacy installations with no pointer use the original directory as their previous generation. Allow disk space for both generations. Old generations are retained.
 
 The [search quality report](docs/search-quality.md) records the semantic model changes, measurements, and vector backfill requirements.
+
+**v0.7.10** adds quote collections for PDFs and email, a new-results filter
+for saved searches, and confidence checks for explicit photo queries.
+Existing saved searches start tracking on their next visit.
+[Release packages](https://github.com/dengkeping/lixun/releases/tag/v0.7.10)
 
 **v0.7.8** shows the parent folder for filename matches and readable file types
 for Office documents and attachments. Existing vendor-type labels are resolved

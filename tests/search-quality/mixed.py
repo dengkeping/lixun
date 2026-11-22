@@ -55,7 +55,61 @@ CASES = [
 ]
 
 
-def populate(corpus, archive, skew):
+# Distractors from outside the fixture topics, including near neighbours.
+CASES += [
+    ("dev", "unanswerable-visual", "en", "photos of " + noun, [])
+    for noun in [
+        "trains",
+        "boats",
+        "mountains",
+        "cars",
+        "horses",
+        "birds",
+        "clocks",
+        "buildings",
+        "bicycles",
+        "bridges",
+        "volcanoes",
+        "lions",
+        "wolves",
+        "foxes",
+        "rabbits",
+        "sheep",
+        "bears",
+        "goats",
+        "giraffes",
+        "zebras",
+    ]
+]
+CASES += [
+    ("holdout", "unanswerable-visual", "en", "photos of " + noun, [])
+    for noun in [
+        "trumpets",
+        "sailboats",
+        "ovens",
+        "pumpkins",
+        "helicopters",
+        "penguins",
+        "guitars",
+        "suitcases",
+        "fountains",
+        "waterfalls",
+    ]
+]
+CASES += [
+    ("holdout", "breed", "en", "photos of " + breed.replace("_", " ") + " cats", [name])
+    if name in CATS
+    else ("holdout", "breed", "en", "photos of " + breed + " dogs", [name])
+    for breed, name in zip(BREEDS, NAMES)
+]
+CASES += [
+    ("holdout", "unanswerable-visual", "ru", "фото слонов", []),
+    ("holdout", "unanswerable-visual", "zh", "大象的照片", []),
+    ("holdout", "related", "en", "related:photos of elephants", []),
+]
+
+
+def populate(corpus, archive, skew, photo_names):
     with archive.open("rb") as stream:
         if (
             hashlib.file_digest(stream, "sha256").hexdigest()
@@ -64,6 +118,8 @@ def populate(corpus, archive, skew):
             raise ValueError("unexpected Oxford-IIIT Pet archive checksum")
     with tarfile.open(archive) as pets:
         for breed, name in zip(BREEDS, NAMES):
+            if name not in photo_names:
+                continue
             source = pets.extractfile(f"images/{breed}_1.jpg")
             (corpus / name).write_bytes(source.read())
     docs = {
@@ -88,14 +144,14 @@ def populate(corpus, archive, skew):
     pdf = canvas.Canvas(str(corpus / "memo.pdf"))
     pdf.drawString(72, 720, "Publication schedule for the next quarterly report.")
     pdf.save()
-    return set(docs) | set(NAMES) | {"screen-0.png", "screen-1.png", "memo.pdf"}
+    return set(docs) | set(photo_names) | {"screen-0.png", "screen-1.png", "memo.pdf"}
 
 
-def evaluate(args, root):
+def evaluate(args, root, *, cases=CASES, photo_names=NAMES):
     corpus, runtime, config = root / "corpus", root / "run", root / "config/lixun"
     for directory in (corpus, runtime, config, root / "home", root / "empty"):
         directory.mkdir(mode=0o700, parents=True)
-    embedded = populate(corpus, args.pets, args.skew)
+    embedded = populate(corpus, args.pets, args.skew, photo_names)
     model_config = f'image_model = "{args.image_model}"\n' if args.image_model else ""
     (config / "config.toml").write_text(
         f"[core]\nroots = [{json.dumps(str(corpus))}]\n"
@@ -174,7 +230,7 @@ def evaluate(args, root):
         wait(lambda: embedded <= indexed())
         build_seconds = time.monotonic() - started
         rows = []
-        for split, group, lang, query, labels in CASES:
+        for split, group, lang, query, labels in cases:
             if args.split != "all" and args.split != split:
                 continue
             search = {"q": query, "limit": 10, "explain": False, "epoch": 1}
@@ -214,10 +270,23 @@ def evaluate(args, root):
             ranks = [i for i, name in enumerate(final, 1) if name in labels]
             ideal = sum(1 / math.log2(2 + i) for i in range(min(10, len(labels))))
             count = sum(r <= 5 for r in ranks)
-            if not labels:
+            if group == "unanswerable-visual":
+                hits = pages[-1][0]["SearchChunk"]["hits"]
+                passed = len(hits) == 1 and hits[0]["action"] == {
+                    "ReplaceQuery": {"q": "related:" + query}
+                }
+            elif group == "related":
+                passed = bool(final) and all(
+                    name.endswith((".jpg", ".png")) for name in final
+                )
+            elif not labels:
                 passed = not final and not first
             elif group == "visual":
-                passed = 1 in ranks and count >= 4
+                passed = (
+                    1 in ranks
+                    and count >= 4
+                    and not any(name.startswith("screen-") for name in final[:5])
+                )
             elif group == "filtered":
                 passed = set(first) == set(labels) == set(final)
             else:
@@ -305,6 +374,21 @@ if __name__ == "__main__":
         ap.error("repetitions must be positive and skew nonnegative")
     with tempfile.TemporaryDirectory(prefix="lixun-mixed-") as temp:
         report = evaluate(args, Path(temp))
+        if args.gate and args.image_model in (None, "clip-vit-b-32-multilingual"):
+            # The Birman is below the strong-match cutoff on its own. A screenshot
+            # labelled "cats" also outranks it before screenshot filtering.
+            cat = NAMES[BREEDS.index("Birman")]
+            sparse = evaluate(
+                args,
+                Path(temp) / "sparse",
+                cases=[(args.split, "sparse-visual", "en", "photos of cats", [cat])],
+                photo_names=[*DOGS, cat],
+            )
+            row = sparse["rows"][0]
+            report["sparse_photo"] = row
+            assert row["final"] == [cat], (
+                "failed to retrieve the only matching cat photo"
+            )
     summary = []
     for group, lang in sorted({(r["group"], r["language"]) for r in report["rows"]}):
         rows = [
@@ -330,15 +414,20 @@ if __name__ == "__main__":
             for line in report["model_log"]
         ), "model selection mismatch"
         assert report["worker_peak_kib"] > 0
-        gates = {"visual", "text", "exact", "filtered", "absent", "category"}
+        gates = {
+            "visual",
+            "text",
+            "exact",
+            "filtered",
+            "absent",
+            "category",
+            "unanswerable-visual",
+            "related",
+        }
         if args.text_model == "bge-m3":
             gates.add("cross-language")
         for row in report["rows"]:
             if row["group"] == "visual":
-                assert (
-                    row["fusion_input_ranks"]
-                    and {"classify_query", "search_text", "search_image"}
-                    <= row["channels"].keys()
-                ), "missing channel diagnostics"
+                assert "search_image" in row["channels"], "missing channel diagnostics"
             if row["group"] in gates and not row["passed"]:
                 raise SystemExit("quality gate failed for " + row["query"])

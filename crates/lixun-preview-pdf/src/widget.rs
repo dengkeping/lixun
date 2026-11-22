@@ -87,6 +87,7 @@ mod imp {
         pub search_state: RefCell<Option<Rc<RefCell<SearchState>>>>,
         pub session: RefCell<Option<Rc<DocumentSession>>>,
         pub max_page_size: Cell<(f64, f64)>,
+        pub revision: RefCell<Option<lixun_preview::citations::Revision>>,
     }
 
     #[glib::object_subclass]
@@ -111,6 +112,85 @@ glib::wrapper! {
 }
 
 impl PdfView {
+    pub(crate) fn enable_citations(&self, path: &std::path::Path) {
+        self.refresh_revision(path);
+        let weak = self.downgrade();
+        self.append(&lixun_preview::citations::capture_button(move || {
+            weak.upgrade()
+                .ok_or_else(|| anyhow::anyhow!("Preview closed"))?
+                .citation()
+        }));
+    }
+
+    pub(crate) fn refresh_revision(&self, path: &std::path::Path) {
+        self.imp()
+            .revision
+            .replace(lixun_preview::citations::Revision::read(path).ok());
+    }
+
+    fn citation(&self) -> anyhow::Result<lixun_preview::citations::Citation> {
+        use anyhow::Context;
+        let session = self.imp().session.borrow();
+        let session = session.as_ref().context("Preview has no document")?;
+        let canvas = self.imp().canvas.borrow();
+        let canvas = canvas.as_ref().context("Preview has no page")?;
+        let (page, quote) = match canvas.selection() {
+            Some(sel) if matches!(sel.mode, PdfSelectionMode::Text { .. }) => (
+                crate::selection::normalized_selection(&sel).0.page,
+                collect_selected_text(session, &sel),
+            ),
+            Some(_) => anyhow::bail!("Select text to save a quote"),
+            None => {
+                let n = canvas.current_page();
+                let text = session
+                    .main_page(n)
+                    .and_then(|p| p.text())
+                    .context("This page has no text")?;
+                (n, text.to_string())
+            }
+        };
+        let path = session.path();
+        let locator = format!("page={}", page + 1);
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let revision = self
+            .imp()
+            .revision
+            .borrow()
+            .clone()
+            .context("Source revision unavailable")?;
+        Ok(lixun_preview::citations::Citation {
+            title: format!("{name} · p. {}", page + 1),
+            quote,
+            uri: format!("{}#{locator}", gtk::gio::File::for_path(&path).uri()),
+            file: Some((path, revision)),
+            locator: Some(locator),
+            mime: Some("application/pdf".into()),
+        })
+    }
+
+    pub(crate) fn reveal_page(&self, page: u32) {
+        let Some(canvas) = self.imp().canvas.borrow().clone() else {
+            return;
+        };
+        let Some(scroll) = self.imp().scroll.borrow().clone() else {
+            return;
+        };
+        let Some(session) = self.imp().session.borrow().clone() else {
+            return;
+        };
+        let epoch = session.current_epoch();
+        self.add_tick_callback(move |_, _| {
+            if session.current_epoch() != epoch {
+                return glib::ControlFlow::Break;
+            }
+            if scroll.vadjustment().page_size() <= 0.0 {
+                return glib::ControlFlow::Continue;
+            }
+            canvas.scroll_to_page(&scroll, page);
+            glib::ControlFlow::Break
+        });
+    }
+
     /// Select the first matching passage and scroll it into view.
     pub fn find_quote(&self, text: &str) {
         if let Some(bar) = self.imp().search_bar.borrow().as_ref() {

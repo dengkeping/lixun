@@ -370,49 +370,27 @@ impl PdfCanvas {
     }
 
     pub fn recompute_current_page(&self, vadj_value: f64, viewport_h: f64) {
-        let pages = self.imp().pages.borrow();
-        if !pages.is_empty() && pages.iter().any(|p| p.height() > 0) {
-            let viewport_top = vadj_value;
-            let viewport_bot = vadj_value + viewport_h;
-            let mut best: (u32, f64) = (0, -1.0);
-            for child in pages.iter() {
-                let Some(bounds) = child.compute_bounds(self) else {
-                    continue;
-                };
-                let child_top = bounds.y() as f64 + vadj_value;
-                let child_bot = child_top + bounds.height() as f64;
-                let inter = (child_bot.min(viewport_bot) - child_top.max(viewport_top)).max(0.0);
-                if inter > best.1 {
-                    best = (child.page_index(), inter);
-                }
-            }
-            if best.1 > 0.0 {
-                self.set_current_page(best.0);
-                return;
-            }
-        }
+        // Adjustment notifications precede child allocation. Use the same document
+        // coordinates as allocate_children so a jump cannot reuse old widget bounds.
         let Some(session) = self.session() else {
             return;
         };
-        let zoom = self.zoom();
-        let scale = (BASE_DPI / POINTS_PER_INCH) * zoom;
-        let n = session.n_pages();
-        if n == 0 {
-            return;
-        }
-        let viewport_center = vadj_value + viewport_h * 0.5;
-        let mut y_pt: f64 = 0.0;
-        let mut best: (u32, f64) = (0, f64::INFINITY);
-        for i in 0..n {
-            let Some(sz) = session.page_size(i) else {
+        let scale = (BASE_DPI / POINTS_PER_INCH) * self.zoom();
+        let mut top = 0.0;
+        let mut best = (self.current_page(), 0.0);
+        for index in 0..session.n_pages() {
+            let Some(size) = session.page_size(index) else {
                 continue;
             };
-            let page_center_px = y_pt * scale + sz.height_pt * scale * 0.5;
-            let dist = (page_center_px - viewport_center).abs();
-            if dist < best.1 {
-                best = (i, dist);
+            let bottom = top + size.height_pt * scale;
+            let visible = bottom.min(vadj_value + viewport_h) - top.max(vadj_value);
+            if visible > best.1 {
+                best = (index, visible);
             }
-            y_pt += sz.height_pt + PAGE_GAP_PT;
+            top = bottom + PAGE_GAP_PT * scale;
+            if top >= vadj_value + viewport_h {
+                break;
+            }
         }
         self.set_current_page(best.0);
     }

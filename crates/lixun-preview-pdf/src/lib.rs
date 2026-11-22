@@ -87,14 +87,27 @@ impl PreviewPlugin for PdfPreview {
         };
 
         match PdfView::new(path.clone()) {
-            Ok(view) => Ok(view.upcast()),
+            Ok(view) => {
+                view.enable_citations(&path);
+                Ok(view.upcast())
+            }
             Err(e) => Ok(error_widget(&open_error_message(&e)).upcast()),
         }
     }
 
     fn reveal_fragment(&self, widget: &gtk::Widget, fragment: &lixun_core::fragment::TextFragment) {
         if let Some(view) = widget.downcast_ref::<PdfView>() {
-            view.find_quote(&fragment.quote);
+            if let Some(page) = fragment
+                .locator
+                .as_deref()
+                .and_then(|s| s.strip_prefix("page="))
+                .and_then(|s| s.parse::<u32>().ok())
+                .and_then(|n| n.checked_sub(1))
+            {
+                view.reveal_page(page);
+            } else {
+                view.find_quote(&fragment.quote);
+            }
         }
     }
 
@@ -114,7 +127,8 @@ impl PreviewPlugin for PdfPreview {
         let view = widget
             .downcast_ref::<PdfView>()
             .ok_or_else(|| anyhow::anyhow!(UPDATE_UNSUPPORTED))?;
-        view.replace_path(new_path)?;
+        view.replace_path(new_path.clone())?;
+        view.refresh_revision(&new_path);
         Ok(())
     }
 }

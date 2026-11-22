@@ -99,10 +99,7 @@ impl HybridSearchHandle {
         let query = query.clone();
         let handle = self.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle
-                .fused_search_streaming(&query, category, tx, cancel)
-                .await
-            {
+            if let Err(e) = handle.stream_query(&query, category, tx, cancel).await {
                 tracing::warn!(target: "lixun_fusion", error = %e, "fused_search_streaming failed");
             }
         });
@@ -174,6 +171,63 @@ impl HybridSearchHandle {
         self.inner.hydrate_docs(doc_ids).await
     }
 
+    async fn stream_query(
+        &self,
+        query: &lixun_core::Query,
+        category: Option<lixun_core::Category>,
+        tx: mpsc::Sender<FusionChunk>,
+        cancel: CancellationToken,
+    ) -> Result<()> {
+        let ann = self
+            .ann
+            .as_ref()
+            .expect("hybrid search requires an ANN provider");
+        let target_limit = query.limit.max(1) as usize;
+        let ann_k = self.candidate_limit(target_limit);
+        let specialized = tokio::select! {
+            _ = cancel.cancelled() => return Ok(()),
+            result = ann.ranked_page(&query.text,category,ann_k) => result,
+        };
+        if let Ok(Some(page)) = specialized {
+            let _ = tx
+                .send(FusionChunk {
+                    phase: Phase::Initial,
+                    hits: Vec::new(),
+                })
+                .await;
+            let mut hits = self.inner.hydrate_docs(page.ids).await?;
+            hits.retain(|(h, _)| category.is_none_or(|c| c == h.category));
+            hits.truncate(target_limit);
+            for (rank, (hit, bd)) in hits.iter_mut().enumerate() {
+                hit.score = 1.0 / (rank + 1) as f32;
+                bd.final_score = hit.score;
+            }
+            if hits.is_empty()
+                && let Some(hit) = page.empty_suggestion
+            {
+                let bd = lixun_core::ScoreBreakdown {
+                    final_score: hit.score,
+                    ..Default::default()
+                };
+                hits.push((hit, bd));
+            }
+            let _ = tx
+                .send(FusionChunk {
+                    phase: Phase::Final,
+                    hits,
+                })
+                .await;
+            return Ok(());
+        }
+
+        self.fused_search_streaming(query, category, tx, cancel)
+            .await
+    }
+
+    fn candidate_limit(&self, limit: usize) -> usize {
+        limit.saturating_mul(self.overfetch).max(limit)
+    }
+
     async fn fused_search_streaming(
         &self,
         query: &lixun_core::Query,
@@ -184,9 +238,7 @@ impl HybridSearchHandle {
         use std::collections::HashMap;
 
         let target_limit = query.limit.max(1) as usize;
-        let ann_k = target_limit
-            .saturating_mul(self.overfetch)
-            .max(target_limit);
+        let ann_k = self.candidate_limit(target_limit);
 
         let ann = self
             .ann
@@ -318,7 +370,7 @@ impl HybridSearchHandle {
         } else {
             modality_res.unwrap_or(lixun_mutation::Modality::Text)
         };
-        let weights = channel_weights(&query.text, modality, &text_hits, &image_hits);
+        let weights = channel_weights(modality, &text_hits, &image_hits);
         tracing::debug!(
             target: "lixun_fusion",
             ?modality,
@@ -606,12 +658,11 @@ fn looks_navigational(query: &str) -> bool {
 }
 
 fn channel_weights(
-    query: &str,
     modality: lixun_mutation::Modality,
     text_hits: &[lixun_mutation::AnnHit],
     image_hits: &[lixun_mutation::AnnHit],
 ) -> (f32, f32, f32) {
-    match explicit_media_intent(query).unwrap_or(modality) {
+    match modality {
         lixun_mutation::Modality::Image => (1.0, 0.8, 2.0),
         // A rank-one neighbour exists even for a channel with no clear
         // match. For ambiguous intent use the separation of the leading
@@ -622,40 +673,6 @@ fn channel_weights(
             1.0 + 1.3 * lead_separation(image_hits),
         ),
         lixun_mutation::Modality::Text => (1.0, 1.0, 1.0),
-    }
-}
-
-fn explicit_media_intent(query: &str) -> Option<lixun_mutation::Modality> {
-    let text = query.trim().to_lowercase();
-    if looks_navigational(&text) {
-        return None;
-    }
-    let photos = [
-        "photo of ",
-        "photos of ",
-        "photograph of ",
-        "photographs of ",
-        "pictures of ",
-        "picture of ",
-        "фото ",
-        "фотография ",
-        "фотографии ",
-    ];
-    if photos.iter().any(|prefix| text.starts_with(prefix)) || text.ends_with("的照片") {
-        Some(lixun_mutation::Modality::Image)
-    } else if [
-        "article about ",
-        "articles about ",
-        "статья о ",
-        "статья об ",
-    ]
-    .iter()
-    .any(|prefix| text.starts_with(prefix))
-        || text.ends_with("的文章")
-    {
-        Some(lixun_mutation::Modality::Text)
-    } else {
-        None
     }
 }
 
@@ -708,21 +725,11 @@ mod tests {
     #[test]
     fn explicit_photo_intent_beats_duplicate_text_votes() {
         use lixun_mutation::Modality;
-        for q in ["Photos of birds", "фото птиц", "鸟的照片"] {
-            let weights = super::channel_weights(q, Modality::Both, &[], &[]);
-            let text = vec![(String::from("article"), 1.0)];
-            let images: Vec<_> = (0..5).map(|i| (format!("photo-{i}"), 1.0)).collect();
-            let ordered = crate::rrf::rrf_fuse_3way_weighted(&text, &text, &images, 60.0, weights);
-            assert!(
-                ordered[..5].iter().all(|(id, _)| id.starts_with("photo-")),
-                "{q}"
-            );
-        }
-        assert_eq!(super::explicit_media_intent("photo.jpg"), None);
-        assert_eq!(
-            super::explicit_media_intent("article about photographs"),
-            Some(Modality::Text)
-        );
+        let weights = super::channel_weights(Modality::Image, &[], &[]);
+        let text = vec![(String::from("article"), 1.0)];
+        let images: Vec<_> = (0..5).map(|i| (format!("photo-{i}"), 1.0)).collect();
+        let ordered = crate::rrf::rrf_fuse_3way_weighted(&text, &text, &images, 60.0, weights);
+        assert!(ordered[..5].iter().all(|(id, _)| id.starts_with("photo-")));
     }
 
     #[test]
